@@ -89,7 +89,7 @@ Shi, Zhang, and Cui, ["A Programming Paradigm for Spatiotemporal Composability"]
 
 ### 4.6 Optimization by prompting
 
-Yang et al., ["Large Language Models as Optimizers"](https://arxiv.org/abs/2309.03409) (arXiv:2309.03409, Google DeepMind), call the method Optimization by PROmpting (OPRO). Each step shows the model earlier solutions together with their scores. The new solutions are scored and added to that prompt. §6.15 uses this shape for a Goal's attempt history: the planner sees prior attempts and their scores. Compaction, retraction markers, and who may write a score are §6.15 and §7.
+Yang et al., ["Large Language Models as Optimizers"](https://arxiv.org/abs/2309.03409) (arXiv:2309.03409, Google DeepMind), call the method Optimization by PROmpting (OPRO). Each step shows the model earlier solutions together with their scores. The new solutions are scored and added to that prompt. Their default meta-prompt keeps the best 20 solutions so far, and each step generates 8 new solutions. §6.15 uses that shape for a Goal's Attempt history, with those two figures as the defaults. Compaction, retraction markers, and who may write a score are §6.15 and §7.
 
 ## 5. Architecture overview
 
@@ -101,14 +101,15 @@ These objects are defined here. Later sections use these names and do not redefi
 - **Board.** The shared message board. Posts are untrusted, signed and audited, and never grant anything.
 - **Capability.** A typed, scoped permission. It is the only authorization boundary, as in §7.
 - **Finding.** A typed, sourced record of something established under a Goal. It is separate from a Board post. The broker writes its provenance. Storage, lineage, and rejection of agent-supplied provenance are §6.14. A retraction flags descendant Findings and reopens the Needs that depend on them (§6.14). Marking policy is §7.
+- **Attempt.** One scored try under a Goal, built from its Tasks and Findings. The evaluator writes and signs the score. The history, the defaults from §4.6, and compaction are §6.15.
 
-An operator registers one Goal. That act fixes the ceiling for every Need, Task, Board topic, Finding, and reservation under it (§7.4.7). A Need is a request inside that ceiling. Meeting a Need does not widen the ceiling. A Goal may fan out into sub-Goals, Needs, and Tasks. Admission of that fan-out is §6.14. Work moves as Tasks. The child holds a narrower Capability set and a smaller budget than the parent (§7.4.6). How a Task and the Board move across machines is §6.10.
+An operator registers one Goal. That act fixes the ceiling for every Need, Task, Board topic, Finding, and reservation under it (§7.4.7). A Need is a request inside that ceiling. Meeting a Need does not widen the ceiling. A Goal may fan out into sub-Goals, Needs, and Tasks. Admission of that fan-out is §6.14. Work moves as Tasks. The child holds a narrower Capability set and a smaller budget than the parent (§7.4.6). Board and Task across machines are §6.10.
 
 The Board is how agents share messages. A post is input to other agents. It is signed by the poster, written to the audit log, and checked before it is stored. It does not grant a Capability, a budget, or any other authority (§7.10).
 
-The control plane stores the Goal, Task records, Board order, and leases. The data plane carries agent traffic and provider calls (§6.4). Model calls use the Provider trait in §8. Keys and the spend ledger stay with the broker (§7.5, §7.6).
+The control plane stores the Goal, Task records, Board order, and leases. The data plane carries agent traffic and provider calls (§6.4). Model calls use the Provider trait in §8. Keys stay with the broker (§7.5). Placement and spend share one reserve: the scheduler reserve phase is §6.2, and the cap ledger is §7.6.2.
 
-Each Goal keeps a scored attempt history built from its Tasks and Findings. The planner reads that history in the OPRO shape from §4.6. How the history is stored, compacted, and filtered by Capability is §6.15.
+Each Goal keeps a scored Attempt history built from its Tasks and Findings. The planner reads that history in the OPRO shape from §4.6. How the history is stored, compacted, and filtered by Capability is §6.15.
 
 Modules follow the component shape in §4.5. A Need is the needs/provides pair: a module declares the Needs it depends on and the Needs it provides. It activates when every Need it depends on is provided, and it deactivates when one of those Needs is withdrawn. Every effect the module performs must be revertible, meaning the runtime holds an inverse and runs it on unload. That requirement is part of how the paper makes modularity provable. The PoC requires the shape. A proof for this codebase is later work (§3).
 
@@ -812,7 +813,7 @@ The trait has two backends.
 
 **Routing.** The Goal allowlist (§7.6.1) is the set of providers and models a call may use. The router refuses a call outside that set. Which concrete backends the PoC must run, and which allowlisted backend wins when several can serve the model, is Q15.
 
-**Cost.** The backend returns usage (token counts and enough data to price the call). The broker hands that usage to the ledger as the settle input. Reserve, settle, release, and overrun handling stay in §7.6.
+**Cost.** The backend returns usage (token counts and enough data to price the call). The broker hands that usage to the ledger as the settle input against the shared reserve: the scheduler reserve phase in §6.2 and the cap ledger in §7.6.2.
 
 **Keys.** Hosted API keys live only in the broker. The self-hosted server is reached by the broker as well, so the agent has no direct route to it, and that call is reserved and settled on the same path. Air-gapped mode (§6.5) uses the self-hosted backend, through the same egress proxy.
 
@@ -820,7 +821,7 @@ The trait has two backends.
 
 "MUST" and "SHOULD" follow RFC 2119, as in §7.
 
-Runtime requirements are R-SCH-*, R-BRD-*, R-NET-1, R-FND-*, and R-HIST-* in §6. Authorization, the ledger, the Board's trust rules, delegation, and unsanctioned-coordination controls are SEC-F-1 through SEC-F-38 in §7.11.
+Runtime requirements are R-SCH-*, R-BRD-*, R-NET-1, R-FND-*, and R-HIST-* in §6. Authorization, the ledger, the Board's trust rules, delegation, and unsanctioned-coordination controls are SEC-F-1 through SEC-F-38 in §7.11. Board and Task across machines are §6.10. The shared reserve is the scheduler reserve phase in §6.2 and the cap ledger in §7.6.2.
 
 Requirements added here:
 
@@ -830,7 +831,7 @@ Requirements added here:
 - **R-PRV-2.** The PoC MUST ship two `Provider` implementations: one for a self-hosted server on cluster GPUs, and one for a hosted inference API.
 - **R-PRV-3.** The broker MUST hold hosted API keys. An agent MUST NOT receive them.
 - **R-PRV-4.** The router MUST send a call only to a provider and model on the Goal allowlist (§7.6.1).
-- **R-PRV-5.** The provider MUST report usage to the broker, and the broker MUST pass that usage to the ledger for settlement (§7.6).
+- **R-PRV-5.** The provider MUST report usage to the broker, and the broker MUST pass that usage to the shared reserve for settlement (§6.2, §7.6.2).
 
 **Non-functional.** Performance targets are the proposed targets in §6.12. Security targets are §7.12. This section adds no numeric targets.
 
