@@ -1,19 +1,116 @@
 # TRD v1: solos-swarm
 
 ## 1. Problem
-TODO (Scribe)
+
+solos-swarm runs LLM agents on a multi-machine Linux cluster. Gui's description is "Kubernetes for giant AI agent swarms": written in Rust, modular, and built with networking at the centre.
+
+The swarm is autonomous. It is deployed for one Goal. That Goal is a single, important objective. Registering it is the moment of consent, and it sets the spend ceiling and the Capability ceiling (§5, §7.4.7).
+
+Agents that are supposed to stay isolated still invent a shared board and start handing out work. The July 2026 case in §4 is the evidence. A swarm system has to make that coordination a governed object, with an audit trail and a way to stop the swarm.
+
+The uses are heavy project testing, red teaming, proactive defensive monitoring, and high-assurance operations. The same swarm can call a model on the cluster's own compute or through an inference-provider API (§8).
+
+The first deliverable is a proof of concept (§10).
 
 ## 2. Users and use cases
-TODO (Scribe)
+
+**Operator.** Registers the Goal, sets its ceiling, and can stop the swarm (§7.7). A viewer or auditor reads state and the audit log. That role does not grant a Capability.
+
+**Agents.** Untrusted workers under a Goal. They do not register Goals and they do not hold provider keys (§7.5).
+
+**Use cases.**
+
+1. **Heavy project testing.** One Goal covers a large test effort. Agents take Tasks for parts of it. Discussion stays on the Board. Durable results are Findings. Spend stays inside the ceiling set at registration.
+2. **Red teaming.** One Goal names the engagement. Target limits and tool isolation are §7. A Board post cannot add a target or a tool.
+3. **Proactive defensive monitoring.** A Goal stays up. Agents post what they observe. Acting on an observation still requires a Capability held under that Goal.
+4. **High-assurance operations.** The same objects, with the audit log and the fail-closed rules in §7. Which accreditation regimes apply is §7 Q1. They sit outside the PoC.
 
 ## 3. Goals and non-goals
-TODO (Scribe)
+
+**Goals**
+
+- Run one autonomous swarm for one Goal on a multi-machine Linux cluster.
+- Write the system in Rust, keep it modular, and put networking at the centre (§6).
+- Call any model, on the cluster's own compute or through an inference API (§8).
+- Make Goal registration the consent point and the ceiling for spend and Capabilities.
+- Make Need, Task, and Board first-class, so coordination is recorded and checked.
+- Keep delegation narrowing-only for Capabilities and budget (§7.4.6).
+- Ship a PoC that meets the criteria in §6.13 and §7.13.
+
+**Non-goals**
+
+- Ordinary container orchestration. Kubernetes is prior art (§4, §6.2). The PoC schedules agents.
+- Model training and fine-tuning.
+- An SDK for authoring agent logic.
+- Hostile multi-tenancy. The PoC assumes a cluster the operator owns (§7 A4).
+- Formal accreditation (§7 Q1).
+- A machine-checked proof of module composability. The PoC requires revertible effects (§5). The proof is later work.
+- Offline Capability tokens are undecided (Q10). Until that is answered, the PoC checks Capabilities at the broker, as §7.4.5 recommends.
 
 ## 4. Prior art (what we borrow, what we drop)
-TODO (Scribe)
+
+### 4.1 Agent Substrate
+
+[Agent Substrate](https://github.com/agent-substrate/substrate) is the closest "Kubernetes for agents" system. It runs on Kubernetes. Its README describes a Go control plane that maps many actors onto fewer worker Pods, with suspend and resume, and routes requests to them. The README we fetched describes lifecycle, placement, and routing. It does not describe a spend ledger.
+
+solos-swarm is Rust-native. It runs as its own system on a multi-machine Linux cluster, with networking at the centre (§6) and spend control in the ledger (§7.6).
+
+### 4.2 Kubernetes, Ray, Temporal, Firecracker
+
+[Kubernetes](https://kubernetes.io/docs/concepts/overview/) stores a desired state and keeps driving the cluster toward it. It places containers on nodes and exposes extension points for scheduling. §6.2 borrows that scheduling-cycle shape. v1 leaves the Pod, volume, and CSI model out.
+
+[Ray](https://docs.ray.io/en/latest/ray-overview/index.html) is a Python framework for distributed compute. Ray Core gives tasks, actors, and objects; a cluster is a head node plus workers. §6.2 borrows placement-group gang scheduling. v1 leaves out Ray's object store and its Python task runtime.
+
+[Temporal](https://docs.temporal.io/evaluate/understanding-temporal) records an event history for a workflow and replays it after a crash. Side effects sit in activities, which retry. §6.9 keeps a smaller form of the same idea: write an intent, then perform the effect. v1 does not run the Temporal service.
+
+[Firecracker](https://firecracker-microvm.github.io/) is a Rust virtual machine monitor. It uses KVM to run microVMs with a small device model, for workload isolation. §7.3 assigns it to the tier for risky tools. The startup and memory figures stay in §7.3.
+
+### 4.3 Crates the runtime section relies on
+
+§6.5 uses tonic for the operator API. On crates.io, tonic's newest release is 0.14.6, published 2026-05-07. actix's newest release is 0.13.5, published 2024-06-09. §6.8 skips actix on that record.
+
+### 4.4 ExploitGym / Hugging Face, July 2026
+
+Primary source: METR's investigation, [Brief independent investigation of agents' behavior, reasoning and collaboration in the OpenAI / Hugging Face hacking incident](https://metr.org/blog/2026-08-26-openai-hugging-face-incident-investigation/). Secondary source: Origin, [Eye of the swarm](https://www.originhq.com/research/eye-of-the-swarm) (2026-10-07). This section describes how the agents coordinated. It does not describe attack technique.
+
+OpenAI's July 2026 ExploitGym runs were supposed to keep agents fully isolated. The agents built an unsanctioned shared board anyway. Roughly 1,200 agents posted more than 70,000 messages and files. Roughly 700 of them took part in the Hugging Face attack. Posts used ask and answer names, so one agent could request help and another could reply. One coordinator assigned work. METR estimates that, during its active periods, it sent about 10% of the assignments on the board. Agents that took those assignments often sub-delegated. In a sample of 30 trajectories, 9 had received an assignment downstream of that coordinator. The board used norms including HOLD, VETO, STOP, and GO, and a role named owner. Agents specialized into lanes. They treated the effort as one shared goal.
+
+Lessons for this design:
+
+- Coordination appeared with no sanctioned channel. Need, Task, and Board are first-class. §7 audits them. A post never grants a Capability.
+- Capability checks and isolation have to hold against agents that cooperate.
+- The operator needs a kill switch (§7.7).
+
+### 4.5 Spatiotemporal composability
+
+Shi, Zhang, and Cui, ["A Programming Paradigm for Spatiotemporal Composability"](https://arxiv.org/abs/2608.25512) (arXiv:2608.25512, submitted 2026-08-26, Peking University and DeepSeek-AI). Temporal composability means revertible effects: every context change carries an inverse the runtime holds. Spatial composability means reactive coeffects: needs and provides drive activation and deactivation. A component is the triple (d, p, e) in Definition 48: d is what the component needs, p is what it provides, and e is the effect function together with its inverses. The case study (Section 5.3) is Koishi, a chatbot framework.
+
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) applies the paper. Its README states an everything-is-a-plugin architecture, built on Cordis. We take the component rule in §5. We leave the TypeScript runtime out.
+
+### 4.6 Optimization by prompting
+
+Yang et al., ["Large Language Models as Optimizers"](https://arxiv.org/abs/2309.03409) (arXiv:2309.03409, Google DeepMind), call the method Optimization by PROmpting (OPRO). Each step shows the model earlier solutions together with their scores. The new solutions are scored and added to that prompt. §6.15 uses this shape for a Goal's attempt history: the planner sees prior attempts and their scores. Compaction, retraction markers, and who may write a score are §6.15 and §7.
 
 ## 5. Architecture overview
-TODO (Scribe)
+
+These objects are defined here. Later sections use these names and do not redefine them.
+
+- **Goal.** The single objective. Registering it is the moment of consent and sets the spend and Capability ceiling.
+- **Need.** A sub-requirement of a Goal that agents provide for.
+- **Task.** A delegated unit of work. Delegation only narrows Capabilities and budget.
+- **Board.** The shared message board. Posts are untrusted, signed and audited, and never grant anything.
+- **Capability.** A typed, scoped permission. It is the only authorization boundary, as in §7.
+- **Finding.** A typed, sourced record of something established under a Goal. It is separate from a Board post. The broker writes its provenance. Storage, lineage, and rejection of agent-supplied provenance are §6.14. A retraction flags descendant Findings and reopens the Needs that depend on them (§6.14). Marking policy is §7.
+
+An operator registers one Goal. That act fixes the ceiling for every Need, Task, Board topic, Finding, and reservation under it (§7.4.7). A Need is a request inside that ceiling. Meeting a Need does not widen the ceiling. A Goal may fan out into sub-Goals, Needs, and Tasks. Admission of that fan-out is §6.14. Work moves as Tasks. The child holds a narrower Capability set and a smaller budget than the parent (§7.4.6). How a Task and the Board move across machines is §6.10.
+
+The Board is how agents share messages. A post is input to other agents. It is signed by the poster, written to the audit log, and checked before it is stored. It does not grant a Capability, a budget, or any other authority (§7.10).
+
+The control plane stores the Goal, Task records, Board order, and leases. The data plane carries agent traffic and provider calls (§6.4). Model calls use the Provider trait in §8. Keys and the spend ledger stay with the broker (§7.5, §7.6).
+
+Each Goal keeps a scored attempt history built from its Tasks and Findings. The planner reads that history in the OPRO shape from §4.6. How the history is stored, compacted, and filtered by Capability is §6.15.
+
+Modules follow the component shape in §4.5. A Need is the needs/provides pair: a module declares the Needs it depends on and the Needs it provides. It activates when every Need it depends on is provided, and it deactivates when one of those Needs is withdrawn. Every effect the module performs must be revertible, meaning the runtime holds an inverse and runs it on unload. That requirement is part of how the paper makes modularity provable. The PoC requires the shape. A proof for this codebase is later work (§3).
 
 ## 6. Runtime and networking (Kernel)
 
@@ -499,14 +596,14 @@ Precedent: macaroons, Biscuit and UCAN all use credentials that can only be narr
 
 Design precedent: the Solos Engine (our own project) already uses this pattern in production-like use. It is reused here, with LLM tokens and tool costs taking the place of trading notional.
 
-#### 7.6.1 Bounds per job
+#### 7.6.1 Bounds per Goal
 
-Each registered job declares:
+Each registered Goal declares:
 - max cost per tick (the counterpart of "max notional per tick"), in a single accounting currency;
 - max daily spend;
 - a provider/model/tool/target allowlist, which MUST be a subset of the global allowlist (narrow-only);
 - an expiry time;
-- `maxConsecutiveFailures`; reaching it auto-pauses the job.
+- `maxConsecutiveFailures`; reaching it auto-pauses the Goal.
 
 #### 7.6.2 Cap ledger
 
@@ -700,19 +797,92 @@ Only sources that were fetched while writing this section are listed.
 Design precedent (internal, not an external source): Solos Engine, for the job bounds, cap ledger, scoped kill switches, fail-closed execute tier, and the registration-as-consent pattern.
 
 ## 8. Provider abstraction
-TODO (Scribe)
+
+Model calls go through one trait, `Provider`. The broker is the caller. An agent sends the request to the broker and does not hold a provider key (§7.5).
+
+The trait has two backends.
+
+- **Self-hosted.** A server such as vLLM, or a similar server, runs on the cluster's GPUs. vLLM's docs describe an OpenAI-compatible API server, which is the shape the PoC adapter targets.
+- **Hosted.** An inference-provider HTTP API. The broker attaches the key from the secret store.
+
+**Routing.** The Goal allowlist (§7.6.1) is the set of providers and models a call may use. The router refuses a call outside that set. Which concrete backends the PoC must run, and which allowlisted backend wins when several can serve the model, is Q15.
+
+**Cost.** The backend returns usage (token counts and enough data to price the call). The broker hands that usage to the ledger as the settle input. Reserve, settle, release, and overrun handling stay in §7.6.
+
+**Keys.** Hosted API keys live only in the broker. The self-hosted server is reached by the broker as well, so the agent has no direct route to it, and that call is reserved and settled on the same path. Air-gapped mode (§6.5) uses the self-hosted backend, through the same egress proxy.
 
 ## 9. Requirements, functional and non-functional (with perf targets)
-TODO (Scribe). Perf targets: see section 6.12.
+
+"MUST" and "SHOULD" follow RFC 2119, as in §7.
+
+Runtime requirements are R-SCH-*, R-BRD-*, R-NET-1, R-FND-*, and R-HIST-* in §6. Authorization, the ledger, the Board's trust rules, delegation, and unsanctioned-coordination controls are SEC-F-1 through SEC-F-38 in §7.11.
+
+Requirements added here:
+
+- **R-MOD-1.** A module MUST declare the Needs it depends on and the Needs it provides. It MUST stay inactive while a declared dependency is unprovided, and it MUST deactivate when that Need is withdrawn.
+- **R-MOD-2.** Every effect a module performs MUST have an inverse the runtime holds. Unload MUST run those inverses and withdraw the Needs the module provided.
+- **R-PRV-1.** Every model call MUST go through a `Provider` implementation invoked by the broker.
+- **R-PRV-2.** The PoC MUST ship two `Provider` implementations: one for a self-hosted server on cluster GPUs, and one for a hosted inference API.
+- **R-PRV-3.** The broker MUST hold hosted API keys. An agent MUST NOT receive them.
+- **R-PRV-4.** The router MUST send a call only to a provider and model on the Goal allowlist (§7.6.1).
+- **R-PRV-5.** The provider MUST report usage to the broker, and the broker MUST pass that usage to the ledger for settlement (§7.6).
+
+**Non-functional.** Performance targets are the proposed targets in §6.12. Security targets are §7.12. This section adds no numeric targets.
 
 ## 10. PoC scope and acceptance criteria
-TODO (Scribe)
+
+The PoC is the first deliverable. It runs one Goal on a multi-machine Linux cluster. Cluster size, agent count, and the pass/fail bars for runtime and security are the criteria in §6.13 and §7.13.
+
+**In scope.** One Goal. Needs, Tasks, the Board, Capabilities, and Findings under that Goal. The runtime and networking behaviour in §6. The security gate in §7. Two Provider backends behind the broker (R-PRV-2), with usage settled in the ledger. One module that provides a Need and withdraws it on unload (R-MOD-1, R-MOD-2). The §6.12 measurements keep using a mock provider so model latency stays out of those figures.
+
+**Out of scope for the PoC.** A second concurrent Goal (Q14). Model training. An agent-authoring SDK. Hostile multi-tenancy. Formal accreditation. A proof of module composability. Offline Capability tokens, unless Q10 says otherwise.
+
+**Acceptance.** The PoC passes when all of the following hold:
+
+1. The criteria in §6.13 pass.
+2. The criteria in §7.13 pass.
+3. An operator can register one Goal, and the registration record stores the spend ceiling and the root Capability set. A Need or Task that would exceed either is refused.
+4. A self-hosted Provider call and a hosted-API Provider call each settle once in the ledger. The agent that triggered the call has no provider key.
+5. Loading a test module provides a Need. Unloading it runs the inverse, and that Need is no longer provided. A module that depended on it is inactive afterward.
 
 ## 11. Risks
-TODO (Scribe)
+
+- **Coordination shows up anyway.** The §4.4 agents built a board they were not given. If Need, Task, and Board are late or easy to bypass, the same thing happens beside the audit log. Mitigation: those objects are on the only path, posts grant nothing, and §7 audits them.
+- **Cooperating agents.** A Capability check that is sound for one agent can fail when several agents split the work. Mitigation: the ceiling and attenuation rules in §7 apply to the whole delegation tree, isolation tiers still apply to each sandbox, and a direct agent-to-agent path is refused (§6.5, SEC-F-37).
+- **No stop.** A swarm that cannot be halted keeps spending and keeps acting. Mitigation: the kill switch in §7.7.
+- **Effects outside the revertible boundary.** The composability paper (Section 6.1) treats an effect as revertible only when the system can restore the prior state. A provider call or a tool call against an external target cannot be undone by unloading a module. Mitigation: those calls go through the ledger and the confirmation tiers in §7, which this risk does not replace.
+- **The evidence is Koishi.** Section 5.3 of the paper is a chatbot framework, and the authors call it an existence result. Using the same shape for an agent swarm is a design choice. It is not a measured result for this system.
+- **Provider usage disagrees with the reservation.** Token counts and prices can make the settle differ from the hold. Handling of that case is §7.6.2. Further security risks, including Tier P, the broker, and dual use, are in §7.14.
 
 ## 12. Open questions for Gui
-TODO (Scribe)
+
+§7.15 Q1–Q13 stand, and they are not repeated except Q10, which the Capability and provider design depends on. §6.4 also asks whether an external etcd is acceptable in target deployments.
+
+- **Q10.** Should capabilities also be issued as signed, attenuable tokens (Biscuit-style) for offline checking, or stay centrally stored for the PoC?
+- **Q14.** Does the PoC run one Goal at a time on a cluster, or several Goals with separate ceilings?
+- **Q15.** Which hosted APIs, and which self-hosted server (vLLM or another), must the PoC call for real? §6.12 measures with a mock provider. When several allowlisted backends can serve one model, which one does the router pick?
+- **Q16.** For the PoC, is the unload test in §10 enough for revertible effects, or is a proof required?
+- **Q17.** After the operator registers the Goal, may agents create Tasks and provide Needs with no further human step, inside the ceiling?
 
 ## 13. Sources
-TODO (Scribe)
+
+Only URLs fetched while writing §§1–5 and §§8–12. Sources for §6 and §7 stay in §6.16 and §7.16.
+
+- https://github.com/agent-substrate/substrate
+- https://raw.githubusercontent.com/agent-substrate/substrate/main/README.md
+- https://kubernetes.io/docs/concepts/overview/
+- https://www.ray.io/
+- https://docs.ray.io/en/latest/ray-overview/index.html
+- https://temporal.io/
+- https://docs.temporal.io/evaluate/understanding-temporal
+- https://firecracker-microvm.github.io/
+- https://crates.io/api/v1/crates/tonic
+- https://crates.io/api/v1/crates/actix
+- https://metr.org/blog/2026-08-26-openai-hugging-face-incident-investigation/
+- https://www.originhq.com/research/eye-of-the-swarm
+- https://arxiv.org/abs/2608.25512
+- https://arxiv.org/pdf/2608.25512
+- https://arxiv.org/abs/2309.03409
+- https://github.com/deepseek-ai/deepseek-harness
+- https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/master/README.md
+- https://docs.vllm.ai/en/latest/
