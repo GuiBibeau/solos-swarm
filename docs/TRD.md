@@ -118,7 +118,7 @@ Goal, Need, Task, Board, Capability, and Attempt are defined here. Later section
 - **Goal.** The single objective. Registering it is the moment of consent and sets the spend and Capability ceiling.
 - **Need.** A sub-requirement of a Goal that agents provide for.
 - **Task.** A delegated unit of work. Delegation only narrows Capabilities and budget.
-- **Board.** The shared message board. Posts are untrusted, signed and audited, and never grant anything.
+- **Board.** Agents post and read here. Posts are untrusted, signed and audited, and never grant anything.
 - **Capability.** A typed, scoped permission. It is the only authorization boundary, as in §7.
 - **Findings (candidate).** A swarm working on a hard problem needs a shared record of what it has found, kept separate from the Board. This is a candidate sixth object, beside Goal, Need, Task, Board, and Capability. A Finding is a typed, versioned record with provenance: who produced it, which sources and tools it came from, and how confident it is. Board posts point at Findings. Convergence on a Goal is measured against its Needs, using the Findings that satisfy each one. Whether Findings stays its own object, or becomes part of Board and Need, is Q22. Until that is answered, §6 stores Findings separately from the Board, the broker writes the provenance, and a retraction flags descendant Findings and reopens the Needs that depend on them. Marking policy is §7.
 - **Attempt.** One scored try under a Goal, derived from its Tasks and Findings, with its score against the Goal's Needs. The evaluator writes and signs the score. The history and compaction are §6.
@@ -129,7 +129,7 @@ The Board is how agents share messages. A post is input to other agents. It is s
 
 The control plane stores the Goal, Task records, Board order, and leases. The data plane carries agent traffic and provider calls (§6). Model calls use the Provider trait in §8. Keys stay with the broker (§7). Placement and spend share one reserve: the scheduler reserve phase is §6, and the cap ledger is §7.
 
-Each Goal keeps a scored Attempt history derived from its Tasks and Findings. Every Attempt carries its score against the Goal's Needs. Every planning loop receives that history in the OPRO form from §4.6: scored, ordered, and truncated to a budget. The loop is given the history, not only the latest draft. Planners propose several candidates per loop, and the scheduler fans those candidates out as Tasks. How the history is stored, compacted, and filtered by Capability is §6.
+Each Goal keeps a scored Attempt history derived from its Tasks and Findings. Every Attempt carries its score against the Goal's Needs. Every planning loop receives that history in the OPRO form from §4.6: scored, ordered, and truncated. The truncation defaults are §6. The loop is given the history, not only the latest draft. Planners propose several candidates per loop, and the scheduler fans those candidates out as Tasks. How the history is stored, compacted, and filtered by Capability is §6.
 
 Modules follow the component shape in §4.5. A Need is the needs/provides pair: a module declares the Needs it depends on and the Needs it provides. It activates when every Need it depends on is provided, and it deactivates when one of those Needs is withdrawn. Every effect the module performs must be revertible, meaning the runtime holds an inverse and runs it on unload. That requirement is part of how the paper makes modularity provable. The PoC requires the shape. A proof for this codebase is later work (§3).
 
@@ -157,7 +157,7 @@ The scheduler maps agents in a swarm spec to nodes. We borrow structure from thr
 
 **Resources** in the PoC are: CPU millicores, memory, concurrent provider calls (a per-node outbound concurrency slot), and token budget per time window. Token budget is a first-class schedulable resource. A node that is close to a provider rate limit MUST be scored lower.
 
-**Budget in the reserve phase is not a second count.** The scheduler keeps no budget tally of its own. Its reserve phase calls the same spend ledger that enforces the spend caps in section 7: a worst-case hold keyed by `intentId`. Unreserve releases that same hold. Because both decisions go through one ledger operation, a placement cannot succeed while the spend is refused, and a spend hold cannot stand without its placement. Section 7 owns the policy (cap values, hold sizing). Section 6 owns only the call site.
+**Budget in the reserve phase is not a second count.** The reserve phase is the call site for the cap ledger (SEC-F-35). Section 6 keeps no second tally.
 
 **Requirements**
 - R-SCH-1
@@ -201,10 +201,10 @@ The control plane holds desired state (swarm specs), observed state (node member
 
 **Proposal**: QUIC/quinn for the data plane and for Raft replication, with a thin framed protocol (length-prefixed, versioned schema). Keep a tonic gRPC surface for the external operator API (CLI and UI), where tooling matters more than latency. Scribe's survey (section 4) recommends tonic for the control API on maturity grounds (crates.io data). **mTLS is mandatory on every inter-node connection.** Both ends present certificates and the node identity comes from the certificate. Certificate issuance and rotation belong to section 7 (Forge). QUIC 0-RTT MUST be disabled for state-changing messages, because RFC 9000 states that 0-RTT data has no replay protection.
 
-Agents have no direct network routes to each other. An agent sandbox gets only a local socket to its node agent, and all agent-to-agent traffic is carried node-to-node over QUIC by the node agents via the Board and Task path (6.10). Any other agent-to-agent path is a breach per section 7. All agent egress leaves through a per-node egress proxy that enforces the per-Capability destination allowlist defined in section 7 and emits a per-flow log (agent, destination, bytes, time) used by section 7's fan-in/fan-out detection. The proxy drops an agent's flows when the agent-scope kill switch fires. This is SEC-F-37 and SEC-F-38: unsanctioned coordination is blocked or detected within 10 s (SEC-NF-20).
+Agents have no direct network routes to each other. An agent sandbox gets only a local socket to its node agent, and all agent-to-agent traffic is carried node-to-node over QUIC by the node agents via the Board and Task path (6.10). All agent egress leaves through a per-node egress proxy. The proxy enforces SEC-F-37, emits a per-flow log (agent, destination, bytes, time) for SEC-F-38, and drops that agent's flows when the agent-scope kill switch fires (SEC-F-18).
 
 **Requirements**
-- R-NET-1: Agents MUST have no direct network routes to each other. An agent sandbox MUST have only a local socket to its node agent, and all agent-to-agent traffic MUST be carried node-to-node over QUIC by node agents via the Board and Task path (6.10). Any other agent-to-agent path is a breach per section 7. All agent egress MUST leave through a per-node egress proxy that enforces the per-Capability destination allowlist defined in section 7, emits per-flow logs (agent, destination, bytes, time) used by section 7 fan-in/fan-out detection, and drops that agent's flows when the agent-scope kill switch fires.
+- R-NET-1: Agents MUST have no direct network routes to each other. An agent sandbox MUST have only a local socket to its node agent, and all agent-to-agent traffic MUST be carried node-to-node over QUIC by node agents via the Board and Task path (6.10). All agent egress MUST leave through a per-node egress proxy that enforces SEC-F-37, emits per-flow logs (agent, destination, bytes, time) for SEC-F-38, and drops that agent's flows when the agent-scope kill switch fires (SEC-F-18).
 
 In air-gapped mode the control plane, the Board, the scheduler and provider routing run fully on-prem, with no outbound dependency. There is no call-home and no telemetry egress by default. Local model providers are reached through the same egress-proxy allowlist.
 
@@ -244,9 +244,9 @@ Unbounded queues are banned on the data path.
 - **At-least-once with idempotency keys (Solos Engine intent pattern).** Before any side effect (provider call, tool call, outbound message), the agent writes an *intent* record with a stable `intentId` to its durable intent log: `{intentId, agentId, incarnation, fencingToken, kind, payloadHash, state: pending}`. Only then does it perform the effect, passing `intentId` as the idempotency key, and afterwards it marks the intent `done` with the result reference. On restart or reschedule, the Starting phase replays `pending` intents. Receivers deduplicate by `intentId`. The result is at-least-once delivery with effectively-once effects wherever the receiver honours the key.
 - **Partitions.** A minority-side control-plane replica can't commit, so no new placements happen there. Nodes cut off from the quorum keep Running agents only until their lease safety margin runs out, then Pause them. When the partition heals, stale incarnations are fenced out by token.
 
-### 6.10 Message board and task delegation across machines
+### 6.10 Board and Task delegation across machines
 
-This subsection covers the mechanics of the Goal, Need, Task, Board and Capability objects defined in section 5. Authorization policy for them (Capability semantics, budget caps, the delegation depth limit, signing keys) belongs to section 7. Section 6 only says where the objects live, how they move between nodes and how they fail.
+This subsection covers the mechanics of the Goal, Need, Task, Board and Capability objects defined in section 5. Authorization policy is SEC-F-9, SEC-F-10, SEC-F-29 and SEC-F-32. Section 6 only says where the objects live, how they move between nodes and how they fail.
 
 **Prior art.** The Board follows the blackboard architecture: specialist knowledge sources watch a shared repository of problems and partial solutions, and a control shell orders their activity. In solos-swarm the scheduler and the Task lifecycle play the control-shell role. The storage and consumption model is borrowed from logs. Kafka keeps consumer position as a per-consumer offset, so consumers rather than the broker track progress. NATS JetStream pull consumers fetch in bounded batches (`batch`, `expires`) and cap unacknowledged messages with `MaxAckPending`. Raft provides the replicated, totally ordered log underneath.
 
@@ -258,13 +258,13 @@ This subsection covers the mechanics of the Goal, Need, Task, Board and Capabili
 
 **Read and subscribe semantics.** A subscriber, whether an agent or a node-local cache, holds a cursor: `(goalId, lastSeq)`, in the style of a Kafka offset. On subscribe or reconnect, it resumes from its cursor, and a node replays from its local follower state when it can. Delivery is at-least-once. Every Board entry carries a stable `entryId` (the idempotency key), and consumers drop duplicates by `entryId`. A subscriber commits its cursor only after it has processed the entry, which may mean writing an intent (6.9). Cursors are stored per subscriber, so a restarted agent continues where it left off. Reads are served from a node-local replica, so they can be stale by the replication lag, which the publish-to-visible metric (6.12) measures. Writes and Task claims always go through the partition leader.
 
-**Board posts are untrusted data.** Each post is signed by the posting agent's identity (key management is in section 7). Before a node appends a post or fans it out, the runtime checks the signature and drops anything unsigned or invalid. A post never grants a Capability, a budget or authority, whatever it says. Agents treat post contents as input, not instructions to the runtime.
+**Board posts are untrusted data.** Each post is signed by the posting agent's identity (SEC-F-5). Before a node appends a post or fans it out, the runtime checks the signature and drops anything unsigned or invalid. What a post may grant is SEC-F-33.
 
-**Delegation as a durable Task record.** A Task (section 5) is stored in the control-plane store with these fields: `taskId`; `intentId` (created by the delegator before the delegation side effect, per 6.9); `delegator` (agent id and incarnation); `delegatee` (empty until claimed); `goalRef` and `needRef`; `requiredCapabilities`; `capabilitySubset` (the child's Capabilities, which MUST be a subset of the delegator's); `budgetSubHold` (a sub-hold carved from the parent's spend-ledger hold, so child spend counts against the parent's hold, section 7); `depth` (the parent's depth + 1); `lease` and `fencingToken` (set at claim); `state` (Open, Claimed, Running, Done, Failed, Expired); and the result reference.
+**Delegation as a durable Task record.** A Task (section 5) is stored in the control-plane store with these fields: `taskId`; `intentId` (created by the delegator before the delegation side effect, per 6.9); `delegator` (agent id and incarnation); `delegatee` (empty until claimed); `goalRef` and `needRef`; `requiredCapabilities`; `capabilitySubset` (SEC-F-10); `budgetSubHold` (SEC-F-15, SEC-F-30); `depth` (the parent's depth + 1); `lease` and `fencingToken` (set at claim); `state` (Open, Claimed, Running, Done, Failed, Expired); and the result reference.
 
-- The ceiling comes from Goal registration. Registering a Goal sets the maximum Capability set and budget for everything under it, and no Task can exceed it (section 7 owns the values).
-- Delegation depth is capped. The runtime rejects a Task whose `depth` exceeds the limit set in section 7.
-- Cross-node checks: before a delegation is routed to another node, the sending node's runtime checks (a) the delegator's post or request signature, (b) that `capabilitySubset` is a subset of the delegator's current Capabilities and within the Goal ceiling, (c) that the budget sub-hold was granted by the ledger, and (d) the depth limit. The receiving node repeats (a) to (d) before it accepts, so nodes don't have to trust each other's checks.
+- The ceiling is SEC-F-32.
+- The runtime rejects a Task whose `depth` exceeds SEC-F-29.
+- Cross-node checks: before a delegation is routed to another node, the sending node's runtime checks (a) the delegator's signature, (b) SEC-F-10, (c) SEC-F-15 and SEC-F-30, and (d) SEC-F-29. The receiving node repeats (a) to (d) before it accepts, so nodes don't have to trust each other's checks.
 - Claiming a Task is a compare-and-swap on the Task record (Open → Claimed). It grants a lease and a fencing token. The claimant presents the token on every side effect done for the Task, and stale tokens are rejected (6.9).
 - Creating, claiming and completing a Task are all keyed by `intentId` and `taskId`, so a retry after a crash can't create a duplicate.
 
@@ -281,13 +281,13 @@ This subsection covers the mechanics of the Goal, Need, Task, Board and Capabili
 **Requirements**
 - R-BRD-1: The Board MUST be an append-only log per Goal with a single committed order.
 - R-BRD-2: Subscriptions MUST be cursor-based and at-least-once, with `entryId` deduplication.
-- R-BRD-3: Posts MUST be signature-verified before append or fan-out, and MUST NOT grant Capabilities.
+- R-BRD-3: Posts MUST be signature-verified before append or fan-out. Grants are SEC-F-33.
 - R-BRD-4: A Task claim MUST be a CAS that returns a lease and a fencing token, and the minority side MUST NOT claim.
 - R-BRD-5: Cross-node delegation MUST verify the signature, Capability subset, budget sub-hold and depth on both sending and receiving nodes.
 
 ### 6.11 Observability
 
-- Tracing through OpenTelemetry (`tracing` plus an OTLP exporter). One trace per task, with spans for scheduling, message hop (sender node, receiver node, queue wait), provider call and tool call. W3C trace context travels in every message header.
+- Tracing through OpenTelemetry (`tracing` plus an OTLP exporter). One trace per Task, with spans for scheduling, message hop (sender node, receiver node, queue wait), provider call and tool call. W3C trace context travels in every message header.
 - Metrics: scheduler latency histograms, queue depths, QUIC connection stats (RTT, loss and congestion window, from quinn), Raft metrics from openraft, lease renewals and misses.
 - Per-agent accounting: input and output tokens, model and provider, cost estimate and wall time, aggregated per agent, swarm and node, and enforced against budgets. Attribute names should follow the OpenTelemetry GenAI semantic conventions (now maintained in a separate repository) where they apply.
 
@@ -312,7 +312,7 @@ All values below are **proposed targets to validate in PoC**, not claims. Sectio
 | Duplicate side effects | Crash an agent mid-intent 1,000 times, then count duplicate effects at an idempotent mock receiver | 0 duplicates |
 | Finding write-to-queryable, cross node | Stamp a monotonic time when the write commits; a query on another node records when the Finding is returned. Clock-synced nodes, or halve a round trip through an echo. 10^4 writes, p99 | p99 ≤ 100 ms on LAN |
 | Lineage and taint walk | Backward: walk the lineage DAG from a Finding to depth 10, following cited Findings and input hashes, on a local replica. 10^3 walks, p99. Forward: retract one source with 10,000 descendant Findings and time until every descendant is flagged and every dependent Need and pending C2/C3 action is reopened. 10^2 retractions, p99 | Depth-10 walk p99 ≤ 20 ms. Forward flag-and-reopen of 10k descendants p99 ≤ 2 s |
-| Fan-out burst, 300 Tasks | One Goal spawns 300 Tasks. Time until every Task is either placed or refused by admission control against the section 7 ceiling. Record queue depth during the burst | Admitted or refused ≤ 5 s on 5 nodes. Queue depth stays within the admission bound |
+| Fan-out burst, 300 Tasks | One Goal spawns 300 Tasks. Time until every Task is either placed or refused by admission control against SEC-F-32. Record queue depth during the burst | Admitted or refused ≤ 5 s on 5 nodes. Queue depth stays within the admission bound |
 | History assembly, 10k Attempts | A Goal has 10,000 scored Attempts. Time from the planner request until its context is assembled, including the token budget and the marking filter. 10^3 assemblies, p99 | p99 ≤ 200 ms |
 | History compaction, 10k Attempts | Compact a 10,000-Attempt history that exceeds the per-Goal token budget: top K (default 20) and the new candidates from the loop (default 8) kept in full, the rest collapsed to one-line summaries, retracted and flagged Attempts kept as markers. 10^3 runs, p99 | p99 ≤ 100 ms |
 
@@ -326,29 +326,29 @@ All values below are **proposed targets to validate in PoC**, not claims. Sectio
 6. Traces show end-to-end spans across nodes. Per-agent token and cost totals are reported.
 7. Board and delegation: across ≥ 3 nodes, an agent posts to a Goal Board and delegates a Task that an agent on another node claims and completes. Unsigned posts and over-privileged or over-depth delegations are rejected on both nodes. A partition test shows that no claim happens on the minority side and that re-delegation works.
 8. A reproducible benchmark harness reports every metric in 6.12, with results recorded against the proposed targets (pass, fail or revise).
-9. An agent attempting a direct connection to another agent or a non-allowlisted destination is refused and logged. The attempt is blocked or detected within 10 s (SEC-F-37, SEC-F-38, SEC-NF-20).
+9. An agent attempting a direct connection to another agent or a non-allowlisted destination is refused and logged (SEC-F-37, SEC-F-38, SEC-NF-20).
 10. A Finding with agent-supplied provenance is rejected. A derived Finding inherits its sources' marking and lowest trust (6.14).
 11. A retracted Attempt appears as a "do not repeat" marker in the next planner context and is never silently dropped (6.15).
 
 ### 6.14 Findings store
 
-Findings (section 5) are typed, sourced records. This subsection says where they are stored, who writes their provenance, and how placement and fan-out behave around them. Section 7 owns provenance and marking policy. Section 6 owns the store, the rejection rule and the scheduler checks.
+Findings (section 5) are typed, sourced records. This subsection says where they are stored, who writes their provenance, and how placement and fan-out behave around them. Label meaning is SEC-F-24. Section 6 owns the store, the rejection rule and the scheduler checks.
 
 Findings are stored separately from the Board log. The store is append-only and content-addressed: the id of a Finding is the hash of its body plus the provenance the broker wrote. The store is replicated per deployment, and it is not shared across deployments (6.5). A lineage index records a DAG from each Finding to the Findings it cites and to the hashes of its inputs. The index walks both ways. A lineage query walks back to cited Findings and input hashes. A taint query walks forward to descendants.
 
-The broker writes the provenance fields, not the agent. The runtime rejects a Finding whose provenance the agent supplied. On a derived Finding, that broker-written provenance inherits the sources' marking and their lowest trust. What the markings and trust levels mean is section 7 policy.
+The broker writes the provenance fields, not the agent. The runtime rejects a Finding whose provenance the agent supplied. On a derived Finding, that broker-written provenance inherits the sources' marking and their lowest trust (SEC-F-24).
 
 A retraction is a broker-signed record (section 7). The runtime walks the lineage index forward from the retracted source, flags every descendant Finding, and reopens dependent Needs and pending C2/C3 actions. Flagging does not rewrite the Finding body.
 
-Marking-aware placement uses the scheduler in 6.2. The filter phase only places an agent on nodes cleared for the markings its read Capabilities cover, and it prefers nodes that hold replicas of the data the agent reads.
+Marking-aware placement uses the scheduler in 6.2. The filter phase only places an agent on nodes cleared for the markings its read Capabilities cover (SEC-F-24), and it prefers nodes that hold replicas of the data the agent reads.
 
-A Goal can spawn sub-Goals and Needs, and those can fan out into Tasks. The scheduler absorbs a burst, for example one Goal spawning hundreds of Tasks, by admission control against the section 7 ceiling, not by queueing it without a bound. Work over the ceiling is refused.
+A Goal can spawn sub-Goals and Needs, and those can fan out into Tasks. The scheduler absorbs a burst, for example one Goal spawning hundreds of Tasks, by admission control against SEC-F-32, not by queueing it without a bound. Work over the ceiling is refused.
 
 **Requirements**
 - R-FND-1: Findings MUST be stored separately from the Board log, in an append-only content-addressed store replicated per deployment. The id MUST be the hash of the body plus broker-written provenance. A lineage DAG index MUST make lineage and taint queries a graph walk.
-- R-FND-2: The broker, not the agent, MUST write provenance fields. The runtime MUST reject a Finding whose provenance the agent supplied. A derived Finding MUST inherit its sources' marking and lowest trust.
-- R-FND-3: The filter phase MUST place an agent only on nodes cleared for the markings its read Capabilities cover, and it SHOULD prefer nodes that hold replicas of the data the agent reads.
-- R-FND-4: Fan-out from a Goal into sub-Goals, Needs and Tasks MUST be admitted against the section 7 ceiling. The scheduler MUST NOT queue that fan-out without a bound.
+- R-FND-2: The broker, not the agent, MUST write provenance fields. The runtime MUST reject a Finding whose provenance the agent supplied. A derived Finding MUST inherit its sources' marking and lowest trust (SEC-F-24).
+- R-FND-3: The filter phase MUST place an agent only on nodes cleared for the markings its read Capabilities cover (SEC-F-24), and it SHOULD prefer nodes that hold replicas of the data the agent reads.
+- R-FND-4: Fan-out from a Goal into sub-Goals, Needs and Tasks MUST be admitted against SEC-F-32. The scheduler MUST NOT queue that fan-out without a bound.
 - R-FND-5: A retraction MUST be a broker-signed record (section 7). The runtime MUST walk the lineage index forward from the retracted source, flag every descendant Finding, and reopen dependent Needs and pending C2/C3 actions.
 
 ### 6.15 Attempt history per Goal
@@ -359,14 +359,14 @@ The defaults come from section 4 (OPRO, arXiv 2309.03409): K=20 top-scored Attem
 
 Every planning loop receives the full history, inside a per-Goal context budget measured in tokens. When the history is over that budget, compaction keeps the top K Attempts by score in full, keeps the new candidates from that loop in full, and collapses the rest to one-line summaries (approach, score, why it failed). Retracted or flagged Attempts are never dropped. They stay in the context as short "do not repeat" markers.
 
-The planner sees only entries whose markings its read Capability covers, the same clearance as Finding reads (6.14). The history is stored in the Findings store and shares its lineage index, so a retraction that flags descendant Findings flags the Attempts built from them too.
+The planner sees only entries whose markings its read Capability covers, the same clearance as Findings reads (6.14, SEC-F-24). The history is stored in the Findings store and shares its lineage index, so a retraction that flags descendant Findings flags the Attempts built from them too.
 
 The evaluator runs as a separate identity on a node pool that proposers cannot be scheduled on. Its code, test set and held-out cases are never placed in a proposer's sandbox, and they are not routable to one. A proposer receives only the signed score (section 7).
 
 **Requirements**
 - R-HIST-1: Each Goal MUST keep an append-only scored Attempt history built from its Tasks and Findings. Scores MUST be written and signed by the Goal's evaluator, never by the agent (section 7).
 - R-HIST-2: Every planning loop MUST receive the full history within the per-Goal token budget. Over budget, compaction MUST keep the top K Attempts by score in full, keep the new candidates from that loop in full, and collapse the rest to one-line summaries (approach, score, why it failed). The defaults MUST be K=20 and 8 new candidate Attempts per loop, both configurable per Goal, taken from section 4 (OPRO, arXiv 2309.03409). Retracted or flagged Attempts MUST NOT be dropped. They MUST remain as short "do not repeat" markers.
-- R-HIST-3: The planner MUST see only history entries covered by its read Capability's markings.
+- R-HIST-3: The planner MUST see only history entries covered by its read Capability's markings (SEC-F-24).
 - R-HIST-4: Attempt history MUST be stored in the Findings store and MUST share its lineage, so a retraction flags Attempts as well as descendant Findings.
 - R-HIST-5: The evaluator MUST run as a separate identity on a node pool proposers cannot be scheduled on. Its code, test set and held-out cases MUST NOT be placed in, or routable to, a proposer's sandbox. A proposer MUST receive only the signed score (section 7).
 
@@ -409,7 +409,7 @@ The TRD defines four first-class objects that this section secures:
 
 - **Goal (with its Needs)**: the top-level unit of work an operator registers. Registering a Goal is the moment of consent (§7.4.7).
 - **Task**: a unit of work given to an agent. Tasks can be delegated to child agents, and delegation only narrows authority (§7.4.6).
-- **Message board**: shared topics that agents post to and read from. Board content is untrusted input (§7.10).
+- **Board**: shared topics that agents post to and read from. Board content is untrusted input (§7.10).
 - **Capability list**: the explicit, typed, scoped grants an agent holds. It is the only authorization boundary for agents (§7.4.5).
 
 Working assumptions for this section:
@@ -426,7 +426,7 @@ Working assumptions for this section:
 | ID | Actor | Trust | Notes |
 |----|-------|-------|-------|
 | T-OP-ROOT | Root or break-glass operator | Highest; human; few people | Can toggle the global kill switch and change global allowlists. |
-| T-OP-ADMIN | Tenant administrator | High within one tenant | Registers jobs and approves unattended mode for the tenant. |
+| T-OP-ADMIN | Tenant administrator | High within one tenant | Registers Goals and approves unattended mode for the tenant. |
 | T-OP-VIEW | Viewer or auditor | Read-only | Reads state and audit logs. |
 | T-CP | Control plane (API server, scheduler, ledger, broker, audit log) | Trusted computing base | A compromise here is a full compromise. |
 | T-NODE | Node agent on each machine | Trusted for its own node only | Must not be able to act for other nodes. |
@@ -442,9 +442,9 @@ Working assumptions for this section:
 1. Provider API keys and other upstream credentials (money and data access).
 2. The budget: real spend across providers and paid tools.
 3. Target systems that agents act on, including red-team targets in scope.
-4. Tenant data: prompts, intermediate results, findings, and monitoring telemetry.
+4. Tenant data: prompts, intermediate results, Findings, and monitoring telemetry.
 5. Control-plane integrity: Goal registrations, Capability lists, delegation records, allowlists, RBAC bindings, kill-switch state.
-8. Message board integrity: who posted what, and when.
+8. Board integrity: who posted what, and when.
 6. Audit-log integrity: the evidence of who did what.
 7. Node integrity: host kernels and the other workloads on each node.
 
@@ -453,10 +453,10 @@ Working assumptions for this section:
 - B1: operator to control plane (human authentication, RBAC).
 - B2: control plane to node agent (mTLS, node identity).
 - B3: node agent to agent sandbox (isolation tier; the agent holds no raw credentials).
-- B4: agent to tool sandbox (capability grant, confirmation tier).
+- B4: agent to tool sandbox (Capability grant, confirmation tier).
 - B5: sandbox to egress broker to provider or target (brokered credentials, allowlists, spend reservation).
 - B6: any external content entering an agent context (untrusted-content boundary).
-- B7: agent to agent, through Task delegation and the Message board (delegation can only narrow capabilities; posts are data, never authority).
+- B7: agent to agent, through Task delegation and the Board (delegation can only narrow Capabilities; posts are data, never authority).
 
 ```mermaid
 flowchart LR
@@ -486,7 +486,7 @@ flowchart LR
   OP -- B1 mTLS/OIDC --> API
   API -- B2 mTLS --> NA
   NA -- B3 spawn + SVID --> AG
-  AG -- B4 capability call --> TL
+  AG -- B4 Capability call --> TL
   AG -- B5 request, no keys --> BRK
   TL -- B5 --> BRK
   BRK -- reserve first --> LED
@@ -505,13 +505,13 @@ flowchart LR
 | Key exfiltration | An injected agent prints its environment or reads a key file | Agents never hold keys (§7.5); egress only through the broker |
 | Runaway spend | Loop of max-token calls across 500 agents | Reserve-before-act ledger, caps, kill switch (§7.6, §7.7) |
 | Sandbox escape | Tool exploits a kernel bug | Isolation tiers; microVM for arbitrary code (§7.3) |
-| Privilege escalation via agents | Agent A asks agent B, which holds more privileges, to act for it; or a delegation chain tries to widen scope | Capability list is the only authority; delegation attenuates; depth cap; board posts are data (§7.4.4–§7.4.6) |
-| Board poisoning | A compromised agent posts instructions that other agents follow | Posts are untrusted input, authenticated and audited, cannot grant capabilities (§7.10) |
-| Excessive agency | Agent uses a broad tool such as "run shell" against an out-of-scope host | Narrow capabilities, allowlists, confirmation tiers (§7.8) |
+| Privilege escalation via agents | Agent A asks agent B, which holds more privileges, to act for it; or a delegation chain tries to widen scope | Capability list is the only authority; delegation attenuates; depth cap; Board posts are data (§7.4.4–§7.4.6) |
+| Board poisoning | A compromised agent posts instructions that other agents follow | Posts are untrusted input, authenticated and audited, cannot grant Capabilities (§7.10) |
+| Excessive agency | Agent uses a broad tool such as "run shell" against an out-of-scope host | Narrow Capabilities, allowlists, confirmation tiers (§7.8) |
 | Audit tampering | Insider deletes the evidence of an action | Hash-chained log, signed tree heads, external witness (§7.9) |
 | Control-plane takeover | Stolen operator credential | MFA, short sessions, separation of duties, privileged tiers |
 | Red-team scope breach | Red-team agent hits a target that is out of scope | Explicit target allowlist enforced at the broker; fail-closed |
-| Emergent unauthorized coordination | Agents that are supposed to stay isolated invent their own side channel and a coordinator. The case study in §4, and METR's investigation (https://metr.org/blog/2026-08-26-openai-hugging-face-incident-investigation/), report that about 1,200 agents meant to be isolated from one another built their own shared message board and a coordinator that assigned work across the group. | Deny-by-default for any agent-to-agent channel that is not the Board or Task delegation; per-capability egress allowlists at the broker; fan-in/fan-out detection can engage the agent- or tenant-scope kill switch (SEC-F-37, SEC-F-38) |
+| Emergent unauthorized coordination | Agents that are supposed to stay isolated invent their own side channel and a coordinator. The case study in §4, and METR's investigation (https://metr.org/blog/2026-08-26-openai-hugging-face-incident-investigation/), report that about 1,200 agents meant to be isolated from one another built their own shared message board and a coordinator that assigned work across the group. | Deny-by-default for any agent-to-agent channel that is not the Board or Task delegation; per-Capability egress allowlists at the broker; fan-in/fan-out detection can engage the agent- or tenant-scope kill switch (SEC-F-37, SEC-F-38) |
 
 ### 7.3 Agent isolation and sandboxing
 
@@ -529,7 +529,7 @@ The figures below are only those stated by the sources fetched for this document
 
 #### 7.3.2 Isolation tiers
 
-solos-swarm defines four tiers. Each job and each tool declares its minimum tier, and the scheduler MUST NOT place work in a weaker tier.
+solos-swarm defines four tiers. Each Goal and each tool declares its minimum tier, and the scheduler MUST NOT place work in a weaker tier.
 
 - **Tier W (Wasm tool)**: pure-function and data tools compiled to Wasm and run in wasmtime with explicit WASI capabilities (no ambient file system, no ambient network; I/O only through host functions brokered by solos-swarm).
 - **Tier P (hardened process)**: agent loops and trusted first-party native tools. Each runs in its own user, PID, mount, network, IPC and UTS namespaces, plus a cgroup v2 limit, `no_new_privs`, a seccomp allowlist that also checks the architecture, a Landlock ruleset (file system, TCP/UDP ports, abstract-socket and signal scoping), and no direct internet route (egress only to the local broker).
@@ -550,7 +550,7 @@ Rationale: the source figures (≤125 ms boot, ≤5 MiB VMM overhead) make a poo
 #### 7.4.1 Workload identity
 
 - Every control-plane component, node agent, agent instance and tool sandbox gets a short-lived cryptographic identity in the SPIFFE format (an X.509 SVID for mTLS; a JWT SVID where mTLS is not possible). SPIRE is the reference implementation; it supports attestation-based issuance, a Workload API that rotates credentials automatically, and VM and bare-metal workloads.
-- The identity encodes trust domain, tenant, job, agent and node, for example `spiffe://<trust-domain>/tenant/<t>/job/<j>/agent/<a>`.
+- The identity encodes trust domain, tenant, Goal, agent and node, for example `spiffe://<trust-domain>/tenant/<t>/goal/<g>/agent/<a>`.
 - Node agents attest nodes. Workloads are attested by the node agent that spawned them. An agent cannot request an identity for another agent.
 - All traffic between components and on B2–B5 is mTLS. There is no bearer-only traffic inside the cluster.
 
@@ -563,60 +563,60 @@ Rationale: the source figures (≤125 ms boot, ≤5 MiB VMM overhead) make a poo
 
 - **RBAC modeled on Kubernetes RBAC**: Roles and ClusterRoles hold additive allow-only rules; Bindings attach them to subjects (operators, groups, workload identities) at tenant or cluster scope. Bindings have an immutable role reference.
 - **Escalation prevention modeled on Kubernetes**: a subject can create or update a role, or bind one, only if it already holds every permission in that role, or holds the explicit `escalate`/`bind` verbs. Wildcards are discouraged, and wildcards on privileged resources are forbidden.
-- **ABAC conditions** on top of RBAC: attributes such as tenant, job risk class, isolation tier, time window, target-allowlist membership and unattended mode can narrow a rule but never widen it.
+- **ABAC conditions** on top of RBAC: attributes such as tenant, Goal risk class, isolation tier, time window, target-allowlist membership and unattended mode can narrow a rule but never widen it.
 - **Split of responsibility**: RBAC and ABAC govern humans and control-plane components (who can register Goals, change allowlists, toggle kill switches). Agents get no RBAC roles. Everything an agent can do is defined by its Capability list (§7.4.5). The control plane checks every agent action against that list in deterministic code; the decision never depends on the LLM's judgment ("complete mediation", OWASP LLM06).
 
 #### 7.4.4 Agent-to-agent privilege escalation
 
 - An agent can gain authority in exactly one way: an attenuated delegation recorded by the control plane (§7.4.6). There is no other path.
-- Messages between agents and Message board posts are untrusted data (§7.10). A request from a peer is never a grant, and a post can never carry, create or widen a capability.
+- Messages between agents and Board posts are untrusted data (§7.10). A request from a peer is never a grant, and a post can never carry, create or widen a Capability.
 - The control plane, not the delegating agent, issues each child's workload identity and Capability list.
 - Agents have no credentials or network routes for the control-plane write API. They can only reach a narrow node-local endpoint (tool requests, board reads and posts, delegation requests, status).
 
 #### 7.4.5 Capability list: the authorization boundary for agents
 
-The Capability list is THE authorization boundary. An agent can call a tool, read or write a Message board topic, delegate a Task, or spend budget only through a capability it holds. Anything not covered by a held capability is denied.
+The Capability list is THE authorization boundary. An agent can call a tool, read or write a Board topic, delegate a Task, or spend budget only through a Capability it holds. Anything not covered by a held Capability is denied.
 
-Each capability is explicit, typed and scoped. At minimum it has:
+Each Capability is explicit, typed and scoped. At minimum it has:
 
 | Field | Meaning |
 |-------|---------|
-| `id` | Unique capability ID, recorded in the audit log |
+| `id` | Unique Capability ID, recorded in the audit log |
 | `kind` | One of: `tool.call`, `board.read`, `board.post`, `task.delegate`, `budget.spend` (closed set; new kinds need a TRD change) |
 | `resource` | The exact tool ID, board topic, provider/model, or target. Hierarchical prefixes are allowed; a bare wildcard is only accepted as the literal `any`, as in §7.8 |
 | `constraints` | Allowed operations and argument constraints (for example read-only, target allowlist, max payload size) |
-| `budget` | Maximum spend that may be charged through this capability, plus per-tick limit |
+| `budget` | Maximum spend that may be charged through this Capability, plus per-tick limit |
 | `confirmation` | Minimum confirmation tier C0–C3 (§7.8) |
 | `notBefore` / `expiry` | Validity window. Expiry is mandatory |
-| `goalId`, `holder`, `parent` | The Goal it belongs to, the holder's workload identity, and the parent capability it was derived from (empty only for capabilities issued at Goal registration) |
+| `goalId`, `holder`, `parent` | The Goal it belongs to, the holder's workload identity, and the parent Capability it was derived from (empty only for Capabilities issued at Goal registration) |
 | `depth` | Delegation depth from the Goal root |
 
-Precedent: macaroons, Biscuit and UCAN all use credentials that can only be narrowed as they are passed on. Macaroons embed caveats that "attenuate and contextually confine" use. A Biscuit token "can only be restricted, it will never gain more rights". UCAN requires each delegation to "either directly restate or attenuate" its capabilities, and recommends minimal lifetime and authority. solos-swarm adopts this rule. Because the control plane is online for every action, the PoC SHOULD store capabilities centrally and check them at the broker and node agent, instead of relying on offline bearer tokens. This avoids two weaknesses UCAN itself notes: no confinement, and no full knowledge of sub-delegations. Whether to also issue Biscuit-style signed tokens for offline checking is open question Q10.
+Precedent: macaroons, Biscuit and UCAN all use credentials that can only be narrowed as they are passed on. Macaroons embed caveats that "attenuate and contextually confine" use. A Biscuit token "can only be restricted, it will never gain more rights". UCAN requires each delegation to "either directly restate or attenuate" its capabilities, and recommends minimal lifetime and authority. solos-swarm adopts this rule. Because the control plane is online for every action, the PoC SHOULD store Capabilities centrally and check them at the broker and node agent, instead of relying on offline bearer tokens. This avoids two weaknesses UCAN itself notes: no confinement, and no full knowledge of sub-delegations. Whether to also issue Biscuit-style signed tokens for offline checking is open question Q10.
 
 #### 7.4.6 Task delegation
 
 - **Attenuation**: a delegated Task carries a Capability list that is a subset of the delegator's: same or narrower kind, resource, constraints and confirmation tier (never a lower tier), and an expiry no later than the parent's. Budget is carved out of the parent's remaining budget, never added to it. The control plane rejects any delegation that does not meet this rule.
-- **No re-widening**: a child cannot get back capabilities its parent dropped, even from another parent. A child holds only what its single delegation chain grants.
-- **Depth cap**: delegation chains are capped at a depth set at Goal registration, with a global maximum (PoC default: 4; see Q11). A `task.delegate` capability at the maximum depth cannot be issued.
+- **No re-widening**: a child cannot get back Capabilities its parent dropped, even from another parent. A child holds only what its single delegation chain grants.
+- **Depth cap**: delegation chains are capped at a depth set at Goal registration, with a global maximum (PoC default: 4; see Q11). A `task.delegate` Capability at the maximum depth cannot be issued.
 - **Fan-out cap**: each Goal sets a maximum number of live descendant agents, which keeps a delegation tree inside the PoC's 500-agent size.
 - **Spend rolls up**: every child's reservation is also charged against each ancestor's ledger hold, up to the Goal. A child's reservation fails if any ancestor's remaining budget would be exceeded (§7.6.2).
-- **Revocation cascades**: revoking, expiring or kill-switching a capability or Task revokes everything derived from it. In-flight reservations settle as described in §7.7.
-- **Audit**: every delegation is logged with parent, child, the capability diff, and the budget carved out.
+- **Revocation cascades**: revoking, expiring or kill-switching a Capability or Task revokes everything derived from it. In-flight reservations settle as described in §7.7.
+- **Audit**: every delegation is logged with parent, child, the Capability diff, and the budget carved out.
 
 #### 7.4.7 Goal and Needs: the moment of consent
 
 - Registering a Goal is the moment of consent. Registration fixes the Goal's budget, its root Capability list, allowed isolation tiers, depth and fan-out caps, expiry, and unattended-mode status.
 - These form a ceiling for everything spawned under the Goal: every Task, delegation, board topic and reservation. Nothing under a Goal can exceed it.
-- Needs declared under a Goal are requests, not grants. Meeting a Need never widens the Goal's capabilities; a Need that requires more than the ceiling needs a new or amended Goal registration by an authorized operator, with the same sign-off rules as the original.
-- Goal registration replaces "job registration" wherever earlier text in this section says job. The per-job bounds in §7.6.1 apply per Goal (and per Task, as narrowed sub-bounds).
+- Needs declared under a Goal are requests, not grants. Meeting a Need never widens the Goal's Capabilities; a Need that requires more than the ceiling needs a new or amended Goal registration by an authorized operator, with the same sign-off rules as the original.
+- The bounds in §7.6.1 apply per Goal, and per Task as narrowed sub-bounds.
 
 ### 7.5 Secrets and provider-key management
 
 - **Brokered credentials**: raw provider API keys and target credentials live only in the control-plane secret store and in the credential/egress broker's memory. Agents and tools send requests to the broker, authenticated by SVID. The broker adds the credential, enforces allowlists and caps, and forwards the request. Agents never see keys (OWASP LLM01 mitigation 4: give the application its own API tokens and handle them in code, not in the model).
-- **Short-lived, scoped tokens**: where a downstream system accepts them, the broker obtains per-job, per-scope credentials with a TTL instead of using long-lived keys (in the style of Vault dynamic secrets: credentials unique per consumer, leased, revoked on expiry, so every action can be traced to one consumer).
+- **Short-lived, scoped tokens**: where a downstream system accepts them, the broker obtains per-Goal, per-scope credentials with a TTL instead of using long-lived keys (in the style of Vault dynamic secrets: credentials unique per consumer, leased, revoked on expiry, so every action can be traced to one consumer).
 - **Static provider keys** (most LLM providers only issue static keys) are stored encrypted, rotated on a schedule, scoped per tenant where the provider supports it, and never written to logs, prompts or sandbox file systems.
 - **Redaction**: the broker and audit pipeline scan outbound and logged content for known secret values and patterns and replace them.
-- **Revocation**: disabling a job or engaging a kill switch revokes that scope's leases and SVIDs.
+- **Revocation**: disabling a Goal or engaging a kill switch revokes that scope's leases and SVIDs.
 
 ### 7.6 Spend caps and budget ledger
 
@@ -637,7 +637,7 @@ Each registered Goal declares:
 - **Settle once**: after the call, the actual cost (from provider usage data) is settled against the hold exactly once.
 - **Release on failure**: if the call fails without being billed, the hold is released.
 - **Idempotency**: reservations are idempotent per intent ID (a retry of the same intent does not reserve twice) and summed per tick ID.
-- **Overrun**: a settle above its hold is never refused (the money is already spent and must be recorded), but it automatically engages the per-job kill switch and raises an alert.
+- **Overrun**: a settle above its hold is never refused (the money is already spent and must be recorded), but it automatically engages the per-Goal kill switch and raises an alert.
 - **Crash safety**: holds are durable. Holds still in flight across a crash or restart stay counted until settled or explicitly reconciled, so a restart cannot cause double spend.
 - **Scheduler reserve phase**: the scheduler's reserve phase (TRD §6) IS this cap-ledger reserve. It is one worst-case hold keyed by intentId. Placement of a Task on a node and the spend hold commit together or fail together: there is no placed-but-unfunded Task and no funded-but-unplaced Task. See TRD §6 for the scheduling side.
 - **Delegation roll-up**: a reservation by a delegated Task is counted against its own budget and against the hold of every ancestor up to the Goal (§7.4.6). Settlement and release roll up the same way.
@@ -645,7 +645,7 @@ Each registered Goal declares:
 
 ### 7.7 Kill switches
 
-- Scopes: **global**, **tenant**, **agent** (and per job, which the ledger engages automatically).
+- Scopes: **global**, **tenant**, **agent** (and per Goal, which the ledger engages automatically).
 - Effect: an engaged switch blocks new reservations, and therefore every new provider and paid tool call in its scope. In-flight work is allowed to settle so the ledger stays correct. Sandboxes in scope are then stopped within the target time (SEC-NF-3).
 - Durability: switch state is stored durably and replicated. An engaged switch stays engaged across restarts of any component. The default state after loss of the store is "engaged" (fail closed).
 - Authority: only privileged operator tiers can toggle switches. The global switch is root only. Release of a global or tenant switch needs step-up authentication, and a second approver is recommended (open question Q4). Agents can never toggle a switch. They MAY request engagement of their own agent-scoped switch.
@@ -653,18 +653,18 @@ Each registered Goal declares:
 
 ### 7.8 Execution tiers, consent and unattended mode
 
-- **Fail-closed execute tier**: a job in the execute tier (any side-effecting action) MUST refuse to start without an explicit allowlist. A wildcard is only accepted when the literal value `any` is typed for that field. An empty or missing allowlist means "nothing", never "everything".
+- **Fail-closed execute tier**: a Goal in the execute tier (any side-effecting action) MUST refuse to start without an explicit allowlist. A wildcard is only accepted when the literal value `any` is typed for that field. An empty or missing allowlist means "nothing", never "everything".
 - **Goal registration is the moment of consent** for unattended work (§7.4.7). The Capability list, bounds and allowlists approved at registration are the most anything under the Goal can ever do. Widening any of them requires a new or amended registration.
 - **Unattended action** (no human confirmation per action) needs: (a) sign-off by a human tenant admin or root, recorded in the audit log; and (b) a passed QA gate, either a funded run (real, capped spend) or a real QA run against the same allowlist, with its result linked to the registration.
 - **Tool-call confirmation tiers** (in line with OWASP LLM06 "Require user approval" and LLM01 "human approval for high-risk actions"):
   - C0 auto: read-only, no egress beyond allowlisted read sources, within caps.
   - C1 auto with audit and rate limit: reversible side effects inside the sandbox or on in-scope test systems.
-  - C2 human confirmation per action, unless the job is registered as unattended for exactly this capability: external side effects, red-team actions against live targets, spend above a per-call threshold.
+  - C2 human confirmation per action, unless the Goal is registered as unattended for exactly this Capability: external side effects, red-team actions against live targets, spend above a per-call threshold.
   - C3 always human, two-person rule: destructive or irreversible actions on production, changes to allowlists, caps or kill switches, and anything outside the registered scope. Unattended mode never covers C3.
 
 ### 7.9 Tamper-evident audit log
 
-- An append-only log of security-relevant events: authentication, RBAC changes, registrations, sign-offs, capability grants, tool calls (with tier and decision), reservations and settlements, kill-switch toggles, sandbox tier fallbacks, and policy denials.
+- An append-only log of security-relevant events: authentication, RBAC changes, registrations, sign-offs, Capability grants, tool calls (with tier and decision), reservations and settlements, kill-switch toggles, sandbox tier fallbacks, and policy denials.
 - Structure: entries form a Merkle hash tree (RFC 6962 style, SHA-256, with domain-separated leaf and node hashes). The log periodically publishes a **signed tree head** (tree size, root hash, timestamp). It supports inclusion proofs (an entry is in the log) and consistency proofs (a later tree extends an earlier one). This is the property behind Certificate Transparency and Sigstore Rekor: rewriting or deleting history is detectable.
 - Witnessing: signed tree heads are copied to at least one store outside the control plane's write authority (a separate host or an operator-held store) so that a compromised control plane cannot present a forked history unseen.
 - Content: entries carry hashes of large payloads (prompts, outputs), not the payloads, so that retention and redaction of data stay separate from audit integrity. Secrets are never logged.
@@ -676,9 +676,9 @@ Grounded in the OWASP Top 10 for LLM Applications 2025, mainly LLM01 Prompt Inje
 
 - **Assume injection succeeds**. The controls in §7.4–§7.8 hold even when the model is fully controlled by an attacker. This is the main defense.
 - **Mark and separate untrusted content** (LLM01 mitigation 6): every piece of external content, tool output and peer-agent message is wrapped with provenance metadata (source, trust level) before it enters a context. The runtime never treats such content as instructions to the runtime.
-- **Message board content is untrusted input**: every post is treated like external content. It is wrapped with provenance (poster identity, Goal, topic, time, and whether the poster had read untrusted content) before it enters any context. A post cannot grant, carry or widen a capability, and the runtime never acts on a post as an instruction. Each post is authenticated by the poster's workload identity (mTLS SVID) through a `board.post` capability, and is written to the audit log (content hash plus metadata). Reading a topic needs a `board.read` capability. Posts and reads across Goals are denied unless both Goals explicitly allow the topic.
+- **Board content is untrusted input**: every post is treated like external content. It is wrapped with provenance (poster identity, Goal, topic, time, and whether the poster had read untrusted content) before it enters any context. A post cannot grant, carry or widen a Capability, and the runtime never acts on a post as an instruction. Each post is authenticated by the poster's workload identity (mTLS SVID) through a `board.post` Capability, and is written to the audit log (content hash plus metadata). Reading a topic needs a `board.read` Capability. Posts and reads across Goals are denied unless both Goals explicitly allow the topic.
 - **Structured tool calls only**: model output becomes actions only through schema-validated tool requests checked by deterministic code (LLM01 mitigation 2, LLM05). Free text is never executed.
-- **Provenance-aware gating**: if a context window contains untrusted content, any C1+ tool request from that turn is raised one confirmation tier, unless the registration explicitly marks the capability as safe under that kind of tainted context. (This is a requirement for the PoC; its exact design is open question Q6.)
+- **Provenance-aware gating**: if a context window contains untrusted content, any C1+ tool request from that turn is raised one confirmation tier, unless the registration explicitly marks the Capability as safe under that kind of tainted context. (This is a requirement for the PoC; its exact design is open question Q6.)
 - **Egress control against exfiltration**: outbound destinations are restricted to allowlists at the broker, which blocks the "render a URL that leaks data" pattern (LLM01 scenario 2).
 - **Unbounded consumption** (LLM10) is covered by §7.6.
 - **Adversarial testing**: the PoC includes an injection test suite run against the swarm itself (LLM01 mitigation 7). solos-swarm's own red-team use case can supply it.
@@ -689,20 +689,20 @@ Grounded in the OWASP Top 10 for LLM Applications 2025, mainly LLM01 Prompt Inje
 - **SEC-F-2** Tier P sandboxes MUST apply: separate user, PID, mount, network and IPC namespaces; cgroup v2 CPU, memory and PID limits; `no_new_privs`; a seccomp allowlist that checks the architecture; and a Landlock ruleset covering file system, network ports and IPC scoping at the highest ABI version the kernel offers. If a required restriction is not available, the sandbox MUST refuse to start, unless the operator has explicitly allowed degraded mode, and any degradation MUST be audited.
 - **SEC-F-3** Tools that execute generated or third-party native code, run browsers, or act on red-team targets MUST run in Tier V. Tier G is allowed as an audited fallback only on nodes without KVM.
 - **SEC-F-4** Tier W tools MUST be granted only explicit WASI capabilities. No ambient file-system or network access.
-- **SEC-F-5** Every workload MUST receive a short-lived, automatically rotated SPIFFE-format identity bound to tenant, job, agent and node. All internal connections MUST use mTLS with these identities.
+- **SEC-F-5** Every workload MUST receive a short-lived, automatically rotated SPIFFE-format identity bound to tenant, Goal, agent and node. All internal connections MUST use mTLS with these identities.
 - **SEC-F-6** Operators MUST authenticate through OIDC with MFA. Privileged actions MUST require step-up authentication.
 - **SEC-F-7** Authorization MUST be RBAC (additive Roles and Bindings at tenant and cluster scope) plus ABAC conditions that can only narrow access.
 - **SEC-F-8** The control plane MUST prevent role and binding escalation: a subject can only grant permissions it holds, unless it has explicit `escalate`/`bind` verbs.
-- **SEC-F-9** The Capability list MUST be the sole authorization boundary for agents. Every tool call, board read, board post, delegation and reservation MUST be checked in deterministic code against a held capability, and denied if none matches.
-- **SEC-F-10** Delegation MUST attenuate: a child's capabilities MUST be a subset of the delegator's in kind, resource, constraints, confirmation tier and expiry, and its budget MUST be carved from the parent's remaining budget. The control plane MUST issue child identities and Capability lists, and MUST reject non-attenuating delegations.
+- **SEC-F-9** The Capability list MUST be the sole authorization boundary for agents. Every tool call, Board read, Board post, delegation and reservation MUST be checked in deterministic code against a held Capability, and denied if none matches.
+- **SEC-F-10** Delegation MUST attenuate: a child's Capabilities MUST be a subset of the delegator's in kind, resource, constraints, confirmation tier and expiry, and its budget MUST be carved from the parent's remaining budget. The control plane MUST issue child identities and Capability lists, and MUST reject non-attenuating delegations.
 - **SEC-F-11** Agents and tool sandboxes MUST NOT hold raw provider keys or target credentials. All provider and target egress MUST pass through the credential/egress broker.
-- **SEC-F-12** The broker MUST use short-lived scoped credentials where the downstream supports them, and MUST revoke leases when a job ends or a kill switch is engaged.
+- **SEC-F-12** The broker MUST use short-lived scoped credentials where the downstream supports them, and MUST revoke leases when a Goal ends or a kill switch is engaged.
 - **SEC-F-13** Secrets MUST be redacted from logs, prompts, audit entries and tool outputs.
-- **SEC-F-14** Each job MUST declare max cost per tick, max daily spend, a narrow-only allowlist, an expiry, and `maxConsecutiveFailures`. Reaching `maxConsecutiveFailures` MUST auto-pause the job.
+- **SEC-F-14** Each Goal MUST declare max cost per tick, max daily spend, a narrow-only allowlist, an expiry, and `maxConsecutiveFailures`. Reaching `maxConsecutiveFailures` MUST auto-pause the Goal.
 - **SEC-F-15** The ledger MUST reserve worst-case cost before every billable action, settle actual cost exactly once, and release on failure. Reservations MUST be idempotent per intent ID and summed per tick ID.
-- **SEC-F-16** A settle above its hold MUST be recorded and MUST automatically engage the per-job kill switch.
+- **SEC-F-16** A settle above its hold MUST be recorded and MUST automatically engage the per-Goal kill switch.
 - **SEC-F-17** Ledger holds MUST be durable and counted across crashes and restarts until settled or reconciled.
-- **SEC-F-18** Kill switches MUST exist at global, tenant and agent scopes (plus per job). Engagement MUST block new reservations while letting in-flight work settle. State MUST be durable. Loss of state MUST mean "engaged".
+- **SEC-F-18** Kill switches MUST exist at global, tenant and agent scopes (plus per Goal). Engagement MUST block new reservations while letting in-flight work settle. State MUST be durable. Loss of state MUST mean "engaged".
 - **SEC-F-19** Only privileged operator tiers MUST be able to toggle kill switches. The global switch MUST be root-only.
 - **SEC-F-20** The execute tier MUST refuse to start without an explicit allowlist. Wildcards MUST require the literal value `any`.
 - **SEC-F-21** Unattended mode MUST require recorded human sign-off and a linked, passed QA gate (funded or real). It MUST NOT cover C3 actions.
@@ -710,19 +710,19 @@ Grounded in the OWASP Top 10 for LLM Applications 2025, mainly LLM01 Prompt Inje
 - **SEC-F-23** All security-relevant events MUST be written to an append-only Merkle-tree audit log with signed tree heads, inclusion proofs and consistency proofs. Signed tree heads MUST be copied to a witness outside the control plane's write authority.
 - **SEC-F-24** All external content, tool outputs and peer messages MUST carry provenance labels and MUST NOT be interpreted as instructions by the runtime.
 - **SEC-F-25** Model output MUST become actions only through schema-validated tool requests.
-- **SEC-F-26** A tool request made in a turn whose context holds untrusted content MUST be raised one confirmation tier, unless the registration exempts that capability.
+- **SEC-F-26** A tool request made in a turn whose context holds untrusted content MUST be raised one confirmation tier, unless the registration exempts that Capability.
 - **SEC-F-27** Price tables and global allowlists MUST be versioned, signed configuration. An unknown model price MUST be treated as not allowlisted.
-- **SEC-F-28** Every capability MUST be typed (`tool.call`, `board.read`, `board.post`, `task.delegate`, `budget.spend`) and MUST have a resource, constraints, a budget, a minimum confirmation tier, a mandatory expiry, its Goal, holder and parent.
+- **SEC-F-28** Every Capability MUST be typed (`tool.call`, `board.read`, `board.post`, `task.delegate`, `budget.spend`) and MUST have a resource, constraints, a budget, a minimum confirmation tier, a mandatory expiry, its Goal, holder and parent.
 - **SEC-F-29** Delegation chain depth MUST be capped per Goal, under a global maximum (PoC default 4). Each Goal MUST cap its number of live descendant agents.
 - **SEC-F-30** Every child reservation MUST be charged against each ancestor's ledger hold up to the Goal, and MUST fail if any ancestor's remaining budget would be exceeded.
-- **SEC-F-31** Revoking, expiring or kill-switching a capability or Task MUST revoke all capabilities and Tasks derived from it.
+- **SEC-F-31** Revoking, expiring or kill-switching a Capability or Task MUST revoke all Capabilities and Tasks derived from it.
 - **SEC-F-32** Goal registration MUST fix the budget, root Capability list, isolation tiers, depth and fan-out caps, expiry and unattended status, and these MUST be a ceiling for everything under the Goal. Needs MUST NOT widen it.
-- **SEC-F-33** Message board posts MUST NOT grant, carry or widen capabilities, and MUST be handled as untrusted input with provenance labels.
-- **SEC-F-34** Every board post MUST be authenticated by the poster's workload identity through a `board.post` capability, and MUST be written to the audit log. Reads MUST require `board.read`.
+- **SEC-F-33** Board posts MUST NOT grant, carry or widen Capabilities, and MUST be handled as untrusted input with provenance labels.
+- **SEC-F-34** Every Board post MUST be authenticated by the poster's workload identity through a `board.post` Capability, and MUST be written to the audit log. Reads MUST require `board.read`.
 - **SEC-F-35** The scheduler's reserve phase (TRD §6) MUST be the cap-ledger reserve: a single worst-case hold keyed by intentId, so that placement and spend hold commit or fail together.
-- **SEC-F-36** Every delegation MUST be audited with parent, child, capability diff and budget carved out.
-- **SEC-F-37** Any agent-to-agent channel that is not brokered by the Message board or by Task delegation MUST be denied by default. Agents MUST NOT share a writable filesystem. Agent sandboxes MUST NOT have network routes to one another. The broker MUST enforce a per-capability egress allowlist, so an external endpoint cannot serve as a meeting point.
-- **SEC-F-38** The broker MUST detect egress fan-in and fan-out. Several agents reaching the same unexpected destination (a destination outside that agent's per-capability egress allowlist, or the same external endpoint used as a rendezvous) MUST flag those agents, and the agent-scope or tenant-scope kill switch MUST be engageable for them.
+- **SEC-F-36** Every delegation MUST be audited with parent, child, Capability diff and budget carved out.
+- **SEC-F-37** Any agent-to-agent channel that is not brokered by the Board or by Task delegation MUST be denied by default. Agents MUST NOT share a writable filesystem. Agent sandboxes MUST NOT have network routes to one another. The broker MUST enforce a per-Capability egress allowlist, so an external endpoint cannot serve as a meeting point.
+- **SEC-F-38** The broker MUST detect egress fan-in and fan-out. Several agents reaching the same unexpected destination (a destination outside that agent's per-Capability egress allowlist, or the same external endpoint used as a rendezvous) MUST flag those agents, and the agent-scope or tenant-scope kill switch MUST be engageable for them.
 
 ### 7.12 Non-functional requirements (SEC-NF-n; referenced from section 9)
 
@@ -739,15 +739,15 @@ Grounded in the OWASP Top 10 for LLM Applications 2025, mainly LLM01 Prompt Inje
 | SEC-NF-9 | Audit completeness | 100% of events in the §7.9 list present, with valid inclusion proofs | Replay a scripted scenario; diff expected and logged events; run the verifier |
 | SEC-NF-10 | Audit tamper detection | 100% of deletions, edits or reorderings detected | Mutate the stored log in 100 random ways; run the verifier against the witnessed tree heads |
 | SEC-NF-11 | Sandbox policy coverage | 100% of Tier P sandboxes report the required seccomp, Landlock, namespace and cgroup settings | Node-agent attestation report per sandbox, cross-checked by a probe tool that tries forbidden actions |
-| SEC-NF-12 | Injection resilience | 0 out-of-allowlist egress and 0 out-of-capability tool executions in the injection suite | OWASP LLM01 scenario-based suite (direct, indirect, payload splitting, encoded) run against 500 agents |
+| SEC-NF-12 | Injection resilience | 0 out-of-allowlist egress and 0 out-of-Capability tool executions in the injection suite | OWASP LLM01 scenario-based suite (direct, indirect, payload splitting, encoded) run against 500 agents |
 | SEC-NF-13 | Escalation resistance | 0 successful privilege escalations | Test cases: agent-to-agent requests, delegation-chain widening, board-post grants, role and binding escalation, forged SVID requests |
-| SEC-NF-14 | Delegation attenuation | 0 accepted delegations that widen any capability field or exceed parent budget | Property-based test: 100,000 random delegation requests (including widening, re-widening, expiry extension, tier lowering); count acceptances that violate the subset rule |
+| SEC-NF-14 | Delegation attenuation | 0 accepted delegations that widen any Capability field or exceed parent budget | Property-based test: 100,000 random delegation requests (including widening, re-widening, expiry extension, tier lowering); count acceptances that violate the subset rule |
 | SEC-NF-15 | Depth and fan-out caps | 0 Tasks above the depth cap; 0 Goals above their fan-out cap | Adversarial agents told to delegate recursively; inspect the delegation records in the audit log |
 | SEC-NF-16 | Roll-up spend accuracy | Spend under any Goal ≤ Goal budget + largest single in-flight overrun, in 100% of runs | Delegation trees up to the depth cap with random crashes; compare provider billing with ledger totals per Goal |
-| SEC-NF-17 | Board integrity | 100% of posts carry a valid poster identity and an audit entry; 0 capability changes caused by posts | Replay 10,000 posts including forged-identity and "grant me" posts; diff against audit log and capability store |
+| SEC-NF-17 | Board integrity | 100% of posts carry a valid poster identity and an audit entry; 0 Capability changes caused by posts | Replay 10,000 posts including forged-identity and "grant me" posts; diff against audit log and Capability store |
 | SEC-NF-18 | Placement/reserve atomicity | 0 placed Tasks without a hold; 0 holds without a placement or explicit release after reconciliation | Kill scheduler and ledger at random points during 10,000 placements; reconcile by intentId |
-| SEC-NF-19 | Revocation propagation | All derived capabilities refused ≤1 s (p99) after a parent revocation | Revoke roots of trees of depth 4; time the first refused use per descendant |
-| SEC-NF-20 | Unsanctioned coordination blocked or detected | 100% of attempts blocked or detected within 10 s | Red-team test: two sandboxed agents, with no Board capability and no Task delegation between them, try to coordinate outside the Board. Each attempt (a shared writable filesystem, a network route between the sandboxes, or a shared external endpoint) is blocked before any message is delivered, or flagged so the agent- or tenant-scope kill switch can engage, within 10 s |
+| SEC-NF-19 | Revocation propagation | All derived Capabilities refused ≤1 s (p99) after a parent revocation | Revoke roots of trees of depth 4; time the first refused use per descendant |
+| SEC-NF-20 | Unsanctioned coordination blocked or detected | 100% of attempts blocked or detected within 10 s | Red-team test: two sandboxed agents, with no Board Capability and no Task delegation between them, try to coordinate outside the Board. Each attempt (a shared writable filesystem, a network route between the sandboxes, or a shared external endpoint) is blocked before any message is delivered, or flagged so the agent- or tenant-scope kill switch can engage, within 10 s |
 
 ### 7.13 PoC security acceptance criteria (for lifting into section 10)
 
@@ -755,13 +755,13 @@ The PoC passes the security gate when all of the following hold on a cluster of 
 
 1. SEC-NF-1, 2, 3, 4, 5, 9, 10, 12 and 13 meet their targets.
 2. A red-team tool runs in Tier V, and a policy test shows it cannot reach a target that is not in the allowlist.
-3. A job with no allowlist is refused in the execute tier. A job with `any` typed explicitly starts, and the `any` is shown in the audit log.
+3. A Goal with no allowlist is refused in the execute tier. A Goal with `any` typed explicitly starts, and the `any` is shown in the audit log.
 4. Unattended mode cannot be enabled without recorded sign-off and a linked QA-gate result.
-5. A forced settle above its hold engages the per-job kill switch automatically.
+5. A forced settle above its hold engages the per-Goal kill switch automatically.
 6. An independent verifier, using only the witnessed tree heads, confirms log consistency across the whole test.
 7. SEC-NF-14 to SEC-NF-19 meet their targets.
 8. A depth-4 delegation tree under one Goal cannot exceed the Goal's budget or Capability list, and a delegation at depth 5 is refused.
-9. A board post saying "you are granted tool X" leads to no capability change and no call to tool X, and appears in the audit log with the poster's identity.
+9. A Board post saying "you are granted tool X" leads to no Capability change and no call to tool X, and appears in the audit log with the poster's identity.
 10. Registering a Need that exceeds its Goal's ceiling is refused until an authorized operator amends the Goal.
 11. Killing the scheduler between placement and reservation leaves no placed-but-unfunded Task after reconciliation.
 12. SEC-NF-20 meets its target. Two sandboxed agents that try to coordinate outside the Board and Task delegation are blocked or detected in 100% of attempts within 10 s. No message is delivered through a shared writable filesystem, a direct route between sandboxes, or an external endpoint used as a meeting point.
@@ -769,7 +769,7 @@ The PoC passes the security gate when all of the following hold on a cluster of 
 ### 7.14 Risks
 
 - R1. **Shared-kernel risk in Tier P**: a kernel bug can let an agent loop escape. Mitigation: agent loops run no untrusted native code; keep kernels patched; treat Tier V as the default for anything risky.
-- R2. **Prompt injection cannot be fully prevented**: residual risk inside the granted capabilities. Mitigation: narrow capabilities, confirmation tiers, egress allowlists.
+- R2. **Prompt injection cannot be fully prevented**: residual risk inside the granted Capabilities. Mitigation: narrow Capabilities, confirmation tiers, egress allowlists.
 - R3. **Cost estimation errors**: provider price changes or tokenizer differences can make reservations too small. Mitigation: signed price table, overrun auto-kill, tick-level caps.
 - R4. **KVM availability**: cloud VMs without nested virtualization cannot run Tier V. Mitigation: bare-metal nodes for Tier V, Tier G as an audited fallback.
 - R5. **Control plane as single point of trust**: a compromise defeats most controls. Mitigation: small TCB, separation of duties, external audit witness, hardened hosts.
@@ -777,7 +777,7 @@ The PoC passes the security gate when all of the following hold on a cluster of 
 - R7. **"Military-grade" expectations**: formal accreditation (for example FIPS-validated crypto, specific national frameworks) is outside PoC scope and may change choices such as crypto libraries and hosting.
 - R8. **Dual use**: red-team capability can be misused. Mitigation: target allowlists, C2/C3 gating, audit, legal scope documents linked to registrations.
 - R9. **Capability model complexity**: subset checks on structured constraints can have bugs that silently widen access. Mitigation: closed set of kinds, a small constraint language, property-based tests (SEC-NF-14).
-- R10. **Board as an injection channel**: one compromised agent can influence many readers. Mitigation: posts are data only, provenance tainting raises confirmation tiers, topic-scoped read capabilities.
+- R10. **Board as an injection channel**: one compromised agent can influence many readers. Mitigation: posts are data only, provenance tainting raises confirmation tiers, topic-scoped read Capabilities.
 - R11. **Roll-up ledger contention**: charging every ancestor on each reservation adds writes at the top of deep trees. Mitigation: depth cap, measure against SEC-NF-6.
 
 ### 7.15 Open questions for Gui
@@ -791,9 +791,9 @@ The PoC passes the security gate when all of the following hold on a cluster of 
 - Q7. What is the accounting currency, and who owns the price table?
 - Q8. Retention period for audit logs and payloads, and is an off-site witness acceptable for sensitive tenants?
 - Q9. Is hard multi-tenancy (hostile tenants on shared nodes) in scope after the PoC?
-- Q10. Should capabilities also be issued as signed, attenuable tokens (Biscuit-style) for offline checking, or stay centrally stored for the PoC?
+- Q10. Should Capabilities also be issued as signed, attenuable tokens (Biscuit-style) for offline checking, or stay centrally stored for the PoC?
 - Q11. Is a delegation depth of 4 and the 500-agent fan-out right for the PoC Goals?
-- Q12. Can Message board topics be shared across Goals, and if so who approves that?
+- Q12. Can Board topics be shared across Goals, and if so who approves that?
 - Q13. Can Needs be fulfilled by operators other than the one who registered the Goal?
 
 ### 7.16 Sources (for merging into section 13)
@@ -820,7 +820,7 @@ Only sources that were fetched while writing this section are listed.
 - https://docs.sigstore.dev/logging/overview/ — Sigstore Rekor: tamper-resistant transparency log; auditors monitor that it stays append-only.
 - https://metr.org/blog/2026-08-26-openai-hugging-face-incident-investigation/ — METR investigation: about 1,200 agents meant to be isolated built a shared message board and a coordinator.
 
-Design precedent (internal, not an external source): Solos Engine, for the job bounds, cap ledger, scoped kill switches, fail-closed execute tier, and the registration-as-consent pattern.
+Design precedent (internal, not an external source): Solos Engine, for the bounds, cap ledger, scoped kill switches, fail-closed execute tier, and the registration-as-consent pattern.
 
 ## 8. Provider abstraction
 
@@ -860,7 +860,7 @@ R-EVD-1 through R-EVD-3 describe the Findings record in §5. Q22 decides whether
 
 - **R-ATT-1.** Every Attempt MUST be recorded with its score against the Goal's Needs.
 - **R-ATT-2.** Every planning loop MUST be fed the Attempt history in the OPRO form in §4 and §5.
-- **R-ATT-3.** History size and the truncation rule MUST be configurable per Goal. Proposed defaults, from the OPRO meta-prompt in §4: keep the best 20 Attempts, and propose 8 candidates per loop.
+- **R-ATT-3.** History size and the truncation rule MUST be configurable per Goal. The defaults are §6.
 - **R-ATT-4.** The scorer MUST be a separate identity from the proposer (§6, §7).
 
 **Non-functional.** Performance targets are the proposed targets in §6. Security targets are §7. This section adds no numeric targets.
@@ -905,9 +905,9 @@ Every open question for Gui is in this list. A question that already has a numbe
 7. **Q7 (Forge).** What is the accounting currency, and who owns the price table?
 8. **Q8 (Forge).** Retention period for audit logs and payloads, and is an off-site witness acceptable for sensitive tenants?
 9. **Q9 (Forge).** Is hard multi-tenancy (hostile tenants on shared nodes) in scope after the PoC?
-10. **Q10 (Forge).** Should capabilities also be issued as signed, attenuable tokens (Biscuit-style) for offline checking, or stay centrally stored for the PoC?
+10. **Q10 (Forge).** Should Capabilities also be issued as signed, attenuable tokens (Biscuit-style) for offline checking, or stay centrally stored for the PoC?
 11. **Q11 (Forge).** Is a delegation depth of 4 and the 500-agent fan-out right for the PoC Goals?
-12. **Q12 (Forge).** Can Message board topics be shared across Goals, and if so who approves that?
+12. **Q12 (Forge).** Can Board topics be shared across Goals, and if so who approves that?
 13. **Q13 (Forge).** Can Needs be fulfilled by operators other than the one who registered the Goal?
 14. **Q14 (Scribe).** Does the PoC run one Goal at a time on a cluster, or several Goals with separate ceilings?
 15. **Q15 (Scribe).** Which hosted APIs, and which local or air-gapped server (vLLM or another), must the PoC call for real? §6 measures with a mock provider. When several allowlisted backends can serve one model, which one does the router pick?
