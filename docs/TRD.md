@@ -276,7 +276,7 @@ This subsection covers the mechanics of the Goal, Need, Task, Board and Capabili
 - Each Goal partition has a bounded append rate and a bounded queue at the leader. When either is full, appends return `Busy` and are never buffered without limit.
 - Fan-out uses the QUIC flow control and per-subscriber credit from 6.7. A slow subscriber falls behind on its cursor and catches up by replaying; it doesn't hold memory on the publisher.
 - Each subscriber has a cap on unacknowledged entries, in the style of `MaxAckPending`, and fetches in bounded batches.
-- Each Goal has a cap on Open Tasks, so a runaway delegator can't flood the Board. The cap value is section 7 policy.
+- Each Goal has a cap on Open Tasks, and each tenant has a cap across its Goals, so a runaway delegator can't flood the Board. The cap values are SEC-F-47.
 
 **Requirements**
 - R-BRD-1: The Board MUST be an append-only log per Goal with a single committed order.
@@ -417,7 +417,7 @@ Working assumptions for this section:
 - A1. Every LLM agent is treated as untrusted. Its output can be wrong, manipulated by injected content, or adversarial. Prompt injection cannot be fully prevented (OWASP LLM01:2025 states that "it is unclear if there are fool-proof methods of prevention"). The design therefore limits what a compromised agent can do. It does not depend on agents behaving well.
 - A2. The agent loop (prompt assembly, provider calls, tool dispatch) is solos-swarm code. The higher-risk code is tool execution, and above all tools that run arbitrary code, browse, or touch targets during red-team work.
 - A3. Cluster nodes run a modern Linux kernel controlled by the operator. Hardware side channels are out of scope for the PoC, beyond keeping kernels and firmware patched.
-- A4. The PoC runs on a cluster the operator owns. It is not multi-tenant with hostile tenants. The design MUST still keep tenant boundaries so that hard multi-tenancy can follow later.
+- A4. The PoC runs on a cluster the operator owns. It is not multi-tenant with hostile tenants. Each tenant and each classification level has its own deployment (SEC-F-41). The cluster mechanism is §6.5. Hostile tenants on one shared node are Q9.
 
 ### 7.2 Threat model
 
@@ -512,6 +512,9 @@ flowchart LR
 | Control-plane takeover | Stolen operator credential | MFA, short sessions, separation of duties, privileged tiers |
 | Red-team scope breach | Red-team agent hits a target that is out of scope | Explicit target allowlist enforced at the broker; fail-closed |
 | Emergent unauthorized coordination | Agents that are supposed to stay isolated invent their own side channel and a coordinator. The case study in §4, and METR's investigation (https://metr.org/blog/2026-08-26-openai-hugging-face-incident-investigation/), report that about 1,200 agents meant to be isolated from one another built their own shared message board and a coordinator that assigned work across the group. | Deny-by-default for any agent-to-agent channel that is not the Board or Task delegation; per-Capability egress allowlists at the broker; fan-in/fan-out detection can engage the agent- or tenant-scope kill switch (SEC-F-37, SEC-F-38) |
+| Goal admitted from a prompt | A prompt requests outbound access to a system the deployment does not own, spend above the policy threshold, or a C3 action, and one operator approves it | Capability classes set by the operator; two-person approval for high-impact classes (SEC-F-39, Q20) |
+| Poisoned Finding used as authority | An untrusted Finding satisfies a Need, and a C2 or C3 action proceeds on that Finding alone | Broker-signed provenance; untrusted Findings do not unlock C2/C3; retraction flags descendants (SEC-F-42, SEC-F-43, SEC-F-44, §6.14) |
+| Evaluator gaming | A proposer reads the held-out cases and tunes attempts to the score | Separate evaluator identity; the proposer receives only the signed score (SEC-F-45, §6.15) |
 
 ### 7.3 Agent isolation and sandboxing
 
@@ -609,6 +612,7 @@ Precedent: macaroons, Biscuit and UCAN all use credentials that can only be narr
 - These form a ceiling for everything spawned under the Goal: every Task, delegation, board topic and reservation. Nothing under a Goal can exceed it.
 - Needs declared under a Goal are requests, not grants. Meeting a Need never widens the Goal's Capabilities; a Need that requires more than the ceiling needs a new or amended Goal registration by an authorized operator, with the same sign-off rules as the original.
 - The bounds in §7.6.1 apply per Goal, and per Task as narrowed sub-bounds.
+- Which capability classes a Goal may request, and two-person approval for high-impact classes, are §7.11 and SEC-F-39. Whether that approval is mandatory or deployer-configurable is Q20.
 
 ### 7.5 Secrets and provider-key management
 
@@ -664,9 +668,9 @@ Each registered Goal declares:
 
 ### 7.9 Tamper-evident audit log
 
-- An append-only log of security-relevant events: authentication, RBAC changes, registrations, sign-offs, Capability grants, tool calls (with tier and decision), reservations and settlements, kill-switch toggles, sandbox tier fallbacks, and policy denials.
+- An append-only log of security-relevant events: authentication, RBAC changes, registrations, sign-offs, two-person registration decisions, Capability grants, tool calls (with tier and decision), reservations and settlements, kill-switch toggles, sandbox tier fallbacks, policy denials, Finding provenance and retractions, and evaluator score signatures.
 - Structure: entries form a Merkle hash tree (RFC 6962 style, SHA-256, with domain-separated leaf and node hashes). The log periodically publishes a **signed tree head** (tree size, root hash, timestamp). It supports inclusion proofs (an entry is in the log) and consistency proofs (a later tree extends an earlier one). This is the property behind Certificate Transparency and Sigstore Rekor: rewriting or deleting history is detectable.
-- Witnessing: signed tree heads are copied to at least one store outside the control plane's write authority (a separate host or an operator-held store) so that a compromised control plane cannot present a forked history unseen.
+- Witnessing: signed tree heads are copied to at least one store outside the control plane's write authority (a separate host or an operator-held store) so that a compromised control plane cannot present a forked history unseen. In air-gapped mode that witness has no internet path (SEC-F-40).
 - Content: entries carry hashes of large payloads (prompts, outputs), not the payloads, so that retention and redaction of data stay separate from audit integrity. Secrets are never logged.
 - A verifier tool (part of the CLI) checks signatures, inclusion and consistency.
 
@@ -683,7 +687,61 @@ Grounded in the OWASP Top 10 for LLM Applications 2025, mainly LLM01 Prompt Inje
 - **Unbounded consumption** (LLM10) is covered by §7.6.
 - **Adversarial testing**: the PoC includes an injection test suite run against the swarm itself (LLM01 mitigation 7). solos-swarm's own red-team use case can supply it.
 
-### 7.11 Functional requirements (SEC-F-n; referenced from section 9)
+### 7.11 Goal registration policy
+
+Any prompt may define a Goal (§1, §3). Registration admits that Goal only after it passes the deployment's policy (SEC-F-39).
+
+The operator sets the capability classes a Goal may request. A class outside that set is refused. Three classes are high-impact: outbound access to a system the deployment does not own, a spend bound above the threshold in deployment policy, and C3 actions (§7.8). A high-impact class takes two distinct human approvers. The same person twice, or an agent, does not satisfy the rule. Whether a deployer may turn the rule off is Q20. Until Q20 is answered, the rule stays on. Per-action C3 approval stays SEC-F-22.
+
+Rationale: the platform takes its Goal from the prompt, so the policy at registration is what limits that Goal.
+
+### 7.12 Air-gapped mode
+
+The on-prem layout is §6.5. Local providers are §8. This subsection is the security rule for that mode.
+
+An air-gapped deployment uses only local model providers, with no external keys. Updates come from media the operator supplies. The deployment does not download them. Whether the PoC must show offline updates is Q21. The audit witness (§7.9) sits on the deployment and has no internet path. Inclusion and consistency checks use that witness alone. Call-home means telemetry, a license check, or any other contact with a service outside the deployment. Call-home is off by default in every deployment (§6.5). Air-gapped mode keeps it off (SEC-F-40).
+
+Rationale: a fetch, a remote witness, or a call home is an outbound path, and it can carry tenant data.
+
+### 7.13 Tenant separation
+
+Each tenant, and each classification level, has its own deployment. The mechanism is §6.5: a separate cluster, with its own Raft group, Board, and mTLS root.
+
+The deployments do not share a node, a Board, a key broker, or an mTLS root (SEC-F-41). The PoC runs on a cluster the operator owns (A4). Putting hostile tenants on one shared node is Q9.
+
+Rationale: a shared node, Board, key broker, or trust root crosses the tenant or classification boundary.
+
+### 7.14 Findings trust
+
+Where Findings are stored, how the lineage index walks, and the rule that rejects agent-supplied provenance are §6.14. Prompt labels for untrusted content stay SEC-F-24.
+
+The broker writes and signs the provenance fields: producer, Capability, Goal, and input hashes. The agent does not write them. A derived Finding takes the lowest trust of its inputs and the markings of its sources. A read Capability is scoped by the markings it may read and by Goal. A read outside either scope is denied (SEC-F-42).
+
+An untrusted-input Finding may satisfy a Need. It does not authorize a C2 or C3 action on its own. The action waits for independent corroboration or for recorded operator approval (SEC-F-43). Independent corroboration is another Finding that does not descend from the untrusted Finding and is not untrusted. The tainted-context tier raise remains SEC-F-26.
+
+A retraction is a new broker-signed record. The Finding stays in the store. The retraction flags every descendant through the lineage index and reopens dependent Needs and pending C2 and C3 actions (SEC-F-44). The walk and the latency target are §6.12 and §6.14.
+
+Rationale: the producer must not certify its own Finding. An untrusted Finding may satisfy a Need, and a C2 or C3 action still needs corroboration or approval. The retracted Finding stays on record, and work that used it stops.
+
+### 7.15 Attempt-history trust
+
+The loop is the optimization-by-prompting shape in §4.6. The history, compaction, and the evaluator node pool are §6.15.
+
+The evaluator identity writes and signs each score. A proposer never holds that identity, including by delegation. The proposer receives the signed score and does not receive the evaluator code, the test set, or the held-out cases (SEC-F-45). A proposer that can see the test can raise the score without improving the attempt (Goodhart).
+
+Each entry keeps the markings of the Findings it comes from. A planner sees only the entries its read Capabilities allow (SEC-F-42). A retracted or flagged Attempt stays as a short "do not repeat" marker. Compaction leaves the marker in place (SEC-F-46).
+
+Rationale: the score is meaningful only when the proposer cannot see or write the test, and a retracted attempt that vanishes will be proposed again.
+
+### 7.16 Open Task caps
+
+§6.10 caps Open Tasks so one delegator cannot fill the Board. The numbers are this policy (SEC-F-47).
+
+Each Goal has a cap, fixed at registration with the other ceiling fields (SEC-F-32). Each tenant has a cap across its Goals. Admission checks the Goal cap, the tenant cap, and the Goal's capability and budget ceiling, and it refuses a Task that would exceed any of them. The cap is separate from the live-descendant cap (SEC-F-29). A missing cap is 0. The PoC default is 500 Open Tasks per Goal and 500 Open Tasks per tenant.
+
+Rationale: §6.10 refers here for the value. 500 matches the PoC swarm size, so the 300-Task burst in §6.12 stays inside the default cap.
+
+### 7.17 Functional requirements (SEC-F-n; referenced from section 9)
 
 - **SEC-F-1** Every agent and tool MUST run in an isolation tier at least as strong as its declared minimum. The scheduler MUST refuse placement otherwise.
 - **SEC-F-2** Tier P sandboxes MUST apply: separate user, PID, mount, network and IPC namespaces; cgroup v2 CPU, memory and PID limits; `no_new_privs`; a seccomp allowlist that checks the architecture; and a Landlock ruleset covering file system, network ports and IPC scoping at the highest ABI version the kernel offers. If a required restriction is not available, the sandbox MUST refuse to start, unless the operator has explicitly allowed degraded mode, and any degradation MUST be audited.
@@ -723,8 +781,17 @@ Grounded in the OWASP Top 10 for LLM Applications 2025, mainly LLM01 Prompt Inje
 - **SEC-F-36** Every delegation MUST be audited with parent, child, Capability diff and budget carved out.
 - **SEC-F-37** Any agent-to-agent channel that is not brokered by the Board or by Task delegation MUST be denied by default. Agents MUST NOT share a writable filesystem. Agent sandboxes MUST NOT have network routes to one another. The broker MUST enforce a per-Capability egress allowlist, so an external endpoint cannot serve as a meeting point.
 - **SEC-F-38** The broker MUST detect egress fan-in and fan-out. Several agents reaching the same unexpected destination (a destination outside that agent's per-Capability egress allowlist, or the same external endpoint used as a rendezvous) MUST flag those agents, and the agent-scope or tenant-scope kill switch MUST be engageable for them.
+- **SEC-F-39** A Goal proposed by any prompt (§1, §3) MUST be admitted only when registration passes the deployment's Goal-registration policy. The operator MUST configure the capability classes a Goal may request, and registration MUST refuse a class outside that set. A high-impact class MUST require approval by two distinct human operators. Two approvals from the same person MUST NOT meet the rule, and an agent MUST NOT be an approver. High-impact classes are: outbound access to a system the deployment does not own, a requested spend bound above the threshold in deployment policy, and C3 actions (§7.8). Until Q20 is answered, two-person approval MUST stay on, and the deployment MUST NOT provide a switch that turns it off. Per-action C3 approval remains SEC-F-22. Rationale: the prompt proposes the Goal, and the deployment policy is what admits it.
+- **SEC-F-40** An air-gapped deployment MUST use only local model providers, and those providers MUST have no external keys (§6.5, §8). It MUST install updates only from media the operator supplies, and it MUST NOT download updates. Whether the PoC must show offline updates is Q21. The audit witness (§7.9) MUST keep the log tamper-evident with no internet access, and inclusion and consistency checks MUST succeed against that witness alone. A deployment MUST NOT call home by default. Air-gapped mode MUST NOT call home at all. Call-home is telemetry, a license check, or any other contact with a service outside the deployment (§6.5). Rationale: a download, a remote witness, or a call home is an outbound path.
+- **SEC-F-41** Each tenant and each classification level MUST have its own deployment. Deployments MUST NOT share a node, a Board, a key broker, or an mTLS root. The cluster mechanism is §6.5. Rationale: a shared node, Board, key broker, or trust root crosses the tenant or classification boundary.
+- **SEC-F-42** The broker MUST write and sign Finding provenance, and the agent MUST NOT write those fields. The signed fields MUST be the producer, the Capability, the Goal, and the input hashes. The runtime MUST reject a Finding whose provenance the agent supplied. Storage and that rejection are §6.14. A derived Finding MUST inherit the lowest trust of its inputs and MUST carry the markings of its sources. A read Capability MUST be scoped by the markings it may read and by Goal, and a read outside either scope MUST be denied. Prompt labels for untrusted content remain SEC-F-24. Rationale: the producer must not certify its own Finding, and a derived Finding must stay within the trust and markings of its inputs.
+- **SEC-F-43** An untrusted-input Finding MAY satisfy a Need. It MUST NOT by itself authorize a C2 or C3 action. That action MUST stay blocked until independent corroboration or recorded operator approval exists. Independent corroboration MUST be a Finding that does not descend from the untrusted Finding and that is not untrusted. The tainted-context tier raise remains SEC-F-26. Rationale: a satisfied Need still leaves the C2 or C3 action blocked until corroboration or approval.
+- **SEC-F-44** A retraction MUST be a broker-signed record appended beside the Finding. The runtime MUST NOT delete the Finding. The retraction MUST flag every descendant through the lineage index and MUST reopen dependent Needs and pending C2 and C3 actions. The walk and its latency target are §6.12 and §6.14. Rationale: the Finding stays as evidence, and work that depended on it stops.
+- **SEC-F-45** Attempt scores use the optimization-by-prompting loop in §4.6. An evaluator identity MUST write and sign each score. A proposer MUST NOT hold that identity, including by delegation (SEC-F-10). A proposer MUST receive only the signed score, and MUST NOT receive the evaluator code, the test set, or the held-out cases. The evaluator node pool is §6.15. Rationale: a proposer that can see the test can raise the score without improving the attempt (Goodhart).
+- **SEC-F-46** An Attempt history entry MUST keep the markings of the Findings it is built from. A planner MUST see only entries its read Capabilities allow (SEC-F-42). A retracted or flagged Attempt MUST remain as a short "do not repeat" marker and MUST NOT be dropped. Compaction is §6.15. Rationale: a planner must stay inside its clearance, and a dropped failure will be proposed again.
+- **SEC-F-47** Each Goal MUST have a cap on Open Tasks, fixed at registration as part of the SEC-F-32 ceiling, and each tenant MUST have a cap on Open Tasks across its Goals. This cap is separate from the live-descendant cap in SEC-F-29. A missing cap MUST be treated as 0. The PoC default is 500 Open Tasks per Goal and 500 Open Tasks per tenant. Admission (§6.10) MUST refuse a Task that would exceed the Goal cap, the tenant cap, or the Goal's capability or budget ceiling (SEC-F-32). Rationale: §6.10 needs this value so one delegator cannot fill the Board with Open Tasks.
 
-### 7.12 Non-functional requirements (SEC-NF-n; referenced from section 9)
+### 7.18 Non-functional requirements (SEC-NF-n; referenced from section 9)
 
 | ID | Requirement | Target | How it is measured |
 |----|-------------|--------|--------------------|
@@ -748,8 +815,16 @@ Grounded in the OWASP Top 10 for LLM Applications 2025, mainly LLM01 Prompt Inje
 | SEC-NF-18 | Placement/reserve atomicity | 0 placed Tasks without a hold; 0 holds without a placement or explicit release after reconciliation | Kill scheduler and ledger at random points during 10,000 placements; reconcile by intentId |
 | SEC-NF-19 | Revocation propagation | All derived Capabilities refused ≤1 s (p99) after a parent revocation | Revoke roots of trees of depth 4; time the first refused use per descendant |
 | SEC-NF-20 | Unsanctioned coordination blocked or detected | 100% of attempts blocked or detected within 10 s | Red-team test: two sandboxed agents, with no Board Capability and no Task delegation between them, try to coordinate outside the Board. Each attempt (a shared writable filesystem, a network route between the sandboxes, or a shared external endpoint) is blocked before any message is delivered, or flagged so the agent- or tenant-scope kill switch can engage, within 10 s |
+| SEC-NF-21 | High-impact registration blocked | 0 high-impact Goals admitted with fewer than two distinct human approvers while two-person approval is on; 0 Goals admitted with a capability class outside deployment policy | Register each high-impact class (outbound access to a system the deployment does not own, spend above the configured threshold, C3) with one approver, with the same approver twice, with an agent approver, with a class outside policy, and with two distinct human approvers. Diff the Goal store and the audit log |
+| SEC-NF-22 | Air-gap has no outbound trust path | 0 external provider keys on the deployment; 0 call-home or downloaded-update flows; 100% of inclusion and consistency checks succeed against the local witness while external egress is denied | Scan the deployment for external provider keys. Count egress-proxy flows during a scripted run. Deny external egress and run the §7.9 verifier against the on-deployment witness |
+| SEC-NF-23 | Tenant and classification separation | 0 nodes, Boards, key brokers, or mTLS roots shared by two deployments | Compare node inventories, Board partition ownership, broker endpoints, and trust anchors of two deployments that represent two tenants or two classification levels |
+| SEC-NF-24 | Finding provenance is broker-signed | 0 accepted Findings whose provenance fields the agent wrote; 100% of derived Findings record the lowest input trust and every source marking; 0 reads outside the reader's marking and Goal | Submit agent-written provenance. Derive a Finding from mixed-trust, mixed-marking inputs and read the stored record. Request a read with the wrong marking and with the wrong Goal |
+| SEC-NF-25 | Untrusted Finding does not unlock C2/C3 | 0 C2 or C3 actions authorized only by an untrusted-input Finding | Satisfy a Need with one untrusted-input Finding. Confirm the Need is satisfied, then request a C2 action and a C3 action. Both stay blocked until independent corroboration or recorded operator approval exists |
+| SEC-NF-26 | Retraction reopens dependents | 100% of descendants flagged; the dependent Need and pending C2 and C3 actions reopened; 0 Findings deleted; flag-and-reopen latency meets the §6.12 target | Append a broker-signed retraction of one source that has descendants, a dependent Need, and a pending C2 or C3 action. Diff the store, the flags, the Need, and the action. Time the walk |
+| SEC-NF-27 | Proposer cannot read or write the evaluation | 0 successful reads of evaluator code, the test set, or held-out cases by a proposer identity; 0 scores accepted from a proposer identity; the proposer receives the signed score | From a proposer identity, request each evaluator object, read the score, and submit a score. Count allows and check the signature on the score |
+| SEC-NF-28 | Open Task caps hold at admission | 0 Tasks admitted that would put the Goal or the tenant above its Open Task cap; 0 Tasks admitted outside the Goal capability or budget ceiling; a missing cap admits 0 | An adversarial delegator opens Tasks up to the cap plus one, and opens a Task outside the ceiling while still under the count. Repeat with the cap unset. Count Open Tasks and audit refusals |
 
-### 7.13 PoC security acceptance criteria (for lifting into section 10)
+### 7.19 PoC security acceptance criteria (for lifting into section 10)
 
 The PoC passes the security gate when all of the following hold on a cluster of at least 3 Linux nodes running 500 agents:
 
@@ -765,8 +840,11 @@ The PoC passes the security gate when all of the following hold on a cluster of 
 10. Registering a Need that exceeds its Goal's ceiling is refused until an authorized operator amends the Goal.
 11. Killing the scheduler between placement and reservation leaves no placed-but-unfunded Task after reconciliation.
 12. SEC-NF-20 meets its target. Two sandboxed agents that try to coordinate outside the Board and Task delegation are blocked or detected in 100% of attempts within 10 s. No message is delivered through a shared writable filesystem, a direct route between sandboxes, or an external endpoint used as a meeting point.
+13. With two-person approval on, a high-impact Goal with one human approver is refused. The test covers each high-impact class: outbound access to a system the deployment does not own, spend above the configured threshold, and a C3 action. The same person twice, and an agent approver, are refused, and each refusal is in the audit log. The same Goal, with two distinct human approvers and only capability classes the deployment policy allows, is admitted (SEC-F-39, SEC-NF-21).
+14. A Need that Finding F satisfies is reopened when a broker-signed retraction of F is appended. F remains in the store. Every descendant of F is flagged. A pending C2 or C3 action that depended on F is reopened. The flag-and-reopen time meets the §6.12 target (SEC-F-44, SEC-NF-26).
+15. A proposer identity is denied the evaluator code, the test set, and the held-out cases. It receives the signed score and no other evaluator output. A score submitted under the proposer identity is rejected (SEC-F-45, SEC-NF-27, §6.15).
 
-### 7.14 Risks
+### 7.20 Risks
 
 - R1. **Shared-kernel risk in Tier P**: a kernel bug can let an agent loop escape. Mitigation: agent loops run no untrusted native code; keep kernels patched; treat Tier V as the default for anything risky.
 - R2. **Prompt injection cannot be fully prevented**: residual risk inside the granted Capabilities. Mitigation: narrow Capabilities, confirmation tiers, egress allowlists.
@@ -779,8 +857,10 @@ The PoC passes the security gate when all of the following hold on a cluster of 
 - R9. **Capability model complexity**: subset checks on structured constraints can have bugs that silently widen access. Mitigation: closed set of kinds, a small constraint language, property-based tests (SEC-NF-14).
 - R10. **Board as an injection channel**: one compromised agent can influence many readers. Mitigation: posts are data only, provenance tainting raises confirmation tiers, topic-scoped read Capabilities.
 - R11. **Roll-up ledger contention**: charging every ancestor on each reservation adds writes at the top of deep trees. Mitigation: depth cap, measure against SEC-NF-6.
+- R12. **Dual use through a Goal-policy bypass**: any prompt can name a Goal. A registration path that skips the deployment policy, or a policy that allows every capability class, lets one operator grant outbound access to systems the deployment does not own, spend above the threshold, or C3 actions. Mitigation: SEC-F-39, with two-person approval on until Q20 is answered.
+- R13. **Evaluator gaming**: a proposer that obtains the evaluator code, the test set, or the held-out cases can raise the score without improving the attempt (Goodhart). Mitigation: SEC-F-45 and the evaluator node pool in §6.15.
 
-### 7.15 Open questions for Gui
+### 7.21 Open questions for Gui
 
 - Q1. Which "military-grade" frameworks or accreditations (if any) must the post-PoC design meet? This affects crypto modules and hosting.
 - Q2. Do PoC nodes have bare-metal KVM? If not, is gVisor acceptable as the Tier V substitute for the PoC?
@@ -795,8 +875,9 @@ The PoC passes the security gate when all of the following hold on a cluster of 
 - Q11. Is a delegation depth of 4 and the 500-agent fan-out right for the PoC Goals?
 - Q12. Can Board topics be shared across Goals, and if so who approves that?
 - Q13. Can Needs be fulfilled by operators other than the one who registered the Goal?
+- Q20. Is two-person approval for high-impact Goal capabilities (SEC-F-39) mandatory, or deployer-configurable? Until this is answered, SEC-F-39 keeps the rule on.
 
-### 7.16 Sources (for merging into section 13)
+### 7.22 Sources (for merging into section 13)
 
 Only sources that were fetched while writing this section are listed.
 
@@ -841,7 +922,7 @@ The trait covers a local provider and a hosted API.
 
 "MUST" and "SHOULD" follow RFC 2119, as in §7.
 
-Runtime requirements are R-SCH-*, R-BRD-*, R-NET-1, R-FND-*, and R-HIST-* in §6. Authorization, the ledger, the Board's trust rules, delegation, and unsanctioned-coordination controls are SEC-F-1 through SEC-F-38 in §7. Board and Task across machines are §6. The shared reserve is the scheduler reserve phase in §6 and the cap ledger in §7.
+Runtime requirements are R-SCH-*, R-BRD-*, R-NET-1, R-FND-*, and R-HIST-* in §6. Authorization, the ledger, the Board's trust rules, delegation, and unsanctioned-coordination controls are SEC-F-1 through SEC-F-47 in §7. Board and Task across machines are §6. The shared reserve is the scheduler reserve phase in §6 and the cap ledger in §7.
 
 Requirements added here:
 
@@ -873,14 +954,14 @@ The PoC is the first deliverable. It runs one Goal on a multi-machine Linux clus
 
 **Out of scope for the PoC.** A second concurrent Goal (Q14). Model training. An agent-authoring SDK. Hostile multi-tenancy. Formal accreditation. A proof of module composability. Offline Capability tokens, unless Q10 says otherwise.
 
-**Acceptance.** The PoC passes when the criteria in §6 pass and the criteria in §7 pass. Those lists keep their own numbers. Criterion 12 is the one in §7. It is part of this acceptance list under that same number, and it is not copied here.
+**Acceptance.** The PoC passes when the criteria in §6 pass and the criteria in §7 pass. Those lists keep their own numbers. Criteria 1 to 15 are the §7 list. They are part of this acceptance list under those numbers, and they are not copied here.
 
-Further criteria, numbered after 12 so they do not collide with §7:
+Further criteria, numbered after 15 so they do not collide with §7:
 
-13. An operator can register one Goal, and the registration record stores the spend ceiling and the root Capability set. A Need or Task that would exceed either is refused.
-14. A self-hosted Provider call and a hosted-API Provider call each settle once in the ledger. The agent that triggered the call has no provider key.
-15. Loading a test module provides a Need. Unloading it runs the inverse, and that Need is no longer provided. A module that depended on it is inactive afterward.
-16. On a fixed benchmark Goal, history-fed planning is compared with single-draft refinement at the same budget.
+16. An operator can register one Goal, and the registration record stores the spend ceiling and the root Capability set. A Need or Task that would exceed either is refused.
+17. A self-hosted Provider call and a hosted-API Provider call each settle once in the ledger. The agent that triggered the call has no provider key.
+18. Loading a test module provides a Need. Unloading it runs the inverse, and that Need is no longer provided. A module that depended on it is inactive afterward.
+19. On a fixed benchmark Goal, history-fed planning is compared with single-draft refinement at the same budget.
 
 ## 11. Risks
 
@@ -891,6 +972,8 @@ Further criteria, numbered after 12 so they do not collide with §7:
 - **The evidence is Koishi.** Section 5.3 of the paper is a chatbot framework, and the authors call it an existence result. Using the same shape for an agent swarm is a design choice. It is not a measured result for this system.
 - **Provider usage disagrees with the reservation.** Token counts and prices can make the settle differ from the hold. Handling of that case, and the other security risks, are in §7.
 - **Dual use and misuse.** The same swarm can be aimed at work the operator should not do. Mitigation: registering the Goal is the consent point, Capabilities bound what agents can do, and the audit log records the actions. Those controls are in §7.
+- **Dual use through a Goal-policy bypass.** Any prompt can define a Goal. A registration that skips the deployment policy can grant outbound access to systems the deployment does not own, spend above the threshold, or C3 actions. Mitigation: SEC-F-39 in §7. Whether two-person approval can be turned off is Q20.
+- **Evaluator gaming.** A proposer that can read the evaluator code, the test set, or the held-out cases can raise the score without improving the attempt. Mitigation: SEC-F-45 in §7. The evaluator node pool is §6.15.
 
 ## 12. Open questions for Gui
 
@@ -915,7 +998,7 @@ Every open question for Gui is in this list. A question that already has a numbe
 17. **Q17 (Scribe).** After the operator registers the Goal, may agents create Tasks and provide Needs with no further human step, inside the ceiling?
 18. **Q18 (Scribe).** Who may register a Goal? For government defensive users, what acceptable-use policy applies, and which deployment do they need: on-prem, air-gapped, or both?
 19. **Q19 (Kernel).** Is an external etcd acceptable in target deployments? This is the question in §6.
-20. **Q20 (Forge).** For high-impact Goals, is two-person approval built in, or a policy each deployer can turn off?
+20. **Q20 (Forge).** Is two-person approval for high-impact Goal capabilities (SEC-F-39) mandatory, or deployer-configurable? Until this is answered, SEC-F-39 keeps the rule on.
 21. **Q21 (Kernel).** For air-gapped deployments, are offline bootstrap and updates in PoC scope, or deferred to v1?
 22. **Q22 (Scribe).** Should Findings be a sixth first-class object, or part of Board and Need?
 23. **Q23 (Scribe).** For an open-ended Goal with no numeric metric, what is the scorer?
