@@ -844,13 +844,13 @@ The PoC is the first deliverable. It runs one Goal on a multi-machine Linux clus
 
 **Out of scope for the PoC.** A second concurrent Goal (Q14). Model training. An agent-authoring SDK. Hostile multi-tenancy. Formal accreditation. A proof of module composability. Offline Capability tokens, unless Q10 says otherwise.
 
-**Acceptance.** The PoC passes when all of the following hold:
+**Acceptance.** The PoC passes when the criteria in §6 pass and the criteria in §7 pass. Those lists keep their own numbers. Criterion 12 is the one in §7. It is part of this acceptance list under that same number, and it is not copied here.
 
-1. The criteria in §6 pass.
-2. The criteria in §7 pass.
-3. An operator can register one Goal, and the registration record stores the spend ceiling and the root Capability set. A Need or Task that would exceed either is refused.
-4. A self-hosted Provider call and a hosted-API Provider call each settle once in the ledger. The agent that triggered the call has no provider key.
-5. Loading a test module provides a Need. Unloading it runs the inverse, and that Need is no longer provided. A module that depended on it is inactive afterward.
+Further criteria, numbered after 12 so they do not collide with §7:
+
+13. An operator can register one Goal, and the registration record stores the spend ceiling and the root Capability set. A Need or Task that would exceed either is refused.
+14. A self-hosted Provider call and a hosted-API Provider call each settle once in the ledger. The agent that triggered the call has no provider key.
+15. Loading a test module provides a Need. Unloading it runs the inverse, and that Need is no longer provided. A module that depended on it is inactive afterward.
 
 ## 11. Risks
 
