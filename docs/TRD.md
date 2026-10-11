@@ -164,8 +164,429 @@ All values below are **proposed targets to validate in PoC**, not claims. Sectio
 - https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/ (page says the GenAI conventions moved to a separate repo)
 
 
-## 7. Security and trust (Forge)
-TODO (Forge)
+## 7. Security and trust
+
+Status: draft for review by Gui. Scope: proof of concept (PoC), with notes on the path beyond it.
+Document type: requirements only. It contains no code and does not prescribe internal implementation, except where a requirement depends on a named mechanism.
+
+Key words: "MUST", "MUST NOT", "SHOULD" and "MAY" have their RFC 2119 meanings.
+
+---
+
+### 7.1 Context and assumptions
+
+solos-swarm schedules and supervises swarms of about 500 LLM agents across multi-machine Linux clusters. It is written in Rust, uses several model providers, and has a modular, Kubernetes-like design (control plane, node agents, pluggable runtimes and providers). Target uses are heavy enterprise project testing, red teaming, always-on defensive monitoring, and high-assurance ("military-grade") operations.
+
+The TRD defines four first-class objects that this section secures:
+
+- **Goal (with its Needs)**: the top-level unit of work an operator registers. Registering a Goal is the moment of consent (§7.4.7).
+- **Task**: a unit of work given to an agent. Tasks can be delegated to child agents, and delegation only narrows authority (§7.4.6).
+- **Message board**: shared topics that agents post to and read from. Board content is untrusted input (§7.10).
+- **Capability list**: the explicit, typed, scoped grants an agent holds. It is the only authorization boundary for agents (§7.4.5).
+
+Working assumptions for this section:
+
+- A1. Every LLM agent is treated as untrusted. Its output can be wrong, manipulated by injected content, or adversarial. Prompt injection cannot be fully prevented (OWASP LLM01:2025 states that "it is unclear if there are fool-proof methods of prevention"). The design therefore limits what a compromised agent can do. It does not depend on agents behaving well.
+- A2. The agent loop (prompt assembly, provider calls, tool dispatch) is solos-swarm code. The higher-risk code is tool execution, and above all tools that run arbitrary code, browse, or touch targets during red-team work.
+- A3. Cluster nodes run a modern Linux kernel controlled by the operator. Hardware side channels are out of scope for the PoC, beyond keeping kernels and firmware patched.
+- A4. The PoC runs on a cluster the operator owns. It is not multi-tenant with hostile tenants. The design MUST still keep tenant boundaries so that hard multi-tenancy can follow later.
+
+### 7.2 Threat model
+
+#### 7.2.1 Actors
+
+| ID | Actor | Trust | Notes |
+|----|-------|-------|-------|
+| T-OP-ROOT | Root or break-glass operator | Highest; human; few people | Can toggle the global kill switch and change global allowlists. |
+| T-OP-ADMIN | Tenant administrator | High within one tenant | Registers jobs and approves unattended mode for the tenant. |
+| T-OP-VIEW | Viewer or auditor | Read-only | Reads state and audit logs. |
+| T-CP | Control plane (API server, scheduler, ledger, broker, audit log) | Trusted computing base | A compromise here is a full compromise. |
+| T-NODE | Node agent on each machine | Trusted for its own node only | Must not be able to act for other nodes. |
+| T-AGENT | LLM agent instance | Untrusted | Can be prompt-injected or misaligned. It may also be an adversarial agent in red-team scenarios. |
+| T-TOOL | Tool code (first-party, third-party, generated) | Untrusted | Runs in a sandbox matched to its risk. |
+| T-PROV | LLM provider APIs | Semi-trusted | Outputs are untrusted content. Billing is real money. |
+| T-EXT | External content (web pages, files, email, target-system output) | Hostile by default | Main vector for indirect prompt injection. |
+| T-ADV | External attacker | Hostile | Targets the API, the network, the supply chain and leaked keys. |
+| T-INSIDER | Malicious or careless insider | Varies | Covered by separation of duties and the audit log. |
+
+#### 7.2.2 Assets
+
+1. Provider API keys and other upstream credentials (money and data access).
+2. The budget: real spend across providers and paid tools.
+3. Target systems that agents act on, including red-team targets in scope.
+4. Tenant data: prompts, intermediate results, findings, and monitoring telemetry.
+5. Control-plane integrity: Goal registrations, Capability lists, delegation records, allowlists, RBAC bindings, kill-switch state.
+8. Message board integrity: who posted what, and when.
+6. Audit-log integrity: the evidence of who did what.
+7. Node integrity: host kernels and the other workloads on each node.
+
+#### 7.2.3 Trust boundaries
+
+- B1: operator to control plane (human authentication, RBAC).
+- B2: control plane to node agent (mTLS, node identity).
+- B3: node agent to agent sandbox (isolation tier; the agent holds no raw credentials).
+- B4: agent to tool sandbox (capability grant, confirmation tier).
+- B5: sandbox to egress broker to provider or target (brokered credentials, allowlists, spend reservation).
+- B6: any external content entering an agent context (untrusted-content boundary).
+- B7: agent to agent, through Task delegation and the Message board (delegation can only narrow capabilities; posts are data, never authority).
+
+```mermaid
+flowchart LR
+  subgraph Humans
+    OP[Operators<br/>root / admin / viewer]
+  end
+  subgraph CP[Control plane - TCB]
+    API[API server<br/>authn + RBAC/ABAC]
+    LED[Cap ledger<br/>reserve / settle / release]
+    KS[Kill-switch store<br/>global / tenant / agent]
+    BRK[Credential + egress broker]
+    AUD[Append-only audit log<br/>Merkle / hash chain]
+    ID[Workload identity issuer<br/>SPIFFE-style SVIDs]
+  end
+  subgraph Node[Cluster node]
+    NA[Node agent]
+    subgraph SB[Agent sandbox - untrusted]
+      AG[LLM agent]
+    end
+    subgraph TS[Tool sandbox - untrusted]
+      TL[Tool]
+    end
+  end
+  PROV[(LLM providers)]
+  EXT[(External content / targets)]
+
+  OP -- B1 mTLS/OIDC --> API
+  API -- B2 mTLS --> NA
+  NA -- B3 spawn + SVID --> AG
+  AG -- B4 capability call --> TL
+  AG -- B5 request, no keys --> BRK
+  TL -- B5 --> BRK
+  BRK -- reserve first --> LED
+  BRK -- check --> KS
+  BRK -- real key --> PROV
+  BRK -- allowlisted --> EXT
+  EXT -. B6 untrusted content .-> AG
+  AG -. B7 attenuated delegation / board posts as data .-> AG
+  API & LED & KS & BRK --> AUD
+```
+
+#### 7.2.4 Main threats (STRIDE-style summary)
+
+| Threat | Example | Primary controls |
+|--------|---------|------------------|
+| Key exfiltration | An injected agent prints its environment or reads a key file | Agents never hold keys (§7.5); egress only through the broker |
+| Runaway spend | Loop of max-token calls across 500 agents | Reserve-before-act ledger, caps, kill switch (§7.6, §7.7) |
+| Sandbox escape | Tool exploits a kernel bug | Isolation tiers; microVM for arbitrary code (§7.3) |
+| Privilege escalation via agents | Agent A asks agent B, which holds more privileges, to act for it; or a delegation chain tries to widen scope | Capability list is the only authority; delegation attenuates; depth cap; board posts are data (§7.4.4–§7.4.6) |
+| Board poisoning | A compromised agent posts instructions that other agents follow | Posts are untrusted input, authenticated and audited, cannot grant capabilities (§7.10) |
+| Excessive agency | Agent uses a broad tool such as "run shell" against an out-of-scope host | Narrow capabilities, allowlists, confirmation tiers (§7.8) |
+| Audit tampering | Insider deletes the evidence of an action | Hash-chained log, signed tree heads, external witness (§7.9) |
+| Control-plane takeover | Stolen operator credential | MFA, short sessions, separation of duties, privileged tiers |
+| Red-team scope breach | Red-team agent hits a target that is out of scope | Explicit target allowlist enforced at the broker; fail-closed |
+
+### 7.3 Agent isolation and sandboxing
+
+#### 7.3.1 Options considered
+
+The figures below are only those stated by the sources fetched for this document. Where no source figure exists, the table says "not stated".
+
+| Option | Isolation mechanism | Strengths | Weaknesses | Startup / density figures from sources |
+|--------|--------------------|-----------|------------|---------------------------------------|
+| OS process + namespaces + seccomp-BPF + Landlock + cgroups | Shared host kernel; reduced syscall surface; unprivileged file and network access control | Lowest overhead and highest density; native to Rust; Landlock lets unprivileged processes restrict themselves, and policies only tighten (rules cannot be removed once applied) | Shared kernel: a kernel bug is a host compromise. The kernel docs state "System call filtering isn't a sandbox" on its own. Landlock cannot yet restrict some actions (for example chmod, chown, stat). Landlock caps stacked rulesets at 16 layers. Namespaces "are not designed for access-control" (Landlock docs). | Not stated in sources |
+| gVisor (runsc) | User-space kernel (Sentry) intercepts syscalls; the Sentry's own host syscalls are minimized | Strong reduction of the host-kernel attack surface without hardware virtualization; OCI-compatible; no direct syscall pass-through | Overhead on syscall-heavy and file-system-heavy work; networking less efficient; does not stop hardware side channels | Benchmarks are published as figures without numbers in the fetched text; it notes that most container start overhead is Docker itself |
+| Firecracker microVM | KVM hardware virtualization with a minimal VMM | Separate guest kernel; small device model; designed for multi-tenant serverless | Needs KVM (bare metal or nested virtualization); guest image management; slower than processes | VMM starts within 8 CPU ms (wall clock typically about 12 ms, range 6–60 ms); ≤125 ms from InstanceStart to guest /sbin/init; VMM memory overhead ≤5 MiB for a 1 vCPU / 128 MiB guest; compute >95% of bare metal (test pending). Measured on M5D.metal and M6G.metal. |
+| Kata Containers | Lightweight VM per pod behind an OCI/CRI runtime; can use QEMU, Cloud Hypervisor or Firecracker | VM isolation with the container toolchain | More moving parts; inherits the chosen hypervisor's requirements | Not stated in sources (marketing claims only) |
+| Wasm runtime (wasmtime) for tools | Wasm linear-memory isolation; capability-based WASI; guard regions; Rust implementation | Fine-grained, deny-by-default capabilities per tool; in-process; a natural fit for a Rust host | Only for tools compiled to Wasm; cannot host arbitrary native binaries or browsers; Spectre mitigations are partial | Not stated in sources |
+
+#### 7.3.2 Isolation tiers
+
+solos-swarm defines four tiers. Each job and each tool declares its minimum tier, and the scheduler MUST NOT place work in a weaker tier.
+
+- **Tier W (Wasm tool)**: pure-function and data tools compiled to Wasm and run in wasmtime with explicit WASI capabilities (no ambient file system, no ambient network; I/O only through host functions brokered by solos-swarm).
+- **Tier P (hardened process)**: agent loops and trusted first-party native tools. Each runs in its own user, PID, mount, network, IPC and UTS namespaces, plus a cgroup v2 limit, `no_new_privs`, a seccomp allowlist that also checks the architecture, a Landlock ruleset (file system, TCP/UDP ports, abstract-socket and signal scoping), and no direct internet route (egress only to the local broker).
+- **Tier G (gVisor)**: optional middle tier for untrusted native tools that do not need KVM. It is a fallback for nodes without KVM.
+- **Tier V (microVM)**: Firecracker (directly, or through Kata) for arbitrary code execution, browsers, exploit tooling, and all red-team actions that touch targets.
+
+#### 7.3.3 PoC recommendation
+
+- Run the **agent loops in Tier P**. The agent loop is solos-swarm's own Rust code, and the untrusted part is model output, which the loop only turns into structured tool requests. Tier P gives the density needed for about 500 agents on a few machines.
+- Run **first-party data tools in Tier W** where practical.
+- Run **any tool that executes generated or third-party code, opens a browser, or touches a red-team target in Tier V (Firecracker)**. Use Tier G only on nodes without KVM, and record the fallback in the audit log.
+- Leave Kata integration to after the PoC, unless an operator needs Kubernetes/CRI compatibility for the PoC.
+
+Rationale: the source figures (≤125 ms boot, ≤5 MiB VMM overhead) make a pool of short-lived microVMs practical for the minority of risky tool calls. Keeping the many agent loops in processes avoids paying VM overhead 500 times.
+
+### 7.4 Identity, authentication and authorization
+
+#### 7.4.1 Workload identity
+
+- Every control-plane component, node agent, agent instance and tool sandbox gets a short-lived cryptographic identity in the SPIFFE format (an X.509 SVID for mTLS; a JWT SVID where mTLS is not possible). SPIRE is the reference implementation; it supports attestation-based issuance, a Workload API that rotates credentials automatically, and VM and bare-metal workloads.
+- The identity encodes trust domain, tenant, job, agent and node, for example `spiffe://<trust-domain>/tenant/<t>/job/<j>/agent/<a>`.
+- Node agents attest nodes. Workloads are attested by the node agent that spawned them. An agent cannot request an identity for another agent.
+- All traffic between components and on B2–B5 is mTLS. There is no bearer-only traffic inside the cluster.
+
+#### 7.4.2 Operator authentication
+
+- Operators authenticate through an OIDC identity provider with phishing-resistant MFA. Sessions are short-lived.
+- Privileged tiers (root, and the toggles listed in §7.7) need step-up authentication when the action is taken.
+
+#### 7.4.3 Authorization model
+
+- **RBAC modeled on Kubernetes RBAC**: Roles and ClusterRoles hold additive allow-only rules; Bindings attach them to subjects (operators, groups, workload identities) at tenant or cluster scope. Bindings have an immutable role reference.
+- **Escalation prevention modeled on Kubernetes**: a subject can create or update a role, or bind one, only if it already holds every permission in that role, or holds the explicit `escalate`/`bind` verbs. Wildcards are discouraged, and wildcards on privileged resources are forbidden.
+- **ABAC conditions** on top of RBAC: attributes such as tenant, job risk class, isolation tier, time window, target-allowlist membership and unattended mode can narrow a rule but never widen it.
+- **Split of responsibility**: RBAC and ABAC govern humans and control-plane components (who can register Goals, change allowlists, toggle kill switches). Agents get no RBAC roles. Everything an agent can do is defined by its Capability list (§7.4.5). The control plane checks every agent action against that list in deterministic code; the decision never depends on the LLM's judgment ("complete mediation", OWASP LLM06).
+
+#### 7.4.4 Agent-to-agent privilege escalation
+
+- An agent can gain authority in exactly one way: an attenuated delegation recorded by the control plane (§7.4.6). There is no other path.
+- Messages between agents and Message board posts are untrusted data (§7.10). A request from a peer is never a grant, and a post can never carry, create or widen a capability.
+- The control plane, not the delegating agent, issues each child's workload identity and Capability list.
+- Agents have no credentials or network routes for the control-plane write API. They can only reach a narrow node-local endpoint (tool requests, board reads and posts, delegation requests, status).
+
+#### 7.4.5 Capability list: the authorization boundary for agents
+
+The Capability list is THE authorization boundary. An agent can call a tool, read or write a Message board topic, delegate a Task, or spend budget only through a capability it holds. Anything not covered by a held capability is denied.
+
+Each capability is explicit, typed and scoped. At minimum it has:
+
+| Field | Meaning |
+|-------|---------|
+| `id` | Unique capability ID, recorded in the audit log |
+| `kind` | One of: `tool.call`, `board.read`, `board.post`, `task.delegate`, `budget.spend` (closed set; new kinds need a TRD change) |
+| `resource` | The exact tool ID, board topic, provider/model, or target. Hierarchical prefixes are allowed; a bare wildcard is only accepted as the literal `any`, as in §7.8 |
+| `constraints` | Allowed operations and argument constraints (for example read-only, target allowlist, max payload size) |
+| `budget` | Maximum spend that may be charged through this capability, plus per-tick limit |
+| `confirmation` | Minimum confirmation tier C0–C3 (§7.8) |
+| `notBefore` / `expiry` | Validity window. Expiry is mandatory |
+| `goalId`, `holder`, `parent` | The Goal it belongs to, the holder's workload identity, and the parent capability it was derived from (empty only for capabilities issued at Goal registration) |
+| `depth` | Delegation depth from the Goal root |
+
+Precedent: macaroons, Biscuit and UCAN all use credentials that can only be narrowed as they are passed on. Macaroons embed caveats that "attenuate and contextually confine" use. A Biscuit token "can only be restricted, it will never gain more rights". UCAN requires each delegation to "either directly restate or attenuate" its capabilities, and recommends minimal lifetime and authority. solos-swarm adopts this rule. Because the control plane is online for every action, the PoC SHOULD store capabilities centrally and check them at the broker and node agent, instead of relying on offline bearer tokens. This avoids two weaknesses UCAN itself notes: no confinement, and no full knowledge of sub-delegations. Whether to also issue Biscuit-style signed tokens for offline checking is open question Q10.
+
+#### 7.4.6 Task delegation
+
+- **Attenuation**: a delegated Task carries a Capability list that is a subset of the delegator's: same or narrower kind, resource, constraints and confirmation tier (never a lower tier), and an expiry no later than the parent's. Budget is carved out of the parent's remaining budget, never added to it. The control plane rejects any delegation that does not meet this rule.
+- **No re-widening**: a child cannot get back capabilities its parent dropped, even from another parent. A child holds only what its single delegation chain grants.
+- **Depth cap**: delegation chains are capped at a depth set at Goal registration, with a global maximum (PoC default: 4; see Q11). A `task.delegate` capability at the maximum depth cannot be issued.
+- **Fan-out cap**: each Goal sets a maximum number of live descendant agents, which keeps a delegation tree inside the PoC's 500-agent size.
+- **Spend rolls up**: every child's reservation is also charged against each ancestor's ledger hold, up to the Goal. A child's reservation fails if any ancestor's remaining budget would be exceeded (§7.6.2).
+- **Revocation cascades**: revoking, expiring or kill-switching a capability or Task revokes everything derived from it. In-flight reservations settle as described in §7.7.
+- **Audit**: every delegation is logged with parent, child, the capability diff, and the budget carved out.
+
+#### 7.4.7 Goal and Needs: the moment of consent
+
+- Registering a Goal is the moment of consent. Registration fixes the Goal's budget, its root Capability list, allowed isolation tiers, depth and fan-out caps, expiry, and unattended-mode status.
+- These form a ceiling for everything spawned under the Goal: every Task, delegation, board topic and reservation. Nothing under a Goal can exceed it.
+- Needs declared under a Goal are requests, not grants. Meeting a Need never widens the Goal's capabilities; a Need that requires more than the ceiling needs a new or amended Goal registration by an authorized operator, with the same sign-off rules as the original.
+- Goal registration replaces "job registration" wherever earlier text in this section says job. The per-job bounds in §7.6.1 apply per Goal (and per Task, as narrowed sub-bounds).
+
+### 7.5 Secrets and provider-key management
+
+- **Brokered credentials**: raw provider API keys and target credentials live only in the control-plane secret store and in the credential/egress broker's memory. Agents and tools send requests to the broker, authenticated by SVID. The broker adds the credential, enforces allowlists and caps, and forwards the request. Agents never see keys (OWASP LLM01 mitigation 4: give the application its own API tokens and handle them in code, not in the model).
+- **Short-lived, scoped tokens**: where a downstream system accepts them, the broker obtains per-job, per-scope credentials with a TTL instead of using long-lived keys (in the style of Vault dynamic secrets: credentials unique per consumer, leased, revoked on expiry, so every action can be traced to one consumer).
+- **Static provider keys** (most LLM providers only issue static keys) are stored encrypted, rotated on a schedule, scoped per tenant where the provider supports it, and never written to logs, prompts or sandbox file systems.
+- **Redaction**: the broker and audit pipeline scan outbound and logged content for known secret values and patterns and replace them.
+- **Revocation**: disabling a job or engaging a kill switch revokes that scope's leases and SVIDs.
+
+### 7.6 Spend caps and budget ledger
+
+Design precedent: the Solos Engine (our own project) already uses this pattern in production-like use. It is reused here, with LLM tokens and tool costs taking the place of trading notional.
+
+#### 7.6.1 Bounds per job
+
+Each registered job declares:
+- max cost per tick (the counterpart of "max notional per tick"), in a single accounting currency;
+- max daily spend;
+- a provider/model/tool/target allowlist, which MUST be a subset of the global allowlist (narrow-only);
+- an expiry time;
+- `maxConsecutiveFailures`; reaching it auto-pauses the job.
+
+#### 7.6.2 Cap ledger
+
+- **Reserve before acting**: before each provider call or paid tool call, the broker reserves the worst-case cost: (max input tokens + max output tokens) × the current price for that model, plus the declared worst-case tool cost. If the reservation would exceed any applicable cap (tick, daily, tenant, global), the call is refused before any money is spent.
+- **Settle once**: after the call, the actual cost (from provider usage data) is settled against the hold exactly once.
+- **Release on failure**: if the call fails without being billed, the hold is released.
+- **Idempotency**: reservations are idempotent per intent ID (a retry of the same intent does not reserve twice) and summed per tick ID.
+- **Overrun**: a settle above its hold is never refused (the money is already spent and must be recorded), but it automatically engages the per-job kill switch and raises an alert.
+- **Crash safety**: holds are durable. Holds still in flight across a crash or restart stay counted until settled or explicitly reconciled, so a restart cannot cause double spend.
+- **Scheduler reserve phase**: the scheduler's reserve phase (TRD §6) IS this cap-ledger reserve. It is one worst-case hold keyed by intentId. Placement of a Task on a node and the spend hold commit together or fail together: there is no placed-but-unfunded Task and no funded-but-unplaced Task. See TRD §6 for the scheduling side.
+- **Delegation roll-up**: a reservation by a delegated Task is counted against its own budget and against the hold of every ancestor up to the Goal (§7.4.6). Settlement and release roll up the same way.
+- **Price table**: model prices are versioned, signed configuration. A missing price for a model means "not allowlisted" (fail closed).
+
+### 7.7 Kill switches
+
+- Scopes: **global**, **tenant**, **agent** (and per job, which the ledger engages automatically).
+- Effect: an engaged switch blocks new reservations, and therefore every new provider and paid tool call in its scope. In-flight work is allowed to settle so the ledger stays correct. Sandboxes in scope are then stopped within the target time (SEC-NF-3).
+- Durability: switch state is stored durably and replicated. An engaged switch stays engaged across restarts of any component. The default state after loss of the store is "engaged" (fail closed).
+- Authority: only privileged operator tiers can toggle switches. The global switch is root only. Release of a global or tenant switch needs step-up authentication, and a second approver is recommended (open question Q4). Agents can never toggle a switch. They MAY request engagement of their own agent-scoped switch.
+- Every toggle is written to the audit log with actor, scope, reason and time.
+
+### 7.8 Execution tiers, consent and unattended mode
+
+- **Fail-closed execute tier**: a job in the execute tier (any side-effecting action) MUST refuse to start without an explicit allowlist. A wildcard is only accepted when the literal value `any` is typed for that field. An empty or missing allowlist means "nothing", never "everything".
+- **Goal registration is the moment of consent** for unattended work (§7.4.7). The Capability list, bounds and allowlists approved at registration are the most anything under the Goal can ever do. Widening any of them requires a new or amended registration.
+- **Unattended action** (no human confirmation per action) needs: (a) sign-off by a human tenant admin or root, recorded in the audit log; and (b) a passed QA gate, either a funded run (real, capped spend) or a real QA run against the same allowlist, with its result linked to the registration.
+- **Tool-call confirmation tiers** (in line with OWASP LLM06 "Require user approval" and LLM01 "human approval for high-risk actions"):
+  - C0 auto: read-only, no egress beyond allowlisted read sources, within caps.
+  - C1 auto with audit and rate limit: reversible side effects inside the sandbox or on in-scope test systems.
+  - C2 human confirmation per action, unless the job is registered as unattended for exactly this capability: external side effects, red-team actions against live targets, spend above a per-call threshold.
+  - C3 always human, two-person rule: destructive or irreversible actions on production, changes to allowlists, caps or kill switches, and anything outside the registered scope. Unattended mode never covers C3.
+
+### 7.9 Tamper-evident audit log
+
+- An append-only log of security-relevant events: authentication, RBAC changes, registrations, sign-offs, capability grants, tool calls (with tier and decision), reservations and settlements, kill-switch toggles, sandbox tier fallbacks, and policy denials.
+- Structure: entries form a Merkle hash tree (RFC 6962 style, SHA-256, with domain-separated leaf and node hashes). The log periodically publishes a **signed tree head** (tree size, root hash, timestamp). It supports inclusion proofs (an entry is in the log) and consistency proofs (a later tree extends an earlier one). This is the property behind Certificate Transparency and Sigstore Rekor: rewriting or deleting history is detectable.
+- Witnessing: signed tree heads are copied to at least one store outside the control plane's write authority (a separate host or an operator-held store) so that a compromised control plane cannot present a forked history unseen.
+- Content: entries carry hashes of large payloads (prompts, outputs), not the payloads, so that retention and redaction of data stay separate from audit integrity. Secrets are never logged.
+- A verifier tool (part of the CLI) checks signatures, inclusion and consistency.
+
+### 7.10 Prompt injection and the untrusted-content boundary
+
+Grounded in the OWASP Top 10 for LLM Applications 2025, mainly LLM01 Prompt Injection, LLM02 Sensitive Information Disclosure, LLM05 Improper Output Handling, LLM06 Excessive Agency, LLM07 System Prompt Leakage and LLM10 Unbounded Consumption.
+
+- **Assume injection succeeds**. The controls in §7.4–§7.8 hold even when the model is fully controlled by an attacker. This is the main defense.
+- **Mark and separate untrusted content** (LLM01 mitigation 6): every piece of external content, tool output and peer-agent message is wrapped with provenance metadata (source, trust level) before it enters a context. The runtime never treats such content as instructions to the runtime.
+- **Message board content is untrusted input**: every post is treated like external content. It is wrapped with provenance (poster identity, Goal, topic, time, and whether the poster had read untrusted content) before it enters any context. A post cannot grant, carry or widen a capability, and the runtime never acts on a post as an instruction. Each post is authenticated by the poster's workload identity (mTLS SVID) through a `board.post` capability, and is written to the audit log (content hash plus metadata). Reading a topic needs a `board.read` capability. Posts and reads across Goals are denied unless both Goals explicitly allow the topic.
+- **Structured tool calls only**: model output becomes actions only through schema-validated tool requests checked by deterministic code (LLM01 mitigation 2, LLM05). Free text is never executed.
+- **Provenance-aware gating**: if a context window contains untrusted content, any C1+ tool request from that turn is raised one confirmation tier, unless the registration explicitly marks the capability as safe under that kind of tainted context. (This is a requirement for the PoC; its exact design is open question Q6.)
+- **Egress control against exfiltration**: outbound destinations are restricted to allowlists at the broker, which blocks the "render a URL that leaks data" pattern (LLM01 scenario 2).
+- **Unbounded consumption** (LLM10) is covered by §7.6.
+- **Adversarial testing**: the PoC includes an injection test suite run against the swarm itself (LLM01 mitigation 7). solos-swarm's own red-team use case can supply it.
+
+### 7.11 Functional requirements (SEC-F-n; referenced from section 9)
+
+- **SEC-F-1** Every agent and tool MUST run in an isolation tier at least as strong as its declared minimum. The scheduler MUST refuse placement otherwise.
+- **SEC-F-2** Tier P sandboxes MUST apply: separate user, PID, mount, network and IPC namespaces; cgroup v2 CPU, memory and PID limits; `no_new_privs`; a seccomp allowlist that checks the architecture; and a Landlock ruleset covering file system, network ports and IPC scoping at the highest ABI version the kernel offers. If a required restriction is not available, the sandbox MUST refuse to start, unless the operator has explicitly allowed degraded mode, and any degradation MUST be audited.
+- **SEC-F-3** Tools that execute generated or third-party native code, run browsers, or act on red-team targets MUST run in Tier V. Tier G is allowed as an audited fallback only on nodes without KVM.
+- **SEC-F-4** Tier W tools MUST be granted only explicit WASI capabilities. No ambient file-system or network access.
+- **SEC-F-5** Every workload MUST receive a short-lived, automatically rotated SPIFFE-format identity bound to tenant, job, agent and node. All internal connections MUST use mTLS with these identities.
+- **SEC-F-6** Operators MUST authenticate through OIDC with MFA. Privileged actions MUST require step-up authentication.
+- **SEC-F-7** Authorization MUST be RBAC (additive Roles and Bindings at tenant and cluster scope) plus ABAC conditions that can only narrow access.
+- **SEC-F-8** The control plane MUST prevent role and binding escalation: a subject can only grant permissions it holds, unless it has explicit `escalate`/`bind` verbs.
+- **SEC-F-9** The Capability list MUST be the sole authorization boundary for agents. Every tool call, board read, board post, delegation and reservation MUST be checked in deterministic code against a held capability, and denied if none matches.
+- **SEC-F-10** Delegation MUST attenuate: a child's capabilities MUST be a subset of the delegator's in kind, resource, constraints, confirmation tier and expiry, and its budget MUST be carved from the parent's remaining budget. The control plane MUST issue child identities and Capability lists, and MUST reject non-attenuating delegations.
+- **SEC-F-11** Agents and tool sandboxes MUST NOT hold raw provider keys or target credentials. All provider and target egress MUST pass through the credential/egress broker.
+- **SEC-F-12** The broker MUST use short-lived scoped credentials where the downstream supports them, and MUST revoke leases when a job ends or a kill switch is engaged.
+- **SEC-F-13** Secrets MUST be redacted from logs, prompts, audit entries and tool outputs.
+- **SEC-F-14** Each job MUST declare max cost per tick, max daily spend, a narrow-only allowlist, an expiry, and `maxConsecutiveFailures`. Reaching `maxConsecutiveFailures` MUST auto-pause the job.
+- **SEC-F-15** The ledger MUST reserve worst-case cost before every billable action, settle actual cost exactly once, and release on failure. Reservations MUST be idempotent per intent ID and summed per tick ID.
+- **SEC-F-16** A settle above its hold MUST be recorded and MUST automatically engage the per-job kill switch.
+- **SEC-F-17** Ledger holds MUST be durable and counted across crashes and restarts until settled or reconciled.
+- **SEC-F-18** Kill switches MUST exist at global, tenant and agent scopes (plus per job). Engagement MUST block new reservations while letting in-flight work settle. State MUST be durable. Loss of state MUST mean "engaged".
+- **SEC-F-19** Only privileged operator tiers MUST be able to toggle kill switches. The global switch MUST be root-only.
+- **SEC-F-20** The execute tier MUST refuse to start without an explicit allowlist. Wildcards MUST require the literal value `any`.
+- **SEC-F-21** Unattended mode MUST require recorded human sign-off and a linked, passed QA gate (funded or real). It MUST NOT cover C3 actions.
+- **SEC-F-22** Tool calls MUST be classified C0–C3 and gated as in §7.8. C3 MUST require two human approvers.
+- **SEC-F-23** All security-relevant events MUST be written to an append-only Merkle-tree audit log with signed tree heads, inclusion proofs and consistency proofs. Signed tree heads MUST be copied to a witness outside the control plane's write authority.
+- **SEC-F-24** All external content, tool outputs and peer messages MUST carry provenance labels and MUST NOT be interpreted as instructions by the runtime.
+- **SEC-F-25** Model output MUST become actions only through schema-validated tool requests.
+- **SEC-F-26** A tool request made in a turn whose context holds untrusted content MUST be raised one confirmation tier, unless the registration exempts that capability.
+- **SEC-F-27** Price tables and global allowlists MUST be versioned, signed configuration. An unknown model price MUST be treated as not allowlisted.
+- **SEC-F-28** Every capability MUST be typed (`tool.call`, `board.read`, `board.post`, `task.delegate`, `budget.spend`) and MUST have a resource, constraints, a budget, a minimum confirmation tier, a mandatory expiry, its Goal, holder and parent.
+- **SEC-F-29** Delegation chain depth MUST be capped per Goal, under a global maximum (PoC default 4). Each Goal MUST cap its number of live descendant agents.
+- **SEC-F-30** Every child reservation MUST be charged against each ancestor's ledger hold up to the Goal, and MUST fail if any ancestor's remaining budget would be exceeded.
+- **SEC-F-31** Revoking, expiring or kill-switching a capability or Task MUST revoke all capabilities and Tasks derived from it.
+- **SEC-F-32** Goal registration MUST fix the budget, root Capability list, isolation tiers, depth and fan-out caps, expiry and unattended status, and these MUST be a ceiling for everything under the Goal. Needs MUST NOT widen it.
+- **SEC-F-33** Message board posts MUST NOT grant, carry or widen capabilities, and MUST be handled as untrusted input with provenance labels.
+- **SEC-F-34** Every board post MUST be authenticated by the poster's workload identity through a `board.post` capability, and MUST be written to the audit log. Reads MUST require `board.read`.
+- **SEC-F-35** The scheduler's reserve phase (TRD §6) MUST be the cap-ledger reserve: a single worst-case hold keyed by intentId, so that placement and spend hold commit or fail together.
+- **SEC-F-36** Every delegation MUST be audited with parent, child, capability diff and budget carved out.
+
+### 7.12 Non-functional requirements (SEC-NF-n; referenced from section 9)
+
+| ID | Requirement | Target | How it is measured |
+|----|-------------|--------|--------------------|
+| SEC-NF-1 | Key non-exposure | 0 raw provider keys found in any sandbox | Plant canary keys in the broker; scan sandbox memory dumps, file systems, environments, logs and model transcripts after a 500-agent run; also run an injection suite that asks agents to reveal keys |
+| SEC-NF-2 | Cap enforcement accuracy | Actual spend ≤ configured cap + the largest single in-flight overrun, for 100% of test runs | Fault-injection test: 500 agents, a cap at 50% of expected spend, random node and control-plane kills; compare provider billing records with the ledger |
+| SEC-NF-3 | Kill-switch latency | New reservations blocked ≤1 s after toggle (p99); all sandboxes in scope stopped ≤10 s (p99) at 500 agents | Timestamps in the audit log versus broker refusal logs and sandbox exit events, over 50 toggles |
+| SEC-NF-4 | Kill-switch durability | 100% of engaged switches still engaged after restarts | Restart every control-plane component and node agent 20 times with switches engaged; check state and reservation refusals |
+| SEC-NF-5 | No double spend on restart | 0 duplicate settlements; 0 lost holds | Crash the ledger at random points during 10,000 reservations; reconcile against intent IDs and provider usage |
+| SEC-NF-6 | Authorization overhead | Broker authz + reservation adds ≤10 ms p99 per call | Load test at 500 agents × expected call rate; compare with a direct call |
+| SEC-NF-7 | Identity lifetime | Workload SVID TTL ≤1 h; rotation without dropped calls | Read certificate validity from issued SVIDs; error rate during rotation |
+| SEC-NF-8 | Tier V availability | p95 time from tool request to a ready microVM ≤500 ms with a warm pool (to be confirmed by the PoC benchmark; sources only state ≤125 ms guest boot) | PoC benchmark on the target hardware |
+| SEC-NF-9 | Audit completeness | 100% of events in the §7.9 list present, with valid inclusion proofs | Replay a scripted scenario; diff expected and logged events; run the verifier |
+| SEC-NF-10 | Audit tamper detection | 100% of deletions, edits or reorderings detected | Mutate the stored log in 100 random ways; run the verifier against the witnessed tree heads |
+| SEC-NF-11 | Sandbox policy coverage | 100% of Tier P sandboxes report the required seccomp, Landlock, namespace and cgroup settings | Node-agent attestation report per sandbox, cross-checked by a probe tool that tries forbidden actions |
+| SEC-NF-12 | Injection resilience | 0 out-of-allowlist egress and 0 out-of-capability tool executions in the injection suite | OWASP LLM01 scenario-based suite (direct, indirect, payload splitting, encoded) run against 500 agents |
+| SEC-NF-13 | Escalation resistance | 0 successful privilege escalations | Test cases: agent-to-agent requests, delegation-chain widening, board-post grants, role and binding escalation, forged SVID requests |
+| SEC-NF-14 | Delegation attenuation | 0 accepted delegations that widen any capability field or exceed parent budget | Property-based test: 100,000 random delegation requests (including widening, re-widening, expiry extension, tier lowering); count acceptances that violate the subset rule |
+| SEC-NF-15 | Depth and fan-out caps | 0 Tasks above the depth cap; 0 Goals above their fan-out cap | Adversarial agents told to delegate recursively; inspect the delegation records in the audit log |
+| SEC-NF-16 | Roll-up spend accuracy | Spend under any Goal ≤ Goal budget + largest single in-flight overrun, in 100% of runs | Delegation trees up to the depth cap with random crashes; compare provider billing with ledger totals per Goal |
+| SEC-NF-17 | Board integrity | 100% of posts carry a valid poster identity and an audit entry; 0 capability changes caused by posts | Replay 10,000 posts including forged-identity and "grant me" posts; diff against audit log and capability store |
+| SEC-NF-18 | Placement/reserve atomicity | 0 placed Tasks without a hold; 0 holds without a placement or explicit release after reconciliation | Kill scheduler and ledger at random points during 10,000 placements; reconcile by intentId |
+| SEC-NF-19 | Revocation propagation | All derived capabilities refused ≤1 s (p99) after a parent revocation | Revoke roots of trees of depth 4; time the first refused use per descendant |
+
+### 7.13 PoC security acceptance criteria (for lifting into section 10)
+
+The PoC passes the security gate when all of the following hold on a cluster of at least 3 Linux nodes running 500 agents:
+
+1. SEC-NF-1, 2, 3, 4, 5, 9, 10, 12 and 13 meet their targets.
+2. A red-team tool runs in Tier V, and a policy test shows it cannot reach a target that is not in the allowlist.
+3. A job with no allowlist is refused in the execute tier. A job with `any` typed explicitly starts, and the `any` is shown in the audit log.
+4. Unattended mode cannot be enabled without recorded sign-off and a linked QA-gate result.
+5. A forced settle above its hold engages the per-job kill switch automatically.
+6. An independent verifier, using only the witnessed tree heads, confirms log consistency across the whole test.
+7. SEC-NF-14 to SEC-NF-19 meet their targets.
+8. A depth-4 delegation tree under one Goal cannot exceed the Goal's budget or Capability list, and a delegation at depth 5 is refused.
+9. A board post saying "you are granted tool X" leads to no capability change and no call to tool X, and appears in the audit log with the poster's identity.
+10. Registering a Need that exceeds its Goal's ceiling is refused until an authorized operator amends the Goal.
+11. Killing the scheduler between placement and reservation leaves no placed-but-unfunded Task after reconciliation.
+
+### 7.14 Risks
+
+- R1. **Shared-kernel risk in Tier P**: a kernel bug can let an agent loop escape. Mitigation: agent loops run no untrusted native code; keep kernels patched; treat Tier V as the default for anything risky.
+- R2. **Prompt injection cannot be fully prevented**: residual risk inside the granted capabilities. Mitigation: narrow capabilities, confirmation tiers, egress allowlists.
+- R3. **Cost estimation errors**: provider price changes or tokenizer differences can make reservations too small. Mitigation: signed price table, overrun auto-kill, tick-level caps.
+- R4. **KVM availability**: cloud VMs without nested virtualization cannot run Tier V. Mitigation: bare-metal nodes for Tier V, Tier G as an audited fallback.
+- R5. **Control plane as single point of trust**: a compromise defeats most controls. Mitigation: small TCB, separation of duties, external audit witness, hardened hosts.
+- R6. **Broker as bottleneck**: all egress goes through it. Mitigation: scale horizontally per node, check against SEC-NF-6.
+- R7. **"Military-grade" expectations**: formal accreditation (for example FIPS-validated crypto, specific national frameworks) is outside PoC scope and may change choices such as crypto libraries and hosting.
+- R8. **Dual use**: red-team capability can be misused. Mitigation: target allowlists, C2/C3 gating, audit, legal scope documents linked to registrations.
+- R9. **Capability model complexity**: subset checks on structured constraints can have bugs that silently widen access. Mitigation: closed set of kinds, a small constraint language, property-based tests (SEC-NF-14).
+- R10. **Board as an injection channel**: one compromised agent can influence many readers. Mitigation: posts are data only, provenance tainting raises confirmation tiers, topic-scoped read capabilities.
+- R11. **Roll-up ledger contention**: charging every ancestor on each reservation adds writes at the top of deep trees. Mitigation: depth cap, measure against SEC-NF-6.
+
+### 7.15 Open questions for Gui
+
+- Q1. Which "military-grade" frameworks or accreditations (if any) must the post-PoC design meet? This affects crypto modules and hosting.
+- Q2. Do PoC nodes have bare-metal KVM? If not, is gVisor acceptable as the Tier V substitute for the PoC?
+- Q3. Do we run SPIRE itself, or build a minimal SPIFFE-compatible issuer into the control plane for the PoC?
+- Q4. Should releasing a global or tenant kill switch require two people?
+- Q5. What exactly counts as a "funded or real QA gate" for each use case (red team, defensive monitoring, project testing)?
+- Q6. What is the precise taint-propagation rule for untrusted content across multi-turn and multi-agent contexts?
+- Q7. What is the accounting currency, and who owns the price table?
+- Q8. Retention period for audit logs and payloads, and is an off-site witness acceptable for sensitive tenants?
+- Q9. Is hard multi-tenancy (hostile tenants on shared nodes) in scope after the PoC?
+- Q10. Should capabilities also be issued as signed, attenuable tokens (Biscuit-style) for offline checking, or stay centrally stored for the PoC?
+- Q11. Is a delegation depth of 4 and the 500-agent fan-out right for the PoC Goals?
+- Q12. Can Message board topics be shared across Goals, and if so who approves that?
+- Q13. Can Needs be fulfilled by operators other than the one who registered the Goal?
+
+### 7.16 Sources (for merging into section 13)
+
+Only sources that were fetched while writing this section are listed.
+
+- https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/SPECIFICATION.md — Firecracker's tested specification: 8 CPU ms VMM start, ≤125 ms to guest init, ≤5 MiB VMM overhead, >95% compute.
+- https://gvisor.dev/docs/architecture_guide/security/ — gVisor threat model: the Sentry intercepts syscalls, has a minimal host surface, and no side-channel protection.
+- https://gvisor.dev/docs/architecture_guide/performance/ — gVisor structural and implementation costs (syscalls, network, VFS); startup overhead is mostly Docker.
+- https://katacontainers.io/ — Kata overview: lightweight VMs behind OCI/CRI, supports QEMU, Cloud Hypervisor and Firecracker.
+- https://docs.kernel.org/userspace-api/landlock.html — Landlock: unprivileged, stackable file-system, TCP/UDP and IPC restrictions; 16-layer limit; known gaps.
+- https://www.kernel.org/doc/html/latest/userspace-api/seccomp_filter.html — seccomp-BPF: reduces kernel surface, "isn't a sandbox" alone, needs no_new_privs, check arch.
+- https://docs.wasmtime.dev/security.html — wasmtime: Wasm isolation, guard regions, capability-based WASI, partial Spectre mitigations.
+- https://spiffe.io/docs/latest/spiffe-about/overview/ — SPIFFE short-lived SVIDs; SPIRE supports attestation, the Workload API with rotation, and bare metal.
+- https://developer.hashicorp.com/vault/docs/secrets/databases — Vault dynamic secrets: unique, leased, revocable credentials per consumer, which helps attribution.
+- https://kubernetes.io/docs/reference/access-authn-authz/rbac/ — Kubernetes RBAC: additive roles, immutable roleRef, escalate/bind escalation prevention, least privilege.
+- https://genai.owasp.org/llm-top-10/ — OWASP Top 10 for LLM Applications 2025, list of risks.
+- https://genai.owasp.org/llmrisk/llm01-prompt-injection/ — LLM01: direct and indirect injection, no fool-proof prevention, mitigations 1–7.
+- https://genai.owasp.org/llmrisk/llm062025-excessive-agency/ — LLM06: excessive functionality, permissions and autonomy; complete mediation; human approval.
+- https://datatracker.ietf.org/doc/html/rfc6962 — Certificate Transparency: Merkle tree log, signed tree heads, inclusion and consistency proofs.
+- https://research.google/pubs/macaroons-cookies-with-contextual-caveats-for-decentralized-authorization-in-the-cloud/ — Macaroons (NDSS 2014): chained-MAC credentials whose caveats attenuate and confine delegated authority.
+- https://raw.githubusercontent.com/ucan-wg/spec/main/README.md — UCAN 1.0 spec: each delegation must restate or attenuate; least authority; no confinement; revocation.
+- https://doc.biscuitsec.org/getting-started/introduction — Biscuit: signed bearer token with offline attenuation that "will never gain more rights"; Datalog policies.
+- https://docs.sigstore.dev/logging/overview/ — Sigstore Rekor: tamper-resistant transparency log; auditors monitor that it stays append-only.
+
+Design precedent (internal, not an external source): Solos Engine, for the job bounds, cap ledger, scoped kill switches, fail-closed execute tier, and the registration-as-consent pattern.
 
 ## 8. Provider abstraction
 TODO (Scribe)
