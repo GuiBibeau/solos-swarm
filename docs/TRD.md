@@ -34,6 +34,8 @@ The first deliverable is a proof of concept (§10).
 - Run one autonomous swarm for one Goal on a multi-machine Linux cluster.
 - Write the system in Rust, keep it modular, and put networking at the centre (§6).
 - Call any model, on the cluster's own compute or through an inference API (§8).
+- Deploy air-gapped. The cluster runs with no outbound dependency (§6, §7).
+- Separate tenants by deployment. Each deployment is its own cluster (§6, §7).
 - Make Goal registration the consent point and the ceiling for spend and Capabilities.
 - Make Need, Task, and Board first-class, so coordination is recorded and checked.
 - Keep delegation narrowing-only for Capabilities and budget (§7).
@@ -810,16 +812,16 @@ Design precedent (internal, not an external source): Solos Engine, for the job b
 
 Model calls go through one trait, `Provider`. The broker is the caller. An agent sends the request to the broker and does not hold a provider key (§7).
 
-The trait has two backends.
+The trait covers a local provider and a hosted API.
 
-- **Self-hosted.** A server such as vLLM, or a similar server, runs on the cluster's GPUs. vLLM's docs describe an OpenAI-compatible API server, which is the shape the PoC adapter targets.
-- **Hosted.** An inference-provider HTTP API. The broker attaches the key from the secret store.
+- **Local, including air-gapped.** A server such as vLLM, or a similar server, runs on the cluster's GPUs. vLLM's docs describe an OpenAI-compatible API server, which is the shape the PoC adapter targets. A local provider takes no external key. An air-gapped deployment (§6) uses only this provider: the model stays on the cluster, and there is no hosted API and no outbound call.
+- **Hosted.** An inference-provider HTTP API. The broker attaches the key from the secret store. An air-gapped deployment does not use this backend.
 
 **Routing.** The Goal allowlist (§7) is the set of providers and models a call may use. The router refuses a call outside that set. Which concrete backends the PoC must run, and which allowlisted backend wins when several can serve the model, is Q15.
 
 **Cost.** The backend returns usage (token counts and enough data to price the call). The broker hands that usage to the ledger as the settle input against the shared reserve: the scheduler reserve phase in §6 and the cap ledger in §7.
 
-**Keys.** Hosted API keys live only in the broker. The self-hosted server is reached by the broker as well, so the agent has no direct route to it, and that call is reserved and settled on the same path. Air-gapped mode (§6) uses the self-hosted backend, through the same egress proxy.
+**Keys.** Hosted API keys live only in the broker. Local and air-gapped providers have no external key. The broker is still the caller, so the agent has no direct route to the model server, and that call is reserved and settled on the same path. Air-gapped mode (§6) uses the local provider, through the same egress proxy.
 
 ## 9. Requirements, functional and non-functional (with perf targets)
 
@@ -867,14 +869,29 @@ Further criteria, numbered after 12 so they do not collide with §7:
 
 ## 12. Open questions for Gui
 
-§7 Q1–Q13 stand, and they are not repeated except Q10, which the Capability and provider design depends on. §6 also asks whether an external etcd is acceptable in target deployments.
+Every open question for Gui is in this list. A question that already has a number in §7 keeps that number. The owner is the section that raised it.
 
-- **Q10.** Should capabilities also be issued as signed, attenuable tokens (Biscuit-style) for offline checking, or stay centrally stored for the PoC?
-- **Q14.** Does the PoC run one Goal at a time on a cluster, or several Goals with separate ceilings?
-- **Q15.** Which hosted APIs, and which self-hosted server (vLLM or another), must the PoC call for real? §6 measures with a mock provider. When several allowlisted backends can serve one model, which one does the router pick?
-- **Q16.** For the PoC, is the unload test in §10 enough for revertible effects, or is a proof required?
-- **Q17.** After the operator registers the Goal, may agents create Tasks and provide Needs with no further human step, inside the ceiling?
-- **Q18.** Who may register a Goal? For government defensive users, what acceptable-use policy applies, and which deployment do they need: on-prem, air-gapped, or both?
+1. **Q1 (Forge).** Which "military-grade" frameworks or accreditations (if any) must the post-PoC design meet? This affects crypto modules and hosting.
+2. **Q2 (Forge).** Do PoC nodes have bare-metal KVM? If not, is gVisor acceptable as the Tier V substitute for the PoC?
+3. **Q3 (Forge).** Do we run SPIRE itself, or build a minimal SPIFFE-compatible issuer into the control plane for the PoC?
+4. **Q4 (Forge).** Should releasing a global or tenant kill switch require two people?
+5. **Q5 (Forge).** What exactly counts as a "funded or real QA gate" for each use case (red team, defensive monitoring, project testing)?
+6. **Q6 (Forge).** What is the precise taint-propagation rule for untrusted content across multi-turn and multi-agent contexts?
+7. **Q7 (Forge).** What is the accounting currency, and who owns the price table?
+8. **Q8 (Forge).** Retention period for audit logs and payloads, and is an off-site witness acceptable for sensitive tenants?
+9. **Q9 (Forge).** Is hard multi-tenancy (hostile tenants on shared nodes) in scope after the PoC?
+10. **Q10 (Forge).** Should capabilities also be issued as signed, attenuable tokens (Biscuit-style) for offline checking, or stay centrally stored for the PoC?
+11. **Q11 (Forge).** Is a delegation depth of 4 and the 500-agent fan-out right for the PoC Goals?
+12. **Q12 (Forge).** Can Message board topics be shared across Goals, and if so who approves that?
+13. **Q13 (Forge).** Can Needs be fulfilled by operators other than the one who registered the Goal?
+14. **Q14 (Scribe).** Does the PoC run one Goal at a time on a cluster, or several Goals with separate ceilings?
+15. **Q15 (Scribe).** Which hosted APIs, and which local or air-gapped server (vLLM or another), must the PoC call for real? §6 measures with a mock provider. When several allowlisted backends can serve one model, which one does the router pick?
+16. **Q16 (Scribe).** For the PoC, is the unload test in §10 enough for revertible effects, or is a proof required?
+17. **Q17 (Scribe).** After the operator registers the Goal, may agents create Tasks and provide Needs with no further human step, inside the ceiling?
+18. **Q18 (Scribe).** Who may register a Goal? For government defensive users, what acceptable-use policy applies, and which deployment do they need: on-prem, air-gapped, or both?
+19. **Q19 (Kernel).** Is an external etcd acceptable in target deployments? This is the question in §6.
+20. **Q20 (Forge).** For high-impact Goals, is two-person approval built in, or a policy each deployer can turn off?
+21. **Q21 (Kernel).** For air-gapped deployments, are offline bootstrap and updates in PoC scope, or deferred to v1?
 
 ## 13. Sources
 
