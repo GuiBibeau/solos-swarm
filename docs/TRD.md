@@ -83,6 +83,15 @@ The control plane holds desired state (swarm specs), observed state (node member
 
 **Proposal**: QUIC/quinn for the data plane and for Raft replication, with a thin framed protocol (length-prefixed, versioned schema). Keep a tonic gRPC surface for the external operator API (CLI and UI), where tooling matters more than latency. Scribe's survey (section 4) recommends tonic for the control API on maturity grounds (crates.io data). **mTLS is mandatory on every inter-node connection.** Both ends present certificates and the node identity comes from the certificate. Certificate issuance and rotation belong to section 7 (Forge). QUIC 0-RTT MUST be disabled for state-changing messages, because RFC 9000 states that 0-RTT data has no replay protection.
 
+Agents have no direct network routes to each other. An agent sandbox gets only a local socket to its node agent, and all agent-to-agent traffic is carried node-to-node over QUIC by the node agents via the Board and Task path (6.10). Any other agent-to-agent path is a breach per section 7. All agent egress leaves through a per-node egress proxy that enforces the per-Capability destination allowlist defined in section 7 and emits a per-flow log (agent, destination, bytes, time) used by section 7's fan-in/fan-out detection. The proxy drops an agent's flows when the agent-scope kill switch fires. This is SEC-F-37 and SEC-F-38: unsanctioned coordination is blocked or detected within 10 s (SEC-NF-20).
+
+**Requirements**
+- R-NET-1: Agents MUST have no direct network routes to each other. An agent sandbox MUST have only a local socket to its node agent, and all agent-to-agent traffic MUST be carried node-to-node over QUIC by node agents via the Board and Task path (6.10). Any other agent-to-agent path is a breach per section 7. All agent egress MUST leave through a per-node egress proxy that enforces the per-Capability destination allowlist defined in section 7, emits per-flow logs (agent, destination, bytes, time) used by section 7 fan-in/fan-out detection, and drops that agent's flows when the agent-scope kill switch fires.
+
+In air-gapped mode the control plane, the Board, the scheduler and provider routing run fully on-prem, with no outbound dependency. There is no call-home and no telemetry egress by default. Local model providers are reached through the same egress-proxy allowlist.
+
+Tenant separation is per deployment: separate clusters, each with its own Raft group, Board and QUIC trust root (an mTLS CA per deployment). No node, Board or key broker is shared across tenants or classification levels. The policy is in section 7.
+
 ### 6.6 Service discovery and membership
 
 **Option A: gossip (SWIM).** The foca crate implements SWIM with the Infection and Suspicion extensions. It is `no_std`-capable and transport-agnostic: it emits bytes for us to send. It supports custom identities (which can carry a shard or version), incarnation numbers for refuting suspicion, and custom broadcasts, so agent-directory updates can piggyback on membership traffic.
@@ -194,6 +203,7 @@ All values below are **proposed targets to validate in PoC**, not claims. Sectio
 6. Traces show end-to-end spans across nodes. Per-agent token and cost totals are reported.
 7. Board and delegation: across ≥ 3 nodes, an agent posts to a Goal Board and delegates a Task that an agent on another node claims and completes. Unsigned posts and over-privileged or over-depth delegations are rejected on both nodes. A partition test shows that no claim happens on the minority side and that re-delegation works.
 8. A reproducible benchmark harness reports every metric in 6.12, with results recorded against the proposed targets (pass, fail or revise).
+9. An agent attempting a direct connection to another agent or a non-allowlisted destination is refused and logged. The attempt is blocked or detected within 10 s (SEC-F-37, SEC-F-38, SEC-NF-20).
 
 ### 6.14 Sources (fetched)
 
