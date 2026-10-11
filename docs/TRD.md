@@ -193,8 +193,10 @@ All values below are **proposed targets to validate in PoC**, not claims. Sectio
 | Re-delegation after partition | Cut the claimant's node off. Time until the Task is claimed on the majority side | ≤ lease TTL + 5 s |
 | Duplicate side effects | Crash an agent mid-intent 1,000 times, then count duplicate effects at an idempotent mock receiver | 0 duplicates |
 | Finding write-to-queryable, cross node | Stamp a monotonic time when the write commits; a query on another node records when the Finding is returned. Clock-synced nodes, or halve a round trip through an echo. 10^4 writes, p99 | p99 ≤ 100 ms on LAN |
-| Lineage walk, depth 10 | Walk the lineage DAG from a Finding to depth 10, following cited Findings and input hashes, on a local replica. 10^3 walks, p99 | p99 ≤ 20 ms |
+| Lineage and taint walk | Backward: walk the lineage DAG from a Finding to depth 10, following cited Findings and input hashes, on a local replica. 10^3 walks, p99. Forward: retract one source with 10,000 descendant Findings and time until every descendant is flagged and every dependent Need and pending C2/C3 action is reopened. 10^2 retractions, p99 | Depth-10 walk p99 ≤ 20 ms. Forward flag-and-reopen of 10k descendants p99 ≤ 2 s |
 | Fan-out burst, 300 Tasks | One Goal spawns 300 Tasks. Time until every Task is either placed or refused by admission control against the section 7 ceiling. Record queue depth during the burst | Admitted or refused ≤ 5 s on 5 nodes. Queue depth stays within the admission bound |
+| History assembly, 10k attempts | A Goal has 10,000 scored attempts. Time from the planner request until its context is assembled, including the token budget and the marking filter. 10^3 assemblies, p99 | p99 ≤ 200 ms |
+| History compaction, 10k attempts | Compact a 10,000-attempt history that exceeds the per-Goal token budget: top K and the most recent N kept in full, the rest collapsed to one-line summaries, retracted and flagged attempts kept as markers. 10^3 runs, p99 | p99 ≤ 100 ms |
 
 ### 6.13 PoC acceptance criteria (runtime and networking)
 
@@ -208,14 +210,17 @@ All values below are **proposed targets to validate in PoC**, not claims. Sectio
 8. A reproducible benchmark harness reports every metric in 6.12, with results recorded against the proposed targets (pass, fail or revise).
 9. An agent attempting a direct connection to another agent or a non-allowlisted destination is refused and logged. The attempt is blocked or detected within 10 s (SEC-F-37, SEC-F-38, SEC-NF-20).
 10. A Finding with agent-supplied provenance is rejected. A derived Finding inherits its sources' marking and lowest trust (6.14).
+11. A retracted attempt appears as a "do not repeat" marker in the next planner context and is never silently dropped (6.15).
 
 ### 6.14 Findings store
 
 Findings (section 5) are typed, sourced records. This subsection says where they are stored, who writes their provenance, and how placement and fan-out behave around them. Section 7 owns provenance and marking policy. Section 6 owns the store, the rejection rule and the scheduler checks.
 
-Findings are stored separately from the Board log. The store is append-only and content-addressed: the id of a Finding is the hash of its body plus the provenance the broker wrote. The store is replicated per deployment, and it is not shared across deployments (6.5). A lineage index records a DAG from each Finding to the Findings it cites and to the hashes of its inputs. A lineage query or a taint query is a walk of that graph.
+Findings are stored separately from the Board log. The store is append-only and content-addressed: the id of a Finding is the hash of its body plus the provenance the broker wrote. The store is replicated per deployment, and it is not shared across deployments (6.5). A lineage index records a DAG from each Finding to the Findings it cites and to the hashes of its inputs. The index walks both ways. A lineage query walks back to cited Findings and input hashes. A taint query walks forward to descendants.
 
 The broker writes the provenance fields, not the agent. The runtime rejects a Finding whose provenance the agent supplied. On a derived Finding, that broker-written provenance inherits the sources' marking and their lowest trust. What the markings and trust levels mean is section 7 policy.
+
+A retraction is a broker-signed record (section 7). The runtime walks the lineage index forward from the retracted source, flags every descendant Finding, and reopens dependent Needs and pending C2/C3 actions. Flagging does not rewrite the Finding body.
 
 Marking-aware placement uses the scheduler in 6.2. The filter phase only places an agent on nodes cleared for the markings its read Capabilities cover, and it prefers nodes that hold replicas of the data the agent reads.
 
@@ -226,8 +231,23 @@ A Goal can spawn sub-Goals and Needs, and those can fan out into Tasks. The sche
 - R-FND-2: The broker, not the agent, MUST write provenance fields. The runtime MUST reject a Finding whose provenance the agent supplied. A derived Finding MUST inherit its sources' marking and lowest trust.
 - R-FND-3: The filter phase MUST place an agent only on nodes cleared for the markings its read Capabilities cover, and it SHOULD prefer nodes that hold replicas of the data the agent reads.
 - R-FND-4: Fan-out from a Goal into sub-Goals, Needs and Tasks MUST be admitted against the section 7 ceiling. The scheduler MUST NOT queue that fan-out without a bound.
+- R-FND-5: A retraction MUST be a broker-signed record (section 7). The runtime MUST walk the lineage index forward from the retracted source, flag every descendant Finding, and reopen dependent Needs and pending C2/C3 actions.
 
-### 6.15 Sources (fetched)
+### 6.15 Attempt history per Goal
+
+Each Goal keeps an append-only scored attempt history, built from its Tasks and Findings. The loop is the optimization-by-prompting style in section 4, where the planner sees prior attempts with their scores. Section 4 cites the source. Scores are written and signed by the Goal's evaluator, never by the agent (section 7).
+
+Every planning loop receives the full history, inside a per-Goal context budget measured in tokens. When the history is over that budget, compaction keeps the top K attempts by score in full, keeps the most recent N in full, and collapses the rest to one-line summaries (approach, score, why it failed). K and N are per-Goal settings. Retracted or flagged attempts are never dropped. They stay in the context as short "do not repeat" markers.
+
+The planner sees only entries whose markings its read Capability covers, the same clearance as Finding reads (6.14). The history is stored in the Findings store and shares its lineage index, so a retraction that flags descendant Findings flags the attempts built from them too.
+
+**Requirements**
+- R-HIST-1: Each Goal MUST keep an append-only scored attempt history built from its Tasks and Findings. Scores MUST be written and signed by the Goal's evaluator, never by the agent (section 7).
+- R-HIST-2: Every planning loop MUST receive the full history within the per-Goal token budget. Over budget, compaction MUST keep the top K by score in full, the most recent N in full, and collapse the rest to one-line summaries (approach, score, why it failed). Retracted or flagged attempts MUST NOT be dropped. They MUST remain as short "do not repeat" markers.
+- R-HIST-3: The planner MUST see only history entries covered by its read Capability's markings.
+- R-HIST-4: Attempt history MUST be stored in the Findings store and MUST share its lineage, so a retraction flags attempts as well as descendant Findings.
+
+### 6.16 Sources (fetched)
 
 - https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/
 - https://developer.hashicorp.com/nomad/docs/concepts/scheduling/how-scheduling-works
