@@ -8,7 +8,7 @@ The swarm is autonomous. It is deployed for one Goal. That Goal is a single, imp
 
 Agents that are supposed to stay isolated still invent a shared board and start handing out work. The July 2026 case in §4 is the evidence. A swarm system has to make that coordination a governed object, with an audit trail and a way to stop the swarm.
 
-The uses are heavy project testing, red teaming, proactive defensive monitoring, and high-assurance operations. The same swarm can call a model on the cluster's own compute or through an inference-provider API (§8).
+The platform is general-purpose. The Goal set by the initial prompt determines what the swarm does. Nothing in the platform is specific to one purpose. Red teaming, testing, and monitoring are example Goals, not the scope. The same swarm can call a model on the cluster's own compute or through an inference-provider API (§8).
 
 The first deliverable is a proof of concept (§10).
 
@@ -16,19 +16,21 @@ The first deliverable is a proof of concept (§10).
 
 **Operator.** Registers the Goal, sets its ceiling, and can stop the swarm (§7). A viewer or auditor reads state and the audit log. That role does not grant a Capability.
 
+**Government defensive users.** Operators doing national cyber defense and critical infrastructure protection. They register a Goal the same way any operator does. What they defend is in that Goal.
+
 **Agents.** Untrusted workers under a Goal. They do not register Goals and they do not hold provider keys (§7).
 
-**Use cases.**
+**Example Goals.** The initial prompt sets the Goal. These are examples, not a fixed scope.
 
-1. **Heavy project testing.** One Goal covers a large test effort. Agents take Tasks for parts of it. Discussion stays on the Board. Durable results are Findings. Spend stays inside the ceiling set at registration.
+1. **Testing.** One Goal covers a large test effort. Agents take Tasks for parts of it. Discussion stays on the Board. Durable results are Findings. Spend stays inside the ceiling set at registration.
 2. **Red teaming.** One Goal names the engagement. Target limits and tool isolation are §7. A Board post cannot add a target or a tool.
-3. **Proactive defensive monitoring.** A Goal stays up. Agents post what they observe. Acting on an observation still requires a Capability held under that Goal.
-4. **High-assurance operations.** The same objects, with the audit log and the fail-closed rules in §7. Which accreditation regimes apply is §7 Q1. They sit outside the PoC.
+3. **Monitoring.** A Goal stays up. Agents post what they observe. Acting on an observation still requires a Capability held under that Goal.
 
 ## 3. Goals and non-goals
 
 **Goals**
 
+- Stay general-purpose. The Goal in the initial prompt decides the work. The core has no domain logic.
 - Run one autonomous swarm for one Goal on a multi-machine Linux cluster.
 - Write the system in Rust, keep it modular, and put networking at the centre (§6).
 - Call any model, on the cluster's own compute or through an inference API (§8).
@@ -39,6 +41,7 @@ The first deliverable is a proof of concept (§10).
 
 **Non-goals**
 
+- Purpose-specific code in the core. Testing, red teaming, monitoring, and any other purpose stay in the Goal.
 - Ordinary container orchestration. Kubernetes is prior art (§4, §6). The PoC schedules agents.
 - Model training and fine-tuning.
 - An SDK for authoring agent logic.
@@ -860,6 +863,7 @@ Further criteria, numbered after 12 so they do not collide with §7:
 - **Effects outside the revertible boundary.** The composability paper (Section 6.1) treats an effect as revertible only when the system can restore the prior state. A provider call or a tool call against an external target cannot be undone by unloading a module. Mitigation: those calls go through the ledger and the confirmation tiers in §7, which this risk does not replace.
 - **The evidence is Koishi.** Section 5.3 of the paper is a chatbot framework, and the authors call it an existence result. Using the same shape for an agent swarm is a design choice. It is not a measured result for this system.
 - **Provider usage disagrees with the reservation.** Token counts and prices can make the settle differ from the hold. Handling of that case, and the other security risks, are in §7.
+- **Dual use and misuse.** The same swarm can be aimed at work the operator should not do. Mitigation: registering the Goal is the consent point, Capabilities bound what agents can do, and the audit log records the actions. Those controls are in §7.
 
 ## 12. Open questions for Gui
 
@@ -870,6 +874,7 @@ Further criteria, numbered after 12 so they do not collide with §7:
 - **Q15.** Which hosted APIs, and which self-hosted server (vLLM or another), must the PoC call for real? §6 measures with a mock provider. When several allowlisted backends can serve one model, which one does the router pick?
 - **Q16.** For the PoC, is the unload test in §10 enough for revertible effects, or is a proof required?
 - **Q17.** After the operator registers the Goal, may agents create Tasks and provide Needs with no further human step, inside the ceiling?
+- **Q18.** Who may register a Goal? For government defensive users, what acceptable-use policy applies, and which deployment do they need: on-prem, air-gapped, or both?
 
 ## 13. Sources
 
