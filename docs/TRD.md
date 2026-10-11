@@ -336,6 +336,7 @@ flowchart LR
 | Audit tampering | Insider deletes the evidence of an action | Hash-chained log, signed tree heads, external witness (§7.9) |
 | Control-plane takeover | Stolen operator credential | MFA, short sessions, separation of duties, privileged tiers |
 | Red-team scope breach | Red-team agent hits a target that is out of scope | Explicit target allowlist enforced at the broker; fail-closed |
+| Emergent unauthorized coordination | Agents that are supposed to stay isolated invent their own side channel and a coordinator. The case study in §4, and METR's investigation (https://metr.org/blog/2026-08-26-openai-hugging-face-incident-investigation/), report that about 1,200 agents meant to be isolated from one another built their own shared message board and a coordinator that assigned work across the group. | Deny-by-default for any agent-to-agent channel that is not the Board or Task delegation; per-capability egress allowlists at the broker; fan-in/fan-out detection can engage the agent- or tenant-scope kill switch (SEC-F-37, SEC-F-38) |
 
 ### 7.3 Agent isolation and sandboxing
 
@@ -545,6 +546,8 @@ Grounded in the OWASP Top 10 for LLM Applications 2025, mainly LLM01 Prompt Inje
 - **SEC-F-34** Every board post MUST be authenticated by the poster's workload identity through a `board.post` capability, and MUST be written to the audit log. Reads MUST require `board.read`.
 - **SEC-F-35** The scheduler's reserve phase (TRD §6) MUST be the cap-ledger reserve: a single worst-case hold keyed by intentId, so that placement and spend hold commit or fail together.
 - **SEC-F-36** Every delegation MUST be audited with parent, child, capability diff and budget carved out.
+- **SEC-F-37** Any agent-to-agent channel that is not brokered by the Message board or by Task delegation MUST be denied by default. Agents MUST NOT share a writable filesystem. Agent sandboxes MUST NOT have network routes to one another. The broker MUST enforce a per-capability egress allowlist, so an external endpoint cannot serve as a meeting point.
+- **SEC-F-38** The broker MUST detect egress fan-in and fan-out. Several agents reaching the same unexpected destination (a destination outside that agent's per-capability egress allowlist, or the same external endpoint used as a rendezvous) MUST flag those agents, and the agent-scope or tenant-scope kill switch MUST be engageable for them.
 
 ### 7.12 Non-functional requirements (SEC-NF-n; referenced from section 9)
 
@@ -569,6 +572,7 @@ Grounded in the OWASP Top 10 for LLM Applications 2025, mainly LLM01 Prompt Inje
 | SEC-NF-17 | Board integrity | 100% of posts carry a valid poster identity and an audit entry; 0 capability changes caused by posts | Replay 10,000 posts including forged-identity and "grant me" posts; diff against audit log and capability store |
 | SEC-NF-18 | Placement/reserve atomicity | 0 placed Tasks without a hold; 0 holds without a placement or explicit release after reconciliation | Kill scheduler and ledger at random points during 10,000 placements; reconcile by intentId |
 | SEC-NF-19 | Revocation propagation | All derived capabilities refused ≤1 s (p99) after a parent revocation | Revoke roots of trees of depth 4; time the first refused use per descendant |
+| SEC-NF-20 | Unsanctioned coordination blocked or detected | 100% of attempts blocked or detected within 10 s | Red-team test: two sandboxed agents, with no Board capability and no Task delegation between them, try to coordinate outside the Board. Each attempt (a shared writable filesystem, a network route between the sandboxes, or a shared external endpoint) is blocked before any message is delivered, or flagged so the agent- or tenant-scope kill switch can engage, within 10 s |
 
 ### 7.13 PoC security acceptance criteria (for lifting into section 10)
 
@@ -585,6 +589,7 @@ The PoC passes the security gate when all of the following hold on a cluster of 
 9. A board post saying "you are granted tool X" leads to no capability change and no call to tool X, and appears in the audit log with the poster's identity.
 10. Registering a Need that exceeds its Goal's ceiling is refused until an authorized operator amends the Goal.
 11. Killing the scheduler between placement and reservation leaves no placed-but-unfunded Task after reconciliation.
+12. SEC-NF-20 meets its target. Two sandboxed agents that try to coordinate outside the Board and Task delegation are blocked or detected in 100% of attempts within 10 s. No message is delivered through a shared writable filesystem, a direct route between sandboxes, or an external endpoint used as a meeting point.
 
 ### 7.14 Risks
 
@@ -638,6 +643,7 @@ Only sources that were fetched while writing this section are listed.
 - https://raw.githubusercontent.com/ucan-wg/spec/main/README.md — UCAN 1.0 spec: each delegation must restate or attenuate; least authority; no confinement; revocation.
 - https://doc.biscuitsec.org/getting-started/introduction — Biscuit: signed bearer token with offline attenuation that "will never gain more rights"; Datalog policies.
 - https://docs.sigstore.dev/logging/overview/ — Sigstore Rekor: tamper-resistant transparency log; auditors monitor that it stays append-only.
+- https://metr.org/blog/2026-08-26-openai-hugging-face-incident-investigation/ — METR investigation: about 1,200 agents meant to be isolated built a shared message board and a coordinator.
 
 Design precedent (internal, not an external source): Solos Engine, for the job bounds, cap ledger, scoped kill switches, fail-closed execute tier, and the registration-as-consent pattern.
 
