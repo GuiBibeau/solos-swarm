@@ -192,6 +192,9 @@ All values below are **proposed targets to validate in PoC**, not claims. Sectio
 | Task claim latency | Time from Task Open being committed to a winning claim (CAS + lease) acknowledged, with 10 competing claimants on 3 nodes, p50/p99. Also check exactly one winner per Task | p99 ≤ 100 ms. 0 double claims |
 | Re-delegation after partition | Cut the claimant's node off. Time until the Task is claimed on the majority side | ≤ lease TTL + 5 s |
 | Duplicate side effects | Crash an agent mid-intent 1,000 times, then count duplicate effects at an idempotent mock receiver | 0 duplicates |
+| Finding write-to-queryable, cross node | Stamp a monotonic time when the write commits; a query on another node records when the Finding is returned. Clock-synced nodes, or halve a round trip through an echo. 10^4 writes, p99 | p99 ≤ 100 ms on LAN |
+| Lineage walk, depth 10 | Walk the lineage DAG from a Finding to depth 10, following cited Findings and input hashes, on a local replica. 10^3 walks, p99 | p99 ≤ 20 ms |
+| Fan-out burst, 300 Tasks | One Goal spawns 300 Tasks. Time until every Task is either placed or refused by admission control against the section 7 ceiling. Record queue depth during the burst | Admitted or refused ≤ 5 s on 5 nodes. Queue depth stays within the admission bound |
 
 ### 6.13 PoC acceptance criteria (runtime and networking)
 
@@ -204,8 +207,27 @@ All values below are **proposed targets to validate in PoC**, not claims. Sectio
 7. Board and delegation: across ≥ 3 nodes, an agent posts to a Goal Board and delegates a Task that an agent on another node claims and completes. Unsigned posts and over-privileged or over-depth delegations are rejected on both nodes. A partition test shows that no claim happens on the minority side and that re-delegation works.
 8. A reproducible benchmark harness reports every metric in 6.12, with results recorded against the proposed targets (pass, fail or revise).
 9. An agent attempting a direct connection to another agent or a non-allowlisted destination is refused and logged. The attempt is blocked or detected within 10 s (SEC-F-37, SEC-F-38, SEC-NF-20).
+10. A Finding with agent-supplied provenance is rejected. A derived Finding inherits its sources' marking and lowest trust (6.14).
 
-### 6.14 Sources (fetched)
+### 6.14 Findings store
+
+Findings (section 5) are typed, sourced records. This subsection says where they are stored, who writes their provenance, and how placement and fan-out behave around them. Section 7 owns provenance and marking policy. Section 6 owns the store, the rejection rule and the scheduler checks.
+
+Findings are stored separately from the Board log. The store is append-only and content-addressed: the id of a Finding is the hash of its body plus the provenance the broker wrote. The store is replicated per deployment, and it is not shared across deployments (6.5). A lineage index records a DAG from each Finding to the Findings it cites and to the hashes of its inputs. A lineage query or a taint query is a walk of that graph.
+
+The broker writes the provenance fields, not the agent. The runtime rejects a Finding whose provenance the agent supplied. On a derived Finding, that broker-written provenance inherits the sources' marking and their lowest trust. What the markings and trust levels mean is section 7 policy.
+
+Marking-aware placement uses the scheduler in 6.2. The filter phase only places an agent on nodes cleared for the markings its read Capabilities cover, and it prefers nodes that hold replicas of the data the agent reads.
+
+A Goal can spawn sub-Goals and Needs, and those can fan out into Tasks. The scheduler absorbs a burst, for example one Goal spawning hundreds of Tasks, by admission control against the section 7 ceiling, not by queueing it without a bound. Work over the ceiling is refused.
+
+**Requirements**
+- R-FND-1: Findings MUST be stored separately from the Board log, in an append-only content-addressed store replicated per deployment. The id MUST be the hash of the body plus broker-written provenance. A lineage DAG index MUST make lineage and taint queries a graph walk.
+- R-FND-2: The broker, not the agent, MUST write provenance fields. The runtime MUST reject a Finding whose provenance the agent supplied. A derived Finding MUST inherit its sources' marking and lowest trust.
+- R-FND-3: The filter phase MUST place an agent only on nodes cleared for the markings its read Capabilities cover, and it SHOULD prefer nodes that hold replicas of the data the agent reads.
+- R-FND-4: Fan-out from a Goal into sub-Goals, Needs and Tasks MUST be admitted against the section 7 ceiling. The scheduler MUST NOT queue that fan-out without a bound.
+
+### 6.15 Sources (fetched)
 
 - https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/
 - https://developer.hashicorp.com/nomad/docs/concepts/scheduling/how-scheduling-works
