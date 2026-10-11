@@ -95,7 +95,15 @@ Shi, Zhang, and Cui, ["A Programming Paradigm for Spatiotemporal Composability"]
 
 ### 4.6 Optimization by prompting
 
-Yang et al., ["Large Language Models as Optimizers"](https://arxiv.org/abs/2309.03409) (arXiv:2309.03409, Google DeepMind), call the method Optimization by PROmpting (OPRO). Each step shows the model earlier solutions together with their scores. The new solutions are scored and added to that prompt. Their default meta-prompt keeps the best 20 solutions so far, and each step generates 8 new solutions. §6 uses that shape for a Goal's Attempt history, with those two figures as the defaults. Compaction, retraction markers, and who may write a score are §6 and §7.
+Yang et al., ["Large Language Models as Optimizers"](https://arxiv.org/abs/2309.03409) (arXiv:2309.03409, Google DeepMind; the arXiv comment lists ICLR 2024). The code is [google-deepmind/opro](https://github.com/google-deepmind/opro). They call the method Optimization by PROmpting (OPRO).
+
+Each loop, the optimizer model receives a meta-prompt. The meta-prompt holds past solutions and their scores, sorted in ascending order of score and truncated to the best 20, plus 3 exemplars and meta-instructions. The model is prompted 8 times and proposes 8 candidates. Those candidates are scored and appended to the trajectory. The next loop generates from that full scored trajectory. It does not refine one draft. The paper's implementation details state that the meta-prompt at each step contains the best 20 instructions so far and 3 randomly picked exemplars from the training set, and that the optimizer is prompted 8 times to generate 8 instructions.
+
+The abstract states that the best prompts optimized by OPRO outperform human-designed prompts by up to 8% on GSM8K, and by up to 50% on Big-Bench Hard tasks. Table 1 reports GSM8K zero-shot test accuracy with pre-trained PaLM 2-L as the scorer: "Let's think step by step." at 71.8, and "Take a deep breath and work on this problem step-by-step." at 80.2.
+
+[AlphaEvolve](https://arxiv.org/abs/2506.13131) (Novikov et al., arXiv:2506.13131, Google DeepMind) is related. Its prompt sampler builds each prompt from programs sampled out of a program database. New programs are scored and registered back into that database.
+
+§6 uses this OPRO shape for a Goal's Attempt history. Compaction, retraction markers, and who may write a score are §6 and §7.
 
 ### 4.7 Palantir Ontology and AIP
 
@@ -113,7 +121,7 @@ Goal, Need, Task, Board, Capability, and Attempt are defined here. Later section
 - **Board.** The shared message board. Posts are untrusted, signed and audited, and never grant anything.
 - **Capability.** A typed, scoped permission. It is the only authorization boundary, as in §7.
 - **Findings (candidate).** A swarm working on a hard problem needs a shared record of what it has found, kept separate from the Board. This is a candidate sixth object, beside Goal, Need, Task, Board, and Capability. A Finding is a typed, versioned record with provenance: who produced it, which sources and tools it came from, and how confident it is. Board posts point at Findings. Convergence on a Goal is measured against its Needs, using the Findings that satisfy each one. Whether Findings stays its own object, or becomes part of Board and Need, is Q22. Until that is answered, §6 stores Findings separately from the Board, the broker writes the provenance, and a retraction flags descendant Findings and reopens the Needs that depend on them. Marking policy is §7.
-- **Attempt.** One scored try under a Goal, built from its Tasks and Findings. The evaluator writes and signs the score. The history, the defaults from §4.6, and compaction are §6.
+- **Attempt.** One scored try under a Goal, derived from its Tasks and Findings, with its score against the Goal's Needs. The evaluator writes and signs the score. The history and compaction are §6.
 
 An operator registers one Goal. That act fixes the ceiling for every Need, Task, Board topic, Finding, and reservation under it (§7). A Need is a request inside that ceiling. Meeting a Need does not widen the ceiling. A Goal may fan out into sub-Goals, Needs, and Tasks. Admission of that fan-out is §6. Work moves as Tasks. The child holds a narrower Capability set and a smaller budget than the parent (§7). Board and Task across machines are §6.
 
@@ -121,7 +129,7 @@ The Board is how agents share messages. A post is input to other agents. It is s
 
 The control plane stores the Goal, Task records, Board order, and leases. The data plane carries agent traffic and provider calls (§6). Model calls use the Provider trait in §8. Keys stay with the broker (§7). Placement and spend share one reserve: the scheduler reserve phase is §6, and the cap ledger is §7.
 
-Each Goal keeps a scored Attempt history built from its Tasks and Findings. The planner reads that history in the OPRO shape from §4.6. How the history is stored, compacted, and filtered by Capability is §6.
+Each Goal keeps a scored Attempt history derived from its Tasks and Findings. Every Attempt carries its score against the Goal's Needs. Every planning loop receives that history in the OPRO form from §4.6: scored, ordered, and truncated to a budget. The loop is given the history, not only the latest draft. Planners propose several candidates per loop, and the scheduler fans those candidates out as Tasks. How the history is stored, compacted, and filtered by Capability is §6.
 
 Modules follow the component shape in §4.5. A Need is the needs/provides pair: a module declares the Needs it depends on and the Needs it provides. It activates when every Need it depends on is provided, and it deactivates when one of those Needs is withdrawn. Every effect the module performs must be revertible, meaning the runtime holds an inverse and runs it on unload. That requirement is part of how the paper makes modularity provable. The PoC requires the shape. A proof for this codebase is later work (§3).
 
@@ -850,6 +858,11 @@ Requirements added here:
 
 R-EVD-1 through R-EVD-3 describe the Findings record in §5. Q22 decides whether that record is its own object.
 
+- **R-ATT-1.** Every Attempt MUST be recorded with its score against the Goal's Needs.
+- **R-ATT-2.** Every planning loop MUST be fed the Attempt history in the OPRO form in §4 and §5.
+- **R-ATT-3.** History size and the truncation rule MUST be configurable per Goal. Proposed defaults, from the OPRO meta-prompt in §4: keep the best 20 Attempts, and propose 8 candidates per loop.
+- **R-ATT-4.** The scorer MUST be a separate identity from the proposer (§6, §7).
+
 **Non-functional.** Performance targets are the proposed targets in §6. Security targets are §7. This section adds no numeric targets.
 
 ## 10. PoC scope and acceptance criteria
@@ -867,6 +880,7 @@ Further criteria, numbered after 12 so they do not collide with §7:
 13. An operator can register one Goal, and the registration record stores the spend ceiling and the root Capability set. A Need or Task that would exceed either is refused.
 14. A self-hosted Provider call and a hosted-API Provider call each settle once in the ledger. The agent that triggered the call has no provider key.
 15. Loading a test module provides a Need. Unloading it runs the inverse, and that Need is no longer provided. A module that depended on it is inactive afterward.
+16. On a fixed benchmark Goal, history-fed planning is compared with single-draft refinement at the same budget.
 
 ## 11. Risks
 
@@ -904,6 +918,7 @@ Every open question for Gui is in this list. A question that already has a numbe
 20. **Q20 (Forge).** For high-impact Goals, is two-person approval built in, or a policy each deployer can turn off?
 21. **Q21 (Kernel).** For air-gapped deployments, are offline bootstrap and updates in PoC scope, or deferred to v1?
 22. **Q22 (Scribe).** Should Findings be a sixth first-class object, or part of Board and Need?
+23. **Q23 (Scribe).** For an open-ended Goal with no numeric metric, what is the scorer?
 
 ## 13. Sources
 
@@ -924,6 +939,10 @@ Only URLs fetched while writing §§1–5 and §§8–12. Sources for §6 and §
 - https://arxiv.org/abs/2608.25512
 - https://arxiv.org/pdf/2608.25512
 - https://arxiv.org/abs/2309.03409
+- https://export.arxiv.org/api/query?id_list=2309.03409
+- https://github.com/google-deepmind/opro
+- https://raw.githubusercontent.com/google-deepmind/opro/main/README.md
+- https://arxiv.org/abs/2506.13131
 - https://github.com/deepseek-ai/deepseek-harness
 - https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/master/README.md
 - https://docs.vllm.ai/en/latest/
