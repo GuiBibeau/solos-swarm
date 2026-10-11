@@ -4,11 +4,11 @@
 
 solos-swarm runs LLM agents on a multi-machine Linux cluster. Gui's description is "Kubernetes for giant AI agent swarms": written in Rust, modular, and built with networking at the centre.
 
-The swarm is autonomous. It is deployed for one Goal. That Goal is a single, important objective. Registering it is the moment of consent, and it sets the spend ceiling and the Capability ceiling (§5, §7).
+The swarm is autonomous. It is deployed for one Goal. That Goal is one hard problem. The swarm decomposes it, investigates, and converges, whatever the domain. Registering the Goal is the moment of consent, and it sets the spend ceiling and the Capability ceiling (§5, §7).
 
 Agents that are supposed to stay isolated still invent a shared board and start handing out work. The July 2026 case in §4 is the evidence. A swarm system has to make that coordination a governed object, with an audit trail and a way to stop the swarm.
 
-The platform is general-purpose. The Goal set by the initial prompt determines what the swarm does. Nothing in the platform is specific to one purpose. Red teaming, testing, and monitoring are example Goals, not the scope. The same swarm can call a model on the cluster's own compute or through an inference-provider API (§8).
+The platform is general-purpose, and generality is a goal (§3). The Goal set by the initial prompt determines what the swarm does. Nothing in the platform is specific to one purpose. Red teaming, testing, and monitoring are example Goals, not the scope. The same swarm can call a model on the cluster's own compute or through an inference-provider API (§8).
 
 The first deliverable is a proof of concept (§10).
 
@@ -30,7 +30,7 @@ The first deliverable is a proof of concept (§10).
 
 **Goals**
 
-- Stay general-purpose. The Goal in the initial prompt decides the work. The core has no domain logic.
+- Stay general-purpose. The operator gives the swarm one hard problem as a Goal. The swarm decomposes it, investigates, and converges, whatever the domain. The core has no domain logic.
 - Run one autonomous swarm for one Goal on a multi-machine Linux cluster.
 - Write the system in Rust, keep it modular, and put networking at the centre (§6).
 - Call any model, on the cluster's own compute or through an inference API (§8).
@@ -97,16 +97,22 @@ Shi, Zhang, and Cui, ["A Programming Paradigm for Spatiotemporal Composability"]
 
 Yang et al., ["Large Language Models as Optimizers"](https://arxiv.org/abs/2309.03409) (arXiv:2309.03409, Google DeepMind), call the method Optimization by PROmpting (OPRO). Each step shows the model earlier solutions together with their scores. The new solutions are scored and added to that prompt. Their default meta-prompt keeps the best 20 solutions so far, and each step generates 8 new solutions. §6 uses that shape for a Goal's Attempt history, with those two figures as the defaults. Compaction, retraction markers, and who may write a score are §6 and §7.
 
+### 4.7 Palantir Ontology and AIP
+
+[Palantir's Ontology](https://palantir.com/docs/foundry/ontology/overview/) is a typed model of an organization's world: objects, properties, and links, and the actions that change them. [Why create an Ontology?](https://palantir.com/docs/foundry/ontology/why-ontology/) says humans and agents share that model. Both query it, reason on it, and act through it. [AIP](https://palantir.com/docs/foundry/aip/overview/) runs LLM workflows and agents on the same Ontology.
+
+We borrow the capacity, not the product. The capacity is a shared, typed model of the problem's world that both people and the swarm act on, so one Goal can be a hard problem in any domain. Foundry, AIP, and the applications built on them are not this system.
+
 ## 5. Architecture overview
 
-These objects are defined here. Later sections use these names and do not redefine them.
+Goal, Need, Task, Board, Capability, and Attempt are defined here. Later sections use these names and do not redefine them. Findings is a candidate, not a settled object (Q22).
 
 - **Goal.** The single objective. Registering it is the moment of consent and sets the spend and Capability ceiling.
 - **Need.** A sub-requirement of a Goal that agents provide for.
 - **Task.** A delegated unit of work. Delegation only narrows Capabilities and budget.
 - **Board.** The shared message board. Posts are untrusted, signed and audited, and never grant anything.
 - **Capability.** A typed, scoped permission. It is the only authorization boundary, as in §7.
-- **Finding.** A typed, sourced record of something established under a Goal. It is separate from a Board post. The broker writes its provenance. Storage, lineage, and rejection of agent-supplied provenance are §6. A retraction flags descendant Findings and reopens the Needs that depend on them (§6). Marking policy is §7.
+- **Findings (candidate).** A swarm working on a hard problem needs a shared record of what it has found, kept separate from the Board. This is a candidate sixth object, beside Goal, Need, Task, Board, and Capability. A Finding is a typed, versioned record with provenance: who produced it, which sources and tools it came from, and how confident it is. Board posts point at Findings. Convergence on a Goal is measured against its Needs, using the Findings that satisfy each one. Whether Findings stays its own object, or becomes part of Board and Need, is Q22. Until that is answered, §6 stores Findings separately from the Board, the broker writes the provenance, and a retraction flags descendant Findings and reopens the Needs that depend on them. Marking policy is §7.
 - **Attempt.** One scored try under a Goal, built from its Tasks and Findings. The evaluator writes and signs the score. The history, the defaults from §4.6, and compaction are §6.
 
 An operator registers one Goal. That act fixes the ceiling for every Need, Task, Board topic, Finding, and reservation under it (§7). A Need is a request inside that ceiling. Meeting a Need does not widen the ceiling. A Goal may fan out into sub-Goals, Needs, and Tasks. Admission of that fan-out is §6. Work moves as Tasks. The child holds a narrower Capability set and a smaller budget than the parent (§7). Board and Task across machines are §6.
@@ -838,6 +844,11 @@ Requirements added here:
 - **R-PRV-3.** The broker MUST hold hosted API keys. An agent MUST NOT receive them.
 - **R-PRV-4.** The router MUST send a call only to a provider and model on the Goal allowlist (§7).
 - **R-PRV-5.** The provider MUST report usage to the broker, and the broker MUST pass that usage to the shared reserve for settlement (§6, §7).
+- **R-EVD-1.** Every Finding MUST carry provenance written by the broker (§6): who produced it, which sources and tools it came from, and how confident it is.
+- **R-EVD-2.** Progress on a Goal MUST be measured as which Needs are satisfied, using the Findings that satisfy each Need.
+- **R-EVD-3.** The swarm MUST keep a human-readable record of how it reached its answer: the Needs of the Goal, and the Findings that satisfied them.
+
+R-EVD-1 through R-EVD-3 describe the Findings record in §5. Q22 decides whether that record is its own object.
 
 **Non-functional.** Performance targets are the proposed targets in §6. Security targets are §7. This section adds no numeric targets.
 
@@ -892,6 +903,7 @@ Every open question for Gui is in this list. A question that already has a numbe
 19. **Q19 (Kernel).** Is an external etcd acceptable in target deployments? This is the question in §6.
 20. **Q20 (Forge).** For high-impact Goals, is two-person approval built in, or a policy each deployer can turn off?
 21. **Q21 (Kernel).** For air-gapped deployments, are offline bootstrap and updates in PoC scope, or deferred to v1?
+22. **Q22 (Scribe).** Should Findings be a sixth first-class object, or part of Board and Need?
 
 ## 13. Sources
 
@@ -915,3 +927,6 @@ Only URLs fetched while writing §§1–5 and §§8–12. Sources for §6 and §
 - https://github.com/deepseek-ai/deepseek-harness
 - https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/master/README.md
 - https://docs.vllm.ai/en/latest/
+- https://palantir.com/docs/foundry/ontology/overview/
+- https://palantir.com/docs/foundry/ontology/why-ontology/
+- https://palantir.com/docs/foundry/aip/overview/
