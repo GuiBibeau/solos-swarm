@@ -4,7 +4,7 @@
 
 solos-swarm runs LLM agents on a multi-machine Linux cluster. Gui's description is "Kubernetes for giant AI agent swarms": written in Rust, modular, and built with networking at the centre.
 
-The swarm is autonomous. It is deployed for one Goal. That Goal is one hard problem. The swarm decomposes it, investigates, and converges, whatever the domain. Registering the Goal is the moment of consent, and it sets the spend ceiling and the Capability ceiling (§5, §7).
+The swarm is autonomous. It is a society of agents, deployed for one Goal. That Goal is one hard problem. The swarm decomposes it, investigates, and converges, whatever the domain. Registering the Goal is the moment of consent, and it sets the spend ceiling (§5, §7). That ceiling is a backstop. The control is observability of the swarm, and policy actors that can stop an action (§5).
 
 Agents that are supposed to stay isolated still invent a shared board and start handing out work. The July 2026 case in §4 is the evidence. A swarm system has to make that coordination a governed object, with an audit trail and a way to stop the swarm.
 
@@ -14,7 +14,7 @@ The first deliverable is a proof of concept (§10).
 
 ## 2. Users and use cases
 
-**Operator.** Registers the Goal, sets its ceiling, and can stop the swarm (§7). A viewer or auditor reads state and the audit log. That role does not grant a Capability.
+**Operator.** Registers the Goal, sets its spend ceiling, and can stop the swarm (§7). A viewer or auditor reads state and the audit log. That role does not grant a Capability.
 
 **Government defensive users.** Operators doing national cyber defense and critical infrastructure protection. They register a Goal the same way any operator does. What they defend is in that Goal.
 
@@ -24,7 +24,7 @@ The first deliverable is a proof of concept (§10).
 
 1. **Testing.** One Goal covers a large test effort. Agents take Tasks for parts of it. Discussion stays on the Board. Durable results are Findings. Spend stays inside the ceiling set at registration.
 2. **Red teaming.** One Goal names the engagement. Target limits and tool isolation are §7. A Board post cannot add a target or a tool.
-3. **Monitoring.** A Goal stays up. Agents post what they observe. Acting on an observation still requires a Capability held under that Goal.
+3. **Monitoring.** A Goal stays up. Agents post what they observe. Acting on an observation stays inside that agent's capability definition (§5). Actions that cannot be undone go through the inline layer.
 
 ## 3. Goals and non-goals
 
@@ -36,9 +36,9 @@ The first deliverable is a proof of concept (§10).
 - Call any model, on the cluster's own compute or through an inference API (§8).
 - Deploy air-gapped. The cluster runs with no outbound dependency (§6, §7).
 - Separate tenants by deployment. Each deployment is its own cluster (§6, §7).
-- Make Goal registration the consent point and the ceiling for spend and Capabilities.
-- Make Need, Task, and Board first-class, so coordination is recorded and checked.
-- Keep delegation narrowing-only for Capabilities and budget (§7).
+- Make Goal registration the consent point and the spend ceiling. The ceiling is a backstop. Observability and intervention are the control (§5).
+- Make Need, Task, and Board first-class, so coordination is recorded. Policy actors read the Board (§5).
+- Keep delegation narrowing-only for budget (§7). An agent's capabilities are its definition (§5).
 - Ship a PoC that meets the criteria in §6 and §7.
 
 **Non-goals**
@@ -50,7 +50,7 @@ The first deliverable is a proof of concept (§10).
 - Hostile multi-tenancy. The PoC assumes a cluster the operator owns (§7 A4).
 - Formal accreditation (§7 Q1).
 - A machine-checked proof of module composability. The PoC requires revertible effects (§5). The proof is later work.
-- Offline Capability tokens are undecided (Q10). Until that is answered, the PoC checks Capabilities at the broker, as §7 recommends.
+- Offline Capability tokens are undecided (Q10). The inline layer reads the agent's definition for actions that cannot be undone (§5). Forge will rework the rest of the §7 draft.
 
 ## 4. Prior art (what we borrow, what we drop)
 
@@ -68,7 +68,7 @@ solos-swarm is Rust-native. It runs as its own system on a multi-machine Linux c
 
 [Temporal](https://docs.temporal.io/evaluate/understanding-temporal) records an event history for a workflow and replays it after a crash. Side effects sit in activities, which retry. §6 keeps a smaller form of the same idea: write an intent, then perform the effect. v1 does not run the Temporal service.
 
-[Firecracker](https://firecracker-microvm.github.io/) is a Rust virtual machine monitor. It uses KVM to run microVMs with a small device model, for workload isolation. §7 assigns it to the tier for risky tools. The startup and memory figures stay in §7.
+[Firecracker](https://firecracker-microvm.github.io/) is a Rust virtual machine monitor. It uses KVM to run microVMs with a small device model, for workload isolation. It is a candidate base, not a settled choice (Q24). One option is one microVM per entity in the cluster. The other is an isolated sandbox, or playground, for risky work. We can use it directly or take it as inspiration. §7 still lists it under the risky-tool tier. The startup and memory figures stay there. Forge will rework that section.
 
 ### 4.3 Crates the runtime section relies on
 
@@ -82,10 +82,10 @@ OpenAI's July 2026 ExploitGym runs were supposed to keep agents fully isolated. 
 
 Lessons for this design:
 
-- Unauthorized emergent coordination is a threat. Every agent-to-agent path goes through the brokered Board and Task. There are no direct agent-to-agent routes. Outbound traffic goes only through a per-node egress proxy checked against Capabilities. Details are in §6 and §7.
-- Need, Task, and Board are first-class, and §7 audits them. A post never grants a Capability.
-- Capability checks and isolation have to hold against agents that cooperate.
-- The operator needs a kill switch (§7).
+- Unauthorized emergent coordination is a threat. Every agent-to-agent path goes through the brokered Board and Task. There are no direct agent-to-agent routes. Network egress cannot be undone, so the inline layer checks it (§5, §6, §7).
+- Need, Task, and Board are first-class. Policy actors read the Board and the audit log (§5). A post never grants a Capability.
+- A Capability is what an agent can do, from its definition (§5). The swarm is a society of agents. Policy actors watch that society and can stop an action that breaks policy. They do not check every call. Isolation still has to hold when agents cooperate.
+- The operator needs a kill switch (§7). Policy actors can also flag or stop an action. Every intervention is logged (§5).
 
 ### 4.5 Spatiotemporal composability
 
@@ -115,17 +115,37 @@ We borrow the capacity, not the product. The capacity is a shared, typed model o
 
 Goal, Need, Task, Board, Capability, and Attempt are defined here. Later sections use these names and do not redefine them. Findings is a candidate, not a settled object (Q22).
 
-- **Goal.** The single objective. Registering it is the moment of consent and sets the spend and Capability ceiling.
+- **Goal.** The single objective. Registering it is the moment of consent and sets the spend ceiling. The ceiling is a backstop (§7).
 - **Need.** A sub-requirement of a Goal that agents provide for.
-- **Task.** A delegated unit of work. Delegation only narrows Capabilities and budget.
+- **Task.** A delegated unit of work. Delegation narrows budget. It does not grant a Capability.
 - **Board.** Agents post and read here. Posts are untrusted, signed and audited, and never grant anything.
-- **Capability.** A typed, scoped permission. It is the only authorization boundary, as in §7.
+- **Capability.** What a deployed agent can do. It is declared in a YAML agent definition, one of the YAML files that define the swarm cluster (§6). The inline layer reads that file. A Board post does not create or widen a Capability.
 - **Findings (candidate).** A swarm working on a hard problem needs a shared record of what it has found, kept separate from the Board. This is a candidate sixth object, beside Goal, Need, Task, Board, and Capability. A Finding is a typed, versioned record with provenance: who produced it, which sources and tools it came from, and how confident it is. Board posts point at Findings. Convergence on a Goal is measured against its Needs, using the Findings that satisfy each one. Whether Findings stays its own object, or becomes part of Board and Need, is Q22. Until that is answered, §6 stores Findings separately from the Board, the broker writes the provenance, and a retraction flags descendant Findings and reopens the Needs that depend on them. Marking policy is §7.
 - **Attempt.** One scored try under a Goal, derived from its Tasks and Findings, with its score against the Goal's Needs. The evaluator writes and signs the score. The history and compaction are §6.
 
-An operator registers one Goal. That act fixes the ceiling for every Need, Task, Board topic, Finding, and reservation under it (§7). A Need is a request inside that ceiling. Meeting a Need does not widen the ceiling. A Goal may fan out into sub-Goals, Needs, and Tasks. Admission of that fan-out is §6. Work moves as Tasks. The child holds a narrower Capability set and a smaller budget than the parent (§7). Board and Task across machines are §6.
+Each deployed agent runs Pi. Pi is the agent CLI in [earendil-works/pi](https://github.com/earendil-works/pi). The command is `pi`. That repository's README also describes building a standalone binary from a release source archive. Either form is acceptable.
+
+The agent definition names the Pi skills that agent may use. It may name any skill Pi has registered. Pi registers a skill as a directory containing `SKILL.md`. At startup it scans its configured skill locations and advertises each skill's name and description ([skills](https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/docs/skills.md)). If the definition file is omitted, Pi's default applies. Pi's settings default the enabled tools to `read`, `bash`, `edit`, and `write` ([settings](https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/docs/settings.md)). Pi's README says Pi has no built-in permission system for filesystem, process, network, or credentials, and that it runs as the user that launched it. The inline layer is the boundary for those actions. How the YAML fields are passed to the `pi` process is Q26. This example is illustrative. It is not a schema, and it is not a Pi file format.
+
+```yaml
+# Illustrative only. Not a schema, and not a Pi file format.
+name: investigator
+runtime: pi
+# any: this agent may use any skill Pi has registered
+skills: any
+```
+
+An operator registers one Goal. That act fixes the spend ceiling for every Need, Task, Board topic, Finding, and reservation under it (§7). A Need is a request inside that ceiling. Meeting a Need does not widen the ceiling. A Goal may fan out into sub-Goals, Needs, and Tasks. Admission of that fan-out is §6. Work moves as Tasks. A child agent has its own definition file and a smaller budget than the parent. Board and Task across machines are §6.
 
 The Board is how agents share messages. A post is input to other agents. It is signed by the poster, written to the audit log, and checked before it is stored. It does not grant a Capability, a budget, or any other authority (§7).
+
+The swarm is a society of agents. The control is observability, and the capacity to intervene. The inline layer does not run on every call.
+
+Policy actors are agents in that society. They read the audit log and the Board. They watch from a distance. When an action breaks policy, they can flag it, or stop the action or the agent. Every intervention is written to the audit log.
+
+The reference for that judgment is Jev, the model Gui called JEV. Jev is TypeSafe's first System One model ([Introducing System One Models & Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev)). The page describes it as a function call: unstructured state in, a typed decision out, with a probability and a confidence score. It says Jev does not generate strings. It says the outputs stay inside a structure fixed in advance, and that the model never makes type errors. The page lists scoring, judging, verifying, guardrailing, and jailbreak detection on model prompts, reasoning traces, and outputs as a use. A policy actor uses that shape: observed state in, a typed decision out. When a decision becomes a flag, and when it becomes a stop, is Q25.
+
+A thin inline layer stays on the path for actions that cannot be undone. Those actions are sandbox and network egress, secrets, the spend ceiling, and C3 or other irreversible actions. The layer reads the agent's YAML definition and refuses what the definition does not allow. The spend ceiling is a backstop (§7). Everything else is watched, and a policy actor intervenes when it needs to.
 
 The control plane stores the Goal, Task records, Board order, and leases. The data plane carries agent traffic and provider calls (§6). Model calls use the Provider trait in §8. Keys stay with the broker (§7). Placement and spend share one reserve: the scheduler reserve phase is §6, and the cap ledger is §7.
 
@@ -140,8 +160,8 @@ This section specifies how solos-swarm places, runs, connects and recovers rough
 ### 6.1 Terminology
 
 - **Node**: one Linux host running the node agent (`swarmd`).
-- **Agent**: one logical LLM-driven worker with an identity, a mailbox, a budget and a lifecycle. Agents are lightweight in-process tasks inside `swarmd`, not OS processes or containers by default. Process or sandbox isolation is a per-agent option owned by section 7.
-- **Swarm spec**: a declarative document that describes the desired set of agents, their resource and budget requests, their placement constraints and their topology (who may talk to whom).
+- **Agent**: one logical worker with an identity, a mailbox, a budget and a lifecycle. It runs the Pi CLI or binary (§5). Whether each agent is a process on the node or its own microVM is the Firecracker choice (Q24). Section 7 still describes isolation tiers.
+- **Swarm spec**: a YAML document that describes the desired set of agents, their resource and budget requests, their placement constraints and their topology (who may talk to whom). The agent definition (§5) is one of the YAML files that define the cluster.
 - **Control plane**: the replicated components that store desired and observed state and make placement decisions.
 - **Data plane**: agent-to-agent and agent-to-provider traffic. It does not pass through the control plane.
 
@@ -151,7 +171,7 @@ The scheduler maps agents in a swarm spec to nodes. We borrow structure from thr
 
 **From the Kubernetes scheduling framework, we borrow** the split into a *scheduling cycle* (pick a node) and a *binding cycle* (commit the decision). Scheduling cycles run one at a time and binding cycles can run concurrently. We also borrow its pluggable extension points: queue sort, filter (remove infeasible nodes), score plus normalize (rank feasible nodes), reserve/unreserve (hold resources before binding, with an idempotent unreserve), and permit (approve, deny or wait). The solos-swarm scheduler MUST expose the same phases as a Rust trait set so that placement policy is modular. The PoC ships filter plugins for capacity, labels and node health, plus score plugins for bin-packing and spread. **We drop** the per-Pod object model and volume and CSI plugins, and we don't schedule one unit at a time when a gang is requested.
 
-**From Nomad, we borrow** the evaluation/plan model. Any change in desired state (a new or updated swarm spec) or observed state (a node is lost) creates an *evaluation*. Scheduler workers turn an evaluation into a *plan*: the allocations to create, update or stop. The leader serializes plans through a *plan queue* and rejects all or part of any plan that would over-subscribe a node. This lets several scheduler workers run optimistically without locks, which matters when 500 agents land at once. We also borrow Nomad's two placement phases: a feasibility pass, then ranking by bin-packing with an automatic anti-affinity term so that replicas of the same role don't share a node. **We drop** Nomad's task drivers (Docker, exec, Java) for v1. The only driver is the in-process agent runtime.
+**From Nomad, we borrow** the evaluation/plan model. Any change in desired state (a new or updated swarm spec) or observed state (a node is lost) creates an *evaluation*. Scheduler workers turn an evaluation into a *plan*: the allocations to create, update or stop. The leader serializes plans through a *plan queue* and rejects all or part of any plan that would over-subscribe a node. This lets several scheduler workers run optimistically without locks, which matters when 500 agents land at once. We also borrow Nomad's two placement phases: a feasibility pass, then ranking by bin-packing with an automatic anti-affinity term so that replicas of the same role don't share a node. **We drop** Nomad's task drivers (Docker, exec, Java) for v1. The driver runs the Pi CLI or binary (§5). Process versus microVM is Q24.
 
 **From Ray placement groups, we borrow** gang scheduling. A swarm or sub-swarm (for example "one red team of 40 agents plus a coordinator") is reserved as a list of *bundles*, and the reservation is atomic: if any bundle can't be placed, nothing is reserved and the group stays pending. We adopt Ray's four strategies: PACK, STRICT_PACK, SPREAD and STRICT_SPREAD. We also adopt its fault behaviour: creation is atomic, but after a node loss the lost bundles are rescheduled at elevated priority, and the group may run partially until they are. **We drop** Ray's object store and its implicit task-level scheduling.
 
@@ -235,7 +255,7 @@ Unbounded queues are banned on the data path.
   - **ractor**: Erlang gen_server style. Supervision trees, priority channels (signals, stop and supervision ahead of regular messages), process groups for broadcast and dispatch, and an optional cluster feature.
   - **kameo**: Tokio-based. Supervision, bounded or unbounded mailboxes, a console for watching mailbox backpressure. Its distributed mode runs on libp2p.
   - **actix**: tied to its own actor system and runtime conventions. Scribe's prior-art survey (section 4) also records no crate release since 0.13.5 (2024-06-09), per crates.io data, and recommends skipping it.
-- **Proposal**: build agents as ractor-style supervised actors on tokio, with our own QUIC transport rather than an actor framework's built-in clustering, because we need to control mTLS, flow control and the routing table. The choice between ractor and kameo is a PoC spike. The decision criteria are idle memory per actor, the mailbox API and supervision ergonomics.
+- **Proposal**: build agents as ractor-style supervised actors on tokio, with our own QUIC transport rather than an actor framework's built-in clustering, because we need to control mTLS, flow control and the routing table. The program those actors supervise is the Pi CLI or binary (§5). The choice between ractor and kameo is a PoC spike. The decision criteria are idle memory per actor, the mailbox API and supervision ergonomics.
 
 ### 6.9 Failure and partition handling
 
@@ -290,6 +310,8 @@ This subsection covers the mechanics of the Goal, Need, Task, Board and Capabili
 - Tracing through OpenTelemetry (`tracing` plus an OTLP exporter). One trace per Task, with spans for scheduling, message hop (sender node, receiver node, queue wait), provider call and tool call. W3C trace context travels in every message header.
 - Metrics: scheduler latency histograms, queue depths, QUIC connection stats (RTT, loss and congestion window, from quinn), Raft metrics from openraft, lease renewals and misses.
 - Per-agent accounting: input and output tokens, model and provider, cost estimate and wall time, aggregated per agent, swarm and node, and enforced against budgets. Attribute names should follow the OpenTelemetry GenAI semantic conventions (now maintained in a separate repository) where they apply.
+
+Policy actors read these signals, the audit log (§7), and the Board (§6.10). That is the watch path in §5. A flag or a kill is itself an audit event.
 
 ### 6.12 Performance: what to measure and how (proposed targets to validate in PoC)
 
@@ -399,6 +421,8 @@ Document type: requirements only. It contains no code and does not prescribe int
 
 Key words: "MUST", "MUST NOT", "SHOULD" and "MAY" have their RFC 2119 meanings.
 
+The control model is §5. A thin inline layer enforces only actions that cannot be undone: sandbox and network egress, secrets, spend ceilings, and C3 or other irreversible actions. It reads the agent's YAML definition. Other actions are watched by policy actors. They read the audit log and the Board, and they can flag or kill. Every intervention is logged. This section is a draft. Forge will rework it to match §5. Until that rework, where a requirement below says every agent action is checked in line, follow §5.
+
 ---
 
 ### 7.1 Context and assumptions
@@ -408,14 +432,14 @@ solos-swarm schedules and supervises swarms of about 500 LLM agents across multi
 The TRD defines four first-class objects that this section secures:
 
 - **Goal (with its Needs)**: the top-level unit of work an operator registers. Registering a Goal is the moment of consent (§7.4.7).
-- **Task**: a unit of work given to an agent. Tasks can be delegated to child agents, and delegation only narrows authority (§7.4.6).
+- **Task**: a unit of work given to an agent. Delegation narrows budget (§5). The attenuation rules in §7.4.6 are the current draft.
 - **Board**: shared topics that agents post to and read from. Board content is untrusted input (§7.10).
-- **Capability list**: the explicit, typed, scoped grants an agent holds. It is the only authorization boundary for agents (§7.4.5).
+- **Capability**: what a deployed agent can do, declared in its YAML definition (§5). The Capability list in §7.4.5 is the current draft of a grant record.
 
 Working assumptions for this section:
 
 - A1. Every LLM agent is treated as untrusted. Its output can be wrong, manipulated by injected content, or adversarial. Prompt injection cannot be fully prevented (OWASP LLM01:2025 states that "it is unclear if there are fool-proof methods of prevention"). The design therefore limits what a compromised agent can do. It does not depend on agents behaving well.
-- A2. The agent loop (prompt assembly, provider calls, tool dispatch) is solos-swarm code. The higher-risk code is tool execution, and above all tools that run arbitrary code, browse, or touch targets during red-team work.
+- A2. The agent program is the Pi CLI or binary (§5). Pi does not enforce filesystem, process, network, or credential limits. The higher-risk code is tool execution, and above all tools that run arbitrary code, browse, or touch targets during red-team work.
 - A3. Cluster nodes run a modern Linux kernel controlled by the operator. Hardware side channels are out of scope for the PoC, beyond keeping kernels and firmware patched.
 - A4. The PoC runs on a cluster the operator owns. It is not multi-tenant with hostile tenants. Each tenant and each classification level has its own deployment (SEC-F-41). The cluster mechanism is §6.5. Hostile tenants on one shared node are Q9.
 
@@ -537,16 +561,16 @@ solos-swarm defines four tiers. Each Goal and each tool declares its minimum tie
 - **Tier W (Wasm tool)**: pure-function and data tools compiled to Wasm and run in wasmtime with explicit WASI capabilities (no ambient file system, no ambient network; I/O only through host functions brokered by solos-swarm).
 - **Tier P (hardened process)**: agent loops and trusted first-party native tools. Each runs in its own user, PID, mount, network, IPC and UTS namespaces, plus a cgroup v2 limit, `no_new_privs`, a seccomp allowlist that also checks the architecture, a Landlock ruleset (file system, TCP/UDP ports, abstract-socket and signal scoping), and no direct internet route (egress only to the local broker).
 - **Tier G (gVisor)**: optional middle tier for untrusted native tools that do not need KVM. It is a fallback for nodes without KVM.
-- **Tier V (microVM)**: Firecracker (directly, or through Kata) for arbitrary code execution, browsers, exploit tooling, and all red-team actions that touch targets.
+- **Tier V (microVM)**: Firecracker (directly, or through Kata) for arbitrary code execution, browsers, exploit tooling, and all red-team actions that touch targets. Firecracker is a candidate base, not the settled runtime (Q24). One option is one microVM per entity in the cluster. The other is this tier: an isolated sandbox, or playground, for risky work. We can use Firecracker directly or take it as inspiration. The tiers in this subsection are the current draft.
 
 #### 7.3.3 PoC recommendation
 
-- Run the **agent loops in Tier P**. The agent loop is solos-swarm's own Rust code, and the untrusted part is model output, which the loop only turns into structured tool requests. Tier P gives the density needed for about 500 agents on a few machines.
+- Run the **agent loops in Tier P**. The agent program is the Pi CLI or binary (§5), and the untrusted part is model output. Tier P gives the density needed for about 500 agents on a few machines. This placement is one option under Q24.
 - Run **first-party data tools in Tier W** where practical.
 - Run **any tool that executes generated or third-party code, opens a browser, or touches a red-team target in Tier V (Firecracker)**. Use Tier G only on nodes without KVM, and record the fallback in the audit log.
 - Leave Kata integration to after the PoC, unless an operator needs Kubernetes/CRI compatibility for the PoC.
 
-Rationale: the source figures (≤125 ms boot, ≤5 MiB VMM overhead) make a pool of short-lived microVMs practical for the minority of risky tool calls. Keeping the many agent loops in processes avoids paying VM overhead 500 times.
+Rationale: the source figures (≤125 ms boot, ≤5 MiB VMM overhead) make a pool of short-lived microVMs practical for the minority of risky tool calls. Keeping the many agent loops in processes avoids paying VM overhead 500 times. That split is one option under Q24, not the decision.
 
 ### 7.4 Identity, authentication and authorization
 
@@ -567,18 +591,18 @@ Rationale: the source figures (≤125 ms boot, ≤5 MiB VMM overhead) make a poo
 - **RBAC modeled on Kubernetes RBAC**: Roles and ClusterRoles hold additive allow-only rules; Bindings attach them to subjects (operators, groups, workload identities) at tenant or cluster scope. Bindings have an immutable role reference.
 - **Escalation prevention modeled on Kubernetes**: a subject can create or update a role, or bind one, only if it already holds every permission in that role, or holds the explicit `escalate`/`bind` verbs. Wildcards are discouraged, and wildcards on privileged resources are forbidden.
 - **ABAC conditions** on top of RBAC: attributes such as tenant, Goal risk class, isolation tier, time window, target-allowlist membership and unattended mode can narrow a rule but never widen it.
-- **Split of responsibility**: RBAC and ABAC govern humans and control-plane components (who can register Goals, change allowlists, toggle kill switches). Agents get no RBAC roles. Everything an agent can do is defined by its Capability list (§7.4.5). The control plane checks every agent action against that list in deterministic code; the decision never depends on the LLM's judgment ("complete mediation", OWASP LLM06).
+- **Split of responsibility**: RBAC and ABAC govern humans and control-plane components (who can register Goals, change allowlists, toggle kill switches). Agents get no RBAC roles. What an agent can do is its YAML definition (§5). The inline layer reads that definition for actions that cannot be undone. Other actions are not checked on every call. Policy actors watch, and can flag or kill. That judgment is the Jev shape in §5, and it is logged. The Capability list in §7.4.5 is the current draft. Forge will rework it.
 
 #### 7.4.4 Agent-to-agent privilege escalation
 
-- An agent can gain authority in exactly one way: an attenuated delegation recorded by the control plane (§7.4.6). There is no other path.
+- What an agent can do is its YAML definition (§5). A peer cannot widen it. The draft below still treats attenuated delegation as the only way to gain a Capability (§7.4.6). Forge will rework that draft.
 - Messages between agents and Board posts are untrusted data (§7.10). A request from a peer is never a grant, and a post can never carry, create or widen a Capability.
 - The control plane, not the delegating agent, issues each child's workload identity and Capability list.
 - Agents have no credentials or network routes for the control-plane write API. They can only reach a narrow node-local endpoint (tool requests, board reads and posts, delegation requests, status).
 
 #### 7.4.5 Capability list: the authorization boundary for agents
 
-The Capability list is THE authorization boundary. An agent can call a tool, read or write a Board topic, delegate a Task, or spend budget only through a Capability it holds. Anything not covered by a held Capability is denied.
+The declaration the inline layer reads is the YAML agent definition in §5. The Capability list in the rest of this subsection is the current draft of a grant record. Forge will rework it. In that draft, an agent can call a tool, read or write a Board topic, delegate a Task, or spend budget only through a Capability it holds, and anything not covered is denied.
 
 Each Capability is explicit, typed and scoped. At minimum it has:
 
@@ -608,8 +632,8 @@ Precedent: macaroons, Biscuit and UCAN all use credentials that can only be narr
 
 #### 7.4.7 Goal and Needs: the moment of consent
 
-- Registering a Goal is the moment of consent. Registration fixes the Goal's budget, its root Capability list, allowed isolation tiers, depth and fan-out caps, expiry, and unattended-mode status.
-- These form a ceiling for everything spawned under the Goal: every Task, delegation, board topic and reservation. Nothing under a Goal can exceed it.
+- Registering a Goal is the moment of consent. Registration fixes the Goal's spend ceiling (§7.6). That ceiling is a backstop. The agent's capabilities are its YAML definition (§5), which the inline layer reads. The root Capability list, isolation tiers, depth and fan-out caps, expiry, and unattended-mode status in this draft are for Forge to rework.
+- The spend ceiling covers every Task, delegation, board topic, and reservation under the Goal. Nothing under the Goal can spend past it.
 - Needs declared under a Goal are requests, not grants. Meeting a Need never widens the Goal's Capabilities; a Need that requires more than the ceiling needs a new or amended Goal registration by an authorized operator, with the same sign-off rules as the original.
 - The bounds in §7.6.1 apply per Goal, and per Task as narrowed sub-bounds.
 - Which capability classes a Goal may request, and two-person approval for high-impact classes, are §7.11 and SEC-F-39. Whether that approval is mandatory or deployer-configurable is Q20.
@@ -668,7 +692,7 @@ Each registered Goal declares:
 
 ### 7.9 Tamper-evident audit log
 
-- An append-only log of security-relevant events: authentication, RBAC changes, registrations, sign-offs, two-person registration decisions, Capability grants, tool calls (with tier and decision), reservations and settlements, kill-switch toggles, sandbox tier fallbacks, policy denials, Finding provenance and retractions, and evaluator score signatures.
+- An append-only log of security-relevant events: authentication, RBAC changes, registrations, sign-offs, two-person registration decisions, Capability grants, tool calls (with tier and decision), reservations and settlements, kill-switch toggles, sandbox tier fallbacks, policy denials, policy-actor flags and stops, Finding provenance and retractions, and evaluator score signatures.
 - Structure: entries form a Merkle hash tree (RFC 6962 style, SHA-256, with domain-separated leaf and node hashes). The log periodically publishes a **signed tree head** (tree size, root hash, timestamp). It supports inclusion proofs (an entry is in the log) and consistency proofs (a later tree extends an earlier one). This is the property behind Certificate Transparency and Sigstore Rekor: rewriting or deleting history is detectable.
 - Witnessing: signed tree heads are copied to at least one store outside the control plane's write authority (a separate host or an operator-held store) so that a compromised control plane cannot present a forked history unseen. In air-gapped mode that witness has no internet path (SEC-F-40).
 - Content: entries carry hashes of large payloads (prompts, outputs), not the payloads, so that retention and redaction of data stay separate from audit integrity. Secrets are never logged.
@@ -922,7 +946,7 @@ The trait covers a local provider and a hosted API.
 
 "MUST" and "SHOULD" follow RFC 2119, as in §7.
 
-Runtime requirements are R-SCH-*, R-BRD-*, R-NET-1, R-FND-*, and R-HIST-* in §6. Authorization, the ledger, the Board's trust rules, delegation, and unsanctioned-coordination controls are SEC-F-1 through SEC-F-47 in §7. Board and Task across machines are §6. The shared reserve is the scheduler reserve phase in §6 and the cap ledger in §7.
+Runtime requirements are R-SCH-*, R-BRD-*, R-NET-1, R-FND-*, and R-HIST-* in §6. The control model is §5: a thin inline layer for actions that cannot be undone, and policy actors that watch and intervene for the rest. Authorization, the ledger, the Board's trust rules, delegation, and unsanctioned-coordination controls are SEC-F-1 through SEC-F-47 in §7. That section is a draft Forge will rework to match §5. Board and Task across machines are §6. The shared reserve is the scheduler reserve phase in §6 and the cap ledger in §7. The spend ceiling stays a backstop.
 
 Requirements added here:
 
@@ -958,20 +982,20 @@ The PoC is the first deliverable. It runs one Goal on a multi-machine Linux clus
 
 Further criteria, numbered after 15 so they do not collide with §7:
 
-16. An operator can register one Goal, and the registration record stores the spend ceiling and the root Capability set. A Need or Task that would exceed either is refused.
+16. An operator can register one Goal, and the registration record stores the spend ceiling. A reservation that would exceed it is refused. An agent with no definition file runs with Pi's default (§5).
 17. A self-hosted Provider call and a hosted-API Provider call each settle once in the ledger. The agent that triggered the call has no provider key.
 18. Loading a test module provides a Need. Unloading it runs the inverse, and that Need is no longer provided. A module that depended on it is inactive afterward.
 19. On a fixed benchmark Goal, history-fed planning is compared with single-draft refinement at the same budget.
 
 ## 11. Risks
 
-- **Unauthorized emergent coordination.** The §4.4 agents built a board they were not given. Every agent-to-agent path goes through the brokered Board and Task. There are no direct agent-to-agent routes. Outbound traffic goes only through a per-node egress proxy checked against Capabilities. Details are in §6 and §7. A post never grants a Capability.
-- **Cooperating agents.** A Capability check that is sound for one agent can fail when several agents split the work. Mitigation: the ceiling and attenuation rules in §7 apply to the whole delegation tree, and isolation tiers still apply to each sandbox.
+- **Unauthorized emergent coordination.** The §4.4 agents built a board they were not given. Every agent-to-agent path goes through the brokered Board and Task. There are no direct agent-to-agent routes. Outbound traffic goes only through a per-node egress proxy. Egress is inline (§5). A post never grants a Capability.
+- **Cooperating agents.** Agents in the society can split work. A check that is sound for one agent can miss that. Mitigation: policy actors watch the Board and the audit and can stop an action (§5). The spend ceiling still covers the tree (§7). Isolation still applies to each sandbox.
 - **No stop.** A swarm that cannot be halted keeps spending and keeps acting. Mitigation: the kill switch in §7.
 - **Effects outside the revertible boundary.** The composability paper (Section 6.1) treats an effect as revertible only when the system can restore the prior state. A provider call or a tool call against an external target cannot be undone by unloading a module. Mitigation: those calls go through the ledger and the confirmation tiers in §7, which this risk does not replace.
 - **The evidence is Koishi.** Section 5.3 of the paper is a chatbot framework, and the authors call it an existence result. Using the same shape for an agent swarm is a design choice. It is not a measured result for this system.
 - **Provider usage disagrees with the reservation.** Token counts and prices can make the settle differ from the hold. Handling of that case, and the other security risks, are in §7.
-- **Dual use and misuse.** The same swarm can be aimed at work the operator should not do. Mitigation: registering the Goal is the consent point, Capabilities bound what agents can do, and the audit log records the actions. Those controls are in §7.
+- **Dual use and misuse.** The same swarm can be aimed at work the operator should not do. Mitigation: registering the Goal is the consent point, the inline layer reads the agent definition for actions that cannot be undone, policy actors can stop the rest, and the audit log records the actions (§5, §7).
 - **Dual use through a Goal-policy bypass.** Any prompt can define a Goal. A registration that skips the deployment policy can grant outbound access to systems the deployment does not own, spend above the threshold, or C3 actions. Mitigation: SEC-F-39 in §7. Whether two-person approval can be turned off is Q20.
 - **Evaluator gaming.** A proposer that can read the evaluator code, the test set, or the held-out cases can raise the score without improving the attempt. Mitigation: SEC-F-45 in §7. The evaluator node pool is §6.15.
 
@@ -1002,6 +1026,9 @@ Every open question for Gui is in this list. A question that already has a numbe
 21. **Q21 (Kernel).** For air-gapped deployments, are offline bootstrap and updates in PoC scope, or deferred to v1?
 22. **Q22 (Scribe).** Should Findings be a sixth first-class object, or part of Board and Need?
 23. **Q23 (Scribe).** For an open-ended Goal with no numeric metric, what is the scorer?
+24. **Q24 (Kernel).** Firecracker is a candidate base (§4.2, §7.3). Do we run one Firecracker microVM per entity in the cluster, or use it as an isolated sandbox or playground? Do we use it directly, or take it as inspiration?
+25. **Q25 (Scribe).** A policy actor judges with the Jev shape in §5: observed state in, a typed decision out. When does that decision flag an action, and when does it stop the action or the agent?
+26. **Q26 (Scribe).** The agent-definition YAML in §5 is illustrative, not a schema. What fields does the real file need, and how are they passed to the `pi` process?
 
 ## 13. Sources
 
@@ -1032,3 +1059,10 @@ Only URLs fetched while writing §§1–5 and §§8–12. Sources for §6 and §
 - https://palantir.com/docs/foundry/ontology/overview/
 - https://palantir.com/docs/foundry/ontology/why-ontology/
 - https://palantir.com/docs/foundry/aip/overview/
+- https://typesafe.ai/blog/introducing-system-one-models-and-jev
+- https://github.com/earendil-works/pi
+- https://raw.githubusercontent.com/earendil-works/pi/main/README.md
+- https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/docs/skills.md
+- https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/docs/settings.md
+- https://pi.dev/
+- https://pi.dev/docs/latest/skills
