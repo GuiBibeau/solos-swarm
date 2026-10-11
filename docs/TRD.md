@@ -39,8 +39,11 @@ The scheduler maps agents in a swarm spec to nodes. We borrow structure from thr
 
 **Resources** in the PoC are: CPU millicores, memory, concurrent provider calls (a per-node outbound concurrency slot), and token budget per time window. Token budget is a first-class schedulable resource. A node that is close to a provider rate limit MUST be scored lower.
 
+**Budget in the reserve phase is not a second count.** The scheduler keeps no budget tally of its own. Its reserve phase calls the same spend ledger that enforces the spend caps in section 7: a worst-case hold keyed by `intentId`. Unreserve releases that same hold. Because both decisions go through one ledger operation, a placement cannot succeed while the spend is refused, and a spend hold cannot stand without its placement. Section 7 owns the policy (cap values, hold sizing). Section 6 owns only the call site.
+
 **Requirements**
-- R-SCH-1: Placement MUST be declarative and reconcile toward the swarm spec continuously.
+- R-SCH-1
+- R-SCH-5: The reserve phase MUST acquire and unreserve MUST release the section 7 spend-ledger hold for the same `intentId`. No separate scheduler-side budget counter is allowed.: Placement MUST be declarative and reconcile toward the swarm spec continuously.
 - R-SCH-2: Gang reservation of N bundles MUST be all-or-nothing.
 - R-SCH-3: The scheduler MUST support plugin-based filter and score phases.
 - R-SCH-4: The leader MUST validate plans against current node capacity before committing (optimistic concurrency).
@@ -78,7 +81,7 @@ The control plane holds desired state (swarm specs), observed state (node member
 
 **Option B: gRPC via tonic over HTTP/2.** This is mature, has typed IDL and broad tooling, and etcd itself uses it. It runs over TCP, so all multiplexed streams share one TCP byte stream and one loss stalls all of them.
 
-**Proposal**: QUIC/quinn for the data plane and for Raft replication, with a thin framed protocol (length-prefixed, versioned schema). Keep a tonic gRPC surface for the external operator API (CLI and UI), where tooling matters more than latency. **mTLS is mandatory on every inter-node connection.** Both ends present certificates and the node identity comes from the certificate. Certificate issuance and rotation belong to section 7 (Forge). QUIC 0-RTT MUST be disabled for state-changing messages, because RFC 9000 states that 0-RTT data has no replay protection.
+**Proposal**: QUIC/quinn for the data plane and for Raft replication, with a thin framed protocol (length-prefixed, versioned schema). Keep a tonic gRPC surface for the external operator API (CLI and UI), where tooling matters more than latency. Scribe's survey (section 4) recommends tonic for the control API on maturity grounds (crates.io data). **mTLS is mandatory on every inter-node connection.** Both ends present certificates and the node identity comes from the certificate. Certificate issuance and rotation belong to section 7 (Forge). QUIC 0-RTT MUST be disabled for state-changing messages, because RFC 9000 states that 0-RTT data has no replay protection.
 
 ### 6.6 Service discovery and membership
 
@@ -104,7 +107,7 @@ Unbounded queues are banned on the data path.
 - **Actor layer, compared briefly:**
   - **ractor**: Erlang gen_server style. Supervision trees, priority channels (signals, stop and supervision ahead of regular messages), process groups for broadcast and dispatch, and an optional cluster feature.
   - **kameo**: Tokio-based. Supervision, bounded or unbounded mailboxes, a console for watching mailbox backpressure. Its distributed mode runs on libp2p.
-  - **actix**: mature, but tied to its own actor system and runtime conventions. It is less aligned with a Tokio-first, custom-transport design.
+  - **actix**: tied to its own actor system and runtime conventions. Scribe's prior-art survey (section 4) also records no crate release since 0.13.5 (2024-06-09), per crates.io data, and recommends skipping it.
 - **Proposal**: build agents as ractor-style supervised actors on tokio, with our own QUIC transport rather than an actor framework's built-in clustering, because we need to control mTLS, flow control and the routing table. The choice between ractor and kameo is a PoC spike. The decision criteria are idle memory per actor, the mailbox API and supervision ergonomics.
 
 ### 6.9 Failure and partition handling
@@ -114,13 +117,54 @@ Unbounded queues are banned on the data path.
 - **At-least-once with idempotency keys (Solos Engine intent pattern).** Before any side effect (provider call, tool call, outbound message), the agent writes an *intent* record with a stable `intentId` to its durable intent log: `{intentId, agentId, incarnation, fencingToken, kind, payloadHash, state: pending}`. Only then does it perform the effect, passing `intentId` as the idempotency key, and afterwards it marks the intent `done` with the result reference. On restart or reschedule, the Starting phase replays `pending` intents. Receivers deduplicate by `intentId`. The result is at-least-once delivery with effectively-once effects wherever the receiver honours the key.
 - **Partitions.** A minority-side control-plane replica can't commit, so no new placements happen there. Nodes cut off from the quorum keep Running agents only until their lease safety margin runs out, then Pause them. When the partition heals, stale incarnations are fenced out by token.
 
-### 6.10 Observability
+### 6.10 Message board and task delegation across machines
+
+This subsection covers the mechanics of the Goal, Need, Task, Board and Capability objects defined in section 5. Authorization policy for them (Capability semantics, budget caps, the delegation depth limit, signing keys) belongs to section 7. Section 6 only says where the objects live, how they move between nodes and how they fail.
+
+**Prior art.** The Board follows the blackboard architecture: specialist knowledge sources watch a shared repository of problems and partial solutions, and a control shell orders their activity. In solos-swarm the scheduler and the Task lifecycle play the control-shell role. The storage and consumption model is borrowed from logs. Kafka keeps consumer position as a per-consumer offset, so consumers rather than the broker track progress. NATS JetStream pull consumers fetch in bounded batches (`batch`, `expires`) and cap unacknowledged messages with `MaxAckPending`. Raft provides the replicated, totally ordered log underneath.
+
+**Where the Board lives.** The Board is an append-only log partitioned by Goal. We considered two options.
+1. *Authoritative ordering per partition.* Each Goal partition is a replicated log with a single order. For the PoC this means entries in the control-plane Raft store (6.4), keyed by `goal/<goalId>/board/<seq>`. If Board write volume outgrows the shared group, the partition moves to its own Raft group. That move is a later option, not a PoC requirement.
+2. *Local fan-out only.* Posts are pushed peer-to-peer over QUIC streams with no global order. This has lower latency but no single order, no durable replay and an ambiguous outcome under partition.
+
+**Proposal**: option 1 is the source of truth. Delivery to subscribers is a fan-out over QUIC streams from the node that holds the partition leader (or a follower that has caught up). So writes are ordered and durable, and reads are pushed, not polled through the leader.
+
+**Read and subscribe semantics.** A subscriber, whether an agent or a node-local cache, holds a cursor: `(goalId, lastSeq)`, in the style of a Kafka offset. On subscribe or reconnect, it resumes from its cursor, and a node replays from its local follower state when it can. Delivery is at-least-once. Every Board entry carries a stable `entryId` (the idempotency key), and consumers drop duplicates by `entryId`. A subscriber commits its cursor only after it has processed the entry, which may mean writing an intent (6.9). Cursors are stored per subscriber, so a restarted agent continues where it left off. Reads are served from a node-local replica, so they can be stale by the replication lag, which the publish-to-visible metric (6.12) measures. Writes and Task claims always go through the partition leader.
+
+**Board posts are untrusted data.** Each post is signed by the posting agent's identity (key management is in section 7). Before a node appends a post or fans it out, the runtime checks the signature and drops anything unsigned or invalid. A post never grants a Capability, a budget or authority, whatever it says. Agents treat post contents as input, not instructions to the runtime.
+
+**Delegation as a durable Task record.** A Task (section 5) is stored in the control-plane store with these fields: `taskId`; `intentId` (created by the delegator before the delegation side effect, per 6.9); `delegator` (agent id and incarnation); `delegatee` (empty until claimed); `goalRef` and `needRef`; `requiredCapabilities`; `capabilitySubset` (the child's Capabilities, which MUST be a subset of the delegator's); `budgetSubHold` (a sub-hold carved from the parent's spend-ledger hold, so child spend counts against the parent's hold, section 7); `depth` (the parent's depth + 1); `lease` and `fencingToken` (set at claim); `state` (Open, Claimed, Running, Done, Failed, Expired); and the result reference.
+
+- The ceiling comes from Goal registration. Registering a Goal sets the maximum Capability set and budget for everything under it, and no Task can exceed it (section 7 owns the values).
+- Delegation depth is capped. The runtime rejects a Task whose `depth` exceeds the limit set in section 7.
+- Cross-node checks: before a delegation is routed to another node, the sending node's runtime checks (a) the delegator's post or request signature, (b) that `capabilitySubset` is a subset of the delegator's current Capabilities and within the Goal ceiling, (c) that the budget sub-hold was granted by the ledger, and (d) the depth limit. The receiving node repeats (a) to (d) before it accepts, so nodes don't have to trust each other's checks.
+- Claiming a Task is a compare-and-swap on the Task record (Open → Claimed). It grants a lease and a fencing token. The claimant presents the token on every side effect done for the Task, and stale tokens are rejected (6.9).
+- Creating, claiming and completing a Task are all keyed by `intentId` and `taskId`, so a retry after a crash can't create a duplicate.
+
+**Capability matching feeds placement.** `requiredCapabilities` on an Open Task becomes a filter-phase input (6.2). Only nodes hosting an agent with the matching Capabilities, or nodes that can start such an agent within its Capability grant, pass the filter. Score plugins can then prefer nodes that already hold the Goal's Board partition replica, for locality. If no agent can claim the Task, the scheduler may place a new agent for it through the normal plan path, and that path includes the spend-ledger reserve.
+
+**Partition behaviour.** On the minority side of a control-plane partition, no new Board appends commit and no Task can be claimed, because both need the partition leader and a quorum. Agents already holding Task leases keep working only until their lease safety margin runs out (6.9), then Pause. When a lease expires, the Task goes back to Open (Expired, then re-Open) with a higher fencing token, and it is re-delegated on the majority side. When the partition heals, the old claimant's writes are fenced out. Its unfinished intents replay under the new token or are dropped as superseded.
+
+**Backpressure on the Board.**
+- Each Goal partition has a bounded append rate and a bounded queue at the leader. When either is full, appends return `Busy` and are never buffered without limit.
+- Fan-out uses the QUIC flow control and per-subscriber credit from 6.7. A slow subscriber falls behind on its cursor and catches up by replaying; it doesn't hold memory on the publisher.
+- Each subscriber has a cap on unacknowledged entries, in the style of `MaxAckPending`, and fetches in bounded batches.
+- Each Goal has a cap on Open Tasks, so a runaway delegator can't flood the Board. The cap value is section 7 policy.
+
+**Requirements**
+- R-BRD-1: The Board MUST be an append-only log per Goal with a single committed order.
+- R-BRD-2: Subscriptions MUST be cursor-based and at-least-once, with `entryId` deduplication.
+- R-BRD-3: Posts MUST be signature-verified before append or fan-out, and MUST NOT grant Capabilities.
+- R-BRD-4: A Task claim MUST be a CAS that returns a lease and a fencing token, and the minority side MUST NOT claim.
+- R-BRD-5: Cross-node delegation MUST verify the signature, Capability subset, budget sub-hold and depth on both sending and receiving nodes.
+
+### 6.11 Observability
 
 - Tracing through OpenTelemetry (`tracing` plus an OTLP exporter). One trace per task, with spans for scheduling, message hop (sender node, receiver node, queue wait), provider call and tool call. W3C trace context travels in every message header.
 - Metrics: scheduler latency histograms, queue depths, QUIC connection stats (RTT, loss and congestion window, from quinn), Raft metrics from openraft, lease renewals and misses.
 - Per-agent accounting: input and output tokens, model and provider, cost estimate and wall time, aggregated per agent, swarm and node, and enforced against budgets. Attribute names should follow the OpenTelemetry GenAI semantic conventions (now maintained in a separate repository) where they apply.
 
-### 6.11 Performance: what to measure and how (proposed targets to validate in PoC)
+### 6.12 Performance: what to measure and how (proposed targets to validate in PoC)
 
 All values below are **proposed targets to validate in PoC**, not claims. Section 9 references this table. Test bed: N = 3, 5 and 10 Linux nodes on one L2/L3 network. Record the hardware with each result. Agents use a mock provider with fixed latency so that LLM variance doesn't pollute the measurements.
 
@@ -135,9 +179,12 @@ All values below are **proposed targets to validate in PoC**, not claims. Sectio
 | Throughput per node | Saturating fan-in of 1 KiB messages. Record msgs/s at which p99 RTT doubles | ≥ 50k msgs/s per node |
 | Idle agent memory | RSS delta of `swarmd` spawning 1,000 idle agents, divided by 1,000 | ≤ 256 KiB per agent (excluding LLM context) |
 | Backpressure safety | One stalled receiver under 10x overload. Watch node RSS and other agents' RTT | Bounded RSS. Other agents' p99 within 2x baseline |
+| Board publish-to-visible, cross node | The publisher stamps a monotonic send time; a subscriber on another node records time to delivery. Nodes are clock-synced, or use a round trip through an echo agent and halve it. 10^4 posts, p50/p99 | p99 ≤ 50 ms on LAN |
+| Task claim latency | Time from Task Open being committed to a winning claim (CAS + lease) acknowledged, with 10 competing claimants on 3 nodes, p50/p99. Also check exactly one winner per Task | p99 ≤ 100 ms. 0 double claims |
+| Re-delegation after partition | Cut the claimant's node off. Time until the Task is claimed on the majority side | ≤ lease TTL + 5 s |
 | Duplicate side effects | Crash an agent mid-intent 1,000 times, then count duplicate effects at an idempotent mock receiver | 0 duplicates |
 
-### 6.12 PoC acceptance criteria (runtime and networking)
+### 6.13 PoC acceptance criteria (runtime and networking)
 
 1. A 500-agent swarm spec deploys across ≥ 3 nodes using gang reservation and PACK/SPREAD strategies, and reaches Running.
 2. All inter-node traffic (data plane and Raft) runs over QUIC with mutual TLS. A plaintext or unauthenticated peer is rejected.
@@ -145,9 +192,10 @@ All values below are **proposed targets to validate in PoC**, not claims. Sectio
 4. The fencing test passes: a paused, then resumed, stale node can't commit a side effect.
 5. Every data-plane queue is bounded, and the backpressure test passes.
 6. Traces show end-to-end spans across nodes. Per-agent token and cost totals are reported.
-7. A reproducible benchmark harness reports every metric in 6.11, with results recorded against the proposed targets (pass, fail or revise).
+7. Board and delegation: across ≥ 3 nodes, an agent posts to a Goal Board and delegates a Task that an agent on another node claims and completes. Unsigned posts and over-privileged or over-depth delegations are rejected on both nodes. A partition test shows that no claim happens on the minority side and that re-delegation works.
+8. A reproducible benchmark harness reports every metric in 6.12, with results recorded against the proposed targets (pass, fail or revise).
 
-### 6.13 Sources (fetched)
+### 6.14 Sources (fetched)
 
 - https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/
 - https://developer.hashicorp.com/nomad/docs/concepts/scheduling/how-scheduling-works
@@ -162,6 +210,11 @@ All values below are **proposed targets to validate in PoC**, not claims. Sectio
 - https://docs.rs/kameo/latest/kameo/
 - https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html
 - https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/ (page says the GenAI conventions moved to a separate repo)
+- https://kafka.apache.org/41/design/design/ (Consumer Position section)
+- https://docs.nats.io/nats-concepts/jetstream/consumers
+- https://raft.github.io/ (links to the Raft paper, Ongaro & Ousterhout; I didn't fetch the paper PDF itself)
+- https://en.wikipedia.org/wiki/Blackboard_system
+- /workspace/solos-swarm-prior-art.md (Scribe, section 4: actix and tonic status from crates.io)
 
 
 ## 7. Security and trust
@@ -592,7 +645,7 @@ Design precedent (internal, not an external source): Solos Engine, for the job b
 TODO (Scribe)
 
 ## 9. Requirements, functional and non-functional (with perf targets)
-TODO (Scribe). Perf targets: see section 6.11.
+TODO (Scribe). Perf targets: see section 6.12.
 
 ## 10. PoC scope and acceptance criteria
 TODO (Scribe)
