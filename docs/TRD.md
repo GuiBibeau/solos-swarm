@@ -292,8 +292,8 @@ All values below are **proposed targets to validate in PoC**, not claims. Sectio
 | Finding write-to-queryable, cross node | Stamp a monotonic time when the write commits; a query on another node records when the Finding is returned. Clock-synced nodes, or halve a round trip through an echo. 10^4 writes, p99 | p99 ≤ 100 ms on LAN |
 | Lineage and taint walk | Backward: walk the lineage DAG from a Finding to depth 10, following cited Findings and input hashes, on a local replica. 10^3 walks, p99. Forward: retract one source with 10,000 descendant Findings and time until every descendant is flagged and every dependent Need and pending C2/C3 action is reopened. 10^2 retractions, p99 | Depth-10 walk p99 ≤ 20 ms. Forward flag-and-reopen of 10k descendants p99 ≤ 2 s |
 | Fan-out burst, 300 Tasks | One Goal spawns 300 Tasks. Time until every Task is either placed or refused by admission control against the section 7 ceiling. Record queue depth during the burst | Admitted or refused ≤ 5 s on 5 nodes. Queue depth stays within the admission bound |
-| History assembly, 10k attempts | A Goal has 10,000 scored attempts. Time from the planner request until its context is assembled, including the token budget and the marking filter. 10^3 assemblies, p99 | p99 ≤ 200 ms |
-| History compaction, 10k attempts | Compact a 10,000-attempt history that exceeds the per-Goal token budget: top K and the most recent N kept in full, the rest collapsed to one-line summaries, retracted and flagged attempts kept as markers. 10^3 runs, p99 | p99 ≤ 100 ms |
+| History assembly, 10k Attempts | A Goal has 10,000 scored Attempts. Time from the planner request until its context is assembled, including the token budget and the marking filter. 10^3 assemblies, p99 | p99 ≤ 200 ms |
+| History compaction, 10k Attempts | Compact a 10,000-Attempt history that exceeds the per-Goal token budget: top K (default 20) and the new candidates from the loop (default 8) kept in full, the rest collapsed to one-line summaries, retracted and flagged Attempts kept as markers. 10^3 runs, p99 | p99 ≤ 100 ms |
 
 ### 6.13 PoC acceptance criteria (runtime and networking)
 
@@ -307,7 +307,7 @@ All values below are **proposed targets to validate in PoC**, not claims. Sectio
 8. A reproducible benchmark harness reports every metric in 6.12, with results recorded against the proposed targets (pass, fail or revise).
 9. An agent attempting a direct connection to another agent or a non-allowlisted destination is refused and logged. The attempt is blocked or detected within 10 s (SEC-F-37, SEC-F-38, SEC-NF-20).
 10. A Finding with agent-supplied provenance is rejected. A derived Finding inherits its sources' marking and lowest trust (6.14).
-11. A retracted attempt appears as a "do not repeat" marker in the next planner context and is never silently dropped (6.15).
+11. A retracted Attempt appears as a "do not repeat" marker in the next planner context and is never silently dropped (6.15).
 
 ### 6.14 Findings store
 
@@ -332,17 +332,22 @@ A Goal can spawn sub-Goals and Needs, and those can fan out into Tasks. The sche
 
 ### 6.15 Attempt history per Goal
 
-Each Goal keeps an append-only scored attempt history, built from its Tasks and Findings. The loop is the optimization-by-prompting style in section 4, where the planner sees prior attempts with their scores. Section 4 cites the source. Scores are written and signed by the Goal's evaluator, never by the agent (section 7).
+Each Goal keeps an append-only scored history of Attempts (section 5), built from its Tasks and Findings. The loop is the optimization-by-prompting style in section 4, where the planner sees prior Attempts with their scores. Scores are written and signed by the Goal's evaluator, never by the agent (section 7).
 
-Every planning loop receives the full history, inside a per-Goal context budget measured in tokens. When the history is over that budget, compaction keeps the top K attempts by score in full, keeps the most recent N in full, and collapses the rest to one-line summaries (approach, score, why it failed). K and N are per-Goal settings. Retracted or flagged attempts are never dropped. They stay in the context as short "do not repeat" markers.
+The defaults come from section 4 (OPRO, arXiv 2309.03409): K=20 top-scored Attempts, and 8 new candidate Attempts per loop. Both are configurable per Goal.
 
-The planner sees only entries whose markings its read Capability covers, the same clearance as Finding reads (6.14). The history is stored in the Findings store and shares its lineage index, so a retraction that flags descendant Findings flags the attempts built from them too.
+Every planning loop receives the full history, inside a per-Goal context budget measured in tokens. When the history is over that budget, compaction keeps the top K Attempts by score in full, keeps the new candidates from that loop in full, and collapses the rest to one-line summaries (approach, score, why it failed). Retracted or flagged Attempts are never dropped. They stay in the context as short "do not repeat" markers.
+
+The planner sees only entries whose markings its read Capability covers, the same clearance as Finding reads (6.14). The history is stored in the Findings store and shares its lineage index, so a retraction that flags descendant Findings flags the Attempts built from them too.
+
+The evaluator runs as a separate identity on a node pool that proposers cannot be scheduled on. Its code, test set and held-out cases are never placed in a proposer's sandbox, and they are not routable to one. A proposer receives only the signed score (section 7).
 
 **Requirements**
-- R-HIST-1: Each Goal MUST keep an append-only scored attempt history built from its Tasks and Findings. Scores MUST be written and signed by the Goal's evaluator, never by the agent (section 7).
-- R-HIST-2: Every planning loop MUST receive the full history within the per-Goal token budget. Over budget, compaction MUST keep the top K by score in full, the most recent N in full, and collapse the rest to one-line summaries (approach, score, why it failed). Retracted or flagged attempts MUST NOT be dropped. They MUST remain as short "do not repeat" markers.
+- R-HIST-1: Each Goal MUST keep an append-only scored Attempt history built from its Tasks and Findings. Scores MUST be written and signed by the Goal's evaluator, never by the agent (section 7).
+- R-HIST-2: Every planning loop MUST receive the full history within the per-Goal token budget. Over budget, compaction MUST keep the top K Attempts by score in full, keep the new candidates from that loop in full, and collapse the rest to one-line summaries (approach, score, why it failed). The defaults MUST be K=20 and 8 new candidate Attempts per loop, both configurable per Goal, taken from section 4 (OPRO, arXiv 2309.03409). Retracted or flagged Attempts MUST NOT be dropped. They MUST remain as short "do not repeat" markers.
 - R-HIST-3: The planner MUST see only history entries covered by its read Capability's markings.
-- R-HIST-4: Attempt history MUST be stored in the Findings store and MUST share its lineage, so a retraction flags attempts as well as descendant Findings.
+- R-HIST-4: Attempt history MUST be stored in the Findings store and MUST share its lineage, so a retraction flags Attempts as well as descendant Findings.
+- R-HIST-5: The evaluator MUST run as a separate identity on a node pool proposers cannot be scheduled on. Its code, test set and held-out cases MUST NOT be placed in, or routable to, a proposer's sandbox. A proposer MUST receive only the signed score (section 7).
 
 ### 6.16 Sources (fetched)
 
