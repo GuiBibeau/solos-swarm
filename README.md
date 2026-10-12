@@ -1,2 +1,57 @@
 # solos-swarm
-Rust orchestrator for large AI agent swarms across multi-machine Linux clusters
+
+Rust broker and scheduler for a swarm of Pi agents. The first preview runs ten real agents on the approved `remote-ai` Linux host, using DeepSeek through a broker that holds the API key. Workers claim ten synthetic reconciliation Tasks, post progress to the Board, submit Findings, and synthesize one artifact. An independent checker requires a useful result and a successful live inference from every agent.
+
+This implements the requested first ten-agent passing grade. It is a single-host preview of the [TRD](docs/TRD.md), with the three-node, 500-agent acceptance and the remaining security and distributed contracts deferred.
+
+## Run the first preview
+
+Local requirements: Python 3.11+, Git, OpenSSH, an existing host-key-verified `remote-ai` SSH alias, and a `deepseek` API-key entry in `~/.pi/agent/auth.json`. The host needs Rust/Cargo, Python 3, bubblewrap with unprivileged user namespaces, a working user systemd manager with lingering enabled, and the existing pinned Node install at `~/.local/opt/node-v24.18.0-linux-x64`. These commands change only solos-swarm-owned directories and units.
+
+```sh
+python3 scripts/remote.py deploy
+```
+
+Copy the returned `candidate_id` into the start command. Deployment copies source, runs `cargo build --release --locked` and `npm ci --ignore-scripts`, and freezes the binary, pinned Pi 1.1.0 dependencies, Node 24.18.0, source revision, and file digests in `candidate.json`. Repeating deployment of the same source returns the same artifact. Run startup verifies its manifest and performs no build or dependency download.
+
+```sh
+python3 scripts/remote.py start --candidate CANDIDATE_ID --run-id poc-20261012-01 --seed 20261012
+python3 scripts/remote.py status --run-id poc-20261012-01
+python3 scripts/remote.py collect --run-id poc-20261012-01 --output work/evidence/poc-20261012-01
+```
+
+The case and seed are frozen before inference. The Goal caps all ten agents at a total of $1, eight calls each, 2,048 output tokens per call, and ten minutes. Provider calls and spending pass through the broker. The API key travels over SSH stdin, is written to a private one-use file outside the run and candidate, and is removed when the broker reads it or when the service stops. It is absent from the worker environment, public config, and evidence. The default auth path can be changed with `--auth-file PATH`.
+
+Start returns immediately. A detached `systemd --user` service survives an SSH disconnect. `RuntimeMaxSec`, the runtime deadline, `KillMode=control-group`, and bubblewrap's parent-death handling bound the run when the controller is unavailable. Repeating `start` with the same run ID and candidate/seed returns the existing run; changing its identity is refused. Failed runs are retained and never silently rerolled.
+
+Collect after the service stops. Read `summary.md` and `report.json` in the retrieved evidence. A passing report requires successful runtime execution, the ten-agent Goal, exact candidate/case digests, and confirmed worker cleanup. `controller-status.json` also records systemd state and `cleanup_confirmed`. Missing or altered evidence, nine idle agents, a failed artifact, or unknown cleanup cannot qualify. Only the exact artifacts that passed are qualified, for this single-host preview.
+
+## Stop and inspect
+
+```sh
+python3 scripts/remote.py cancel --run-id poc-20261012-01
+python3 scripts/remote.py status --run-id poc-20261012-01
+```
+
+Cancellation stops only `solos-swarm-poc-20261012-01.service`. Host cleanup removes the one-use credential, runs the independent checker, and preserves evidence. Run artifacts remain at `~/.local/state/solos-swarm/runs/RUN_ID`; protected scorer expectations remain separately under `~/.local/state/solos-swarm/evaluators/RUN_ID`; immutable candidates live under `~/.local/share/solos-swarm/CANDIDATE_ID`. Retention is manual for this preview.
+
+Lifecycle probes use the same candidate and isolated Pi workers but make no paid model requests. They are explicitly marked non-live and cannot pass the live checker. Use distinct IDs while keeping the same seed; the first command demonstrates host-side deadline expiry, and the second pair demonstrates cancellation.
+
+```sh
+python3 scripts/remote.py start --candidate CANDIDATE_ID --run-id deadline-probe-01 --seed 20261012 --idle-probe --deadline-seconds 10
+python3 scripts/remote.py start --candidate CANDIDATE_ID --run-id cancel-probe-01 --seed 20261012 --idle-probe --deadline-seconds 120
+python3 scripts/remote.py cancel --run-id cancel-probe-01
+```
+
+## Local checks
+
+```sh
+cargo test --locked
+python3 -m unittest discover -s tests -p 'test_*.py'
+npm ci --ignore-scripts --no-audit --no-fund
+npm run test:broker
+```
+
+The Python checks exercise scoring failures, altered or missing evidence, candidate integrity, and idempotent remote identity without live inference. The Pi extension checks run a real RPC subprocess against a fixture Unix-socket broker.
+
+The preview does not establish Raft/QUIC or HA behavior, 500-agent scaling, a local provider or air-gapped bootstrap, a signed audit witness, Firecracker/Tier P acceptance, three catalog families, or the complete TRD verification scenario catalog. Candidate construction currently occurs on the approved Linux build host before its immutable run artifact is frozen; the fully relocatable offline bundle contract remains deferred. See [TRD acceptance](docs/TRD.md#10-poc-scope-and-acceptance-criteria) and [QA backlog](docs/QA-BACKLOG.md).

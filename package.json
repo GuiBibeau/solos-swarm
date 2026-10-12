@@ -1,0 +1,12 @@
+{
+  "name": "solos-swarm-pi-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.19.0" },
+  "scripts": { "test:broker": "node --test tests/broker.test.ts" },
+  "dependencies": {
+    "@earendil-works/pi-ai": "1.1.0",
+    "@earendil-works/pi-coding-agent": "1.1.0"
+  }
+}
