@@ -20,6 +20,8 @@ The first deliverable is a proof of concept (§10).
 
 **Agents.** Untrusted workers under a Goal. They do not register Goals and they do not hold provider keys (§7).
 
+**Maintainers and coding agents.** They build a release candidate, run the small live gate, prepare test states and read the evidence. They use short commands, on a local machine or on a remote Linux host. The QA tooling gives them no Goal authority (§6.16–§6.19, SEC-F-48).
+
 **Example Goals.** The initial prompt sets the Goal. These are examples, not a fixed scope.
 
 1. **Testing.** One Goal covers a large test effort. Agents take Tasks for parts of it. Discussion stays on the Board. Durable results are Findings. Spend stays inside the ceiling set at registration.
@@ -40,6 +42,8 @@ The first deliverable is a proof of concept (§10).
 - Make Need, Task, and Board first-class, so coordination is recorded. Policy actors read the Board (§5).
 - Keep delegation narrowing-only for budget (§7). An agent's capabilities are its definition (§5).
 - Ship a PoC that meets the criteria in §6 and §7.
+- Qualify every runtime release with a live small-swarm run before promotion. Keep that gate separate from PoC acceptance (§6.19).
+- Make verification repeatable. Scenarios, prepared states and evidence run with short commands, locally or on a remote Linux host (§6.16–§6.18).
 
 **Non-goals**
 
@@ -51,6 +55,8 @@ The first deliverable is a proof of concept (§10).
 - Formal accreditation (Q1, §12).
 - A machine-checked proof of module composability. The PoC requires reversible lifecycle cleanup (§5). The proof is later work.
 - Offline Capability tokens. The PoC uses centrally compiled grants from operator-controlled agent definitions, with online revocation (§5, §7). Offline checking is a later deployment choice (Q10).
+- A QA fleet manager, a hosted observability service or a required Kubernetes deployment for release qualification (§6.18).
+- The full 500-agent acceptance suite as a gate for every incremental release (§6.19). The acceptance obligation itself stays (§10).
 
 ## 4. Prior art (what we borrow, what we drop)
 
@@ -112,6 +118,19 @@ Table 1 reports GSM8K accuracy of 71.8% for the step-by-step baseline and 80.2% 
 [Palantir's Ontology](https://palantir.com/docs/foundry/ontology/overview/) is a typed model of an organization's world: objects, properties, and links, and the actions that change them. [Why create an Ontology?](https://palantir.com/docs/foundry/ontology/why-ontology/) says humans and agents share that model. Both query it, reason on it, and act through it. [AIP](https://palantir.com/docs/foundry/aip/overview/) runs LLM workflows and agents on the same Ontology.
 
 We borrow the capacity, not the product. The capacity is a shared, typed model of the problem's world that both people and the swarm act on, so one Goal can be a hard problem in any domain. Foundry, AIP, and the applications built on them are not this system.
+
+### 4.8 Verification and QA tooling
+
+The documentation below was retrieved on 2026-10-12 (§13). It supports the tooling choices in §§6.16–6.19. It does not show that any of these integrations exists in solos-swarm.
+
+- **pstack.** Its `/poteto-mode` routes engineering work through playbooks. Its `/create-verification-skill` produces repository-specific launch, doctor, drive, evidence and cleanup instructions, plus a feature map. A maintenance skill checks that map against source and live behavior. We borrow the workflow and run it around native commands. The skill is documentation and orchestration. It is not the runtime verifier.
+- **cargo xtask.** A pattern for project-local automation written in Rust. We use it for builds and test-bundle preparation. Operator-facing checks stay in the existing CLI.
+- **Nextest archives.** Nextest archives compiled tests and runs the archive elsewhere. It supports path remapping and explicit extra files. We build on the correct Linux target and verify that the archive relocates. An archive alone does not guarantee that every fixture or library is present.
+- **OpenSSH and Ansible.** OpenSSH supplies host-key verification and noninteractive connection controls. Ansible normally uses native OpenSSH and host inventories. We start with a thin OpenSSH adapter and an approved inventory. We reuse existing Ansible provisioning if it exists, and we build no second provisioner.
+- **systemd and Ansible async.** systemd supervises services and bounds their runtime. Ansible can start a command asynchronously and check it later. Starting a background command is not evidence that it completed.
+- **Inspect.** It separates datasets, execution and scoring, and it supports external-agent integrations. We keep framework-neutral run and score exports now. We evaluate an external adapter later. We add no Python dependency to the Rust runtime.
+
+**We drop** a required Kubernetes deployment, a hosted observability service and a new fleet-management control plane for QA (§3).
 
 ## 5. Architecture overview
 
@@ -276,6 +295,7 @@ Unbounded queues are banned on the data path.
 - **Leases.** Each allocation (agent on node) holds a TTL lease in the control-plane store, renewed by the node. If renewal fails, the node MUST stop side effects for that agent before the lease could expire, measured with a monotonic clock and a safety margin. Expiry moves the agent to Lost and triggers rescheduling.
 - **Fencing tokens and admission.** Every lease grant returns a strictly increasing token (the store revision). Every side-effecting request carries its allocation token and, for Task work, its Task token. At the trusted broker or executor, admission MUST validate the current authoritative holder, incarnation, token, unexpired lease and kill-switch state, atomically with accepting the intent for dispatch. An expired, revoked or superseded token is rejected even when it is the first token that executor has seen. Admission fails closed when authoritative state cannot be checked. Queued intents MUST be revalidated before dispatch. Shared-resource writes also reject tokens lower than their durable highest accepted token. An external provider need not implement fencing; the broker is its mandatory admission boundary. Lease loss prevents new admission and invalidates queued dispatch, but does not undo an external request already dispatched; its outcome remains tracked and funded until reconciled. This follows Kleppmann's argument that leases alone are unsafe under process pauses and network delay.
 - **Recoverable intents (Solos Engine intent pattern).** Before any side effect (provider call, tool call, outbound message), the trusted runtime commits an *intent* to the quorum-replicated store: `{intentId, goalId, taskId, agentId, incarnation, allocationToken, taskToken, kind, payloadHash, payloadRef, state: pending}`. The complete request or its durable content-addressed payload MUST be accessible from another node before dispatch; a hash or a worker-local file alone is insufficient. Results, provider request IDs and settlement references are persisted there too. The broker records `dispatched` before contacting the receiver and `done` after durably recording the result. A replacement incarnation adopts the same logical `intentId` and payload, with current authorization; it MUST NOT turn recovery into a fresh effect ID. Deduplication of a runtime-owned effect MUST atomically cover the effect and its stored result, not just recording that a key was seen.
+- **Verification evidence.** The committed intent record is the one source of execution truth. Verification reads it and attaches references to it. It keeps no parallel copy. The evidence for an action links to its `intentId`, Task, agent incarnation, allocation and Task fencing tokens, the applicable policy decision and a result reference (§6.16). An intent with no recorded outcome has no `PASS`.
 - **Retry and unknown outcomes.** Automatic replay is allowed only when the receiver's adapter has a documented idempotency guarantee covering the retry interval, the effect is inherently idempotent, or reconciliation proves the earlier request was not applied. The same idempotency key is reused. A timeout or crash after dispatch to a receiver without that guarantee leaves the intent `unknown`; the runtime MUST NOT blindly replay it or release its spend hold. It pauses dependent work and reconciles using the provider/tool's status or billing records, or recorded operator resolution. SDK, proxy and failover retries obey the same rule. At-least-once delivery with effectively-once effects is a guarantee only for receivers satisfying this contract, not for arbitrary provider and tool APIs.
 - **Partitions.** A minority-side control-plane replica can't commit, so no new placements happen there. Nodes cut off from the quorum keep Running agents only until their lease safety margin runs out, then Pause them. When the partition heals, stale incarnations are fenced out by token.
 
@@ -328,9 +348,18 @@ This subsection covers the mechanics of the Goal, Need, Task, Board and Capabili
 
 Policy actors read these signals, the audit log (§7), and the Board (§6.10). That is the watch path in §5. A flag or a kill is itself an audit event.
 
+**Correlation and evidence.** Every record that describes one action carries the same stable identifiers: `deploymentId`, `runId`, `goalId`, `taskId`, `intentId`, agent identity and incarnation, node, and execution attempt. The one-trace-per-Task rule and the W3C trace context above stay. High-cardinality identifiers live in records and traces. Aggregate metrics use bounded dimensions only. Required evidence (intents, settlements, audit entries, Finding provenance) is written whether or not diagnostic sampling is on.
+
+Read-only diagnostic queries report the recorded reason for a state: waiting for an allocation that matches a Capability, exhausted budget, an unavailable provider, a lease safety pause, or a missing dependency. A query returns the authoritative state revision with its answer. The runtime also records queue depth and wait, placement delay, lease misses, provider failures, settled spend, participation and cleanup progress. A reason that was not recorded is reported as unknown. It is not guessed from log text.
+
+**Requirements**
+- R-OBS-1: Every record that describes one action MUST carry the correlation identifiers above. Required evidence MUST NOT depend on trace or metric sampling.
+- R-OBS-2: A diagnostic query (`explain`) MUST be read-only. It MUST return the recorded reason with the authoritative state revision, and it MUST report an unrecorded reason as unknown.
+- R-OBS-3: Missing required evidence MUST be reported as missing (R-VER-2). It MUST NOT be reported as success.
+
 ### 6.12 Performance: what to measure and how (proposed targets to validate in PoC)
 
-All values below are **proposed targets to validate in PoC**, not claims. Section 9 references this table. Test bed: N = 3, 5 and 10 Linux nodes on one L2/L3 network. Record the hardware, Pi version, sandbox mode, process/VM count, context size and workload with each result. The 500-agent acceptance run uses real Pi processes or binaries with a mock provider of fixed latency, so model variance is removed without replacing the agent runtime with empty Rust actors. Report transport-only measurements separately from governed Board/Task operations, whose signature checks, Raft commits, intent admission and ledger work are included. Measure lease renewal and kill-switch latency while saturating Board appends. A target revision requires the measured result, bottleneck and an operator-approved replacement target; a failed target is not silently a pass.
+All values below are **proposed targets to validate in PoC**, not claims. Section 9 references this table. Test bed: N = 3, 5 and 10 Linux nodes on one L2/L3 network. Record the hardware, Pi version, sandbox mode, process/VM count, context size and workload with each result. The 500-agent acceptance run uses real Pi processes or binaries with a mock provider of fixed latency, so model variance is removed without replacing the agent runtime with empty Rust actors. Report transport-only measurements separately from governed Board/Task operations, whose signature checks, Raft commits, intent admission and ledger work are included. Measure lease renewal and kill-switch latency while saturating Board appends. A target revision requires the measured result, bottleneck and an operator-approved replacement target; a failed target is not silently a pass. The live small-swarm release run (§6.19) uses real inference and varies from run to run. It does not replace this table.
 
 | Metric | How to measure | Proposed target |
 |---|---|---|
@@ -370,6 +399,8 @@ All values below are **proposed targets to validate in PoC**, not claims. Sectio
 11. A retracted Attempt remains in the archive and exclusion index, is represented by a marker or bounded marker summary in the next planner context, and cannot be readmitted as the same candidate (6.15). Test oversized top-scoring bodies, too many individual markers, an oversized fixed rubric with empty history and a switch to a smaller model. Fixed contract overflow fails before spending without silently dropping its security posture or acceptance predicates.
 12. A non-idempotent mock applies an effect and loses its response. Crash and replace the agent and broker: there is no automatic replay, the intent becomes `unknown`, its hold stays counted, and an explicit reconciliation resolves it exactly once.
 13. Restart the Raft leader and restore a snapshot: revisions and fencing tokens do not go backwards, leases and holds survive, atomic gang placement leaves no partial allocations, and a watch cursor older than retained history receives a snapshot-resync response.
+
+**Scenarios and declared coverage.** Each criterion above is tied to one or more versioned scenarios (R-QA-1, §6.17). The acceptance report lists, per criterion, the scenario, its declared coverage and its result. A criterion with no executable scenario is reported as not covered. The small release gate (§6.19) satisfies none of these criteria. It does not lower an agent count or replace a pass condition.
 
 ### 6.14 Findings store
 
@@ -413,7 +444,150 @@ The evaluator runs as a separate identity on a node pool that proposers cannot b
 - R-HIST-4: Attempt history MUST be stored in the Findings store and MUST share its lineage, so a retraction flags Attempts as well as descendant Findings.
 - R-HIST-5: The evaluator MUST run as a separate identity on a node pool proposers cannot be scheduled on. Its code, test set and held-out cases MUST NOT be placed in, or routable to, a proposer's sandbox. A proposer MUST receive only the signed score (section 7).
 
-### 6.16 Sources (fetched)
+**Run records and later evaluation.** Every run keeps enough to reconstruct what was attempted, which configuration ran, what it cost, which artifacts it produced and which independent scorer judged them. The result schema separates validity, correctness, evidence quality and operational limits. Runtime correctness and Goal quality are different dimensions. A run can be correct and give a poor answer, or the reverse. The proposed minimum fields are `run_id`, `goal_case_id`, `dataset_version`, `fixture_digest`, `runtime_digest`, `agent_config_digest`, `model_config`, `scorer_id` and version, `artifact_refs`, `score_dimensions`, `termination_reason`, `usage`, and the evaluator signature and provenance. Unscored and inconclusive results are first-class records.
+
+Broad evaluation campaigns come later. The signed Attempt scoring in this subsection does not. A later campaign uses fixed regression cases for comparability and held-out cases for generalization. The random release Goal (§6.19) is a smoke signal, not a benchmark. A comparison of ten agents with one agent uses matched total budgets and the same case and model settings. The comparison of history-fed planning with single-draft refinement is §10 criterion 19. Ten cooperating agents in one run are not ten independent samples. A campaign therefore repeats independent Goal trials, fixes the comparison, the stopping rule, the treatment of failed runs and the regression thresholds in advance, and keeps every trial. It records unsafe successful effects apart from denied unauthorized requests. An evaluator treats submitted artifacts as untrusted data and never takes grading instructions from them.
+
+An external evaluation framework such as Inspect can drive the existing QA and Goal interface and score retained artifacts. This is optional, and it comes after the native result schema works. A model-call proxy or agent bridge MUST NOT bypass the broker, price accounting, the allowlist or the scorer separation. Bridged runs count as release evidence only after behavioral equivalence is shown. Exports and independent scoring are not optional.
+
+**Requirements (evaluation records)**
+- R-EVAL-1: Run records MUST support independently versioned datasets, Goal templates, agent configuration, models, scorers, outcome artifacts and scores. Runtime correctness and Goal quality MUST stay distinct dimensions.
+- R-EVAL-2: Evaluation MUST preserve R-HIST-5 and SEC-F-45. A proposer MUST NOT gain access to the evaluator identity, code, held-out cases or score authority. A reporting framework MUST NOT bypass the broker, the ledger or Capability checks.
+
+### 6.16 Verification contracts
+
+Verification checks that an action did what its contract says. It uses the evidence the runtime already keeps: the intent log (§6.9), the ledger (§7.6), the audit log (§7.9) and the Findings store (§6.14). It adds no second source of execution truth. The QA runner, the scenario catalog and the release gate sit outside the kernel (§6.17–§6.19). Testing stays an example Goal, not domain logic in the core (§3).
+
+**Action contract.** Every supported operator-facing or agent-facing action has a contract: its invocation surface, preconditions, observable postconditions, prohibited effects and verification method. An action whose effect cannot be verified states that boundary. The contracts form the action map. The repository holds the map and updates it when behavior changes. A coding agent runs its instructions end to end before it hands them to another agent.
+
+**Three layers.** Diagnostic telemetry (§6.11), authoritative execution and accounting records (§6.9, §7.6, §7.9), and verification or evaluation results are separate. A trace helps diagnosis. It does not replace a durable settlement or an independent observation of an effect. A valid audit proof shows properties of the log. It does not show that the answer to a Goal is correct.
+
+**Result.** A check ends in `PASS`, `FAIL` or `INCONCLUSIVE`, with reason codes and evidence references. A completed wrong answer is `FAIL`. These are never `PASS`: missing required evidence, a skipped required check, a missing verifier, an empty selection of required checks and an unavailable observation path. A missing external receipt is `INCONCLUSIVE`, not success. The proposed CLI exit status is 0 for `PASS`, 1 for a verified `FAIL` and 2 for `INCONCLUSIVE` or blocked. Machine output goes to stdout and progress to stderr.
+
+**Read-only inspection.** Verifying an existing action reads its records and never replays its side effects. Authorization, accounting, audit integrity and the observed outcome each have their own verdict and evidence. A good audit proof therefore cannot hide a missing receipt.
+
+**Requirements**
+- R-VER-1: Every supported operator-facing or agent-facing action MUST identify its invocation surface, preconditions, observable postconditions, prohibited effects and verification method. Otherwise it MUST state an unsupported verification boundary.
+- R-VER-2: A check MUST produce a machine-readable `PASS`, `FAIL` or `INCONCLUSIVE`, with reason codes and evidence references. Missing required evidence, a skipped required check or a missing verifier MUST NOT produce `PASS`. A report MUST NOT claim `PASS` for an empty selection.
+- R-VER-3: Verification of an existing action MUST NOT replay its side effects. Authorization, accounting, audit integrity and observed outcome MUST be separately inspectable.
+
+### 6.17 Scenarios and test-state preparation
+
+A scenario is data plus a small Rust implementation. It declares its fixture version, inputs, setup, readiness checks, action, assertions, time and resource limits, and cleanup ownership. It also carries its requirement IDs, risk tags, supported topology, provider mode, expected outcome and independent observation method. It exercises the production surface for the behavior it claims to verify. The PoC starts with a data structure and a handful of implementations. It does not design a general-purpose scenario language.
+
+**State recipes.** A recipe names an initial state, how the runtime reaches it and how its readiness is verified. The first set is `task-open`, `task-claimed`, `budget-nearly-exhausted`, `budget-paused`, `finding-with-descendants` and `module-dependency-provided`. Ordinary states are prepared through the real registration, delegation, broker and operator APIs. Readiness comes from authoritative readbacks and revision barriers, not from sleeps. A setup failure stops the scenario before its assertions run.
+
+**Test-state boundaries.** A state that cannot be reached safely through ordinary operations uses an offline fixture or a separate fault harness. Direct storage mutation and invalid-state injection are isolated and labeled. They are excluded from evidence that the real setup path worked. A corruption test does not show that the normal API created the corrupted state. No production endpoint sets arbitrary state (SEC-F-48).
+
+**Fixture provider.** A fixture provider gives deterministic accounting, timeout and retry scenarios. It sits behind the real Provider and broker boundary (R-PRV-7). It replaces neither authorization, nor the ledger, nor the live inference that §6.19 requires.
+
+**First scenario coverage.** Goal registration, with a refused over-ceiling case (§10 criterion 16). Task delegation, with a competing-claim case (R-BRD-4). Provider reservation and settlement, with a denied-call check on the receiver (SEC-F-15, §10 criterion 17). Pause and stop behavior (SEC-F-18). Module unload (R-MOD-2) and Finding retraction (SEC-F-44) when those features are implemented or changed.
+
+**Profiles.** Five profiles select scenarios.
+
+| Profile | When | Coverage |
+|---|---|---|
+| `quick` | Development and ordinary pull requests | Relevant unit and property tests, selected CLI and API scenarios, and a small deterministic control set. No mandatory live model spend. |
+| `release-small` | Every runtime release candidate | The exact candidate on a declared Linux target. The required targeted checks. Ten live agents on the recorded random Goal. Outcome, evidence and cleanup verification (§6.19). |
+| `integration` | Scheduled CI, manual investigation and relevant changes | Cross-host cases, restart and partition behavior, broader provider and isolation coverage, and longer scenario combinations. |
+| `acceptance` | PoC milestones, and before a claim of the matching guarantee | The large runtime and security suites and the benchmark conditions in §6.12, §6.13 and §7.19, including the 500-agent runs. |
+| `eval` | Later evaluation campaigns | Repeated fixed and held-out Goals, quality and cost comparisons, ablations and independent scoring (§6.15). |
+
+**Selection.** Selection uses the changed components plus the maintained dependency and action map. A change to shared authorization, the ledger, transport, a storage schema, a provider, a build feature, a prompt or the release harness requires its relevant regression checks. Unknown impact broadens the selection or blocks it. It never means "run nothing". Tests that are critical to the small gate stay mandatory whatever the diff. A provider adapter change also gets a real compatibility check for that adapter.
+
+**Interface (illustrative and proposed; not implemented).** The commands below show the intended experience. Names follow the existing CLI where one exists. The agent count and the required checks of a qualifying run live in the protected release profile, not in flags. A custom five-agent run is valid QA, but it is not a qualifying `release-small` run.
+
+```
+swarmctl qa doctor --target lab --json
+swarmctl qa prepare task-open --target lab --seed 42 --ttl 15m --json
+swarmctl qa scenario run claim-race --fixture <fixture-id> --target lab --json
+swarmctl verify intent <intent-id> --json     # reads; never executes again
+swarmctl explain task <task-id> --json
+```
+
+**Requirements**
+- R-QA-1: A scenario MUST declare its fixture version, inputs, setup, readiness checks, action, assertions, time and resource limits, and cleanup ownership. It MUST exercise the production surface for the behavior it claims to verify.
+- R-QA-2: State preparation for an end-to-end check MUST use supported, authorized interfaces. Direct storage mutation and invalid-state injection MUST be isolated and labeled, and MUST be excluded from evidence that the real setup path worked.
+- R-QA-3: Unknown change impact MUST broaden the selection or block it. It MUST NOT select nothing.
+
+### 6.18 Remote execution of QA runs
+
+**Transport.** An execution-target boundary starts with two implementations: `local` and `ssh`. A transport stages a bundle, starts a named job, reports its status, retrieves its evidence, and cancels or cleans up that job. It does not reimplement the scheduler. The same runner and scenario definitions run locally and remotely. SSH provisions and starts the runtime. The runtime's Swarm spec and scheduler start the agents; ten SSH processes are not ten agents. An existing remote CI agent, Ansible installation or management service can implement the boundary. The first delivery needs no second backend.
+
+**Bundle.** The runner builds once and stages the exact candidate. The bundle holds the runtime and CLI binaries, the QA executable, scenario definitions, public input fixtures, a separately protected evaluator payload or reference, schemas, version metadata and the launch assets. Compiled Rust test archives are optional. The manifest records the source revision, build target and features, artifact digests, dynamic-library requirements, scenario and catalog versions, the verifier version and the expected configuration. Source-relative files are resolved explicitly. The target does not run `git pull` and does not rebuild. A test-only build with different security behavior cannot certify a production binary. All offline dependencies arrive through the approved import path, and the target never fetches "latest" (§7.12).
+
+**Lifecycle.** A run persists one state of `Planned -> Staged -> Prepared -> Running -> Draining -> Collected -> Cleaned`. Failure and cancellation are recorded apart from the cleanup state. The client chooses a stable run ID. A retried start after a lost response returns the existing run and starts no second billable Goal. Status and artifact retrieval work after a reconnect. A dropped operator terminal neither erases the run nor gives it an unbounded lifetime.
+
+**Bounded lifetime.** A host-side supervisor and an expiry cover the QA job and every run-owned worker service. Stopping only the controller while agents stay active is not enough. Run-scoped stop actions, broker and Goal expiry, service deadlines and later orphan discovery reinforce each other. systemd or an existing equivalent is the supervisor, and the failure behavior is tested, not assumed from a background shell. systemd's `RuntimeMaxSec` has no effect on `Type=oneshot` services, so the service type and the start and stop limits are chosen with that in mind. A reboot or a restart policy MUST NOT reset the overall deadline or restart paid work.
+
+**Safeguards.** The runner uses an approved host inventory and verified host keys. It fails without prompting when a credential is missing, never sets `StrictHostKeyChecking=no`, and keeps SSH agent forwarding off unless a separately justified workflow needs it. Operator identities are scoped to the privileges that host setup needs. Each run has its own run directory, ports, cluster identity and cleanup owner. One Goal per deployment still holds (§5, Q14). Runs share a deployment only in series, or they get separate deployments. A `run_id` label alone does not isolate shared state. Agents get no shared writable filesystem for the harness's sake (SEC-F-37). Provider credentials stay in the broker (§7.5) and never appear in a Goal, a transcript or a bundle. The target is a dedicated disposable environment. Destructive fault injection does not default to production. A network partition stays inside the fixture and never cuts the only management path.
+
+**Lost hosts.** A lost host or an unconfirmed cleanup leaves the run nonqualifying. The runner keeps the evidence it already collected, reconciles the remote state when the host returns, and reports the exact unresolved resources. A missing process response is not proof that the process stopped.
+
+**Requirements**
+- R-RUN-1: The harness MUST stage and execute a versioned runtime and test bundle on approved Linux infrastructure, with remote status, cancellation, artifact retrieval and safe cleanup.
+- R-RUN-2: Every run MUST have a stable run ID, isolated resources, an expiry, enforced spend and work limits, and a host-side termination mechanism that does not depend on the initiating SSH connection staying alive.
+- R-RUN-3: The bundle manifest MUST record the digests and versions listed above. A mismatched artifact or a missing fixture MUST stop the run before any live spend. The target MUST NOT download or rebuild.
+- R-RUN-4: A repeated start with the same run ID MUST return the existing run. Run-owned services MUST stop at the expiry while the controller is unavailable. Cleanup MUST affect only owned state and MUST preserve evidence. An unconfirmed cleanup MUST be reported and MUST block qualification.
+
+### 6.19 Release qualification (live small-swarm gate)
+
+**Owner requirements (decided).** These come from the owner's follow-up requirements, as recorded in the verification handoff of 2026-10-12.
+
+1. Every released version gets a small-swarm test first.
+2. The initial count is ten real, LLM-driven agents under one Goal. They are not ten mocked workers and not ten independent Goals.
+3. The Goal varies between releases.
+4. The test suite deploys and runs remotely, through SSH or an equivalent operator-controlled mechanism.
+5. Developers and coding agents get short commands to exercise the CLI and the application, prepare useful states and inspect results.
+6. The full suite does not run on every iteration. More systematic evaluations come later.
+
+Everything else in §§6.16–6.19 is proposed. It is subject to Q27–Q30 and to PoC measurements.
+
+**Qualification is not acceptance.** Qualification decides whether one runtime candidate can be promoted. Acceptance (§6.13, §7.19, §10) decides whether the PoC guarantees hold. The small gate leaves the 500-agent, three-node obligations in place. It does not replace them. The policy applies to versioned runtime releases, including previews. Engineering commits and unpromoted build artifacts can exist while the gate is built, and they are never labeled as having passed it. An exception needs an explicit owner decision. A missing CI job or an automatic skip is not an exception.
+
+**First deliverable.** One command stages an immutable candidate and its QA assets on approved Linux infrastructure and prepares an isolated deployment. It launches ten agents, runs a selected Goal, checks the observed result, retrieves the evidence and stops the resources of the run. A release needs both a small deterministic set of safety and contract checks and the live swarm run. A successful compile is not enough. Ten agents that reached `Running` are not enough.
+
+**Execution contract.** The run uses the exact candidate binaries through the normal operator and agent paths. It registers one Goal with a capped Swarm spec and real provider routing. The ten-agent count includes any coordinator agent. The trusted QA controller and the independent evaluator do not count. All ten agents acquire valid allocations and take part in the Goal. For the initial catalog, taking part means a successful, non-replayed model inference and an attributable, useful Task result or broker-recorded contribution. Heartbeats, self-reported "done" messages and ten copies of an idle loop do not count. The run keeps evidence that the running lifetimes of the agents overlapped. Provider concurrency can stay below ten to control cost. The Goal needs synthesis across contributions. It is not ten unrelated requests in one run. A small independent checker verifies the final artifact. The checker does not demand an exact message sequence, a wording or an incidental Task order from an LLM.
+
+**Gate dimensions.**
+
+| Dimension | Initial pass condition |
+|---|---|
+| Candidate and environment | The runtime and QA digests match the manifest. The required host features, trust, provider, policy and fixtures are available. |
+| Participation and coordination | Ten distinct agents contribute under one Goal. Task and Board activity and the expected synthesis are observable. Where several worker hosts are declared, a cross-host Task flow occurs. |
+| Outcome | The bounded Goal produces its required artifact. The artifact passes its independent, versioned smoke checker. A nonempty file is not enough. |
+| Runtime and control behavior | The required targeted authorization, accounting, idempotency and stop checks pass. No unexplained panic and no unauthorized successful effect occurs. |
+| Evidence and shutdown | The required records and artifacts are retained. Billable work is settled or explicitly reconciled. Run-owned resources are confirmed stopped. An unresolved billable hold or an unknown cleanup status blocks qualification. |
+
+Targeted stop and denial checks run in separate, short fixture phases, so they do not interrupt the Goal before its outcome is measured. Passing them at ten agents does not establish the p99 targets of the larger security tests (§7.18, for example SEC-NF-3 and SEC-NF-19).
+
+**Goal catalog.** The random Goal comes from a versioned catalog of bounded, operator-approved test Goals, with generated fixture parameters. The selection is recorded before execution. This gives variety without arbitrary production targets, unlimited research tasks or unscorable prompts. Catalog Goals use fixture data and the declared Provider only. They need no C2 or C3 action and no external target. Each has an objective checker. Scoring of open-ended Goals follows Q23. The catalog lives outside the kernel. It starts with three families.
+
+| Family | Example Goal | Independent outcome check |
+|---|---|---|
+| Record reconciliation | Reconcile ten generated data partitions and identify seeded inconsistencies in one consolidated report. | Compare the normalized findings with an evaluator-only expected set of inconsistencies. |
+| Dependency planning | Reconcile ten component inventories into a valid dependency and rollout plan under generated constraints. | Check completeness, dependency order and constraints. Claim no optimality unless it is established independently. |
+| Evidence synthesis | Investigate a fixed local document packet and produce a structured, cited answer to generated factual questions. | Validate the required answers, the source references and the cross-document consistency against held-out expectations. |
+
+Implementation starts with one family. The rotating release profile is ready only when all three exist. The family and its parameters come from a recorded seed and catalog digest. A failed Goal is never rerolled to obtain a green release. A seed reproduces the case selection and the fixture. It does not necessarily reproduce live model output or distributed scheduling. The run records the provider and model identifiers, the model revision or local weights digest when available, prompts, generation settings, and the request and response evidence that the deployment permits. A **live rerun** is distinct from a **recorded-response replay**. Only a live rerun satisfies the gate.
+
+**Limits and time.** The release limit policy sets total Goal spend, the per-call, per-tick and daily limits that apply, token and turn limits, the maximum active agents, the maximum Open Tasks and a hard expiry. A missing value is 0 and refuses the start. It never means unlimited (SEC-F-47 uses the same rule). Amounts and the accounting currency are approved and calibrated, not inferred (Q7, Q29). As a starting engineering target, a run allows about ten minutes of Goal execution and a twenty-minute overall deadline, excluding an initial model download. These are proposed calibration values, not measurements. Where offline operation is required, the local model is already staged.
+
+**Verdicts.** A run records `runtime_verdict`, `goal_verdict`, `evidence_verdict` and `cleanup_verdict`. The release aggregate passes only when all required dimensions pass. A completed wrong answer fails the Goal check. An unavailable observation path is inconclusive. Both block promotion. Every attempt is preserved. A policy-defined bounded retry is allowed only for a classified transient failure, on the same case, within a cumulative campaign budget.
+
+**Topology.** Ten agents do not mean ten machines. A single-host Linux profile and a multi-host profile run the same scenarios. The release manifest declares which topology it qualifies. A single-host run can qualify only an explicitly scoped single-host preview. It does not qualify distributed or HA behavior. A release that claims the cluster PoC needs the multi-node acceptance conditions: at least three Linux nodes and 500 agents (§6.13, §7.19, §10). For a distributed small-swarm release test, the proposal is three worker hosts with the ten agents spread 4/3/3. The evaluator node pool stays separate from proposers (R-HIST-5). It is not silently placed on a worker host to fit three hosts. Three local processes are not three independent host failure domains. The supported minimum topology is Q27.
+
+**Evidence.** Every run retains the manifest, a machine-readable and a human-readable report, an event log, state readbacks, usage and ledger records, the score, a trace export, audit proofs, public artifacts and a cleanup report. Hidden evaluator inputs are stored apart from the public artifacts that proposers can read. Evidence sensitivity, payload retention, secret redaction and access control follow deployment policy (§7.5, §7.9, Q8). A retention period is something to document. It is no reason to delete evidence at teardown. The manifest binds the runtime digest, the build revision, the actual topology and isolation, the model and provider settings, the policy and price-table revisions, the seed, the fixture and catalog digests, the verifier and scorer versions, the run attempts, the timestamps and the scope of coverage. An unavailable model revision is recorded as unknown. A release attestation references the hashes of the immutable report and artifacts. The protected verifier and release identity are not available to the swarm (SEC-F-48). A bundle checksum detects a change. It does not by itself establish who produced the file, so the audit witness requirement stays (§7.9).
+
+**Promotion.** The pipeline stages a candidate, runs the gate, then promotes the same immutable artifacts. It never publishes first and calls the smoke test a post-release check. A CLI flag, a missing credential, an unavailable host or an untrusted pull-request change to the gate cannot turn a failure into a success.
+
+**Requirements**
+- R-REL-1: Every version promoted as a runtime release MUST first pass a real-provider, single-Goal small-swarm run. The initial release profile MUST require ten distinct participating agents. It MUST NOT meet that count with idle identities, mocks or recorded responses.
+- R-REL-2: The catalog revision, selected Goal, fixture parameters and seed MUST be committed to the run record before execution. Qualification MUST bind to the exact release artifacts and declared configuration. A rebuild or a material change MUST invalidate the result.
+- R-REL-3: The release report MUST list the required checks, the checks run, the skipped and deferred checks, the topology, and the tested provider and isolation configuration. A small-swarm success MUST NOT be presented as full PoC, HA, security or performance acceptance.
+- R-REL-4: A release MUST be promoted only from the artifacts that passed. A stale report, an altered binary, a failed Goal, an unknown cleanup status, an unavailable host or provider, a missing credential or an altered gate MUST block promotion. Nothing MAY skip the gate silently. Only an explicit, recorded owner decision is an exception.
+
+### 6.20 Sources (fetched)
 
 - https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/
 - https://developer.hashicorp.com/nomad/docs/concepts/scheduling/how-scheduling-works
@@ -566,6 +740,7 @@ flowchart LR
 | Goal admitted from a prompt | A prompt proposes a third-party target engagement, spend above the policy threshold, or C3 authority without required approval/target permission | Deployment policy bounds the Goal posture; owned-project testing is permitted within its recorded scope; high-impact classes require two-person admission (SEC-F-39, Q20) |
 | Poisoned Finding used as authority | An untrusted Finding satisfies a Need, and a C2 or C3 action proceeds on that Finding alone | Broker-signed provenance; untrusted Findings do not unlock C2/C3; retraction flags descendants (SEC-F-42, SEC-F-43, SEC-F-44, §6.14) |
 | Evaluator gaming | A proposer reads the held-out cases and tunes attempts to the score | Separate evaluator identity; the proposer receives only the signed score (SEC-F-45, §6.15) |
+| QA harness as a bypass | A `--qa` flag, a state-setting endpoint or a harness identity that agents can reach lets a test run skip a control. A release result is reused as authority for another Goal | No QA bypass; test state through authorized interfaces; release identities unavailable to agents; evidence bound to artifacts and scope (SEC-F-48, SEC-NF-29, §6.19) |
 
 ### 7.3 Agent isolation and sandboxing
 
@@ -713,6 +888,7 @@ Each registered Goal declares:
 - **Fail-closed execute tier**: a Goal in the execute tier (any side-effecting action) MUST refuse to start without an explicit allowlist. A wildcard requires the literal `any` and still ranges only over the resource/target inventory authorized by the Goal posture and deployment policy; it cannot authorize unknown targets. An empty or missing allowlist means "nothing", never "everything".
 - **Goal registration is the moment of consent** for unattended work (§7.4.7). Its security posture authorizes targets, operations, isolation, recipient/data-release rules, and unattended Capability bounds within deployment policy. Widening any of them requires an amended registration. A company may register an autonomous red-team Goal against its own authorized project, including cloud assets; the core has no purpose-specific prohibition.
 - **Unattended action** (no human confirmation per action) needs: (a) sign-off by a human tenant admin or root, recorded in the audit log; and (b) a passed QA gate, either a funded run (real, capped spend) or a real QA run against the same allowlist, with its result linked to the registration.
+- **Release qualification is not a Goal's QA gate.** A passed release-qualification run (§6.19) qualifies one runtime candidate. It is not the linked QA result in (b) for any Goal, and it does not authorize an unrelated Goal, allowlist or target (SEC-F-48). The first bounded registration of a release-qualification Goal needs human sign-off through the normal path. No `--qa` flag or other bypass exists. Q28 asks how that first registration is authorized without needing its own prior QA result.
 - **Autonomous in-scope work**: a registered unattended C0–C2 Capability, including authorized live red-team actions, runs without another human or model-policy approval on every call. Its posture records permitted tainted-context handling; deterministic scope, isolation, budget, and evidence guards still apply. Third-party target engagements need recorded engagement authorization and the admission approvals in §7.11, after which the registered C0–C2 work is also autonomous. C3 is never preapproved by unattended mode.
 - **Tool-call confirmation tiers** (in line with OWASP LLM06 "Require user approval" and LLM01 "human approval for high-risk actions"):
   - C0 auto: read-only, no egress beyond allowlisted read sources, within caps.
@@ -727,6 +903,7 @@ Each registered Goal declares:
 - Witnessing: signed tree heads are copied to at least one store outside the control plane's write authority (a separate host or an operator-held store) so that a compromised control plane cannot present a forked history unseen. In air-gapped mode that witness has no internet path (SEC-F-40).
 - Content: entries carry hashes of large payloads (prompts, outputs), not the payloads, so that retention and redaction of data stay separate from audit integrity. Secrets are never logged.
 - A verifier tool (part of the CLI) checks signatures, inclusion and consistency.
+- Release evidence: a release attestation references the hashes of the immutable run report and artifacts (§6.19). The audit entries, tree heads and witness copies of a run follow the same rules as any other entry. A bundle checksum shows that a file changed. It does not by itself show who produced the file, so the witness requirement above is not relaxed.
 
 ### 7.10 Prompt injection and the untrusted-content boundary
 
@@ -757,6 +934,8 @@ The on-prem layout is §6.5. Local providers are §8. This subsection is the sec
 
 An air-gapped deployment uses only local model providers, with no external keys. PoC bootstrap must succeed with external egress denied from the start, using operator-supplied verified artifacts, models, dependencies, and local authentication/identity services. The automated offline upgrade lifecycle is deferred to v1; any PoC update is manually supplied and verified, never downloaded by the deployment. The audit witness (§7.9) sits on the deployment and has no internet path. Inclusion and consistency checks use that witness alone. Call-home means telemetry, a license check, or any other contact with a service outside the deployment. Call-home is off by default in every deployment (§6.5), including Pi install/update telemetry. Air-gapped mode keeps it off (SEC-F-40).
 
+Release qualification on an air-gapped target (§6.19) runs from an operator-supplied QA bundle. The bundle enters through the same verified-artifact path as the deployment, and the harness fetches nothing. The live smoke run uses the real local provider. Its model weights are already staged and their digest is recorded. The run needs no external provider, key or telemetry (R-REL-1, R-RUN-3).
+
 Rationale: a fetch, a remote witness, or a call home is an outbound path, and it can carry tenant data.
 
 ### 7.13 Tenant separation
@@ -784,6 +963,8 @@ Rationale: the producer must not certify its own Finding. An untrusted Finding m
 The loop is the optimization-by-prompting shape in §4.6. The history, compaction, and the evaluator node pool are §6.15.
 
 The trusted evaluator writes and signs a typed, finite, bounded score bound to the Attempt content hash and evaluator/test-set version. A proposer never holds that identity, including by delegation. Submitted candidate code runs as an untrusted tool in the required tier. Its isolated invocation may receive the current test input, but not the case corpus, expected answers, evaluator files, signing identity or control API. It has no egress and no raw logs/results returned to the proposer. Only the evaluator wrapper signs the measured result. The proposer receives the signed score without case data. A separate final held-out evaluation is not fed into search: repeated score feedback can overfit an optimization set even when its contents stay hidden (SEC-F-45).
+
+Run, dataset, scorer and configuration versions are recorded with each score (R-EVAL-1, §6.15). The release smoke Goal's checker and held-out expectations obey the same separation: a proposer never reads them (R-EVAL-2).
 
 Each entry keeps the markings of the Findings it comes from. A planner sees only the entries its read Capabilities allow (SEC-F-42). Retracted or flagged Attempts remain in the archive and exclusion index. The planner receives bounded individual or aggregate "do not repeat" markers with authorized references (§6.15, SEC-F-46).
 
@@ -846,6 +1027,7 @@ Rationale: §6.10 refers here for the value. 500 matches the PoC swarm size, so 
 - **SEC-F-45** Only the trusted evaluator MUST sign a typed finite bounded score bound to the Attempt hash and evaluator/test-set version. Proposers and candidate code MUST NOT hold its signing identity or control API, including by delegation. Candidate tools MAY receive only the current test invocation's input; the corpus, expected answers and evaluator files MUST remain inaccessible. Candidate execution MUST have no egress or raw results/logs returned to proposers. Proposers MUST receive only signed scores without case data. A separate final held-out evaluation MUST NOT feed search; score secrecy alone MUST NOT be claimed to prevent adaptive overfitting. The node pool is §6.15.
 - **SEC-F-46** An Attempt history entry MUST keep the markings of the Findings it is built from. A planner MUST see only entries its read Capabilities allow (SEC-F-42). A retracted or flagged Attempt MUST remain in the archive and exclusion index. Its planner representation MAY be a bounded aggregate marker with references; compaction MUST preserve exclusion checks independently of the prompt (§6.15).
 - **SEC-F-47** Each Goal MUST have a cap on Open Tasks, fixed at registration as part of the SEC-F-32 ceiling, and each tenant MUST have a cap on Open Tasks across its Goals. This cap is separate from the live-descendant cap in SEC-F-29. A missing cap MUST be treated as 0. The PoC default is 500 Open Tasks per Goal and 500 Open Tasks per tenant. Admission (§6.10) MUST refuse a Task that would exceed the Goal cap, the tenant cap, or the Goal's capability or budget ceiling (SEC-F-32). Rationale: §6.10 needs this value so one delegator cannot fill the Board with Open Tasks.
+- **SEC-F-48** The QA runner, release controller and release-verifier identities MUST NOT be available to agents. No QA mode MUST bypass registration policy, confirmation tiers, the ledger or the broker. QA state MUST be prepared through supported, authorized interfaces, and no production endpoint MUST set arbitrary state. A release-qualification result MUST bind to its candidate artifacts, configuration and declared scope (R-REL-2). It MUST NOT serve as the linked QA result of SEC-F-21 for any other Goal, allowlist or target. Provider credentials MUST stay in the broker and MUST NOT appear in a Goal, a transcript, a bundle or an artifact. Rationale: a harness that can bypass the controls it tests proves nothing about them, and a universal QA flag is a universal bypass.
 
 ### 7.18 Non-functional requirements (SEC-NF-n; referenced from section 9)
 
@@ -879,6 +1061,7 @@ Rationale: §6.10 refers here for the value. 500 matches the PoC swarm size, so 
 | SEC-NF-26 | Retraction reopens dependents without a dispatch race | 100% descendants flagged and dependent Needs/actions reopened; 0 deleted Findings or dependent new dispatches after retraction commit; walk meets §6.12 | Retract while a descendant walk is delayed and an approved C2/C3 dispatch is racing it. Use stale replicas and cached approvals; verify current evidence is rechecked, then inspect flags and remediation records |
 | SEC-NF-27 | Evaluator authority and final holdout stay isolated | 0 proposer access to cases; candidates see only their current invocation's input; 0 signing-authority access or forged/non-finite/mismatched scores; final holdout stays outside search | Run a candidate on its supplied input, then attempt corpus/expected-answer/harness reads, signing, egress and raw-log leakage. Test score replay across Attempt/versions; verify bounded signed output and separate final evaluation |
 | SEC-NF-28 | Open Task caps hold at admission | 0 Tasks admitted that would put the Goal or the tenant above its Open Task cap; 0 Tasks admitted outside the Goal capability or budget ceiling; a missing cap admits 0 | An adversarial delegator opens Tasks up to the cap plus one, and opens a Task outside the ceiling while still under the count. Repeat with the cap unset. Count Open Tasks and audit refusals |
+| SEC-NF-29 | Release qualification cannot be forged or borrowed | 0 qualification results accepted for an altered artifact, a stale configuration or another scope; 0 secrets in bundles, transcripts or artifacts; 0 agent access to the QA controller or verifier identity; no `PASS` from missing evidence | Alter one byte of the candidate after the run. Rebuild. Change a limit. Present a release result to enable unattended mode for an unrelated Goal. Scan bundles, transcripts and artifacts for planted canary keys. Try to read the verifier identity from an agent sandbox. Delete required evidence and rerun the verifier |
 
 ### 7.19 PoC security acceptance criteria (for lifting into section 10)
 
@@ -900,6 +1083,8 @@ The PoC passes the security gate when all of the following hold on a cluster of 
 14. SEC-NF-24, 25 and 26 pass: omitted citations and context compaction cannot launder trust/markings; an allowlisted but uncleared provider is denied; repeating an untrusted source is not corroboration. An exact registered unattended C2 evidence exception allows its target/operation/source scope without another human gate, but cannot admit an outside-scope action or C3. Retraction preserves F, flags descendants, reopens dependent Needs/actions, and prevents new dependent C2/C3 dispatch even while the descendant walk is delayed.
 15. SEC-NF-27 passes: a candidate can execute against its current supplied input, but cannot read the corpus, expected answers or evaluator files, acquire signing authority, leak inputs or forge scores. Only the bounded signed score reaches the proposer, and final held-out evaluation stays outside search. SEC-NF-22 also passes from offline bootstrap, not just an already running cluster.
 
+**Scenarios and declared coverage.** Each criterion above is tied to one or more versioned scenarios (R-QA-1, §6.17), and the acceptance report lists the scenario, its declared coverage and its result per criterion. A criterion with no executable scenario is reported as not covered. The release gate (§6.19) satisfies none of these criteria and does not lower their agent counts. SEC-NF-29 is checked under §10 criterion 23, so that this list keeps its numbering.
+
 ### 7.20 Risks
 
 - R1. **Shared-kernel risk in Tier P**: a kernel bug can let an agent loop escape. Mitigation: disable native Pi execution in the loop and broker it to Tier V/G; isolate the whole Pi process, pin extensions, and keep kernels patched. Residual shared-kernel risk remains.
@@ -916,6 +1101,7 @@ The PoC passes the security gate when all of the following hold on a cluster of 
 - R12. **Dual use through a Goal-policy bypass**: any prompt can name a Goal. A path that bypasses deployment policy can grant excess authority. Mitigation: authorized human registration, mandatory high-impact two-person approval, and exact-action C3 approval under SEC-F-39/22.
 - R13. **Evaluator gaming and adaptive overfitting**: isolation prevents direct case access and score forgery but does not prevent overfitting through repeated scores. Mitigation: SEC-F-45's isolated evaluator, versioned scores, and a separate final holdout; test-set quality remains deployment-specific.
 - R14. **Allowed destinations and cooperative actors**: allowed endpoints can still carry secrets or indirect messages. Mitigation: payload marking checks, operation/resource constraints, conservative lineage, and registered stop policy. The PoC tests named paths and does not prove absence of all covert channels.
+- R15. **QA harness privilege and fixture leakage**: a harness or release identity that agents can reach, or a bundle that carries evaluator inputs, turns a test into a bypass or lets a proposer read held-out cases. Mitigation: SEC-F-48, a separately protected evaluator payload (§6.18), R-HIST-5, and the SEC-NF-29 test.
 
 ### 7.21 Deployment decisions
 
@@ -968,6 +1154,8 @@ The result includes a normalized finish reason, tool calls or output, upstream r
 
 For the PoC, the operator chooses one pinned local vLLM-compatible model and one hosted model (Q15). The router uses the Goal's explicit backend preference; it does not automatically pick the cheapest or fastest provider. This keeps routing and billing reproducible while preserving the general Provider interface.
 
+**Release smoke.** The live small-swarm run (§6.19) uses a real `Provider` implementation behind the broker. Its report names the one it exercised. A fixture provider can stand behind the same Provider and broker boundary for deterministic accounting, timeout and retry scenarios (§6.17). It replaces neither authorization, nor the ledger, nor the live inference that R-REL-1 requires. A recorded-response replay does not satisfy the gate. A change to a provider adapter gets a real compatibility check for that adapter.
+
 **Cost.** The backend returns usage (token counts and enough data to price the call). The broker hands that usage to the ledger as the settle input against the shared reserve: the scheduler reserve phase in §6 and the cap ledger in §7.
 
 **Keys.** Hosted API keys live only in the broker. Local and air-gapped providers have no external key. The broker is still the caller, so the agent has no direct route to the model server, and that call is reserved and settled on the same path. Air-gapped mode (§6) uses the local provider, through the same egress proxy.
@@ -976,7 +1164,7 @@ For the PoC, the operator chooses one pinned local vLLM-compatible model and one
 
 "MUST" and "SHOULD" follow RFC 2119, as in §7.
 
-Runtime requirements are R-SCH-*, R-BRD-*, R-NET-1, R-FND-*, and R-HIST-* in §6. The control model is §5: deterministic trust-boundary guards and a thin inline effect layer, with policy actors observing and intervening. Authorization, the ledger, the Board's trust rules, delegation, and unsanctioned-coordination controls are SEC-F-1 through SEC-F-47 in §7. Board and Task across machines are §6. Placement envelopes and per-effect holds share the §7 ledger. The spend ceiling stays a backstop.
+Runtime requirements are R-SCH-*, R-BRD-*, R-NET-1, R-FND-*, R-HIST-*, R-OBS-*, R-VER-*, R-QA-*, R-RUN-*, R-REL-* and R-EVAL-* in §6. The control model is §5: deterministic trust-boundary guards and a thin inline effect layer, with policy actors observing and intervening. Authorization, the ledger, the Board's trust rules, delegation, and unsanctioned-coordination controls are SEC-F-1 through SEC-F-48 in §7. Board and Task across machines are §6. Placement envelopes and per-effect holds share the §7 ledger. The spend ceiling stays a backstop.
 
 Requirements added here:
 
@@ -988,6 +1176,7 @@ Requirements added here:
 - **R-PRV-4.** The router MUST send a call only to a provider and model on the Goal allowlist (§7).
 - **R-PRV-5.** The provider MUST report usage and dispatch outcome to the broker. The broker MUST settle once or retain an unknown-outcome hold for reconciliation (§6, §7). Missing usage MUST NOT cause release.
 - **R-PRV-6.** Provider adapters MUST implement the §8 request, feature, outcome and retry contract. Every Pi model path, including retries and nested calls, MUST use it through the broker.
+- **R-PRV-7.** A fixture provider MUST sit behind the real Provider and broker boundary. It MUST NOT satisfy R-REL-1, and it MUST NOT replace authorization or the ledger (§6.17).
 - **R-EVD-1.** Every Finding MUST carry broker-observed provenance (§6): producer, recorded context/tool inputs, immutable source references and markings. Agent-reported confidence MUST remain a claim distinct from evaluator acceptance.
 - **R-EVD-2.** Progress on a Goal MUST be measured as which Needs are satisfied, using the Findings that satisfy each Need.
 - **R-EVD-3.** The swarm MUST keep a human-readable record of how it reached its answer: the Needs of the Goal, and the Findings that satisfied them.
@@ -998,18 +1187,36 @@ R-EVD-1 through R-EVD-3 describe the first-class Finding object in §5. Need sat
 - **R-ATT-2.** Every planning loop MUST receive a bounded context selected from the durable Attempt history as specified in §6.15; the full archive MUST remain queryable within clearance.
 - **R-ATT-3.** History size and the truncation rule MUST be configurable per Goal. The defaults are §6.
 - **R-ATT-4.** The scorer MUST be a separate identity from the proposer (§6, §7).
+- **R-ATT-5.** Every scored run MUST also record its dataset, Goal template, agent configuration, model and scorer versions (R-EVAL-1, §6.15).
 
 **Non-functional.** Performance targets are the proposed targets in §6. Security targets are §7. This section adds no numeric targets.
+
+**Verification delivery map.** The requirement families R-OBS, R-VER, R-QA, R-RUN, R-REL and R-EVAL (§§6.11, 6.15–6.19), with SEC-F-48 and SEC-NF-29 (§7), are delivered through the stories below. The story text is `docs/QA-BACKLOG.md`. The story IDs are suggested backlog IDs, and estimates wait for the repository audit. The requirement IDs are provisional until checked against the repository.
+
+| Story | Priority | Requirements | First evidence |
+|---|---|---|---|
+| QA-00 Audit the repository and amend the TRD | P0 | All families (this amendment) | Revised TRD, change log, gap map |
+| QA-01 QA runner and result contract | P0 | R-VER-1 to R-VER-3, R-QA-1, R-EVAL-1 | §10 criterion 24 |
+| QA-02 Prepare and inspect reusable states | P0 | R-QA-2, R-QA-3, R-PRV-7, SEC-F-48 | `claim-race` and denied-provider-call scenarios |
+| QA-03 Immutable, relocatable QA bundle | P0 | R-RUN-3, R-REL-2 | Manifest check and relocation run |
+| QA-04 Run, reconnect and stop over SSH | P0 | R-RUN-1, R-RUN-2, R-RUN-4 | §10 criterion 23 (c), (d) |
+| QA-05 Live ten-agent Goal catalog | P0 | R-REL-1, R-REL-2, R-EVAL-2, R-PRV-7 | §10 criterion 23 (a) |
+| QA-06 Verify actions and explain state | P0 | R-VER-1 to R-VER-3, R-OBS-1 to R-OBS-3 | §10 criterion 24 |
+| QA-07 Candidate-before-release qualification | P0 | R-REL-3, R-REL-4, SEC-F-48, SEC-NF-29 | §10 criterion 23 (b) |
+| QA-08 Tested verification skill and feature map | P0, after the commands exist | R-VER-1 | End-to-end run of the skill's instructions |
+| QA-09 Fault and compatibility scenarios | P1 | R-RUN-*, §6.13 criteria 3, 4, 12 | Mid-intent crash and node-loss cases |
+| QA-10 Repeatable evaluation campaigns | P1 | R-EVAL-1, R-EVAL-2, R-ATT-5 | §10 criterion 19 |
+| QA-11 Remaining app surfaces | P1, or P0 when a new surface ships | R-VER-1, R-MOD-2, SEC-F-44 | Action-map extension |
 
 ## 10. PoC scope and acceptance criteria
 
 The PoC is the first deliverable. It runs one Goal on a multi-machine Linux cluster. Cluster size, agent count, and the pass/fail bars for runtime and security are the criteria in §6 and §7.
 
-**In scope.** One root Goal. Needs, Tasks, the Board, Capabilities, Findings and Attempts under that Goal. The runtime and networking behaviour in §6. The security gate in §7. Actual Pi integration and two Provider backends behind the broker (R-PRV-2), with usage settled in the ledger. One module that provides a service and withdraws it on unload (R-MOD-1, R-MOD-2). The §6 transport measurements use a mock provider; the real-agent and Provider integration checks are separate.
+**In scope.** One root Goal. Needs, Tasks, the Board, Capabilities, Findings and Attempts under that Goal. The runtime and networking behaviour in §6. The security gate in §7. Actual Pi integration and two Provider backends behind the broker (R-PRV-2), with usage settled in the ledger. One module that provides a service and withdraws it on unload (R-MOD-1, R-MOD-2). The §6 transport measurements use a mock provider; the real-agent and Provider integration checks are separate. Release qualification: a remote, live small-swarm gate on an exact candidate, with the verification, scenario and evidence contracts of §§6.16–6.19.
 
-**Out of scope for the PoC.** A second concurrent Goal (Q14). Model training. An agent-authoring SDK. Hostile multi-tenancy. Formal accreditation. A proof of module composability. Offline Capability tokens (Q10).
+**Out of scope for the PoC.** A second concurrent Goal (Q14). Model training. An agent-authoring SDK. Hostile multi-tenancy. Formal accreditation. A proof of module composability. Offline Capability tokens (Q10). Evaluation campaigns beyond criterion 19 and the one-agent comparison in §6.15. A QA fleet manager or a hosted observability service (§3).
 
-**Acceptance.** The PoC passes when the correctness and security criteria in §6 and §7 pass, plus the integration criteria below. Those lists keep their own numbers. Criteria 1 to 15 are the §7 list. Performance numbers are hypotheses: record hardware, software versions, agent/sandbox mix and results for each §6.12 target. A missed target is reported as a failure against that target; revising it requires an explicit TRD change with the result and rationale. A mock-only run does not establish Pi or real-provider integration.
+**Acceptance.** The PoC passes when the correctness and security criteria in §6 and §7 pass, plus the integration criteria below. Those lists keep their own numbers. Criteria 1 to 15 are the §7 list. Performance numbers are hypotheses: record hardware, software versions, agent/sandbox mix and results for each §6.12 target. A missed target is reported as a failure against that target; revising it requires an explicit TRD change with the result and rationale. A mock-only run does not establish Pi or real-provider integration. Release qualification (§6.19) is separate from this acceptance. A passing `release-small` run satisfies none of these criteria and does not lower any agent count (R-REL-3).
 
 Further criteria, numbered after 15 so they do not collide with §7:
 
@@ -1020,6 +1227,8 @@ Further criteria, numbered after 15 so they do not collide with §7:
 20. Bootstrap the local-provider deployment from a pinned offline bundle on three nodes with external egress blocked, including Pi, skills/extensions, model assets, identity bootstrap and an on-deployment audit witness. Run a complete Goal and the verifier without external OIDC, package registries, DNS or license services. Offline upgrade/rollback procedures are v1 work (Q21).
 21. A policy actor can flag an event and stop work within its admitted scope through the trusted actuator. Out-of-scope requests and release attempts are refused. Record decision false positives, missed violations and latency on a fixed labelled suite; deterministic boundary guards hold when the actor is unavailable or wrong.
 22. Register a company-owned test-project red-team Goal with recorded target authority, an admitted unattended C2 posture and explicit tainted-input handling. Agents can plan, delegate and run permitted checks across nodes without further per-call human or model-policy approval. The same request against an out-of-scope target is denied; destructive production work still needs exact-action C3 approval. The Goal's posture, not its example use-case name or a Board post, determines those outcomes.
+23. Release qualification, demonstrated on the exact candidate and run remotely: (a) ten distinct agents contribute under one Goal, and an independent checker passes the artifact; nine idle agents and one productive agent fail. (b) One deliberate failure, such as a wrong answer, an altered artifact or missing evidence, blocks qualification. (c) A lost SSH session reconnects, and a repeated start after a lost acknowledgement starts no second run. (d) Deadline expiry and cancellation stop every run-owned service while the controller is unavailable. (e) The evidence survives cleanup. The record includes the command, the environment and the actual report for each demonstration. SEC-NF-29 passes. This is a demonstration of the delivery model. It does not replace any criterion above.
+24. Verification contracts, on the first scenario set of §6.17: verifying an existing intent replays nothing. A wrong receipt, an omitted event and incomplete evidence are each detected, and none gives `PASS`. An empty selection cannot pass. A setup failure stops a scenario before its assertions. `explain` returns a recorded reason and a state revision.
 
 ## 11. Risks
 
@@ -1032,6 +1241,13 @@ Further criteria, numbered after 15 so they do not collide with §7:
 - **Dual use and misuse.** The Goal selects what the swarm does and its approved security posture. Admission records target authority and operational scope; deterministic guards enforce that posture, policy actors can stop violations, and the audit log records actions (§5, §7).
 - **Dual use through a Goal-policy bypass.** Any prompt can propose a Goal. Admission still requires deployment policy and mandatory two-person approval for high-impact classes (SEC-F-39). A prompt is not itself an authorization grant.
 - **Evaluator gaming.** A proposer that can read the evaluator code, the test set, or the held-out cases can raise the score without improving the attempt. Mitigation: SEC-F-45 in §7. The evaluator node pool is §6.15.
+- **Smoke result read as acceptance.** A ten-agent run on one host is easy to mistake for PoC, HA, security or performance acceptance. Mitigation: every release report lists the checks run, skipped and deferred, with the topology and the provider and isolation configuration (R-REL-3).
+- **Stochastic gate.** Live model output and distributed scheduling vary from run to run. A flaky gate invites rerolls until it is green. Mitigation: the case is frozen before inference (R-REL-2), every attempt is kept, and a retry is allowed only for a classified transient failure on the same case (§6.19).
+- **Fixture leakage.** Held-out expectations or the evaluator payload can reach a proposer through a bundle or a shared path. Mitigation: store them apart from public artifacts (§6.18), and apply R-HIST-5 and SEC-F-45 to QA Goals.
+- **Remote cleanup failure.** A lost controller or host can leave paid agents running. Mitigation: a host-side expiry that does not depend on SSH (R-RUN-2); an unconfirmed cleanup blocks qualification (R-RUN-4).
+- **QA authorization circularity.** The first bounded test registration needs sign-off before any QA result exists. Mitigation: Q28, and no QA bypass (SEC-F-48).
+- **Test build differs from release build.** A test-only build with different security behavior cannot certify a production binary. Mitigation: artifact binding and no rebuild between test and promotion (R-REL-2, R-REL-4).
+- **Agent isolation profile.** A lower-isolation test build cannot certify the stronger profile. The agent loop runs in Tier P (§6.1, §7.3.3). Mitigation: the release report names the isolation configuration that was tested (R-REL-3).
 
 ## 12. PoC defaults and remaining deployment decisions
 
@@ -1069,10 +1285,14 @@ Remaining deployment decisions:
 - **Q9.** Hostile tenants on shared nodes after the PoC; no such support is assumed.
 - **Q15.** The exact local/hosted model pair, pinned versions and shared upstream-account limits. Routing uses explicit preference (§8), not an implicit fallback.
 - **Q18, deployment part.** Authorized target ownership/engagement documents, acceptable-use policy and on-prem/air-gapped profile for the intended users.
+- **Q27.** Minimum supported topology for the distributed small-swarm gate: the Raft layout, and where the evaluator-only pool runs. Proposal: three worker hosts with agents spread 4/3/3, and a separate evaluator pool (R-HIST-5). A single-host profile qualifies only a scoped preview. Resolve it against the real hardware (Q2) during the repository audit. Contract: §6.19.
+- **Q28.** How the first bounded release-qualification registration is authorized without requiring its own prior QA result (SEC-F-21; related to Q5). Proposal: normal registration with human sign-off by a tenant admin or root. Catalog Goals use C0–C1 only, on fixture data, with no external target, so they need no QA gate. No universal QA flag exists (SEC-F-48). A release result is not automatic authorization for an unrelated production Goal or allowlist. Contract: §7.8, §6.19.
+- **Q29.** First QA environment and limits: host architecture and approved infrastructure, the brokered model and its availability, the accounting currency (Q7), the release limit values and retention (Q8). The starting calibration is about ten minutes of Goal execution and a twenty-minute run deadline, excluding model download. These are proposals, not measurements. No infrastructure purchase, external account or paid live run happens without authorization. Contract: §6.19.
+- **Q30.** Release scope: which versions count as runtime releases (including previews), how the owner records an exception, and who approves the catalog families and their checkers. Contract: §6.19, R-REL-4.
 
 ## 13. Sources
 
-Sources for §§1–5 and §§8–12 are listed below; sources specific to §§6–7 remain there. Critical research and harness references were checked on 2026-10-11. Versioned papers and commit links identify the reviewed evidence, not selected runtime dependency versions. Live documentation must be rechecked when implementing it. Retrieval verifies attribution; it does not reproduce research results or certify the implementation.
+Sources for §§1–5 and §§8–12 are listed below, with the verification and QA tooling sources that serve §4.8 and §§6.16–6.19. Other sources specific to §§6–7 remain there. Critical research and harness references were checked on 2026-10-11. Versioned papers and commit links identify the reviewed evidence, not selected runtime dependency versions. Live documentation must be rechecked when implementing it. Retrieval verifies attribution; it does not reproduce research results or certify the implementation.
 
 - https://github.com/agent-substrate/substrate
 - https://raw.githubusercontent.com/agent-substrate/substrate/b73ee7f91c84ffe0ec3f153ecb5f56e8f76fbc21/README.md — reviewed lifecycle and placement comparison.
@@ -1109,3 +1329,18 @@ Sources for §§1–5 and §§8–12 are listed below; sources specific to §§6
 - https://raw.githubusercontent.com/earendil-works/pi/89e5c2c075535e2f427c30fc74720d65b2944ff9/packages/coding-agent/docs/extensions.md — trusted executable extension and custom-provider registration.
 - https://pi.dev/
 - https://pi.dev/docs/latest/skills
+
+Verification and QA tooling (§4.8, §§6.16–6.19), retrieved on 2026-10-12. These pages move. Pin the commits, tool versions and dependency configuration when implementing. A spot check confirmed that each URL resolves and that the terms cited in §4.8 and §6.18 appear in the page. For systemd it confirmed the exact `RuntimeMaxSec=` and `Type=oneshot` statement. The other pages were matched by keyword and were not read in full.
+
+- https://raw.githubusercontent.com/cursor/plugins/1b6d44ff26d4e242f4e8f68c391e6d2f7ca16def/pstack/README.md — pstack workflows and verification-related skills (pinned to commit 1b6d44f).
+- https://raw.githubusercontent.com/cursor/plugins/1b6d44ff26d4e242f4e8f68c391e6d2f7ca16def/pstack/skills/create-verification-skill/SKILL.md — repository inspection, launch, doctor, drive, evidence, cleanup and the feature map.
+- https://raw.githubusercontent.com/cursor/plugins/1b6d44ff26d4e242f4e8f68c391e6d2f7ca16def/pstack/skills/maintain-verification-skill/SKILL.md — checking the verification map against the application.
+- https://github.com/matklad/cargo-xtask — project-local Rust automation pattern (reviewed at commit 1559f86).
+- https://nexte.st/docs/ci-features/archiving/ — compiled test archives, extra files and path remapping. The page is unversioned; the latest release at retrieval was cargo-nextest 0.9.148.
+- https://man.openbsd.org/ssh_config — host-key verification, noninteractive operation and forwarding controls.
+- https://docs.ansible.com/projects/ansible/latest/inventory_guide/connection_details.html — native OpenSSH and connection configuration.
+- https://raw.githubusercontent.com/systemd/systemd/f48efd110e265f78e8fd3646706ad0a83d1044f8/man/systemd.service.xml — supervised services, runtime and start/stop deadlines, restart behavior. `RuntimeMaxSec=` has no effect on `Type=oneshot` services. The rendered documentation endpoint was unavailable to the handoff's author; this is the official source (pinned to commit f48efd1).
+- https://docs.ansible.com/projects/ansible/latest/playbook_guide/playbooks_async.html — asynchronous actions, polling and job status.
+- https://inspect.aisi.org.uk/ — Inspect: evaluation composition and external-agent support.
+- https://inspect.aisi.org.uk/scorers.html — Inspect scorers and aggregate metrics.
+- https://inspect.aisi.org.uk/agent-bridge.html — Inspect Agent Bridge: an integration option, not an existing solos-swarm adapter.
