@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -196,6 +197,7 @@ def start_host(request):
                 raise ValueError("First preview requires ten agents, deadline <=1200s, and budget <=$1")
             credentials = STATE / "credentials"
             credentials.mkdir(parents=True, exist_ok=True, mode=0o700)
+            # shortcut: a host crash before service creation can retain this private file; use an in-memory handoff before production.
             fd, credential = tempfile.mkstemp(prefix=f"{run_id}-", dir=credentials)
             os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w") as handle:
@@ -218,6 +220,7 @@ def start_host(request):
                                "--property=Type=exec", "--property=Restart=no", "--property=KillMode=control-group",
                                f"--property=RuntimeMaxSec={deadline + 20}", "--property=TimeoutStopSec=15",
                                "--property=SendSIGKILL=yes", "--property=UMask=0077", "--property=NoNewPrivileges=yes",
+                               "--property=LimitCORE=0",
                                f"--property=WorkingDirectory={path}", f"--property=StandardOutput=append:{path / 'stdout.log'}",
                                f"--property=StandardError=append:{path / 'stderr.log'}", f"--property=ExecStopPost={finish}",
                                "--setenv=PATH=/usr/bin:/bin", "--", *command]
@@ -275,15 +278,21 @@ def host_main(action):
     else:
         request = json.load(sys.stdin)
         if action == "start":
+            # The manager handoff must finish even if SSH loses its client mid-start.
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
             result = start_host(request)
         elif action == "status":
             result = status_host(request["run_id"])
         elif action == "cancel":
-            status_host(request["run_id"])  # Refuse a unit without this controller's owned run record.
-            subprocess.run(["systemctl", "--user", "stop", unit_name(request["run_id"])], check=True)
-            result = status_host(request["run_id"])
-            if not result["service_stopped"]:
-                raise ValueError("Run-owned systemd service is not confirmed stopped")
+            run_id = request["run_id"]
+            run_path(run_id)
+            with lock(f"run-{run_id}"):
+                result = status_host(run_id)  # Require this controller's owned run record.
+                if not result["service_stopped"]:
+                    subprocess.run(["systemctl", "--user", "stop", unit_name(run_id)], check=True)
+                    result = status_host(run_id)
+                if not result["service_stopped"]:
+                    raise ValueError("Run-owned systemd service is not confirmed stopped")
         else:
             raise ValueError("Unknown remote operation")
     print(json.dumps(result))

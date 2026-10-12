@@ -2,7 +2,9 @@
 
 import hashlib
 import importlib.util
+import io
 import json
+from contextlib import contextmanager
 from pathlib import Path
 import tempfile
 import unittest
@@ -55,6 +57,49 @@ class RemoteTests(unittest.TestCase):
             auth.write_text(json.dumps({"deepseek": {"type": "oauth", "key": "test-secret"}}))
             with self.assertRaisesRegex(ValueError, "no DeepSeek api_key"):
                 remote.read_deepseek_key(auth)
+
+    def test_start_ignores_only_ssh_hangup_after_reading_complete_request(self):
+        request = {"run_id": "preview-42"}
+        stdin = io.StringIO(json.dumps(request))
+
+        def check_policy(signum, disposition):
+            self.assertEqual(stdin.tell(), len(stdin.getvalue()))
+            self.assertEqual((signum, disposition), (remote.signal.SIGHUP, remote.signal.SIG_IGN))
+
+        with patch.object(remote.sys, "stdin", stdin), patch.object(remote.sys, "stdout", io.StringIO()), \
+                patch.object(remote.signal, "signal", side_effect=check_policy) as signals, \
+                patch.object(remote, "start_host", return_value={"existing": False}) as start:
+            remote.host_main("start")
+            signals.assert_called_once_with(remote.signal.SIGHUP, remote.signal.SIG_IGN)
+            start.assert_called_once_with(request)
+
+    def test_cancel_already_stopped_run_returns_status_without_stop(self):
+        request = {"run_id": "preview-42"}
+        status = {"run_id": "preview-42", "service_stopped": True, "cleanup_confirmed": True}
+        stdout = io.StringIO()
+        locked = False
+
+        @contextmanager
+        def run_lock(name):
+            nonlocal locked
+            self.assertEqual(name, "run-preview-42")
+            locked = True
+            yield
+            locked = False
+
+        def current_status(run_id):
+            self.assertTrue(locked, "Cancellation must wait for a concurrent start's run lock")
+            return status
+
+        with patch.object(remote.sys, "stdin", io.StringIO(json.dumps(request))), \
+                patch.object(remote.sys, "stdout", stdout), \
+                patch.object(remote, "lock", side_effect=run_lock), \
+                patch.object(remote, "status_host", side_effect=current_status) as read_status, \
+                patch.object(remote.subprocess, "run") as stop:
+            remote.host_main("cancel")
+            stop.assert_not_called()
+            read_status.assert_called_once_with(request["run_id"])
+            self.assertEqual(json.loads(stdout.getvalue()), status)
 
 
 if __name__ == "__main__":

@@ -24,6 +24,8 @@ The case and seed are frozen before inference. The Goal caps all ten agents at a
 
 Start returns immediately. A detached `systemd --user` service survives an SSH disconnect. `RuntimeMaxSec`, the runtime deadline, `KillMode=control-group`, and bubblewrap's parent-death handling bound the run when the controller is unavailable. Repeating `start` with the same run ID and candidate/seed returns the existing run; changing its identity is refused. Failed runs are retained and never silently rerolled.
 
+After receiving a complete start request, the host controller ignores SSH hangup until the manager handoff finishes. A forced `SIGKILL` or host crash during that handoff can still leave a private credential file under `~/.local/state/solos-swarm/credentials/`; recovery requires the trusted operator to confirm the matching service is stopped and remove that run's file. This setup-crash recovery is outside the first passing grade.
+
 Collect after the service stops. Read `summary.md` and `report.json` in the retrieved evidence. A passing report requires successful runtime execution, the ten-agent Goal, exact candidate/case digests, and confirmed worker cleanup. `controller-status.json` also records systemd state and `cleanup_confirmed`. Missing or altered evidence, nine idle agents, a failed artifact, or unknown cleanup cannot qualify. Only the exact artifacts that passed are qualified, for this single-host preview.
 
 ## Stop and inspect
@@ -33,7 +35,7 @@ python3 scripts/remote.py cancel --run-id poc-20261012-01
 python3 scripts/remote.py status --run-id poc-20261012-01
 ```
 
-Cancellation stops only `solos-swarm-poc-20261012-01.service`. Host cleanup removes the one-use credential, runs the independent checker, and preserves evidence. Run artifacts remain at `~/.local/state/solos-swarm/runs/RUN_ID`; protected scorer expectations remain separately under `~/.local/state/solos-swarm/evaluators/RUN_ID`; immutable candidates live under `~/.local/share/solos-swarm/CANDIDATE_ID`. Retention is manual for this preview.
+Cancellation stops only `solos-swarm-poc-20261012-01.service`; repeating cancellation after it has stopped returns its recorded status. Host cleanup removes the one-use credential, runs the independent checker, and preserves evidence. Run artifacts remain at `~/.local/state/solos-swarm/runs/RUN_ID`; protected scorer expectations remain separately under `~/.local/state/solos-swarm/evaluators/RUN_ID`; immutable candidates live under `~/.local/share/solos-swarm/CANDIDATE_ID`. Retention is manual for this preview.
 
 Lifecycle probes use the same candidate and isolated Pi workers but make no paid model requests. They are explicitly marked non-live and cannot pass the live checker. Use distinct IDs while keeping the same seed; the first command demonstrates host-side deadline expiry, and the second pair demonstrates cancellation.
 
