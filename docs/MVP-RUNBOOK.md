@@ -195,6 +195,8 @@ Protected catalog generation is an operator/evaluator action. `mvp catalog` outp
 
 ## Observe, stop and resume
 
+Workers with an explicitly registered `ToolCall` for operation `task_status` on `task/GOAL_ID` can read bounded, paginated current Task metadata through the `task_status` tool. The response omits Task inputs and bodies, filters transitive clearance, and records its provenance. Coordinators can use it to wait for peer completion before submitting a final candidate. The new `task_status` input type needs an explicit approved taint exemption if the Goal permits unattended inference over that metadata.
+
 Authenticated `read_state` returns retained authoritative revision, domain revision, snapshot and signed head for privileged root viewers. Scoped viewers receive filtered state. Reads do not replay effects or advance the authoritative revision. Save the packet as a unit; a standalone JSON snapshot does not prove an authoritative readback revision.
 
 Use `engage_stop {scope,reason}` for a Goal, agent, tenant or global stop. New effects are blocked, worker quotas and owned child processes are cancelled, and pending accounting liabilities remain. Repeating the stop is idempotent. `release_stop {scope,approvals}` requires the exact current stop binding and two privileged humans. Resume preserves versions, immutable attempts, audit history and liabilities; expired Tasks or fenced incarnations do not become usable again.

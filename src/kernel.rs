@@ -714,6 +714,7 @@ impl Kernel {
             "invalid request identity"
         );
         let request_hash = content_hash(&(actor, request))?;
+        let _writer = self.cluster.kernel_write(control).await;
         for _ in 0..16 {
             let read = if control {
                 self.cluster.read_control(STATE_KEY).await?
@@ -1671,6 +1672,71 @@ impl Kernel {
             }
             let value = json!({"findings":findings,"next_id":findings.last().map(|f|&f.id),"revision":state.domain.revision});
             let effect = state.effects.get_mut(intent).unwrap(); effect.state = "done".into(); effect.result = Some(value.clone()); Ok(value)
+        }).await
+    }
+    #[allow(clippy::too_many_arguments)] // Bounded Goal metadata and current Task authority commit together.
+    pub(crate) async fn task_status(
+        &self,
+        id: &str,
+        subject: &AuthenticatedSubject,
+        intent: &str,
+        goal_id: &str,
+        after_id: Option<String>,
+        limit: usize,
+        leases: Vec<LeaseCheck>,
+    ) -> Result<Reply> {
+        check_allocation(subject, &leases)?;
+        self.commit(id, subject.id(), &(intent, goal_id, &after_id, limit), leases, |state| {
+            ensure!((1..=128).contains(&limit) && after_id.as_ref().is_none_or(|after| after.len() <= 200), "invalid Task-status page bounds");
+            let now = crate::cluster::now_ms() / 1000;
+            let effect = state.effects.get(intent).context("Task status lacks admitted intent")?.clone();
+            ensure!(!effect.permit.payload.billable && effect.state == "pending"
+                && effect.request.action.kind == security::CapabilityKind::ToolCall
+                && effect.request.action.operation == "task_status"
+                && effect.request.action.resource == format!("task/{goal_id}")
+                && effect.permit.payload.goal_id == goal_id, "Task-status Capability/scope mismatch");
+            ensure!(effect.payload == json!({"goal_id":goal_id,"after_id":after_id,"limit":limit}), "Task-status read differs from admitted payload");
+            check_task(state, subject, effect.task_context.as_ref(), false)?;
+            let clearance = state.security.grants[&effect.request.grant_id].capabilities.iter()
+                .find(|cap| cap.id == effect.request.capability_id).context("Task-status Capability absent")?.constraints.read_markings.clone();
+            let classification = state.security.policy.payload.classification.clone();
+            ensure!(clearance.contains(&classification), "Task metadata exceeds read clearance");
+            state.security.consume_permit(subject, &effect.permit, &mut state.ledger, now)?;
+            let version = state.domain.goal(goal_id)?.spec.version;
+            let mut rows = vec![];
+            let mut parents = BTreeSet::new();
+            let mut markings = BTreeSet::from([classification]);
+            for task in state.domain.tasks.values().filter(|task| task.goal_id == goal_id && task.goal_version == version
+                && after_id.as_ref().is_none_or(|after| task.spec.id > *after)) {
+                let mut roots = state.task_input_sources.get(&format!("{goal_id}/{}", task.spec.id)).cloned().unwrap_or_default();
+                if let Some(source) = task.result_ref.as_ref().and_then(|finding| state.finding_sources.get(finding)) {
+                    roots.insert(source.clone());
+                }
+                let Ok(mut labels) = lineage_markings(state, &roots) else { continue; };
+                if let Some(finding) = task.result_ref.as_ref().and_then(|id| state.domain.findings.get(id)) {
+                    labels.extend(finding.markings.iter().cloned());
+                }
+                if !labels.is_subset(&clearance) { continue; }
+                markings.extend(labels);
+                parents.extend(roots);
+                if let Some(source) = task.result_ref.as_ref().and_then(|finding| state.finding_sources.get(finding)) {
+                    parents.insert(source.clone());
+                }
+                rows.push(json!({"id":task.spec.id,"need_id":task.spec.need_id,"state":task.state,
+                    "claimed_by":task.claimed_by,"incarnation":task.incarnation,"fencing_token":task.fencing_token,
+                    "lease_expiry_ms":task.lease_expiry_ms,"result_ref":task.result_ref}));
+                if rows.len() == limit { break; }
+            }
+            let value = json!({"goal_id":goal_id,"goal_version":version,"next_id":rows.last().map(|row| &row["id"]),
+                "tasks":rows,"domain_revision":state.domain.revision});
+            let source = format!("task-status/{intent}");
+            observe(state, subject, source.clone(), "task_status", goal_id, &value, &self.signer, now)?;
+            let input = state.security.inputs.get_mut(&source).unwrap();
+            input.parents.extend(parents);
+            input.markings.extend(markings);
+            let stored = state.effects.get_mut(intent).unwrap();
+            stored.state = "done".into(); stored.result = Some(value.clone());
+            Ok(value)
         }).await
     }
     #[allow(clippy::too_many_arguments)] // Pagination and the current Task/allocation share the authorization transaction.

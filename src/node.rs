@@ -962,6 +962,57 @@ impl BrokerNode {
                     .await?
                     .require();
             }
+            "task_status" => {
+                let limit = args["limit"].as_u64().unwrap_or(128) as usize;
+                let after_id = args["after_id"].as_str().map(str::to_owned);
+                let payload = json!({"goal_id":goal_id,"after_id":after_id,"limit":limit});
+                let request = self
+                    .request(
+                        session,
+                        &intent,
+                        tool.kind,
+                        &tool.operation,
+                        &tool.resource,
+                        payload.clone(),
+                        tool.class,
+                        None,
+                        None,
+                    )
+                    .await?;
+                let admission = self
+                    .kernel
+                    .admit(
+                        &format!("admit-{}", message.request_id),
+                        &peer.subject,
+                        Admission {
+                            request,
+                            payload,
+                            prices: None,
+                            approvals: vec![],
+                            leases: Self::leases(session),
+                            quota: None,
+                            task: Self::task_context(session),
+                        },
+                    )
+                    .await?
+                    .require()?;
+                if admission["status"] == "confirmation_required" {
+                    return Ok(admission);
+                }
+                return self
+                    .kernel
+                    .task_status(
+                        &format!("apply-{}", message.request_id),
+                        &peer.subject,
+                        &intent,
+                        &goal_id,
+                        after_id,
+                        limit,
+                        Self::leases(session),
+                    )
+                    .await?
+                    .require();
+            }
             "request_stop" | "request_flag" => {
                 ensure!(
                     tool.kind == CapabilityKind::PolicyRequest,
@@ -1397,6 +1448,17 @@ pub fn make_tools(grant: &crate::security::Grant) -> Vec<ToolDefinition> {
             CapabilityKind::FindingRead,
             "finding_read",
             format!("finding/{goal}"),
+            object(
+                json!({"after_id":text(),"limit":{"type":"integer","minimum":1,"maximum":128}}),
+                vec![],
+            ),
+        ),
+        (
+            "task_status",
+            "Read bounded current Goal Task statuses within metadata clearance; no Task inputs or bodies.",
+            CapabilityKind::ToolCall,
+            "task_status",
+            format!("task/{goal}"),
             object(
                 json!({"after_id":text(),"limit":{"type":"integer","minimum":1,"maximum":128}}),
                 vec![],

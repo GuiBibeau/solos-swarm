@@ -63,9 +63,19 @@ impl Harness {
     pub(crate) async fn open() -> Self {
         Self::open_with_tools(Arc::new(DenyTools), vec![]).await
     }
+    pub(crate) async fn open_with_concurrency(concurrency: usize) -> Self {
+        Self::open_configured(Arc::new(DenyTools), vec![], concurrency).await
+    }
     pub(crate) async fn open_with_tools(
         tools: Arc<dyn ToolExecutor>,
         extra_tools: Vec<ToolDefinition>,
+    ) -> Self {
+        Self::open_configured(tools, extra_tools, 1).await
+    }
+    async fn open_configured(
+        tools: Arc<dyn ToolExecutor>,
+        extra_tools: Vec<ToolDefinition>,
+        concurrency: usize,
     ) -> Self {
         let mut f = test_support::fixture();
         let ca = IdentityAuthority::generate("test.local").unwrap();
@@ -524,7 +534,7 @@ impl Harness {
                 },
                 endpoint,
                 None,
-                1,
+                concurrency,
                 1_000_000,
                 1_000_000,
             )
@@ -634,7 +644,7 @@ impl Harness {
                 resolver: None,
                 max_request_bytes: 1_000_000,
                 max_response_bytes: 1_000_000,
-                connections: 8,
+                connections: concurrency.saturating_mul(4).max(8),
                 request_timeout_ms: 60_000,
             },
             Arc::new(broker),

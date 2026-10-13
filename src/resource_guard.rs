@@ -50,6 +50,7 @@ impl ResourceGuard {
     ) -> Result<Self> {
         let request_hash = content_hash(&request)?;
         let key = format!("resources/tool/{}", request.invocation_intent);
+        let write = kernel.cluster.kernel_write(false).await;
         for _ in 0..16 {
             let view = kernel.cluster.view().await?;
             let original = view
@@ -118,6 +119,7 @@ impl ResourceGuard {
             tx.leases = leases;
             let result = kernel.cluster.transact(tx).await?;
             if result.applied {
+                drop(write);
                 return Ok(Self {
                     kernel,
                     executor,
@@ -549,6 +551,7 @@ async fn retire(
     record: &Record,
 ) -> Result<()> {
     let key = format!("resources/tool/{}", record.intent);
+    let _write = kernel.cluster.kernel_write(true).await;
     for _ in 0..16 {
         let view = kernel.cluster.view_control().await?;
         let value = view.kv.get(&key).context("resource record missing")?;

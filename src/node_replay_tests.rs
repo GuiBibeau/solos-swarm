@@ -61,6 +61,167 @@ async fn advance_authority(h: &Harness, suffix: &str) -> u64 {
     next.security.grant_epoch
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires release-profile receiver stress; explicitly run with --release --ignored"]
+async fn ten_overlapping_authenticated_claims_and_models_settle_once_without_cas_exhaustion() {
+    use std::sync::Arc;
+    use tokio::{sync::Barrier, task::JoinSet};
+
+    let h = Arc::new(Harness::open_with_concurrency(10).await);
+    let mut claims = JoinSet::new();
+    for index in 0..10 {
+        let h = h.clone();
+        claims.spawn(async move {
+            h.send(&format!("ten-claim-{index}"), "/tool/claim_task", json!({}))
+                .await
+        });
+    }
+    while let Some(result) = claims.join_next().await {
+        let (status, body) = result.unwrap();
+        assert_eq!(status, 200, "concurrent claim failed: {body}");
+    }
+    let observer_h = h.clone();
+    let observer = tokio::spawn(async move {
+        for _ in 0..36 {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                observer_h.kernel.control_state(),
+            )
+            .await
+            {
+                Ok(Ok(state)) => eprintln!(
+                    "ten-request diagnostic: upstream={} effects={:?} spent={} held={} boards={} rounds={}",
+                    observer_h.upstream.lock().await.len(),
+                    state
+                        .effects
+                        .iter()
+                        .map(|(id, effect)| (id, &effect.state))
+                        .collect::<Vec<_>>(),
+                    state.ledger.accounts["global"].total.spent,
+                    state.ledger.accounts["global"].total.held,
+                    state.domain.boards.get("g").map_or(0, Vec::len),
+                    state.domain.planning_rounds.len(),
+                ),
+                result => eprintln!("ten-request diagnostic state read failed: {result:?}"),
+            }
+        }
+    });
+    let barrier = Arc::new(Barrier::new(11));
+    let mut requests = JoinSet::new();
+    for index in 0..10 {
+        let model_h = h.clone();
+        let model_barrier = barrier.clone();
+        requests.spawn(async move {
+            model_barrier.wait().await;
+            let id = format!("ten-model-{index}");
+            let (status, body) = model_h
+                .send(
+                    &id,
+                    "/model",
+                    inference(&format!(
+                        "__delayed_receipt__ ten concurrent inference {index}"
+                    )),
+                )
+                .await;
+            (id, status, body)
+        });
+    }
+    barrier.wait().await;
+    while let Some(result) = requests.join_next().await {
+        let (id, status, body) = result.unwrap();
+        assert_eq!(status, 200, "{id} failed: {body}");
+    }
+    observer.abort();
+    let _ = observer.await;
+    let state = h.kernel.state().await.unwrap();
+    assert_eq!(h.upstream.lock().await.len(), 10);
+    assert_eq!(state.ledger.accounts["global"].total.spent, 70);
+    assert_eq!(state.ledger.accounts["global"].total.held, 0);
+    assert!(!state.security.stopped(&crate::security::Scope::Goal {
+        tenant: "t".into(),
+        goal: "g".into(),
+    }));
+    assert_eq!(state.domain.planning_rounds.len(), 10);
+    assert!(state.domain.boards.get("g").is_none_or(Vec::is_empty));
+    for index in 0..10 {
+        let intent = format!("model-ten-model-{index}");
+        assert_eq!(state.effects[&intent].state, "done");
+        assert_eq!(state.ledger.intents[&intent].state, IntentState::Settled);
+        assert_eq!(state.ledger.intents[&intent].settled, 7);
+        assert_eq!(state.quotas.reservations[&intent].state, "done");
+        let (status, body) = h
+            .send(
+                &format!("ten-model-{index}"),
+                "/model",
+                inference(&format!(
+                    "__delayed_receipt__ ten concurrent inference {index}"
+                )),
+            )
+            .await;
+        assert_eq!(status, 200, "cached model failed: {body}");
+    }
+    assert_eq!(h.upstream.lock().await.len(), 10);
+    let final_state = h.kernel.state().await.unwrap();
+    assert_eq!(final_state.ledger.accounts["global"].total.spent, 70);
+    assert_eq!(final_state.ledger.accounts["global"].total.held, 0);
+    final_state.audit.validate().unwrap();
+    Arc::try_unwrap(h)
+        .unwrap_or_else(|_| panic!("receiver fixture still shared"))
+        .close()
+        .await;
+}
+
+#[tokio::test]
+async fn control_writer_bypasses_ten_queued_normal_writers() {
+    let h = Harness::open().await;
+    let cluster = h.kernel.cluster.clone();
+    let inflight = cluster.kernel_write(false).await;
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(11);
+    let (order_tx, mut order_rx) = tokio::sync::mpsc::channel(11);
+    let mut writers = tokio::task::JoinSet::new();
+    for index in 0..10 {
+        let cluster = cluster.clone();
+        let started = started_tx.clone();
+        let order = order_tx.clone();
+        writers.spawn(async move {
+            started.send(()).await.unwrap();
+            let _guard = cluster.kernel_write(false).await;
+            order.send(format!("normal-{index}")).await.unwrap();
+            tokio::task::yield_now().await;
+        });
+    }
+    for _ in 0..10 {
+        started_rx.recv().await.unwrap();
+    }
+    let control_cluster = cluster.clone();
+    writers.spawn(async move {
+        started_tx.send(()).await.unwrap();
+        let _guard = control_cluster.kernel_write(true).await;
+        order_tx.send("control".into()).await.unwrap();
+    });
+    started_rx.recv().await.unwrap();
+    // This single-thread runtime has polled each writer to its awaited gate.
+    tokio::task::yield_now().await;
+    drop(inflight);
+    let mut order = vec![];
+    while let Some(next) = tokio::time::timeout(std::time::Duration::from_secs(5), order_rx.recv())
+        .await
+        .expect("writer queue did not drain")
+    {
+        order.push(next);
+    }
+    while let Some(result) = writers.join_next().await {
+        result.unwrap();
+    }
+    assert_eq!(order.len(), 11);
+    assert!(
+        order.iter().position(|entry| entry == "control").unwrap() <= 1,
+        "control waited behind the normal queue: {order:?}"
+    );
+    h.close().await;
+}
+
 #[tokio::test]
 async fn typed_authority_phase_retry_preserves_one_model_intent_contact_and_fee() {
     let h = Harness::open().await;
@@ -809,5 +970,88 @@ async fn concurrent_claims_and_paid_receipt_cross_second_without_backwards_audit
     let flows = state.egress.goal_view("g", 32);
     assert_eq!(flows.records.len(), 1);
     assert!(flows.records[0].closed_ms.unwrap() / 1000 > flows.records[0].opened_ms / 1000);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn declared_task_status_returns_bounded_current_metadata_without_task_bodies() {
+    use crate::{
+        node::ToolDefinition,
+        security::{CapabilityKind, OperationClass},
+    };
+    use std::sync::Arc;
+    let plain = Harness::open().await;
+    assert_eq!(
+        plain
+            .send("status-no-cap-claim", "/tool/claim_task", json!({}))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        plain
+            .send("status-no-cap", "/tool/task_status", json!({}))
+            .await
+            .0,
+        403
+    );
+    assert!(plain.upstream.lock().await.is_empty());
+    plain.close().await;
+    let descriptor = ToolDefinition {
+        name: "declare_task_status".into(),
+        description: "explicit fixture metadata permission".into(),
+        parameters: json!({"type":"object"}),
+        kind: CapabilityKind::ToolCall,
+        operation: "task_status".into(),
+        resource: "task/g".into(),
+        class: OperationClass::ReadOnly,
+    };
+    let h = Harness::open_with_tools(Arc::new(super::receiver_tests::DenyTools), vec![descriptor])
+        .await;
+    assert_eq!(
+        h.send("status-claim", "/tool/claim_task", json!({}))
+            .await
+            .0,
+        200
+    );
+    let (code, page) = h
+        .send("status-page", "/tool/task_status", json!({"limit":1}))
+        .await;
+    assert_eq!(code, 200, "{page}");
+    assert_eq!(page["goal_id"], "g");
+    assert_eq!(page["goal_version"], 1);
+    let rows = page["tasks"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "task-1");
+    assert_eq!(rows[0]["state"], "claimed");
+    for key in ["input", "body", "spec", "failure_reason"] {
+        assert!(rows[0].get(key).is_none());
+    }
+    let (code, next) = h
+        .send(
+            "status-next",
+            "/tool/task_status",
+            json!({"after_id":"task-1","limit":1}),
+        )
+        .await;
+    assert_eq!(code, 200, "{next}");
+    assert_eq!(next["tasks"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        h.send("status-zero", "/tool/task_status", json!({"limit":0}))
+            .await
+            .0,
+        403
+    );
+    assert!(h.upstream.lock().await.is_empty());
+    let state = h.kernel.state().await.unwrap();
+    assert_eq!(state.ledger.accounts["global"].total.spent, 0);
+    assert_eq!(state.ledger.accounts["global"].total.held, 0);
+    assert!(
+        state
+            .security
+            .inputs
+            .values()
+            .any(|input| input.source_type == "task_status")
+    );
     h.close().await;
 }

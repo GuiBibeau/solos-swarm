@@ -15,7 +15,10 @@ use crate::{
     provider::Features,
     sandbox::{ProcessLimits, ToolLimits},
     scheduler::{Resources, Strategy},
-    security::{CapabilityKind, ResourceSelector, SecurityState, bind_goal_contract, test_support},
+    security::{
+        CapabilityKind, ResourceSelector, SecurityState, TaintExemption, bind_goal_contract,
+        test_support,
+    },
 };
 fn put(path: &Path, value: &impl Serialize) -> Result<()> {
     atomic_private(path, &serde_json::to_vec_pretty(value)?)
@@ -66,6 +69,19 @@ fn prepare_runtime_fixture() -> Result<()> {
     let output_tokens = 1024;
     let root = env_path("SOLOS_RUNTIME_SMOKE_ROOT")?;
     ensure!(!root.exists(), "fixture destination must be fresh");
+    let run_name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("fixture destination needs a UTF-8 run name")?;
+    ensure!(
+        !run_name.is_empty()
+            && run_name.len() <= 40
+            && run_name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
+        "fixture run name must be bounded and contain only letters, digits and hyphens"
+    );
+    let deployment_id = format!("isolated-fixture-{run_name}");
     let binary = env_path("SOLOS_RUNTIME_SMOKE_BINARY")?;
     let pi = env_path("SOLOS_RUNTIME_SMOKE_PI_ROOT")?;
     let node = env_path("SOLOS_RUNTIME_SMOKE_NODE")?;
@@ -200,6 +216,7 @@ fn prepare_runtime_fixture() -> Result<()> {
     .collect();
     let operations: BTreeSet<_> = [
         "task_work",
+        "task_status",
         "board_read",
         "board_post",
         "finding_append",
@@ -224,6 +241,21 @@ fn prepare_runtime_fixture() -> Result<()> {
         cap.constraints.read_markings.insert("test".into());
         cap.constraints.max_payload_bytes = 262144;
     }
+    f.posture.taint_exemptions.push(TaintExemption {
+        kind: CapabilityKind::ToolCall,
+        resource: ResourceSelector::Exact(model_resource.clone()),
+        operations: ["inference".into()].into(),
+        source_types: [
+            "task_input",
+            "model_context",
+            "model_result",
+            "finding",
+            "task_status",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+    });
     f.policy.payload.inventory = f.posture.resources.clone();
     f.policy.payload.root_humans = f.operators.iter().map(|op| op.id()).collect();
     f.policy.payload.trusted_components = [base.uri()?, evaluator_workload.uri()?].into();
@@ -238,7 +270,7 @@ fn prepare_runtime_fixture() -> Result<()> {
     goal.evaluator_id = evaluator_workload.uri()?;
     goal.expiry_ms = (now + ttl) * 1000;
     if actual_local {
-        goal.intent = "Compare source_a and source_b for the assigned records. Record exactly unequal rows as submit_finding({body:{inconsistencies:[{id,source_a,source_b}]}}). Save that Finding id, then complete_task using that result_ref. Task-09 is coordinator: first submit its own shard Finding, then read_findings until ten shard Findings are present, merge their unequal rows, submit_attempt({payload:{inconsistencies:[...]},finding_ids:[all ten IDs]}), then complete_task using its own shard Finding id. Use only the approved tools; do not invent rows or IDs.".into();
+        goal.intent = "Compare source_a and source_b for the assigned records. Record exactly unequal rows as submit_finding({body:{inconsistencies:[{id,source_a,source_b}]}}). Save that Finding id, then complete_task using that result_ref. Task-09 is coordinator: first submit its own shard Finding, then read_findings until ten shard Findings are present. Use task_status to wait until task-00 through task-08 are all completed. Merge the ten shard Findings. In one final assistant response, call submit_attempt({payload:{inconsistencies:[...]},finding_ids:[all ten IDs]}) followed by complete_task using its own shard Finding id; do not request another model turn between those final tool calls. Use only the approved tools; do not invent rows or IDs.".into();
     }
     goal.initial_needs = vec![
         NeedSpec {
@@ -260,6 +292,7 @@ fn prepare_runtime_fixture() -> Result<()> {
             required_capabilities: BTreeSet::new(),
         },
     ];
+    f.posture.intent = goal.intent.clone();
     bind_goal_contract(&mut f.posture, &goal)?;
     goal.security = serde_json::to_value(&f.posture)?;
     let security = SecurityState::new(f.policy.clone(), &f.signer.public_key(), now)?;
@@ -317,6 +350,10 @@ fn prepare_runtime_fixture() -> Result<()> {
                 cap.id = format!("{id}-cap-{j}");
                 cap.holder = workload.uri().unwrap();
                 cap.budget.total = 50_000;
+                cap.constraints.operations.remove("task_status");
+                if index == 9 && cap.kind == CapabilityKind::ToolCall {
+                    cap.constraints.operations.insert("task_status".into());
+                }
                 if actual_local {
                     cap.constraints.operations = ["task_work", "finding_append", "inference"]
                         .into_iter()
@@ -326,6 +363,9 @@ fn prepare_runtime_fixture() -> Result<()> {
                         cap.constraints
                             .operations
                             .extend(["finding_read".into(), "attempt_submit".into()]);
+                        if cap.kind == CapabilityKind::ToolCall {
+                            cap.constraints.operations.insert("task_status".into());
+                        }
                     }
                 }
                 cap
@@ -630,7 +670,7 @@ fn prepare_runtime_fixture() -> Result<()> {
     };
     let runtime = RuntimeConfig {
         egress: crate::flow::FlowConfig::default(),
-        deployment_id: "isolated-daemon-ten-pi-fixture".into(),
+        deployment_id,
         node: Node {
             id: "n1".into(),
             capacity: Resources {

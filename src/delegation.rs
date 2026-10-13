@@ -114,6 +114,7 @@ impl Kernel {
         );
         let request = json!({"intent":intent,"parent_grant":parent_grant_id,"parent_envelope":parent_envelope_id,"context":context,"task":task});
         let request_hash = content_hash(&(subject.id(), &request))?;
+        let _write = self.cluster.kernel_write(false).await;
         for _ in 0..16 {
             let view = self.cluster.view().await?;
             let old = view

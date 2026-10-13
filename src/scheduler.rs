@@ -440,6 +440,19 @@ impl Scheduler {
         reserve: &dyn Reserve,
         lease_ms: u64,
     ) -> Result<TxnResult> {
+        let _write = cluster.kernel_write(false).await;
+        self.bind_while_locked(cluster, plan, reserve, lease_ms)
+            .await
+    }
+    /// Runtime holds the shared gate before the fresh state snapshot and placement plan.
+    /// Standalone callers use `bind`, which acquires the gate and rejects an older plan.
+    pub(crate) async fn bind_while_locked(
+        &self,
+        cluster: &Cluster,
+        plan: &Plan,
+        reserve: &dyn Reserve,
+        lease_ms: u64,
+    ) -> Result<TxnResult> {
         ensure!(
             (100..=3_600_000).contains(&lease_ms),
             "invalid allocation lease TTL"
@@ -519,6 +532,7 @@ impl Scheduler {
         allocations: &[Allocation],
         plugin: &dyn Unreserve,
     ) -> Result<TxnResult> {
+        let _write = cluster.kernel_write(true).await;
         ensure!(!allocations.is_empty(), "empty unreserve selection");
         let transaction_id = format!(
             "unreserve/{}",

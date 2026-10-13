@@ -158,6 +158,7 @@ impl ScopedToolIdentityFactory {
     async fn spawn(&self, request: &ToolSpawnRequest) -> Result<Record> {
         let hash = content_hash(request)?;
         let key = format!("tools/bindings/{}", request.invocation_intent);
+        let _write = self.kernel.cluster.kernel_write(false).await;
         for _ in 0..16 {
             let view = self.kernel.cluster.view().await?;
             let original = view
@@ -246,6 +247,7 @@ impl ScopedToolIdentityFactory {
             }
         }
         let key = format!("tools/bindings/{}", record.invocation_intent);
+        let _write = self.kernel.cluster.kernel_write(true).await;
         for _ in 0..16 {
             let view = self.kernel.cluster.view_control().await?;
             let value = view.kv.get(&key).context("tool scope record missing")?;

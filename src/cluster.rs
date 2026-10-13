@@ -1481,6 +1481,12 @@ fn tls(config: &ClusterConfig) -> Result<(ServerConfig, ClientConfig)> {
         )?)),
     ))
 }
+/// Local state writers retain quorum CAS checks while avoiding repeated snapshot races.
+/// Controls bypass the normal queue; at most one queued normal writer can precede them.
+pub(crate) struct KernelWriteGuard<'a> {
+    _writer: tokio::sync::MutexGuard<'a, ()>,
+    _normal: Option<tokio::sync::MutexGuard<'a, ()>>,
+}
 pub struct Cluster {
     pub node_id: NodeId,
     raft: Raft,
@@ -1490,6 +1496,8 @@ pub struct Cluster {
     tasks: Mutex<Vec<JoinHandle<()>>>,
     bulk_slots: Arc<Semaphore>,
     control_slots: Arc<Semaphore>,
+    kernel_normal_writers: Mutex<()>,
+    kernel_writer: Mutex<()>,
     ready: AtomicBool,
 }
 pub fn now_ms() -> u64 {
@@ -1499,6 +1507,18 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 impl Cluster {
+    pub(crate) async fn kernel_write(&self, control: bool) -> KernelWriteGuard<'_> {
+        let normal = if control {
+            None
+        } else {
+            Some(self.kernel_normal_writers.lock().await)
+        };
+        let writer = self.kernel_writer.lock().await;
+        KernelWriteGuard {
+            _writer: writer,
+            _normal: normal,
+        }
+    }
     pub async fn open(config: ClusterConfig) -> Result<Arc<Self>> {
         Self::open_with_startup_admission(config, None).await
     }
@@ -1625,6 +1645,8 @@ impl Cluster {
             tasks: Mutex::new(vec![]),
             bulk_slots,
             control_slots: Arc::new(Semaphore::new(4)),
+            kernel_normal_writers: Mutex::new(()),
+            kernel_writer: Mutex::new(()),
             ready: AtomicBool::new(startup.is_none()),
         });
         let weak = Arc::downgrade(&cluster);
