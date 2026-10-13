@@ -48,6 +48,8 @@ Private files use mode `0600`; private directories use `0700`. All paths in a se
 
 For the evaluator's separate-UID IPC, provision a dedicated group shared by the two service accounts. The evaluator owns its `0710` IPC directory and creates its socket `0660`. The CP owns the separate evaluator delivery socket directory; the runtime applies its configured evaluator group and creates that socket with bounded group traversal/connect permissions. Do not make a private evaluator corpus directory traversable to the CP or workers. The protected service checks the peer CP UID with `SO_PEERCRED`; both IPC directions also bind signatures to exact requests.
 
+Retain the evaluator's private primary group and explicitly provision its configured delivery group with `SupplementaryGroups` when needed. Numeric systemd `User`/`Group` settings must not be assumed to load account memberships. Check the actual service PID's UID/GIDs and directory/socket access before admitting Tasks. The synthetic fixture launcher derives this delivery group from its admitted evaluator profile; it does not broaden directory or key permissions.
+
 The workload identity is:
 
 ```text
