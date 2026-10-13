@@ -1851,6 +1851,58 @@ fn task_completed_rpc(event: &Value) -> bool {
         && event["result"]["terminate"] == true
         && event["result"]["details"]["status"] != "confirmation_required"
 }
+async fn initial_worker_prompt<F, Fut>(
+    input: &mut (impl tokio::io::AsyncWrite + Unpin),
+    prompt: &str,
+    start: &mut watch::Receiver<bool>,
+    stop: &mut watch::Receiver<bool>,
+    safety_ms: u64,
+    authority: F,
+) -> Result<bool>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<bool>>,
+{
+    while !*start.borrow() {
+        if *stop.borrow() {
+            return Ok(false);
+        }
+        tokio::select! {
+            changed=start.changed()=>{changed.context("worker startup barrier disappeared")?;},
+            changed=stop.changed()=>{changed.context("worker stop signal disappeared")?;},
+        }
+    }
+    if *stop.borrow() {
+        return Ok(false);
+    }
+    let current = tokio::time::timeout(Duration::from_millis(safety_ms), authority())
+        .await
+        .context("fresh initial prompt authority unavailable inside lease margin")??;
+    if !current || *stop.borrow() {
+        return Ok(false);
+    }
+    let initial = serde_json::to_vec(&json!({"id":"initial","type":"prompt","message":prompt}))?;
+    input.write_all(&initial).await?;
+    input.write_all(b"\n").await?;
+    input.flush().await?;
+    Ok(true)
+}
+async fn reap_worker_child(
+    child: &mut tokio::process::Child,
+    stderr: &mut JoinHandle<Result<()>>,
+    stderr_done: bool,
+) {
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    if !stderr_done
+        && tokio::time::timeout(Duration::from_secs(2), &mut *stderr)
+            .await
+            .is_err()
+    {
+        stderr.abort();
+        let _ = stderr.await;
+    }
+}
 #[allow(clippy::too_many_arguments)]
 async fn pi_worker(
     kernel: Arc<Kernel>,
@@ -1889,24 +1941,18 @@ async fn pi_worker(
             }
         }
     });
-    // Finish every newly allocated Task bootstrap before releasing any model traffic in this reconciliation batch.
-    while !*start.borrow() {
-        tokio::select! {
-            changed=start.changed()=>{changed.context("worker startup barrier disappeared")?;},
-            _=stop.changed()=>{if *stop.borrow(){let _=child.start_kill();return Ok(());}}
-        }
-    }
-    let initial = serde_json::to_vec(&json!({"id":"initial","type":"prompt","message":prompt}))?;
-    input.write_all(&initial).await?;
-    input.write_all(b"\n").await?;
-    input.flush().await?;
-    let mut bytes = 0u64;
     let mut stderr_done = false;
+    let result = async {
+    // The batch barrier may outlive a Task, stop, or input lineage. Fresh authority
+    // is required after it opens and before any frozen Task body reaches Pi.
+    if !initial_worker_prompt(&mut input, &prompt, &mut start, &mut stop, scope.safety_ms,
+        || may_prompt(&kernel, &scope)).await? { return Ok(()); }
+    let mut bytes = 0u64;
     let mut idle = false;
     let mut terminal_task = false;
     let mut wake = tokio::time::interval(Duration::from_secs(5));
     wake.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let result = loop {
+    loop {
         tokio::select! {
             _=stop.changed()=>{if *stop.borrow(){break Ok(());}},
             diagnostic=&mut stderr,if !stderr_done=>{stderr_done=true;match diagnostic{Ok(Ok(()))=>{},Ok(Err(error))=>break Err(error),Err(_)=>break Err(anyhow::anyhow!("Pi diagnostic reader failed"))}},
@@ -1918,17 +1964,11 @@ async fn pi_worker(
                 idle=false;let message=serde_json::to_vec(&json!({"id":uuid::Uuid::new_v4().to_string(),"type":"prompt","message":"Continue the registered assigned Task. Use the approved tools to report evidence, submit an attempt and finish the Task when its required work is complete."}))?;input.write_all(&message).await?;input.write_all(b"\n").await?;input.flush().await?;
             },
         }
-    };
-    let _ = child.start_kill();
-    let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-    if !stderr_done
-        && tokio::time::timeout(Duration::from_secs(2), &mut stderr)
-            .await
-            .is_err()
-    {
-        stderr.abort();
-        let _ = stderr.await;
     }
+    }.await;
+    // Every initial-phase stop/error and every established-loop exit takes the
+    // same reaping and bounded diagnostic drain. Runtime then proves unit cleanup.
+    reap_worker_child(&mut child, &mut stderr, stderr_done).await;
     result
 }
 fn prompt(
@@ -4189,6 +4229,166 @@ mod cluster_rotation_tests {
 #[cfg(test)]
 mod final_drain_tests {
     use super::*;
+    #[tokio::test]
+    async fn initial_watch_barrier_rechecks_real_authority_before_body_and_reaps_child() {
+        use crate::{node::receiver_tests::Harness, operator::OperatorKernel};
+        use std::{
+            process::Stdio,
+            sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        for withdraw in [false, true] {
+            let h = Harness::open().await;
+            assert_eq!(
+                h.send("initial-claim", "/tool/claim_task", json!({}))
+                    .await
+                    .0,
+                200
+            );
+            h.kernel
+                .apply_operator(
+                    h.fixture.operators[0].clone(),
+                    crate::operator::OperatorRequest {
+                        request_id: "initial-workers-module".into(),
+                        operation: crate::operator::OperatorCommand::Module {
+                            command: ModuleCommand::Register {
+                                spec: ModuleSpec {
+                                    id: "workers".into(),
+                                    dependencies: Default::default(),
+                                    provides: ["workers".into()].into(),
+                                },
+                            },
+                        },
+                    },
+                    &h.fixture.signer,
+                    crate::cluster::now_ms() / 1000,
+                )
+                .await
+                .unwrap();
+            let view = h.kernel.cluster.view_control().await.unwrap();
+            let allocation = serde_json::from_value(view.kv["allocations/a1"].clone()).unwrap();
+            let state = h.kernel.state().await.unwrap();
+            let deadline = state.domain.task("g", "task-1").unwrap().spec.expiry_ms;
+            let scope = WorkerPromptScope {
+                allocation,
+                task_id: "task-1".into(),
+                retraction_epoch: goal_retraction_epoch(&state, "g"),
+                safety_ms: 5000,
+            };
+            assert!(may_prompt(&h.kernel, &scope).await.unwrap());
+            let body_path = h.directory.join("initial-body.jsonl");
+            fs::write(&body_path, []).unwrap();
+            let mut child = tokio::process::Command::new("sh")
+                .args(["-c", "exec cat > \"$1\"", "--", body_path.to_str().unwrap()])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut input = child.stdin.take().unwrap();
+            let mut errors = child.stderr.take().unwrap();
+            let drained = Arc::new(AtomicBool::new(false));
+            let drained_reader = drained.clone();
+            let mut diagnostic = tokio::spawn(async move {
+                let mut bytes = Vec::new();
+                errors.read_to_end(&mut bytes).await?;
+                drained_reader.store(true, Ordering::SeqCst);
+                Ok::<_, anyhow::Error>(())
+            });
+            let (start, mut ready) = watch::channel(false);
+            let (_stop, mut stopped) = watch::channel(false);
+            let (entered, waiting) = tokio::sync::oneshot::channel();
+            let kernel = h.kernel.clone();
+            let checks = Arc::new(AtomicUsize::new(0));
+            let fresh_checks = checks.clone();
+            let task = tokio::spawn(async move {
+                entered.send(()).unwrap();
+                let delivered = initial_worker_prompt(
+                    &mut input,
+                    "FROZEN-INITIAL-TASK-BODY",
+                    &mut ready,
+                    &mut stopped,
+                    scope.safety_ms,
+                    || async {
+                        fresh_checks.fetch_add(1, Ordering::SeqCst);
+                        may_prompt(&kernel, &scope).await
+                    },
+                )
+                .await;
+                drop(input);
+                if delivered.as_ref().is_ok_and(|delivered| *delivered) {
+                    tokio::time::timeout(Duration::from_secs(5), child.wait())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
+                reap_worker_child(&mut child, &mut diagnostic, false).await;
+                (
+                    delivered,
+                    child.try_wait().unwrap().is_some(),
+                    diagnostic.is_finished(),
+                )
+            });
+            waiting.await.unwrap();
+            assert_eq!(
+                checks.load(Ordering::SeqCst),
+                0,
+                "authority is checked after the gate opens"
+            );
+            if withdraw {
+                h.kernel
+                    .apply_operator(
+                        h.fixture.operators[0].clone(),
+                        crate::operator::OperatorRequest {
+                            request_id: "stop-during-initial-watch".into(),
+                            operation: crate::operator::OperatorCommand::EngageStop {
+                                scope: Scope::Goal {
+                                    tenant: "t".into(),
+                                    goal: "g".into(),
+                                },
+                                reason: "withdraw initial prompt while startup watch is held"
+                                    .into(),
+                            },
+                        },
+                        &h.fixture.signer,
+                        crate::cluster::now_ms() / 1000,
+                    )
+                    .await
+                    .unwrap();
+            }
+            start.send_replace(true);
+            let (delivered, reaped, joined) = task.await.unwrap();
+            assert_eq!(delivered.unwrap(), !withdraw);
+            assert!(reaped && joined && drained.load(Ordering::SeqCst));
+            assert_eq!(checks.load(Ordering::SeqCst), 1);
+            let bytes = fs::read(&body_path).unwrap();
+            if withdraw {
+                assert!(bytes.is_empty());
+            } else {
+                assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 1);
+                let prompt: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(
+                    prompt,
+                    json!({"id":"initial","type":"prompt","message":"FROZEN-INITIAL-TASK-BODY"})
+                );
+            }
+            assert_eq!(
+                h.kernel
+                    .state()
+                    .await
+                    .unwrap()
+                    .domain
+                    .task("g", "task-1")
+                    .unwrap()
+                    .spec
+                    .expiry_ms,
+                deadline
+            );
+            assert!(h.upstream.lock().await.is_empty());
+            h.close().await;
+        }
+    }
+
     #[tokio::test]
     async fn startup_accepts_only_current_open_or_owned_task_and_fences_withdrawal() {
         use crate::node::receiver_tests::Harness;
