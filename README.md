@@ -1,8 +1,20 @@
 # solos-swarm
 
-Rust broker and scheduler for a swarm of Pi agents. The first preview runs ten real agents on the approved `remote-ai` Linux host, using DeepSeek through a broker that holds the API key. Workers claim ten synthetic reconciliation Tasks, post progress to the Board, submit Findings, and synthesize one artifact. An independent checker requires a useful result and a successful live inference from every agent.
+Rust control plane and broker for a swarm of Pi agents. The MVP implements the [TRD](docs/TRD.md) domain and security contracts: Goal, Need, Task, ordered Board, Capability, Finding and Attempt; Raft over mTLS QUIC; atomic placement and delegation; bounded provider spending; protected evaluation; and read-only evidence verification.
 
-This implements the requested first ten-agent passing grade. It is a single-host preview of the [TRD](docs/TRD.md), with the three-node, 500-agent acceptance and the remaining security and distributed contracts deferred.
+Workers use signed workload identities and receive no provider key. Hosted DeepSeek and a pinned local Qwen/llama.cpp server use the same admission, receipt and quota path. Generated WASI runs in a bounded separate process. Native tools use Firecracker with a scoped broker identity; gVisor is an explicit fallback only on hosts without KVM. Findings, artifacts, input markings and retractions remain part of the recorded lineage. The Board has append, bounded read and cursor APIs; operator state readback and `mvp inspect --kind board` expose its recorded entries.
+
+Use [the MVP operator runbook](docs/MVP-RUNBOOK.md) for cold-checkout provisioning and startup, [MVP implementation and qualification](docs/MVP-TRACEABILITY.md) for all requirement mappings and remaining acceptance evidence, and [matched evaluation campaigns](docs/CAMPAIGNS.md) for the normal authenticated campaign driver. Runtime startup consumes an operator-prepared configuration, approved policy, private identity files and verified dependencies. It does not grant itself operator approval.
+
+```sh
+cargo build --locked --release
+solos-swarm mvp serve --config /absolute/path/runtime.json
+solos-swarm mvp witness-serve --config /absolute/path/witness.json
+solos-swarm mvp qa --config /absolute/path/qa.json --profile integration --output /absolute/path/evidence
+solos-swarm mvp campaign --config /absolute/path/campaign.json --output /absolute/path/campaign
+```
+
+The authorized test host is currently `remote-ai`. The earlier ten-agent DeepSeek preview passed using its frozen binary; it does not qualify a rebuilt MVP binary. Independent worker hosts/evaluator failure domains and the unchanged 500-agent, air-gap, production identity and performance acceptance gates remain separately recorded as pending. Missing evidence returns `INCONCLUSIVE`, and failed scenarios stay failed.
 
 ## Run the first preview
 
@@ -48,7 +60,9 @@ python3 scripts/remote.py cancel --run-id cancel-probe-01
 ## Local checks
 
 ```sh
+python3 scripts/bootstrap_tokenizers.py --output work/tokenizers
 cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
 python3 -m unittest discover -s tests -p 'test_*.py'
 npm ci --ignore-scripts --no-audit --no-fund
 npm run test:broker
@@ -56,4 +70,4 @@ npm run test:broker
 
 The Python checks exercise scoring failures, altered or missing evidence, candidate integrity, and idempotent remote identity without live inference. The Pi extension checks run a real RPC subprocess against a fixture Unix-socket broker.
 
-The preview does not establish Raft/QUIC or HA behavior, 500-agent scaling, a local provider or air-gapped bootstrap, a signed audit witness, Firecracker/Tier P acceptance, three catalog families, or the complete TRD verification scenario catalog. Candidate construction currently occurs on the approved Linux build host before its immutable run artifact is frozen; the fully relocatable offline bundle contract remains deferred. See [TRD acceptance](docs/TRD.md#10-poc-scope-and-acceptance-criteria) and [QA backlog](docs/QA-BACKLOG.md).
+The legacy preview commands above retain their original behavior and evidence. The expanded runtime uses `mvp serve`, inherited file-descriptor or one-use peer-checked socket credentials, separate evaluator/witness services, and `scripts/bundle.py` for verified offline artifacts. Its implementation and qualification status are recorded separately in [MVP-TRACEABILITY.md](docs/MVP-TRACEABILITY.md); the historical preview cannot establish those new contracts.

@@ -1,4 +1,5 @@
 mod broker;
+mod mvp;
 
 use anyhow::{Context, Result, ensure};
 use broker::{Broker, DeepSeek, Goal, Store, file_digest, now_ms, router, write_json};
@@ -21,13 +22,30 @@ use tokio::{
 };
 
 #[derive(Parser)]
-#[command(version, about = "Single-host Rust/Pi swarm preview")]
+#[command(version, about = "Governed Rust/Pi swarm runtime")]
 struct Cli {
     #[command(subcommand)]
     command: Action,
 }
 #[derive(Subcommand)]
 enum Action {
+    #[command(hide = true)]
+    WasiWorker {
+        #[arg(long)]
+        policy: PathBuf,
+    },
+    SandboxEnter {
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        node: PathBuf,
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    Mvp {
+        #[command(subcommand)]
+        command: mvp::MvpCommand,
+    },
     Run {
         #[arg(long)]
         config: PathBuf,
@@ -492,9 +510,31 @@ async fn run(
     result
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // Guards enter their policy before creating any runtime threads.
     let result = match Cli::parse().command {
+        Action::WasiWorker { policy } => solos_swarm::wasi_worker::worker_entry(&policy),
+        Action::SandboxEnter { policy, node, args } => (|| -> Result<()> {
+            let policy = serde_json::from_slice(&fs::read(policy)?)?;
+            solos_swarm::sandbox::enter_process(&policy, &node, &args)
+        })(),
+        command => tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("runtime startup failed")
+            .and_then(|runtime| runtime.block_on(execute(command))),
+    };
+    if let Err(error) = result {
+        eprintln!("{error:#}");
+        std::process::exit(1);
+    }
+}
+async fn execute(command: Action) -> Result<()> {
+    match command {
+        Action::WasiWorker { .. } | Action::SandboxEnter { .. } => {
+            anyhow::bail!("guard must enter before async runtime")
+        }
+        Action::Mvp { command } => mvp::execute(command).await,
         Action::Run {
             config,
             run_dir,
@@ -516,10 +556,6 @@ async fn main() {
             .await
         }
         Action::Doctor { pi_root, node } => doctor(&pi_root, &node).await,
-    };
-    if let Err(error) = result {
-        eprintln!("{error:#}");
-        std::process::exit(1);
     }
 }
 async fn doctor(root: &Path, node: &Path) -> Result<()> {
