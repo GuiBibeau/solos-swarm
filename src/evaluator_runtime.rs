@@ -740,7 +740,7 @@ async fn serve_inner(
                     );
                     let subject = runtime_subject(&config)?;
                     kernel
-                        .register_workload_certificate(
+                        .register_workload_certificate_control(
                             &format!(
                                 "evaluator-renewed-{}",
                                 crate::kernel::hex(&crate::audit::hash(&certificate))

@@ -770,6 +770,15 @@ pub struct Decision {
     pub permit: Signed<DispatchPermit>,
     pub audit: AuditEvent,
 }
+#[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)] // Bounded permit/review DTOs stay intact for the caller's atomic application.
+pub enum NonbillablePermitRefresh {
+    Ready {
+        permit: Signed<DispatchPermit>,
+        audit: Option<AuditEvent>,
+    },
+    ConfirmationRequired(ConfirmationReview),
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecurityState {
@@ -2649,6 +2658,120 @@ impl SecurityState {
             payload_hash: content_hash(permit)?,
         })
     }
+    /// Re-review an unused local effect after unrelated authority changes, before its application.
+    /// The caller must preserve and atomically recheck the original Task and allocation leases.
+    #[allow(clippy::too_many_arguments)] // Original binding, current human authority and ledger share one review.
+    pub fn refresh_nonbillable_permit(
+        &mut self,
+        subject: &AuthenticatedSubject,
+        request: &ActionRequest,
+        permit: &Signed<DispatchPermit>,
+        approvals: &[Signed<HumanApproval>],
+        ledger: &mut Ledger,
+        signer: &CryptoSigner,
+        now: u64,
+    ) -> Result<NonbillablePermitRefresh> {
+        permit.verify("dispatch-permit", &self.policy.payload.permit_signer)?;
+        let original = &permit.payload;
+        ensure!(
+            !original.billable
+                && original.price_version.is_none()
+                && request.budget_capability_id.is_none()
+                && request.envelope_id.is_none()
+                && request.usage_bound.is_empty()
+                && !ledger.intents.contains_key(&request.intent_id),
+            "paid effects cannot refresh local application authority"
+        );
+        ensure!(
+            original.intent_id == request.intent_id
+                && original.grant_id == request.grant_id
+                && original.grant_version == request.grant_version
+                && original.holder == subject.id()
+                && original.certificate_hash == subject.certificate_hash()
+                && original.issued <= now
+                && now < original.expiry
+                && !self.used.contains(&request.intent_id),
+            "refresh changed identity or reused consumed authority"
+        );
+        let saved = self
+            .pending
+            .get(&request.intent_id)
+            .context("refresh requires the original pending permit")?;
+        ensure!(
+            content_hash(saved)? == content_hash(permit)?,
+            "refresh requires the recorded signed permit"
+        );
+        let grant = self.live_grant(&request.grant_id, now)?;
+        ensure!(
+            grant.goal_id == original.goal_id
+                && grant.lease.fencing_token == original.fencing_token,
+            "refresh changed Goal or allocation fence"
+        );
+        let (observed, _, _, _) = self.lineage(subject.id())?;
+        ensure!(
+            content_hash(&observed)? == original.observed_hash,
+            "refresh changed the originally observed input lineage"
+        );
+        let mut review = self.confirmation_review(subject, request, ledger, now)?;
+        review.expiry = review.expiry.min(subject.expires).min(original.expiry);
+        ensure!(
+            review.action_hash == original.action_hash
+                && review.evidence_hash == original.evidence_hash,
+            "refresh changed the original action or evidence binding"
+        );
+        if original.grant_epoch == self.grant_epoch
+            && original.stop_epoch == self.stop_epoch
+            && original.retraction_epoch == self.retraction_epoch
+            && original.confirmation == review.tier
+            && now < original.expiry
+        {
+            return Ok(NonbillablePermitRefresh::Ready {
+                permit: permit.clone(),
+                audit: None,
+            });
+        }
+        let selected = self.review_approvals(&review, approvals.iter().cloned(), now)?;
+        if !self.review_confirmed(&review, &selected, now)? {
+            return Ok(NonbillablePermitRefresh::ConfirmationRequired(review));
+        }
+        // authorize intentionally reuses pending permits, so replace it only in a staged state.
+        // A failed review must leave both the original pending permit and all money unchanged.
+        let mut staged = self.clone();
+        let mut staged_ledger = ledger.clone();
+        staged.pending.remove(&request.intent_id);
+        let mut decision = staged.authorize(
+            subject,
+            request.clone(),
+            &selected,
+            None,
+            &mut staged_ledger,
+            signer,
+            now,
+        )?;
+        ensure!(
+            !decision.permit.payload.billable
+                && content_hash(&staged_ledger)? == content_hash(ledger)?,
+            "local authority refresh changed financial state"
+        );
+        let mut refreshed = decision.permit.payload;
+        refreshed.expiry = refreshed.expiry.min(original.expiry);
+        decision.audit.payload_hash = content_hash(&refreshed)?;
+        decision.permit = signer.sign("dispatch-permit", refreshed)?;
+        staged
+            .pending
+            .insert(request.intent_id.clone(), decision.permit.clone());
+        let digest: String = content_hash(&decision.permit)?
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        decision.audit.id = format!("permit-refresh/{}/{digest}", request.intent_id);
+        decision.audit.kind = "dispatch_permit_refreshed".into();
+        *self = staged;
+        Ok(NonbillablePermitRefresh::Ready {
+            permit: decision.permit,
+            audit: Some(decision.audit),
+        })
+    }
     /// Root commits this with the audit event before handing a permit to an executor.
     pub fn consume_permit(
         &mut self,
@@ -3105,6 +3228,370 @@ mod tests {
                 recipient: None,
                 evidence: BTreeSet::new(),
             },
+        }
+    }
+    fn compile_unrelated_grant(
+        f: &test_support::Fixture,
+        state: &mut SecurityState,
+        ledger: &mut Ledger,
+    ) {
+        let mut definition = f.definition.clone();
+        definition.id = "unrelated-grant".into();
+        definition.holder.agent = "unrelated-agent".into();
+        let holder = definition.holder.uri().unwrap();
+        for cap in &mut definition.capabilities {
+            cap.id = format!("unrelated-{}", cap.id);
+            cap.holder = holder.clone();
+        }
+        state
+            .compile_definition(definition, None, ledger, f.now)
+            .unwrap();
+    }
+    fn action_approvals(
+        f: &test_support::Fixture,
+        state: &SecurityState,
+        request: &ActionRequest,
+        humans: usize,
+    ) -> Vec<Signed<HumanApproval>> {
+        let (action, evidence, scope, version) =
+            state.approval_binding(&f.subject, request, f.now).unwrap();
+        f.operators[..humans]
+            .iter()
+            .map(|operator| {
+                state
+                    .issue_approval(
+                        operator,
+                        action,
+                        evidence,
+                        version,
+                        scope.clone(),
+                        f.now + 100,
+                        &f.signer,
+                        f.now,
+                    )
+                    .unwrap()
+            })
+            .collect()
+    }
+    #[test]
+    fn nonbillable_refresh_survives_unrelated_grant_change_once_without_extending_expiry() {
+        let (f, mut state, mut ledger) = registered();
+        let mut request = request("local-application");
+        request.action.class = OperationClass::ReadOnly;
+        let original = state
+            .authorize(
+                &f.subject,
+                request.clone(),
+                &[],
+                None,
+                &mut ledger,
+                &f.signer,
+                f.now,
+            )
+            .unwrap();
+        assert_eq!(original.permit.payload.confirmation, ConfirmationTier::C0);
+        compile_unrelated_grant(&f, &mut state, &mut ledger);
+        assert!(
+            state
+                .consume_permit(&f.subject, &original.permit, &mut ledger, f.now + 1)
+                .is_err()
+        );
+        let financial_hash = content_hash(&ledger).unwrap();
+        let NonbillablePermitRefresh::Ready { permit, audit } = state
+            .refresh_nonbillable_permit(
+                &f.subject,
+                &request,
+                &original.permit,
+                &[],
+                &mut ledger,
+                &f.signer,
+                f.now + 1,
+            )
+            .unwrap()
+        else {
+            panic!("C0 refresh requested human authority");
+        };
+        let audit = audit.unwrap();
+        assert_eq!(audit.kind, "dispatch_permit_refreshed");
+        assert_eq!(audit.payload_hash, content_hash(&permit.payload).unwrap());
+        assert_eq!(permit.payload.intent_id, original.permit.payload.intent_id);
+        assert_eq!(
+            permit.payload.action_hash,
+            original.permit.payload.action_hash
+        );
+        assert_eq!(
+            permit.payload.evidence_hash,
+            original.permit.payload.evidence_hash
+        );
+        assert_eq!(
+            permit.payload.observed_hash,
+            original.permit.payload.observed_hash
+        );
+        assert_eq!(
+            permit.payload.certificate_hash,
+            original.permit.payload.certificate_hash
+        );
+        assert_eq!(
+            permit.payload.fencing_token,
+            original.permit.payload.fencing_token
+        );
+        assert_eq!(permit.payload.expiry, original.permit.payload.expiry);
+        assert_eq!(permit.payload.grant_epoch, state.grant_epoch);
+        assert_eq!(content_hash(&ledger).unwrap(), financial_hash);
+        assert!(ledger.intents.is_empty());
+        assert!(matches!(
+            state
+                .refresh_nonbillable_permit(
+                    &f.subject,
+                    &request,
+                    &permit,
+                    &[],
+                    &mut ledger,
+                    &f.signer,
+                    f.now + 1,
+                )
+                .unwrap(),
+            NonbillablePermitRefresh::Ready { audit: None, .. }
+        ));
+        state
+            .consume_permit(&f.subject, &permit, &mut ledger, f.now + 1)
+            .unwrap();
+        assert!(
+            state
+                .refresh_nonbillable_permit(
+                    &f.subject,
+                    &request,
+                    &permit,
+                    &[],
+                    &mut ledger,
+                    &f.signer,
+                    f.now + 1,
+                )
+                .is_err()
+        );
+        assert_eq!(content_hash(&ledger).unwrap(), financial_hash);
+    }
+    #[test]
+    fn nonbillable_refresh_requires_fresh_c2_and_c3_humans_after_unrelated_epoch_change() {
+        for humans in [1, 2] {
+            let (f, mut state, mut ledger) = registered();
+            let mut request = request(&format!("privileged-local-{humans}"));
+            request.action.class = OperationClass::External;
+            if humans == 2 {
+                state
+                    .record_input(
+                        &f.subject,
+                        InputRecord {
+                            id: "untrusted-evidence".into(),
+                            source_type: "external".into(),
+                            hash: [9; 32],
+                            goal_id: "g".into(),
+                            producer: "outside".into(),
+                            trust: Trust::Untrusted,
+                            markings: BTreeSet::new(),
+                            parents: BTreeSet::new(),
+                        },
+                        &f.signer,
+                        f.now,
+                    )
+                    .unwrap();
+            }
+            let old_approvals = action_approvals(&f, &state, &request, humans);
+            let original = state
+                .authorize(
+                    &f.subject,
+                    request.clone(),
+                    &old_approvals,
+                    None,
+                    &mut ledger,
+                    &f.signer,
+                    f.now,
+                )
+                .unwrap();
+            assert_eq!(
+                original.permit.payload.confirmation,
+                if humans == 1 {
+                    ConfirmationTier::C2
+                } else {
+                    ConfirmationTier::C3
+                }
+            );
+            assert!(matches!(
+                state
+                    .refresh_nonbillable_permit(
+                        &f.subject,
+                        &request,
+                        &original.permit,
+                        &[],
+                        &mut ledger,
+                        &f.signer,
+                        f.now,
+                    )
+                    .unwrap(),
+                NonbillablePermitRefresh::Ready { audit: None, .. }
+            ));
+            compile_unrelated_grant(&f, &mut state, &mut ledger);
+            let pending_hash = content_hash(&state).unwrap();
+            let financial_hash = content_hash(&ledger).unwrap();
+            let NonbillablePermitRefresh::ConfirmationRequired(review) = state
+                .refresh_nonbillable_permit(
+                    &f.subject,
+                    &request,
+                    &original.permit,
+                    &old_approvals,
+                    &mut ledger,
+                    &f.signer,
+                    f.now,
+                )
+                .unwrap()
+            else {
+                panic!("stale human approval refreshed privileged authority");
+            };
+            assert_eq!(review.required_humans, humans);
+            assert_eq!(review.grant_epoch, state.grant_epoch);
+            assert_eq!(review.action_hash, original.permit.payload.action_hash);
+            assert_eq!(review.expiry, original.permit.payload.expiry);
+            assert_eq!(content_hash(&state).unwrap(), pending_hash);
+            assert_eq!(content_hash(&ledger).unwrap(), financial_hash);
+            let approvals = action_approvals(&f, &state, &request, humans);
+            let NonbillablePermitRefresh::Ready { permit, .. } = state
+                .refresh_nonbillable_permit(
+                    &f.subject,
+                    &request,
+                    &original.permit,
+                    &approvals,
+                    &mut ledger,
+                    &f.signer,
+                    f.now,
+                )
+                .unwrap()
+            else {
+                panic!("fresh distinct human approvals were not applied");
+            };
+            state
+                .consume_permit(&f.subject, &permit, &mut ledger, f.now)
+                .unwrap();
+            assert_eq!(content_hash(&ledger).unwrap(), financial_hash);
+        }
+    }
+    #[test]
+    fn nonbillable_refresh_rejects_changed_bindings_expiry_stop_and_retracted_evidence() {
+        for case in [
+            "payload",
+            "lineage",
+            "budget",
+            "expired",
+            "revoked",
+            "stopped",
+            "retracted",
+        ] {
+            let (f, mut state, mut ledger) = registered();
+            let mut request = request(&format!("refresh-rejected-{case}"));
+            request.action.class = OperationClass::ReadOnly;
+            if case == "retracted" {
+                state
+                    .append_finding(
+                        &f.subject,
+                        "original-evidence".into(),
+                        [7; 32],
+                        "agent-grant",
+                        &f.signer,
+                        f.now,
+                    )
+                    .unwrap();
+                request.action.evidence.insert("original-evidence".into());
+            }
+            let original = state
+                .authorize(
+                    &f.subject,
+                    request.clone(),
+                    &[],
+                    None,
+                    &mut ledger,
+                    &f.signer,
+                    f.now,
+                )
+                .unwrap();
+            compile_unrelated_grant(&f, &mut state, &mut ledger);
+            match case {
+                "payload" => request.action.arguments = serde_json::json!({"different":true}),
+                "budget" => request.budget_capability_id = Some("agent-cap-6".into()),
+                "lineage" => state
+                    .record_input(
+                        &f.subject,
+                        InputRecord {
+                            id: "new-input".into(),
+                            source_type: "external".into(),
+                            hash: [6; 32],
+                            goal_id: "g".into(),
+                            producer: "outside".into(),
+                            trust: Trust::Untrusted,
+                            markings: BTreeSet::new(),
+                            parents: BTreeSet::new(),
+                        },
+                        &f.signer,
+                        f.now,
+                    )
+                    .unwrap(),
+                "revoked" => state.revoke_grant("agent-grant").unwrap(),
+                "stopped" => {
+                    state
+                        .engage_stop(
+                            &f.subject,
+                            Scope::Agent {
+                                tenant: "t".into(),
+                                goal: "g".into(),
+                                holder: f.subject.id().into(),
+                            },
+                            [5; 32],
+                            f.now,
+                        )
+                        .unwrap();
+                }
+                "retracted" => {
+                    state
+                        .retract_finding(
+                            &AuthenticatedSubject::operator(&f.operators[0]),
+                            "original-evidence",
+                            [8; 32],
+                            &f.signer,
+                            f.now,
+                        )
+                        .unwrap();
+                }
+                "expired" => {}
+                _ => unreachable!(),
+            }
+            let state_hash = content_hash(&state).unwrap();
+            let ledger_hash = content_hash(&ledger).unwrap();
+            assert!(
+                state
+                    .refresh_nonbillable_permit(
+                        &f.subject,
+                        &request,
+                        &original.permit,
+                        &[],
+                        &mut ledger,
+                        &f.signer,
+                        if case == "expired" {
+                            original.permit.payload.expiry
+                        } else {
+                            f.now
+                        },
+                    )
+                    .is_err(),
+                "invalid refresh accepted: {case}"
+            );
+            assert_eq!(
+                content_hash(&state).unwrap(),
+                state_hash,
+                "changed pending state: {case}"
+            );
+            assert_eq!(
+                content_hash(&ledger).unwrap(),
+                ledger_hash,
+                "changed money: {case}"
+            );
         }
     }
     #[test]

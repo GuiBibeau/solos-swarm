@@ -354,6 +354,128 @@ pub async fn execute(command: MvpCommand) -> Result<()> {
     }
     Ok(())
 }
+fn verify_permit_authorization(
+    intent: &str,
+    current: &Signed<solos_swarm::security::DispatchPermit>,
+    events: &[solos_swarm::audit::AuditEvent],
+    replies: &BTreeMap<String, solos_swarm::kernel::RecordedReply>,
+    signer: &Hash,
+) -> Result<()> {
+    use solos_swarm::audit::content_hash;
+    current.verify("dispatch-permit", signer)?;
+    let permit = &current.payload;
+    ensure!(
+        permit.intent_id == intent,
+        "permit intent differs from effect"
+    );
+    let original_index = events
+        .iter()
+        .position(|event| event.id == format!("authorize/{intent}"))
+        .context("effect lacks original authorization event")?;
+    let authorization = &events[original_index];
+    ensure!(
+        authorization.kind == "dispatch_authorized"
+            && authorization.actor == permit.holder
+            && authorization.goal.as_deref() == Some(permit.goal_id.as_str()),
+        "original authorization identity or Goal mismatch"
+    );
+    if authorization.payload_hash == content_hash(permit)? {
+        ensure!(
+            authorization.decision == format!("{:?}", permit.confirmation),
+            "original authorization confirmation mismatch"
+        );
+        return Ok(());
+    }
+    let refresh_id = format!("permit-refresh/{intent}/{}", hex(&content_hash(current)?));
+    let refresh_index = events
+        .iter()
+        .position(|event| event.id == refresh_id)
+        .context("effect lacks the exact signed-permit refresh event")?;
+    let refresh = &events[refresh_index];
+    ensure!(
+        original_index < refresh_index
+            && refresh.kind == "dispatch_permit_refreshed"
+            && refresh.actor == permit.holder
+            && refresh.goal.as_deref() == Some(permit.goal_id.as_str())
+            && refresh.payload_hash == content_hash(permit)?
+            && refresh.decision == format!("{:?}", permit.confirmation),
+        "permit refresh audit binding mismatch"
+    );
+    let mut original: Option<Signed<solos_swarm::security::DispatchPermit>> = None;
+    for (id, reply) in replies {
+        if !reply.ok
+            || reply.actor != permit.holder
+            || reply.value["intent"] != intent
+            || reply.value["state"] != "pending"
+        {
+            continue;
+        }
+        let candidate: Signed<solos_swarm::security::DispatchPermit> =
+            serde_json::from_value(reply.value["permit"].clone())?;
+        if content_hash(&candidate.payload)? != authorization.payload_hash {
+            continue;
+        }
+        candidate.verify("dispatch-permit", signer)?;
+        ensure!(
+            candidate.payload.intent_id == intent
+                && candidate.payload.holder == reply.actor
+                && authorization.decision == format!("{:?}", candidate.payload.confirmation),
+            "original admission permit identity mismatch"
+        );
+        let request_index = events
+            .iter()
+            .position(|event| event.id == format!("request/{id}"))
+            .context("original admission lacks recorded request evidence")?;
+        let request = &events[request_index];
+        ensure!(
+            original_index < request_index
+                && request_index < refresh_index
+                && request.kind == "kernel_request"
+                && request.actor == reply.actor
+                && request.decision == "allow"
+                && request.payload_hash == reply.request_hash
+                && content_hash(&(&reply.actor, &reply.request))? == reply.request_hash,
+            "original admission request/audit binding mismatch"
+        );
+        if let Some(previous) = &original {
+            ensure!(
+                content_hash(previous)? == content_hash(&candidate)?,
+                "original admission contains conflicting signed permits"
+            );
+        }
+        original = Some(candidate);
+    }
+    let original =
+        original.context("refreshed effect lost its original signed admission permit")?;
+    let old = &original.payload;
+    ensure!(
+        !old.billable
+            && !permit.billable
+            && old.price_version.is_none()
+            && permit.price_version.is_none()
+            && permit.intent_id == old.intent_id
+            && permit.holder == old.holder
+            && permit.certificate_hash == old.certificate_hash
+            && permit.goal_id == old.goal_id
+            && permit.grant_id == old.grant_id
+            && permit.grant_version == old.grant_version
+            && permit.fencing_token == old.fencing_token
+            && permit.action_hash == old.action_hash
+            && permit.evidence_hash == old.evidence_hash
+            && permit.observed_hash == old.observed_hash
+            && permit.confirmation >= old.confirmation
+            && permit.grant_epoch >= old.grant_epoch
+            && permit.stop_epoch >= old.stop_epoch
+            && permit.retraction_epoch >= old.retraction_epoch
+            && permit.issued >= old.issued
+            && permit.issued < old.expiry
+            && permit.expiry > permit.issued
+            && permit.expiry <= old.expiry,
+        "permit refresh widened or changed the original application authority"
+    );
+    Ok(())
+}
+
 pub fn verify_snapshot(
     state: &KernelState,
     head: &solos_swarm::audit::SignedTreeHead,
@@ -403,25 +525,18 @@ pub fn verify_snapshot(
             );
         }
         for (id, effect) in &state.effects {
-            effect.permit.verify(
-                "dispatch-permit",
-                &state.security.policy.payload.permit_signer,
-            )?;
             ensure!(
                 effect.permit.payload.intent_id == *id
                     && effect.payload == effect.request.action.arguments,
                 "effect identity/payload mismatch"
             );
-            let event = state
-                .audit
-                .events()
-                .iter()
-                .find(|event| event.id == format!("authorize/{id}"))
-                .context("effect lacks authorization event")?;
-            ensure!(
-                event.payload_hash == solos_swarm::audit::content_hash(&effect.permit.payload)?,
-                "effect authorization audit mismatch"
-            );
+            verify_permit_authorization(
+                id,
+                &effect.permit,
+                state.audit.events(),
+                &state.replies,
+                &state.security.policy.payload.permit_signer,
+            )?;
             if effect.permit.payload.billable {
                 let reservation = state
                     .ledger
@@ -496,5 +611,278 @@ mod recovery_input_tests {
         assert!(public_bytes(&path, 1).is_err());
         assert!(public_bytes(&root, 100).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod permit_history_tests {
+    use super::*;
+    use solos_swarm::{
+        audit::{AuditEvent, CryptoSigner, content_hash},
+        kernel::RecordedReply,
+        security::{ConfirmationTier, DispatchPermit},
+    };
+
+    struct History {
+        signer: CryptoSigner,
+        original: Signed<DispatchPermit>,
+        current: Signed<DispatchPermit>,
+        events: Vec<AuditEvent>,
+        replies: BTreeMap<String, RecordedReply>,
+    }
+    impl History {
+        fn new() -> Self {
+            let signer = CryptoSigner::from_seed([73; 32]);
+            let original = signer
+                .sign(
+                    "dispatch-permit",
+                    DispatchPermit {
+                        intent_id: "local-intent".into(),
+                        holder: "spiffe://test.local/t/g/n/a/1".into(),
+                        certificate_hash: Some([1; 32]),
+                        goal_id: "g".into(),
+                        grant_id: "a-1".into(),
+                        grant_version: 1,
+                        fencing_token: 4,
+                        action_hash: [2; 32],
+                        stop_epoch: 0,
+                        grant_epoch: 1,
+                        retraction_epoch: 0,
+                        evidence_hash: [3; 32],
+                        observed_hash: [4; 32],
+                        price_version: None,
+                        confirmation: ConfirmationTier::C1,
+                        issued: 100,
+                        expiry: 130,
+                        billable: false,
+                    },
+                )
+                .unwrap();
+            let mut refreshed = original.payload.clone();
+            refreshed.grant_epoch = 2;
+            refreshed.issued = 101;
+            let current = signer.sign("dispatch-permit", refreshed).unwrap();
+            let reply = RecordedReply {
+                actor: original.payload.holder.clone(),
+                request: json!({"immutable_request_hash":"fixture-only"}),
+                request_hash: [0; 32],
+                ok: true,
+                value: json!({"intent":"local-intent","state":"pending","permit":original}),
+            };
+            let mut reply = reply;
+            reply.request_hash = content_hash(&(&reply.actor, &reply.request)).unwrap();
+            let events = vec![
+                AuditEvent {
+                    id: "authorize/local-intent".into(),
+                    kind: "dispatch_authorized".into(),
+                    actor: original.payload.holder.clone(),
+                    goal: Some("g".into()),
+                    timestamp: 100,
+                    decision: "C1".into(),
+                    payload_hash: content_hash(&original.payload).unwrap(),
+                },
+                AuditEvent {
+                    id: "request/admit-local/phase".into(),
+                    kind: "kernel_request".into(),
+                    actor: reply.actor.clone(),
+                    goal: None,
+                    timestamp: 100,
+                    decision: "allow".into(),
+                    payload_hash: reply.request_hash,
+                },
+                AuditEvent {
+                    id: format!(
+                        "permit-refresh/local-intent/{}",
+                        hex(&content_hash(&current).unwrap())
+                    ),
+                    kind: "dispatch_permit_refreshed".into(),
+                    actor: current.payload.holder.clone(),
+                    goal: Some("g".into()),
+                    timestamp: 101,
+                    decision: "C1".into(),
+                    payload_hash: content_hash(&current.payload).unwrap(),
+                },
+            ];
+            Self {
+                signer,
+                original,
+                current,
+                events,
+                replies: [("admit-local/phase".into(), reply)].into(),
+            }
+        }
+        fn verify(&self) -> Result<()> {
+            verify_permit_authorization(
+                "local-intent",
+                &self.current,
+                &self.events,
+                &self.replies,
+                &self.signer.public_key(),
+            )
+        }
+        fn resign_current(&mut self) {
+            self.current = self
+                .signer
+                .sign("dispatch-permit", self.current.payload.clone())
+                .unwrap();
+            self.events[2].id = format!(
+                "permit-refresh/local-intent/{}",
+                hex(&content_hash(&self.current).unwrap())
+            );
+            self.events[2].payload_hash = content_hash(&self.current.payload).unwrap();
+            self.events[2].decision = format!("{:?}", self.current.payload.confirmation);
+            self.events[2].actor = self.current.payload.holder.clone();
+            self.events[2].goal = Some(self.current.payload.goal_id.clone());
+        }
+    }
+    #[test]
+    fn verifier_accepts_exact_refreshed_history_and_preserves_original_admission() {
+        let history = History::new();
+        let before = content_hash(&history.replies).unwrap();
+        history.verify().unwrap();
+        verify_permit_authorization(
+            "local-intent",
+            &history.original,
+            &history.events,
+            &history.replies,
+            &history.signer.public_key(),
+        )
+        .unwrap();
+        assert_eq!(content_hash(&history.replies).unwrap(), before);
+    }
+    #[test]
+    fn verifier_rejects_missing_or_tampered_original_and_exact_refresh_evidence() {
+        for case in [
+            "original-event",
+            "refresh-event",
+            "refresh-id",
+            "refresh-hash",
+            "refresh-actor",
+            "refresh-goal",
+            "refresh-kind",
+            "refresh-order",
+            "original-ack",
+            "original-signature",
+            "original-request",
+            "original-holder",
+            "original-hash",
+        ] {
+            let mut history = History::new();
+            match case {
+                "original-event" => {
+                    history.events.remove(0);
+                }
+                "refresh-event" => {
+                    history.events.pop();
+                }
+                "refresh-id" => {
+                    history.events[2].id = "permit-refresh/unrelated/same-payload-hash".into()
+                }
+                "refresh-hash" => history.events[2].payload_hash = [9; 32],
+                "refresh-actor" => history.events[2].actor = "other-holder".into(),
+                "refresh-goal" => history.events[2].goal = Some("other-goal".into()),
+                "refresh-kind" => history.events[2].kind = "dispatch_authorized".into(),
+                "refresh-order" => history.events.swap(0, 2),
+                "original-ack" => history.replies.clear(),
+                "original-signature" => {
+                    history.original.signature[0] ^= 1;
+                    history.replies.get_mut("admit-local/phase").unwrap().value["permit"] =
+                        serde_json::to_value(&history.original).unwrap();
+                }
+                "original-request" => {
+                    history
+                        .replies
+                        .get_mut("admit-local/phase")
+                        .unwrap()
+                        .request["extra"] = json!(true)
+                }
+                "original-holder" => {
+                    history.replies.get_mut("admit-local/phase").unwrap().actor =
+                        "other-holder".into()
+                }
+                "original-hash" => history.events[0].payload_hash = [9; 32],
+                _ => unreachable!(),
+            }
+            assert!(
+                history.verify().is_err(),
+                "tampered history accepted: {case}"
+            );
+        }
+    }
+    #[test]
+    fn verifier_rejects_validly_signed_refreshes_that_change_authority_or_extend_deadlines() {
+        for case in [
+            "intent",
+            "holder",
+            "certificate",
+            "goal",
+            "grant",
+            "version",
+            "fence",
+            "action",
+            "evidence",
+            "observed",
+            "billable",
+            "price",
+            "confirmation",
+            "grant-epoch",
+            "stop-epoch",
+            "retraction-epoch",
+            "expiry",
+            "issued",
+            "expired-before-refresh",
+        ] {
+            let mut history = History::new();
+            let current = &mut history.current.payload;
+            match case {
+                "intent" => current.intent_id = "other-intent".into(),
+                "holder" => current.holder = "other-holder".into(),
+                "certificate" => current.certificate_hash = Some([9; 32]),
+                "goal" => current.goal_id = "other-goal".into(),
+                "grant" => current.grant_id = "other-grant".into(),
+                "version" => current.grant_version += 1,
+                "fence" => current.fencing_token += 1,
+                "action" => current.action_hash = [9; 32],
+                "evidence" => current.evidence_hash = [9; 32],
+                "observed" => current.observed_hash = [9; 32],
+                "billable" => current.billable = true,
+                "price" => current.price_version = Some("v2".into()),
+                "confirmation" => current.confirmation = ConfirmationTier::C0,
+                "grant-epoch" => current.grant_epoch = 0,
+                "stop-epoch" => {
+                    history.original.payload.stop_epoch = 1;
+                    current.stop_epoch = 0;
+                }
+                "retraction-epoch" => {
+                    history.original.payload.retraction_epoch = 1;
+                    current.retraction_epoch = 0;
+                }
+                "expiry" => current.expiry += 1,
+                "issued" => current.issued = 99,
+                "expired-before-refresh" => {
+                    current.issued = 130;
+                    current.expiry = 131;
+                }
+                _ => unreachable!(),
+            }
+            if matches!(case, "stop-epoch" | "retraction-epoch") {
+                history.original = history
+                    .signer
+                    .sign("dispatch-permit", history.original.payload.clone())
+                    .unwrap();
+                history.events[0].payload_hash = content_hash(&history.original.payload).unwrap();
+                history.replies.get_mut("admit-local/phase").unwrap().value["permit"] =
+                    serde_json::to_value(&history.original).unwrap();
+            }
+            history.resign_current();
+            history
+                .current
+                .verify("dispatch-permit", &history.signer.public_key())
+                .unwrap();
+            assert!(
+                history.verify().is_err(),
+                "changed authority accepted: {case}"
+            );
+        }
     }
 }

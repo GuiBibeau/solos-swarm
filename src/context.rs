@@ -218,12 +218,30 @@ impl ContextBuilder {
                         .all(|part| part["type"] == "text" && part["text"].is_string()),
                     "unsupported multimodal input"
                 );
+                if matches!(self.spec.format, ChatFormat::Qwen3LlamaCppB11429) {
+                    // The pinned server's OpenAI parser joins text parts before template rendering.
+                    // Keep empty parts: their separators are part of the admitted prompt bytes.
+                    message["content"] = json!(
+                        parts
+                            .iter()
+                            .map(|part| part["text"].as_str().unwrap())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    );
+                }
             } else {
                 ensure!(
                     message["content"].is_string()
                         || (message["role"] == "assistant" && message["tool_calls"].is_array()),
                     "unsupported message content"
                 );
+                if matches!(self.spec.format, ChatFormat::Qwen3LlamaCppB11429)
+                    && message["role"] == "assistant"
+                    && message["content"].is_null()
+                    && message["tool_calls"].is_array()
+                {
+                    message["content"] = json!("");
+                }
             }
             if matches!(self.spec.format, ChatFormat::DeepseekV41) {
                 // The hosted API handles literal control tokens differently from the model tokenizer.

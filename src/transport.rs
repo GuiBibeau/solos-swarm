@@ -216,7 +216,7 @@ pub async fn serve(
                         async move {
                             let response = tokio::time::timeout(Duration::from_millis(config.request_timeout_ms), process(request, &leaf, &config, handler)).await;
                             let (status, value) = match response {
-                                Ok(Ok(value)) => (200, value), Ok(Err(error)) => (403, serde_json::json!({"error":error.to_string()})),
+                                Ok(Ok(value)) => (200, value), Ok(Err(error)) => (403, rejection(&error)),
                                 Err(_) => (504, serde_json::json!({"error":"broker deadline reached; inspect effect before retry"})),
                             };
                             let mut bytes = serde_json::to_vec(&value).unwrap_or_else(|_| b"{\"error\":\"encoding failed\"}".to_vec());
@@ -238,6 +238,16 @@ pub async fn serve(
     drop(listener);
     remove_socket(&config.path)?;
     Ok(())
+}
+fn rejection(error: &anyhow::Error) -> Value {
+    let mut value = serde_json::json!({"error":error.to_string()});
+    if error
+        .downcast_ref::<crate::kernel::StateCapacityError>()
+        .is_some()
+    {
+        value["code"] = Value::String("state_capacity".into());
+    }
+    value
 }
 fn remove_socket(path: &Path) -> Result<()> {
     match std::fs::remove_file(path) {
@@ -291,6 +301,13 @@ async fn process(
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_typed_capacity_rejections_carry_a_retriable_code() {
+        let typed: anyhow::Error = crate::kernel::StateCapacityError.into();
+        assert_eq!(super::rejection(&typed)["code"], "state_capacity");
+        let text_only = anyhow::anyhow!(typed.to_string());
+        assert!(super::rejection(&text_only).get("code").is_none());
+    }
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     #[test]

@@ -1046,7 +1046,10 @@ async fn launch_evaluator(
     );
     kernel
         .register_workload_certificate(
-            &format!("evaluator-leaf-{}", uuid::Uuid::new_v4()),
+            &format!(
+                "evaluator-leaf-{}",
+                crate::kernel::hex(&crate::audit::hash(&certificate))
+            ),
             subject,
             &session.grant_id,
             &certificate,
@@ -1767,7 +1770,91 @@ async fn bounded_line(
         }
     }
 }
+struct WorkerPromptScope {
+    allocation: Allocation,
+    task_id: String,
+    retraction_epoch: u64,
+    safety_ms: u64,
+}
+fn prompt_scope_active(
+    state: &KernelState,
+    view: &crate::cluster::StateView,
+    scope: &WorkerPromptScope,
+    now_ms: u64,
+) -> bool {
+    let allocation = &scope.allocation;
+    let Ok(grant) = state.security.live_grant(
+        &format!("{}-{}", allocation.agent_id, allocation.incarnation),
+        now_ms / 1000,
+    ) else {
+        return false;
+    };
+    let Ok(holder) = grant.holder.uri() else {
+        return false;
+    };
+    let Ok(goal) = state.domain.goal(&allocation.goal_id) else {
+        return false;
+    };
+    let Ok(task) = state.domain.task(&allocation.goal_id, &scope.task_id) else {
+        return false;
+    };
+    crate::kernel::search_open(state, &allocation.goal_id)
+        && goal.spec.expiry_ms > now_ms
+        && goal_retraction_epoch(state, &allocation.goal_id) <= scope.retraction_epoch
+        && state
+            .modules
+            .modules
+            .get("workers")
+            .is_some_and(|module| module.active)
+        && task.goal_version == goal.spec.version
+        && matches!(task.state, TaskState::Claimed | TaskState::Running)
+        && task.claimed_by.as_deref() == Some(holder.as_str())
+        && task.incarnation == allocation.incarnation
+        && task.fencing_token == allocation.fence
+        && task.lease_expiry_ms > now_ms
+        && task.spec.expiry_ms > now_ms
+        && view
+            .leases
+            .get(&format!("allocation/{}", allocation.agent_id))
+            .is_some_and(|lease| {
+                !lease.revoked
+                    && lease.holder == allocation.node_id
+                    && lease.fence == allocation.fence
+                    && lease.expires_ms > now_ms.saturating_add(scope.safety_ms)
+            })
+        && view
+            .leases
+            .get(&format!("node/{}", allocation.node_id))
+            .is_some_and(|lease| {
+                !lease.revoked && lease.holder == allocation.node_id && lease.expires_ms > now_ms
+            })
+}
+async fn may_prompt(kernel: &Kernel, scope: &WorkerPromptScope) -> Result<bool> {
+    let view = kernel.cluster.view_control().await?;
+    let state: KernelState = serde_json::from_value(
+        view.kv
+            .get("kernel/state")
+            .context("prompt authority absent")?
+            .clone(),
+    )?;
+    Ok(prompt_scope_active(
+        &state,
+        &view,
+        scope,
+        crate::cluster::now_ms(),
+    ))
+}
+fn task_completed_rpc(event: &Value) -> bool {
+    event["type"] == "tool_execution_end"
+        && event["toolName"] == "complete_task"
+        && event["isError"] == false
+        && event["result"]["terminate"] == true
+        && event["result"]["details"]["status"] != "confirmation_required"
+}
+#[allow(clippy::too_many_arguments)]
 async fn pi_worker(
+    kernel: Arc<Kernel>,
+    scope: WorkerPromptScope,
     plan: ProcessPlan,
     prompt: String,
     line_bytes: usize,
@@ -1816,14 +1903,20 @@ async fn pi_worker(
     let mut bytes = 0u64;
     let mut stderr_done = false;
     let mut idle = false;
+    let mut terminal_task = false;
     let mut wake = tokio::time::interval(Duration::from_secs(5));
     wake.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let result = loop {
         tokio::select! {
             _=stop.changed()=>{if *stop.borrow(){break Ok(());}},
             diagnostic=&mut stderr,if !stderr_done=>{stderr_done=true;match diagnostic{Ok(Ok(()))=>{},Ok(Err(error))=>break Err(error),Err(_)=>break Err(anyhow::anyhow!("Pi diagnostic reader failed"))}},
-            line=bounded_line(&mut output,line_bytes)=>{match line{Ok(Some(line))=>{bytes=bytes.checked_add(line.len() as u64).context("RPC output accounting overflow")?;if bytes>output_bytes{break Err(anyhow::anyhow!("Pi output ceiling exceeded"));}let event:Value=serde_json::from_slice(&line).context("Pi emitted malformed RPC frame")?;if event["type"]=="extension_error" || event["type"]=="response" && event["success"]==false || event["type"]=="message_end" && event["message"]["stopReason"]=="error" { let retained=&line[..line.len().min(16384)];atomic_private(&plan.work_dir.join("worker-rpc-error.private"),retained)?;break Err(anyhow::anyhow!("Pi RPC rejected assigned work; error_sha256={}",crate::kernel::hex(&crate::audit::hash(&line)))); } else if matches!(event["type"].as_str(),Some("agent_settled")){idle=true;}},Ok(None)=>{let status=child.wait().await?;break if status.success(){Ok(())}else{Err(anyhow::anyhow!("Pi exited unsuccessfully"))};},Err(error)=>break Err(error)}},
-            _=wake.tick(),if idle && !*bookkeeping.borrow()=>{idle=false;let message=serde_json::to_vec(&json!({"id":uuid::Uuid::new_v4().to_string(),"type":"prompt","message":"Continue the registered assigned Task. Use the approved tools to report evidence, submit an attempt and finish the Task when its required work is complete."}))?;input.write_all(&message).await?;input.write_all(b"\n").await?;input.flush().await?;},
+            line=bounded_line(&mut output,line_bytes)=>{match line{Ok(Some(line))=>{bytes=bytes.checked_add(line.len() as u64).context("RPC output accounting overflow")?;if bytes>output_bytes{break Err(anyhow::anyhow!("Pi output ceiling exceeded"));}let event:Value=serde_json::from_slice(&line).context("Pi emitted malformed RPC frame")?;terminal_task |= task_completed_rpc(&event);if event["type"]=="extension_error" || event["type"]=="response" && event["success"]==false || event["type"]=="message_end" && event["message"]["stopReason"]=="error" { let retained=&line[..line.len().min(16384)];atomic_private(&plan.work_dir.join("worker-rpc-error.private"),retained)?;break Err(anyhow::anyhow!("Pi RPC rejected assigned work; error_sha256={}",crate::kernel::hex(&crate::audit::hash(&line)))); } else if matches!(event["type"].as_str(),Some("agent_settled")){idle=true;}},Ok(None)=>{let status=child.wait().await?;break if status.success(){Ok(())}else{Err(anyhow::anyhow!("Pi exited unsuccessfully"))};},Err(error)=>break Err(error)}},
+            _=wake.tick(),if idle && !terminal_task && !*bookkeeping.borrow()=>{
+                match tokio::time::timeout(Duration::from_millis(scope.safety_ms),may_prompt(&kernel,&scope)).await {
+                    Ok(Ok(true))=>{},Ok(Ok(false))=>break Ok(()),Ok(Err(error))=>break Err(error),Err(_)=>break Err(anyhow::anyhow!("fresh prompt authority unavailable inside lease margin")),
+                }
+                idle=false;let message=serde_json::to_vec(&json!({"id":uuid::Uuid::new_v4().to_string(),"type":"prompt","message":"Continue the registered assigned Task. Use the approved tools to report evidence, submit an attempt and finish the Task when its required work is complete."}))?;input.write_all(&message).await?;input.write_all(b"\n").await?;input.flush().await?;
+            },
         }
     };
     let _ = child.start_kill();
@@ -1873,6 +1966,234 @@ fn prompt(
     ensure!(text.len() <= 262144, "worker input exceeds declared bound");
     Ok(text)
 }
+// Kept only while an admitted allocation is waiting for normal state capacity.
+// Retrying startup must not mint a new key/certificate on each reconciliation tick.
+struct StartupIdentity {
+    issued: IssuedIdentity,
+}
+
+#[derive(Debug)]
+struct StartAuthorityChanged;
+impl std::fmt::Display for StartAuthorityChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("worker startup authority is no longer current")
+    }
+}
+impl std::error::Error for StartAuthorityChanged {}
+
+fn startup_scope_active(
+    state: &KernelState,
+    view: &crate::cluster::StateView,
+    scope: &WorkerPromptScope,
+    now_ms: u64,
+    claimed: bool,
+) -> bool {
+    let allocation = &scope.allocation;
+    let Ok(grant) = state.security.live_grant(
+        &format!("{}-{}", allocation.agent_id, allocation.incarnation),
+        now_ms / 1000,
+    ) else {
+        return false;
+    };
+    let Ok(holder) = grant.holder.uri() else {
+        return false;
+    };
+    let Ok(goal) = state.domain.goal(&allocation.goal_id) else {
+        return false;
+    };
+    let Ok(task) = state.domain.task(&allocation.goal_id, &scope.task_id) else {
+        return false;
+    };
+    let owned = matches!(task.state, TaskState::Claimed | TaskState::Running)
+        && task.claimed_by.as_deref() == Some(holder.as_str())
+        && task.incarnation == allocation.incarnation
+        && task.fencing_token == allocation.fence
+        && task.lease_expiry_ms > now_ms;
+    let claimable = !claimed
+        && (task.state == TaskState::Open
+            || matches!(
+                task.state,
+                TaskState::Claimed | TaskState::Running | TaskState::Expired
+            ) && task.lease_expiry_ms <= now_ms)
+        && allocation.fence > task.fencing_token;
+    crate::kernel::search_open(state, &allocation.goal_id)
+        && matches!(goal.status.as_str(), "active" | "awaiting_evaluation")
+        && goal.spec.expiry_ms > now_ms.saturating_add(scope.safety_ms)
+        && task.spec.expiry_ms > now_ms.saturating_add(scope.safety_ms)
+        && task.goal_version == goal.spec.version
+        && (owned || claimable)
+        && grant.holder.agent == allocation.agent_id
+        && grant.holder.node == allocation.node_id
+        && grant.holder.incarnation == allocation.incarnation.to_string()
+        && grant.lease.fencing_token == allocation.fence
+        && grant.lease.expiry.saturating_mul(1000) > now_ms.saturating_add(scope.safety_ms)
+        && !state.security.stopped(&Scope::Agent {
+            tenant: grant.holder.tenant.clone(),
+            goal: allocation.goal_id.clone(),
+            holder,
+        })
+        && goal_retraction_epoch(state, &allocation.goal_id) <= scope.retraction_epoch
+        && state
+            .modules
+            .modules
+            .get("workers")
+            .is_some_and(|module| module.active)
+        && state
+            .desired_swarms
+            .get(&allocation.goal_id)
+            .is_some_and(|(_, spec)| {
+                spec.agents
+                    .iter()
+                    .any(|agent| agent.id == allocation.agent_id && agent.task.id == scope.task_id)
+            })
+        && serde_json::to_value(allocation).is_ok_and(|value| {
+            view.kv.get(&format!("allocations/{}", allocation.agent_id)) == Some(&value)
+        })
+        && view
+            .leases
+            .get(&format!("allocation/{}", allocation.agent_id))
+            .is_some_and(|lease| {
+                !lease.revoked
+                    && lease.holder == allocation.node_id
+                    && lease.fence == allocation.fence
+                    && lease.expires_ms > now_ms.saturating_add(scope.safety_ms)
+            })
+        && view
+            .leases
+            .get(&format!("node/{}", allocation.node_id))
+            .is_some_and(|lease| {
+                !lease.revoked && lease.holder == allocation.node_id && lease.expires_ms > now_ms
+            })
+}
+
+async fn startup_scope_current(
+    kernel: &Kernel,
+    scope: &WorkerPromptScope,
+    claimed: bool,
+) -> Result<bool> {
+    let view = kernel.cluster.view_control().await?;
+    let state: KernelState = serde_json::from_value(
+        view.kv
+            .get("kernel/state")
+            .context("startup authority state absent")?
+            .clone(),
+    )?;
+    Ok(startup_scope_active(
+        &state,
+        &view,
+        scope,
+        crate::cluster::now_ms(),
+        claimed,
+    ))
+}
+
+async fn close_startup_broker(
+    socket: &Path,
+    stop: &watch::Sender<bool>,
+    broker_task: &mut JoinHandle<Result<()>>,
+) -> Result<()> {
+    stop.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(5), broker_task)
+        .await
+        .context("unlaunched worker broker did not stop")???;
+    ensure!(!socket.exists(), "unlaunched worker broker socket remains");
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stop_unlaunched_worker(
+    kernel: &Kernel,
+    runtime_subject: &AuthenticatedSubject,
+    broker: &BrokerNode,
+    holder: &str,
+    work: &Path,
+    socket: &Path,
+    stop: &watch::Sender<bool>,
+    broker_task: &mut JoinHandle<Result<()>>,
+    launch_registered: bool,
+) -> Result<()> {
+    close_startup_broker(socket, stop, broker_task).await?;
+    broker.sessions.lock().await.remove(holder);
+    broker.stops.lock().await.remove(holder);
+    if launch_registered {
+        let resource = work
+            .join("process-plan.json")
+            .to_string_lossy()
+            .into_owned();
+        // No pi_worker future or systemd command has been created at this boundary.
+        let proof = json!({"holder":holder,"not_dispatched":true});
+        atomic_private(
+            &work.join("startup-not-dispatched.json"),
+            &serde_json::to_vec(&proof)?,
+        )?;
+        kernel
+            .runtime_control_commit(
+                &format!("startup-cleanup-{}", uuid::Uuid::new_v4()),
+                runtime_subject,
+                &proof,
+                |state| {
+                    let module = state
+                        .modules
+                        .modules
+                        .get_mut("workers")
+                        .context("worker module absent")?;
+                    let cleanup = module
+                        .cleanup
+                        .iter_mut()
+                        .find(|cleanup| cleanup.id == holder)
+                        .context("startup cleanup registration absent")?;
+                    ensure!(
+                        cleanup.kind == "systemd_unit" && cleanup.resource == resource,
+                        "startup cleanup resource differs from admitted plan"
+                    );
+                    cleanup.done = true;
+                    cleanup.last_error = None;
+                    Ok(proof.clone())
+                },
+            )
+            .await?
+            .require()?;
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct CapacityBackoff {
+    entries: BTreeMap<String, (Instant, u8)>,
+}
+impl CapacityBackoff {
+    fn ready(&self, id: &str, now: Instant) -> bool {
+        self.entries.get(id).is_none_or(|(until, _)| now >= *until)
+    }
+    fn result<T>(&mut self, id: &str, result: Result<T>, now: Instant) -> Result<Option<T>> {
+        match result {
+            Ok(value) => {
+                self.entries.remove(id);
+                Ok(Some(value))
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<crate::kernel::StateCapacityError>()
+                    .is_some() =>
+            {
+                let attempts = self.entries.get(id).map_or(0, |(_, attempts)| *attempts);
+                let delay = Duration::from_secs((1u64 << attempts.min(5)).min(30));
+                self.entries
+                    .insert(id.into(), (now + delay, attempts.saturating_add(1)));
+                Ok(None)
+            }
+            Err(error) if error.downcast_ref::<StartAuthorityChanged>().is_some() => {
+                self.entries.remove(id);
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+    fn retain(&mut self, mut retained: impl FnMut(&str) -> bool) {
+        self.entries.retain(|id, _| retained(id));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn start_worker(
     config: &RuntimeConfig,
@@ -1883,8 +2204,24 @@ async fn start_worker(
     allocation: Allocation,
     spec: &placement::SwarmSpec,
     agent: &placement::DesiredAgent,
+    staged: &mut Option<StartupIdentity>,
 ) -> Result<Worker> {
-    let state = kernel.state().await?;
+    let view = kernel.cluster.view_control().await?;
+    let state: KernelState = serde_json::from_value(
+        view.kv
+            .get("kernel/state")
+            .context("startup authority state absent")?
+            .clone(),
+    )?;
+    let scope = WorkerPromptScope {
+        allocation: allocation.clone(),
+        task_id: agent.task.id.clone(),
+        retraction_epoch: goal_retraction_epoch(&state, &allocation.goal_id),
+        safety_ms: config.lease_safety_ms,
+    };
+    if !startup_scope_active(&state, &view, &scope, crate::cluster::now_ms(), false) {
+        return Err(StartAuthorityChanged.into());
+    }
     let grant_id = format!("{}-{}", allocation.agent_id, allocation.incarnation);
     let grant = state
         .security
@@ -1896,6 +2233,7 @@ async fn start_worker(
     let goal_intent = state.domain.goal(&spec.goal_id)?.spec.intent.clone();
     let goal_retraction_epoch = goal_retraction_epoch(&state, &allocation.goal_id);
     drop(state);
+    drop(view);
     let holder = grant.holder.uri()?;
     let expiry = spec.expiry_ms.min(agent.task.expiry_ms);
     ensure!(
@@ -1911,11 +2249,29 @@ async fn start_worker(
     let identity_dir = work.join("identity");
     let now = crate::cluster::now_ms() / 1000;
     let ttl = config.workers.identity_ttl_seconds.min(expiry / 1000 - now);
-    let issued = authority.issue(grant.holder.clone(), now, ttl)?;
-    write_identity(&identity_dir, &issued)?;
+    if staged
+        .as_ref()
+        .is_some_and(|cached| cached.issued.expires_unix <= now)
+    {
+        *staged = None;
+    }
+    if staged.is_none() {
+        let issued = authority.issue(grant.holder.clone(), now, ttl)?;
+        write_identity(&identity_dir, &issued)?;
+        *staged = Some(StartupIdentity { issued });
+    }
+    let staged = staged.as_mut().unwrap();
+    let issued = &staged.issued;
+    ensure!(
+        issued.identity == grant.holder && issued.expires_unix > now,
+        "staged workload identity expired or differs from allocation"
+    );
     kernel
         .register_workload_certificate(
-            &format!("identity-{}", uuid::Uuid::new_v4()),
+            &format!(
+                "identity-{}",
+                crate::kernel::hex(&crate::audit::hash(&issued.certificate_der))
+            ),
             runtime_subject,
             &grant_id,
             &issued.certificate_der,
@@ -1992,104 +2348,191 @@ async fn start_worker(
         connections: 16,
         request_timeout_ms: 120000,
     };
-    let broker_task = tokio::spawn(crate::transport::serve(
+    let mut broker_task = tokio::spawn(crate::transport::serve(
         socket_config,
         Arc::new(broker.clone()),
         rx.clone(),
     ));
-    for _ in 0..100 {
-        if socket.exists() {
-            break;
+    let mut launch_registered = false;
+    let prepared: Result<_> = async {
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            ensure!(
+                !broker_task.is_finished(),
+                "workload broker failed before binding"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        ensure!(socket.exists(), "workload broker socket not ready");
+        let plan = crate::sandbox::prepare_process(&ProcessSpec {
+            run_id: config.deployment_id.clone(),
+            agent_id: allocation.agent_id.clone(),
+            incarnation: allocation.incarnation,
+            expires_ms: expiry,
+            limits: ProcessLimits {
+                cpu_millicores: allocation.resources.cpu_millicores,
+                memory_bytes: allocation.resources.memory_bytes,
+                pids: config.workers.pids,
+                max_output_bytes: config.workers.rpc_output_bytes,
+            },
+            node_binary: config.workers.node_binary.clone(),
+            pi_root: config.workers.pi_root.clone(),
+            guard_binary: config.workers.guard_binary.clone(),
+            broker_socket: socket.clone(),
+            identity_dir: identity_dir.clone(),
+            broker_server_name: format!("node-{}", server.workload.node),
+            work_dir: work.clone(),
+            allow_degraded_landlock: config.workers.allow_degraded_landlock,
+            args: vec![
+                "--provider".into(),
+                "swarm".into(),
+                "--model".into(),
+                spec.model.clone(),
+                "--thinking".into(),
+                "off".into(),
+            ],
+        })?;
+        let record =
+            json!({"holder":holder,"allocation":allocation,"plan":plan,"state":"launch_committed"});
+        kernel
+            .runtime_commit(
+                &format!("launch-{}", uuid::Uuid::new_v4()),
+                runtime_subject,
+                &record,
+                |state| {
+                    let module = "workers";
+                    state.modules.register_cleanup(
+                        module,
+                        crate::modules::Cleanup {
+                            id: holder.clone(),
+                            kind: "systemd_unit".into(),
+                            resource: work.join("process-plan.json").to_string_lossy().into(),
+                            done: false,
+                            last_error: None,
+                        },
+                    )?;
+                    Ok(json!({"launch":holder}))
+                },
+            )
+            .await?
+            .require()?;
+        launch_registered = true;
+        let current_view = kernel.cluster.view_control().await?;
+        let current: KernelState = serde_json::from_value(
+            current_view
+                .kv
+                .get("kernel/state")
+                .context("startup authority state absent")?
+                .clone(),
+        )?;
+        if !startup_scope_active(
+            &current,
+            &current_view,
+            &scope,
+            crate::cluster::now_ms(),
+            false,
+        ) {
+            return Err(StartAuthorityChanged.into());
+        }
+        let task = current.domain.task(&spec.goal_id, &agent.task.id)?;
+        let already_claimed = matches!(task.state, TaskState::Claimed | TaskState::Running)
+            && task.claimed_by.as_deref() == Some(holder.as_str())
+            && task.incarnation == allocation.incarnation
+            && task.fencing_token == allocation.fence;
+        drop(current);
+        drop(current_view);
+        if !already_claimed {
+            bootstrap_claim(&socket, issued, &format!("node-{}", server.workload.node)).await?;
+        }
+        let subject = AuthenticatedSubject::workload(
+            &issued.certificate_der,
+            &issued.ca_der,
+            issued.identity.clone(),
+            now,
+        )?;
+        let task_input = kernel
+            .observe_task_input(
+                &format!("task-input-{}", uuid::Uuid::new_v4()),
+                &subject,
+                &grant_id,
+                crate::kernel::TaskContext {
+                    id: agent.task.id.clone(),
+                    incarnation: allocation.incarnation,
+                    fence: allocation.fence,
+                },
+                vec![crate::cluster::LeaseCheck {
+                    id: format!("allocation/{}", allocation.agent_id),
+                    holder: allocation.node_id.clone(),
+                    fence: allocation.fence,
+                }],
+            )
+            .await?
+            .require()?["input"]
+            .clone();
+        let text = prompt(config, agent, &goal_intent, &task_input)?;
+        let view = kernel.cluster.view_control().await?;
+        let state: KernelState = serde_json::from_value(
+            view.kv
+                .get("kernel/state")
+                .context("startup authority state absent")?
+                .clone(),
+        )?;
+        if !startup_scope_active(&state, &view, &scope, crate::cluster::now_ms(), true) {
+            return Err(StartAuthorityChanged.into());
+        }
+        let lease = view
+            .leases
+            .get(&format!("allocation/{}", allocation.agent_id))
+            .context("launch lease missing")?
+            .clone();
         ensure!(
-            !broker_task.is_finished(),
-            "workload broker failed before binding"
+            !lease.revoked
+                && lease.holder == allocation.node_id
+                && lease.fence == allocation.fence
+                && lease.expires_ms > crate::cluster::now_ms() + config.lease_safety_ms,
+            "allocation lacks live startup safety margin"
         );
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        Ok((plan, text, lease))
     }
-    ensure!(socket.exists(), "workload broker socket not ready");
-    let plan = crate::sandbox::prepare_process(&ProcessSpec {
-        run_id: config.deployment_id.clone(),
-        agent_id: allocation.agent_id.clone(),
-        incarnation: allocation.incarnation,
-        expires_ms: expiry,
-        limits: ProcessLimits {
-            cpu_millicores: allocation.resources.cpu_millicores,
-            memory_bytes: allocation.resources.memory_bytes,
-            pids: config.workers.pids,
-            max_output_bytes: config.workers.rpc_output_bytes,
-        },
-        node_binary: config.workers.node_binary.clone(),
-        pi_root: config.workers.pi_root.clone(),
-        guard_binary: config.workers.guard_binary.clone(),
-        broker_socket: socket.clone(),
-        identity_dir: identity_dir.clone(),
-        broker_server_name: format!("node-{}", server.workload.node),
-        work_dir: work.clone(),
-        allow_degraded_landlock: config.workers.allow_degraded_landlock,
-        args: vec![
-            "--provider".into(),
-            "swarm".into(),
-            "--model".into(),
-            spec.model.clone(),
-            "--thinking".into(),
-            "off".into(),
-        ],
-    })?;
-    let record =
-        json!({"holder":holder,"allocation":allocation,"plan":plan,"state":"launch_committed"});
-    kernel
-        .runtime_commit(
-            &format!("launch-{}", uuid::Uuid::new_v4()),
-            runtime_subject,
-            &record,
-            |state| {
-                let module = "workers";
-                state.modules.register_cleanup(
-                    module,
-                    crate::modules::Cleanup {
-                        id: holder.clone(),
-                        kind: "systemd_unit".into(),
-                        resource: work.join("process-plan.json").to_string_lossy().into(),
-                        done: false,
-                        last_error: None,
-                    },
-                )?;
-                Ok(json!({"launch":holder}))
-            },
-        )
-        .await?
-        .require()?;
-    bootstrap_claim(&socket, &issued, &format!("node-{}", server.workload.node)).await?;
-    let subject = AuthenticatedSubject::workload(
-        &issued.certificate_der,
-        &issued.ca_der,
-        issued.identity.clone(),
-        now,
-    )?;
-    let task_input = kernel
-        .observe_task_input(
-            &format!("task-input-{}", uuid::Uuid::new_v4()),
-            &subject,
-            &grant_id,
-            crate::kernel::TaskContext {
-                id: agent.task.id.clone(),
-                incarnation: allocation.incarnation,
-                fence: allocation.fence,
-            },
-            vec![crate::cluster::LeaseCheck {
-                id: format!("allocation/{}", allocation.agent_id),
-                holder: allocation.node_id.clone(),
-                fence: allocation.fence,
-            }],
-        )
-        .await?
-        .require()?["input"]
-        .clone();
-    let text = prompt(config, agent, &goal_intent, &task_input)?;
+    .await;
+    let (plan, text, lease) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            stop_unlaunched_worker(
+                &kernel,
+                runtime_subject,
+                broker,
+                &holder,
+                &work,
+                &socket,
+                &tx,
+                &mut broker_task,
+                launch_registered,
+            )
+            .await?;
+            startup.armed = false;
+            if error
+                .downcast_ref::<crate::kernel::StateCapacityError>()
+                .is_none()
+                && !startup_scope_current(&kernel, &scope, false).await?
+            {
+                return Err(StartAuthorityChanged.into());
+            }
+            return Err(error);
+        }
+    };
     let (start, ready) = watch::channel(false);
     let (bookkeeping, finishing) = watch::channel(false);
     let worker_task = tokio::spawn(pi_worker(
+        kernel.clone(),
+        WorkerPromptScope {
+            allocation: allocation.clone(),
+            task_id: agent.task.id.clone(),
+            retraction_epoch: goal_retraction_epoch,
+            safety_ms: config.lease_safety_ms,
+        },
         plan.clone(),
         text,
         config.workers.rpc_line_bytes,
@@ -2098,13 +2541,6 @@ async fn start_worker(
         finishing,
         rx,
     ));
-    let view = kernel.cluster.view().await?;
-    let lease = view
-        .leases
-        .get(&format!("allocation/{}", allocation.agent_id))
-        .context("launch lease missing")?
-        .clone();
-    drop(view);
     startup.armed = false;
     Ok(Worker {
         start,
@@ -2641,7 +3077,7 @@ async fn renew_worker(
             .min(grant.lease.expiry - now);
         let issued = authority.issue(grant.holder.clone(), now, ttl)?;
         kernel
-            .register_workload_certificate(
+            .register_workload_certificate_control(
                 &format!("rotate-{}", uuid::Uuid::new_v4()),
                 subject,
                 &grant_id,
@@ -2750,6 +3186,8 @@ pub async fn serve_with_tools(path: &Path, tools: Arc<dyn ToolExecutor>) -> Resu
     });
     let mut operator_task: Option<(watch::Sender<bool>, JoinHandle<Result<()>>)> = None;
     let mut workers = BTreeMap::<String, Worker>::new();
+    let mut startup_identities = BTreeMap::<String, Option<StartupIdentity>>::new();
+    let mut capacity_backoff = CapacityBackoff::default();
     let measurement = runtime_attestation(&config)?;
     let profiles = evaluator_profiles(&config)?;
     let evaluator_agents: BTreeSet<_> = profiles
@@ -2816,7 +3254,10 @@ if operator_task.as_ref().is_some_and(|(_,task)|task.is_finished()){anyhow::bail
                 if registered.spec.expiry_ms<=now || !matches!(registered.status.as_str(),"active"|"awaiting_evaluation")
                     || state.final_evaluations.contains_key(&format!("{goal}/{}",registered.spec.version)) {continue;}
                 if state.security.grants.get(&profile.session.grant_id).is_some_and(|grant|!grant.revoked) {
-                    let active=launch_evaluator(&config,profile,kernel.clone(),&broker,&authority,&runtime_subject).await?;evaluators.insert(goal.clone(),active);
+                    let capacity_key=format!("evaluator/{goal}");
+                    if !capacity_backoff.ready(&capacity_key,Instant::now()){continue;}
+                    let result=launch_evaluator(&config,profile,kernel.clone(),&broker,&authority,&runtime_subject).await;
+                    if let Some(active)=capacity_backoff.result(&capacity_key,result,Instant::now())?{evaluators.insert(goal.clone(),active);}
                 }
             }
             let ids:Vec<_>=workers.keys().cloned().collect();for id in ids{let worker=workers.get_mut(&id).unwrap();let task_done=state.domain.tasks.values().any(|t|t.spec.id==worker.task_id && t.goal_id==worker.allocation.goal_id && matches!(t.state,TaskState::Completed|TaskState::Failed|TaskState::Expired));let mut stopped=goal_retraction_epoch(&state,&worker.allocation.goal_id)>worker.goal_retraction_epoch || state.modules.modules.get("workers").is_some_and(|m|!m.active) || worker.task.is_finished() || worker.broker.is_finished() || task_done;
@@ -2825,10 +3266,18 @@ if !stopped && (search_closed(&state,&worker.allocation.goal_id)
     stopped = !drain_worker(&config,&kernel,worker).await?;
 }
 if stopped{let worker=workers.remove(&id).unwrap();stop_worker(worker,&broker,&kernel,&runtime_subject,"worker stopped, fenced, completed or lease unavailable").await?;}}
-            if cluster.leader().await==Some(config.cluster.node_id){retire_lost_allocations(&kernel,&runtime_subject).await?;for(operator,spec)in state.desired_swarms.values(){if search_closed(&state,&spec.goal_id) || now>=spec.expiry_ms || state.security.stopped(&Scope::Goal{tenant:spec.tenant.clone(),goal:spec.goal_id.clone()}){continue;}let mut spec=spec.clone();spec.agents.retain(|a|!state.domain.task(&spec.goal_id,&a.task.id).is_ok_and(|t|matches!(t.state,TaskState::Completed|TaskState::Failed)));if spec.agents.is_empty(){continue;}let _write=cluster.kernel_write(false).await;let view=cluster.view_control().await?;let snapshot=placement::snapshot(&view)?;spec.agents.retain(|agent|!snapshot.allocations.contains_key(&agent.id));if spec.agents.is_empty(){continue;}let planning_state:KernelState=serde_json::from_value(view.kv.get("kernel/state").context("planning state absent")?.clone())?;let gang=spec.gang(view.revision,&next_incarnations(&planning_state,&spec)?)?;if gang.bundles.iter().all(|b|snapshot.allocations.contains_key(&b.agent_id)){continue;}
-if let Ok(plan)=scheduler.plan(&gang,&snapshot){let reserve=placement::Reserve{max_state_bytes:kernel.max_state_bytes,state:planning_state,spec:spec.clone(),operator:Actor{id:operator.clone(),role:DomainRole::Operator},now_ms:now};let _=scheduler.bind_while_locked(&cluster,&plan,&reserve,spec.lease_ms).await?;}}}
-            let view=cluster.view_control().await?;let snapshot=placement::snapshot(&view)?;let state=control_state(&kernel).await?;for allocation in snapshot.allocations.values().filter(|a|a.node_id==config.node.id){let id=format!("{}-{}",allocation.agent_id,allocation.incarnation);if search_closed(&state,&allocation.goal_id) || evaluator_agents.contains(&allocation.agent_id){continue;}
-if workers.contains_key(&id) || state.modules.modules.get("workers").is_some_and(|m|!m.active){continue;}let Some((_,spec))=state.desired_swarms.get(&allocation.goal_id)else{continue};let Some(agent)=spec.agents.iter().find(|a|a.id==allocation.agent_id)else{continue};let task=state.domain.task(&spec.goal_id,&agent.task.id)?;if matches!(task.state,TaskState::Completed|TaskState::Failed){continue;}let worker=start_worker(&config,kernel.clone(),&broker,&authority,&runtime_subject,allocation.clone(),spec,agent).await?;workers.insert(id,worker);}
+            if cluster.leader().await==Some(config.cluster.node_id){retire_lost_allocations(&kernel,&runtime_subject).await?;for(operator,spec)in state.desired_swarms.values(){let capacity_key=format!("placement/{}",spec.goal_id);if !capacity_backoff.ready(&capacity_key,Instant::now()){continue;}
+if search_closed(&state,&spec.goal_id) || now>=spec.expiry_ms || state.security.stopped(&Scope::Goal{tenant:spec.tenant.clone(),goal:spec.goal_id.clone()}){continue;}let mut spec=spec.clone();spec.agents.retain(|a|!state.domain.task(&spec.goal_id,&a.task.id).is_ok_and(|t|matches!(t.state,TaskState::Completed|TaskState::Failed)));if spec.agents.is_empty(){continue;}let _write=cluster.kernel_write(false).await;let view=cluster.view_control().await?;let snapshot=placement::snapshot(&view)?;spec.agents.retain(|agent|!snapshot.allocations.contains_key(&agent.id));if spec.agents.is_empty(){continue;}let planning_state:KernelState=serde_json::from_value(view.kv.get("kernel/state").context("planning state absent")?.clone())?;let gang=spec.gang(view.revision,&next_incarnations(&planning_state,&spec)?)?;if gang.bundles.iter().all(|b|snapshot.allocations.contains_key(&b.agent_id)){continue;}
+if let Ok(plan)=scheduler.plan(&gang,&snapshot){let reserve=placement::Reserve{max_state_bytes:kernel.max_state_bytes,state:planning_state,spec:spec.clone(),operator:Actor{id:operator.clone(),role:DomainRole::Operator},now_ms:now};let result=scheduler.bind_while_locked(&cluster,&plan,&reserve,spec.lease_ms).await;let _=capacity_backoff.result(&capacity_key,result,Instant::now())?;}}}
+            let view=cluster.view_control().await?;let snapshot=placement::snapshot(&view)?;let state=control_state(&kernel).await?;
+            let allocation_ids:BTreeSet<_>=snapshot.allocations.values().map(|allocation|format!("{}-{}",allocation.agent_id,allocation.incarnation)).collect();
+            startup_identities.retain(|id,_|allocation_ids.contains(id) && !workers.contains_key(id));
+            capacity_backoff.retain(|id|id.strip_prefix("worker/").is_some_and(|worker|allocation_ids.contains(worker)) || id.strip_prefix("placement/").is_some_and(|goal|state.desired_swarms.contains_key(goal)) || id.strip_prefix("evaluator/").is_some_and(|goal|profiles.contains_key(goal)));
+            for allocation in snapshot.allocations.values().filter(|a|a.node_id==config.node.id){let id=format!("{}-{}",allocation.agent_id,allocation.incarnation);if search_closed(&state,&allocation.goal_id) || evaluator_agents.contains(&allocation.agent_id){continue;}
+if workers.contains_key(&id) || state.modules.modules.get("workers").is_some_and(|m|!m.active){continue;}let Some((_,spec))=state.desired_swarms.get(&allocation.goal_id)else{continue};let Some(agent)=spec.agents.iter().find(|a|a.id==allocation.agent_id)else{continue};let task=state.domain.task(&spec.goal_id,&agent.task.id)?;if matches!(task.state,TaskState::Completed|TaskState::Failed) || task.spec.expiry_ms<=now.saturating_add(config.lease_safety_ms){continue;}
+let capacity_key=format!("worker/{id}");if !capacity_backoff.ready(&capacity_key,Instant::now()){continue;}
+let result=start_worker(&config,kernel.clone(),&broker,&authority,&runtime_subject,allocation.clone(),spec,agent,startup_identities.entry(id.clone()).or_default()).await;
+if let Some(worker)=capacity_backoff.result(&capacity_key,result,Instant::now())?{startup_identities.remove(&id);workers.insert(id,worker);}}
             for worker in workers.values(){worker.start.send_replace(true);}
         }}}
         Ok::<_,anyhow::Error>(())
@@ -2910,10 +3359,7 @@ async fn bootstrap_claim(
         .json(&message)
         .send()
         .await?;
-    ensure!(
-        response.status().is_success(),
-        "signed bootstrap Task claim was denied"
-    );
+    let successful = response.status().is_success();
     let mut bytes = vec![];
     while let Some(chunk) = response.chunk().await? {
         ensure!(
@@ -2922,7 +3368,11 @@ async fn bootstrap_claim(
         );
         bytes.extend_from_slice(&chunk);
     }
-    let _: Value = serde_json::from_slice(&bytes)?;
+    let value: Value = serde_json::from_slice(&bytes)?;
+    if !successful && value["code"] == "state_capacity" {
+        return Err(crate::kernel::StateCapacityError.into());
+    }
+    ensure!(successful, "signed bootstrap Task claim was denied");
     Ok(())
 }
 
@@ -3291,10 +3741,37 @@ async fn shutdown_signal() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    #[test]
+    fn normal_capacity_defers_only_that_scope_with_bounded_retry() {
+        let mut retry = CapacityBackoff::default();
+        let mut now = Instant::now();
+        for seconds in [1, 2, 4, 8, 16, 30, 30] {
+            let result: Result<()> = Err(crate::kernel::StateCapacityError.into());
+            assert!(retry.result("placement/g", result, now).unwrap().is_none());
+            assert!(!retry.ready("placement/g", now));
+            assert!(retry.ready("worker/existing", now));
+            assert!(!retry.ready(
+                "placement/g",
+                now + Duration::from_secs(seconds) - Duration::from_millis(1)
+            ));
+            now += Duration::from_secs(seconds);
+            assert!(retry.ready("placement/g", now));
+        }
+        // A successful fresh admission resets the pressure delay immediately.
+        assert_eq!(retry.result("placement/g", Ok(17), now).unwrap(), Some(17));
+        assert!(retry.entries.is_empty());
+        let result: Result<()> = Err(anyhow::anyhow!(
+            "deployment state admission limit reached; outstanding receipt and control capacity remain reserved"
+        ));
+        assert!(retry.result("placement/g", result, now).is_err());
+        assert!(retry.entries.is_empty());
+    }
+
     struct ClaimReceiver {
         count: Arc<AtomicUsize>,
         holder: String,
+        capacity: Arc<AtomicBool>,
     }
     impl crate::transport::Handler for ClaimReceiver {
         fn handle(
@@ -3306,6 +3783,7 @@ mod tests {
         ) -> crate::transport::HandlerFuture {
             let count = self.count.clone();
             let expected = self.holder.clone();
+            let capacity = self.capacity.clone();
             Box::pin(async move {
                 ensure!(
                     peer.subject.id() == expected
@@ -3316,6 +3794,9 @@ mod tests {
                 );
                 message.verify(&peer.public_key, crate::cluster::now_ms(), 1024)?;
                 count.fetch_add(1, Ordering::SeqCst);
+                if capacity.load(Ordering::SeqCst) {
+                    return Err(crate::kernel::StateCapacityError.into());
+                }
                 Ok(json!({"claimed":true}))
             })
         }
@@ -3340,10 +3821,12 @@ mod tests {
         private_dir(&directory).unwrap();
         let socket = directory.join("broker.sock");
         let count = Arc::new(AtomicUsize::new(0));
+        let capacity = Arc::new(AtomicBool::new(false));
         let (tx, rx) = watch::channel(false);
         let handler = Arc::new(ClaimReceiver {
             count: count.clone(),
             holder: id.uri().unwrap(),
+            capacity: capacity.clone(),
         });
         let config = SocketConfig {
             path: socket.clone(),
@@ -3356,7 +3839,7 @@ mod tests {
             connections: 2,
             request_timeout_ms: 3000,
         };
-        let task = tokio::spawn(crate::transport::serve(config, handler, rx));
+        let mut task = tokio::spawn(crate::transport::serve(config, handler, rx));
         for _ in 0..100 {
             if socket.exists() {
                 break;
@@ -3371,8 +3854,17 @@ mod tests {
                 .is_err()
         );
         assert_eq!(count.load(Ordering::SeqCst), 1);
-        tx.send(true).unwrap();
-        task.await.unwrap().unwrap();
+        capacity.store(true, Ordering::SeqCst);
+        let error = bootstrap_claim(&socket, &worker, "node-n1")
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::kernel::StateCapacityError>()
+                .is_some()
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        close_startup_broker(&socket, &tx, &mut task).await.unwrap();
         assert!(!socket.exists());
         fs::remove_dir_all(directory).unwrap();
     }
@@ -3697,6 +4189,157 @@ mod cluster_rotation_tests {
 #[cfg(test)]
 mod final_drain_tests {
     use super::*;
+    #[tokio::test]
+    async fn startup_accepts_only_current_open_or_owned_task_and_fences_withdrawal() {
+        use crate::node::receiver_tests::Harness;
+        let h = Harness::open().await;
+        let view = h.kernel.cluster.view_control().await.unwrap();
+        let allocation: Allocation =
+            serde_json::from_value(view.kv["allocations/a1"].clone()).unwrap();
+        let spec: placement::SwarmSpec =
+            serde_json::from_value(view.kv["swarms/g"].clone()).unwrap();
+        let scope = WorkerPromptScope {
+            allocation,
+            task_id: "task-1".into(),
+            retraction_epoch: 0,
+            safety_ms: 100,
+        };
+        let read_fixture = |mut state: KernelState| {
+            // Read-only runtime declarations; authority remains the normally admitted Harness state.
+            state
+                .modules
+                .register(ModuleSpec {
+                    id: "workers".into(),
+                    dependencies: Default::default(),
+                    provides: ["workers".into()].into(),
+                })
+                .unwrap();
+            state
+                .desired_swarms
+                .insert("g".into(), ("fixture-operator".into(), spec.clone()));
+            state
+        };
+        let state = read_fixture(h.kernel.state().await.unwrap());
+        let now = crate::cluster::now_ms();
+        assert!(startup_scope_active(&state, &view, &scope, now, false));
+        assert!(!startup_scope_active(&state, &view, &scope, now, true));
+        assert_eq!(
+            h.send("startup-claim", "/tool/claim_task", json!({}))
+                .await
+                .0,
+            200
+        );
+        let view = h.kernel.cluster.view_control().await.unwrap();
+        let state = read_fixture(h.kernel.state().await.unwrap());
+        let now = crate::cluster::now_ms();
+        assert!(startup_scope_active(&state, &view, &scope, now, true));
+        let mut closed = state.clone();
+        closed.domain.goals.get_mut("g").unwrap().status = "completed".into();
+        assert!(!startup_scope_active(&closed, &view, &scope, now, false));
+        let mut fenced = view.clone();
+        fenced.leases.get_mut("allocation/a1").unwrap().fence += 1;
+        assert!(!startup_scope_active(&state, &fenced, &scope, now, true));
+        let mut revoked = state;
+        revoked.security.grants.get_mut("a1-1").unwrap().revoked = true;
+        assert!(!startup_scope_active(&revoked, &view, &scope, now, true));
+        let mut retry = CapacityBackoff::default();
+        let result: Result<()> = Err(StartAuthorityChanged.into());
+        assert!(
+            retry
+                .result("worker/a1-1", result, Instant::now())
+                .unwrap()
+                .is_none()
+        );
+        assert!(retry.entries.is_empty());
+        h.close().await;
+    }
+
+    #[test]
+    fn only_successful_completed_tool_inhibits_idle_wakes() {
+        let successful = json!({"type":"tool_execution_end","toolName":"complete_task","isError":false,"result":{"terminate":true,"details":{"state":"completed"}}});
+        assert!(task_completed_rpc(&successful));
+        let mut review = successful.clone();
+        review["result"]["details"]["status"] = json!("confirmation_required");
+        assert!(!task_completed_rpc(&review));
+        let mut denied = successful.clone();
+        denied["isError"] = json!(true);
+        assert!(!task_completed_rpc(&denied));
+        let mut attempt = successful;
+        attempt["toolName"] = json!("submit_attempt");
+        assert!(!task_completed_rpc(&attempt));
+    }
+
+    #[tokio::test]
+    async fn idle_prompt_requires_current_task_and_allocation_authority() {
+        use crate::node::receiver_tests::Harness;
+        let h = Harness::open().await;
+        assert_eq!(
+            h.send("idle-claim", "/tool/claim_task", json!({})).await.0,
+            200
+        );
+        let view = h.kernel.cluster.view_control().await.unwrap();
+        let allocation: Allocation =
+            serde_json::from_value(view.kv["allocations/a1"].clone()).unwrap();
+        let mut state = h.kernel.state().await.unwrap();
+        // This module declaration is a read-only predicate fixture. It never enters the Kernel.
+        state
+            .modules
+            .register(ModuleSpec {
+                id: "workers".into(),
+                dependencies: Default::default(),
+                provides: ["workers".into()].into(),
+            })
+            .unwrap();
+        let scope = WorkerPromptScope {
+            allocation,
+            task_id: "task-1".into(),
+            retraction_epoch: 0,
+            safety_ms: 100,
+        };
+        let now = crate::cluster::now_ms();
+        assert!(prompt_scope_active(&state, &view, &scope, now));
+        let mut fenced = view.clone();
+        fenced.leases.get_mut("allocation/a1").unwrap().fence += 1;
+        assert!(!prompt_scope_active(&state, &fenced, &scope, now));
+        let mut expired = state.clone();
+        expired
+            .domain
+            .tasks
+            .get_mut("g/task-1")
+            .unwrap()
+            .lease_expiry_ms = now;
+        assert!(!prompt_scope_active(&expired, &view, &scope, now));
+        let mut stopped = state.clone();
+        stopped.security.grants.get_mut("a1-1").unwrap().revoked = true;
+        assert!(!prompt_scope_active(&stopped, &view, &scope, now));
+        assert_eq!(h.send("idle-inference", "/model", json!({"model":"m1","messages":[{"role":"user","content":"Produce scoped completion evidence"}],"max_tokens":16})).await.0, 200);
+        let (status, finding) = h
+            .send(
+                "idle-finding",
+                "/tool/submit_finding",
+                json!({"body":{"fact":"scoped completion"}}),
+            )
+            .await;
+        assert_eq!(status, 200, "{finding}");
+        let (status, result) = h
+            .send(
+                "idle-complete",
+                "/tool/complete_task",
+                json!({"result_ref":finding["id"]}),
+            )
+            .await;
+        assert_eq!(status, 200, "{result}");
+        let mut completed = h.kernel.state().await.unwrap();
+        completed.modules = state.modules;
+        assert!(!prompt_scope_active(
+            &completed,
+            &h.kernel.cluster.view_control().await.unwrap(),
+            &scope,
+            crate::cluster::now_ms()
+        ));
+        h.close().await;
+    }
+
     #[test]
     fn final_drain_deadline_is_monotonic_and_never_extended() {
         let start = Instant::now();

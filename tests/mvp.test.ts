@@ -87,6 +87,9 @@ test("pinned Pi preserves iterative attempts and executes the final scoped batch
   let claimed = false;
   let finalSubmitted = false;
   let completed = false;
+  let reviewApproved = false;
+  let attemptedReviews = 0;
+  let completionReviews = 0;
   const server = createServer({key: await readFile(join(dir, "server.key")), cert: await readFile(join(dir, "server.pem")), ca, requestCert: true, rejectUnauthorized: true, minVersion: "TLSv1.3", maxVersion: "TLSv1.3"}, async (req, res) => {
     try {
       const chunks: Buffer[] = []; for await (const chunk of req) chunks.push(chunk);
@@ -120,7 +123,9 @@ test("pinned Pi preserves iterative attempts and executes the final scoped batch
         const finding = {id: "finding-1", type: "function", function: {name: "submit_finding", arguments: JSON.stringify({body: {fact: "Verified Ω\u2028 from task-1"}})}};
         const forged = {id: "forged-1", type: "function", function: {name: "bash", arguments: JSON.stringify({command: "touch forbidden-side-effect"})}};
         const attempt = {id: "attempt-search", type: "function", function: {name: "submit_attempt", arguments: JSON.stringify({payload: {phase: "search"}})}};
-        const finalAttempt = {id: "attempt-final", type: "function", function: {name: "submit_attempt", arguments: JSON.stringify({payload: {phase: "final"}})}};
+        const reviewAttempt = {id: "attempt-review", type: "function", function: {name: "submit_attempt", arguments: JSON.stringify({payload: {phase: "review"}})}};
+        const reviewComplete = {id: "complete-review", type: "function", function: {name: "complete_task", arguments: JSON.stringify({result_ref: "finding-result-1"})}};
+        const finalAttempt = {id: "attempt-final", type: "function", function: {name: "submit_attempt", arguments: JSON.stringify({payload: {phase: "review"}})}};
         const complete = {id: "complete-final", type: "function", function: {name: "complete_task", arguments: JSON.stringify({result_ref: "finding-result-1"})}};
         if (modelCalls > 1) {
           assert.ok(payload.messages.some((message: any) => message.role === "tool" && message.tool_call_id === "claim-1" && message.content.includes("task-1")));
@@ -130,8 +135,8 @@ test("pinned Pi preserves iterative attempts and executes the final scoped batch
           assert.ok(payload.messages.some((message: any) => message.role === "tool" && message.tool_call_id === "forged-1" && /not found|compiled definition/i.test(message.content)));
         }
         if (modelCalls === 4) assert.ok(payload.messages.some((message: any) => message.role === "tool" && message.tool_call_id === "attempt-search" && message.content.includes("accepted")));
-        assert.ok(modelCalls <= 5, "The final batch must settle without a sixth model request");
-        const selected = modelCalls === 1 ? [claim] : modelCalls === 2 ? [finding, forged] : modelCalls === 3 ? [attempt] : modelCalls === 5 ? [finalAttempt, complete] : null;
+        assert.ok(modelCalls <= 7, "The final batch must settle without an eighth model request");
+        const selected = modelCalls === 1 ? [claim] : modelCalls === 2 ? [finding, forged] : modelCalls === 3 ? [attempt] : modelCalls === 5 ? [reviewAttempt, reviewComplete] : modelCalls === 7 ? [finalAttempt, complete] : null;
         return res.end(JSON.stringify({id: `mvp-receipt-${modelCalls}`, created: 1, model: modelId, swarm_cost_microusd: 7,
           choices: [{index: 0, message: selected ? {role: "assistant", content: null, tool_calls: selected} : {role: "assistant", content: "MVP finished Ω\u2028 with scoped evidence."}, finish_reason: selected ? "tool_calls" : "stop"}],
           usage: {prompt_tokens: 20, completion_tokens: 3, total_tokens: 23, prompt_cache_hit_tokens: 2},
@@ -146,8 +151,10 @@ test("pinned Pi preserves iterative attempts and executes the final scoped batch
       }
       if (message.path === "/tool/submit_attempt") {
         assert.equal(claimed, true);
-        if (message.request_id === "tool-attempt-final") {
-          assert.deepEqual(payload, {payload: {phase: "final"}});
+        if (message.request_id === "tool-attempt-review") {
+          attemptedReviews++;
+          assert.deepEqual(payload, {payload: {phase: "review"}});
+          if (!reviewApproved) return res.end(JSON.stringify({status: "confirmation_required", intent: message.request_id}));
           // Pi defaults to parallel tools. The extension must wait for this reply
           // before executing CompleteTask from the same assistant message.
           await new Promise((done) => setTimeout(done, 100));
@@ -159,9 +166,11 @@ test("pinned Pi preserves iterative attempts and executes the final scoped batch
         return res.end(JSON.stringify({accepted: true}));
       }
       if (message.path === "/tool/complete_task") {
-        assert.equal(finalSubmitted, true, "CompleteTask must follow the committed final submission");
         assert.deepEqual(payload, {result_ref: "finding-result-1"});
-        assert.equal(message.request_id, "tool-complete-final");
+        assert.equal(message.request_id, "tool-complete-review", "Approval retry must retain the original exact intent");
+        completionReviews++;
+        if (!reviewApproved) return res.end(JSON.stringify({status: "confirmation_required", intent: message.request_id}));
+        assert.equal(finalSubmitted, true, "CompleteTask must follow the committed final submission");
         completed = true;
         return res.end(JSON.stringify({accepted: true}));
       }
@@ -225,12 +234,28 @@ test("pinned Pi preserves iterative attempts and executes the final scoped batch
     assert.equal(final?.usage.cost.total, 0.000007);
     assert.equal(final?.usage.cacheRead, 2);
     const finalSettled = waitForSettled();
-    child.stdin.write(`${JSON.stringify({id: "mvp-final", type: "prompt", message: "Submit the final candidate and complete the Task in one ordered assistant batch."})}\n`);
+    child.stdin.write(`${JSON.stringify({id: "mvp-review", type: "prompt", message: "Submit the candidate and complete the Task; the fixture requires exact-action review."})}\n`);
     await finalSettled;
     assert.deepEqual(serverFailures, [], stderr);
-    assert.equal(modelCalls, 5, "The final two-tool batch must not request another model completion");
+    assert.equal(modelCalls, 6, "Confirmation-required results must not set terminal flags");
+    assert.equal(finalSubmitted, false);
+    assert.equal(completed, false);
+    const deniedCompletion = records.find((record) => record.type === "tool_execution_end" && record.toolCallId === "complete-review");
+    assert.equal(deniedCompletion?.isError, true);
+    assert.notEqual(deniedCompletion?.result?.terminate, true);
+    reviewApproved = true; // Fixture response switch; no claim of production approval or MFA.
+    const resumed = waitForSettled();
+    child.stdin.write(`${JSON.stringify({id: "mvp-final", type: "prompt", message: "Resume the exact reviewed candidate and complete the Task in one ordered assistant batch."})}\n`);
+    await resumed;
+    assert.deepEqual(serverFailures, [], stderr);
+    assert.equal(modelCalls, 7, "The final two-tool batch must not request another model completion");
     assert.equal(finalSubmitted, true);
     assert.equal(completed, true);
+    assert.equal(attemptedReviews, 2);
+    assert.equal(completionReviews, 2);
+    const completion = records.findLast((record) => record.type === "tool_execution_end" && record.toolName === "complete_task");
+    assert.equal(completion?.isError, false);
+    assert.equal(completion?.result?.terminate, true, "The supervisor receives a terminal-success marker before agent_settled");
     assert.deepEqual(calls.filter((call) => call.path.startsWith("/tool/")).slice(-2).map((call) => call.path), ["/tool/submit_attempt", "/tool/complete_task"]);
   } finally {
     child.kill("SIGKILL");

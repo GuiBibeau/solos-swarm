@@ -579,6 +579,22 @@ impl BrokerNode {
         backend
             .provider
             .validate(&inference, crate::cluster::now_ms())?;
+        let cancel = self
+            .stops
+            .lock()
+            .await
+            .get(peer.subject.id())
+            .context("workload supervisor stop channel missing")?
+            .subscribe();
+        // A local slot is not spend authority. Wait before creating any funded intent, then
+        // derive and consume current quorum authority without a provider queue between them.
+        let slot = backend
+            .provider
+            .acquire(inference.deadline_ms, cancel.clone())
+            .await?;
+        backend
+            .provider
+            .validate(&inference, crate::cluster::now_ms())?;
         let frozen_price = prices
             .as_ref()
             .context("inference prices missing")?
@@ -607,33 +623,6 @@ impl BrokerNode {
         let funded_request_hash =
             serde_json::from_value(admission["permit"]["payload"]["action_hash"].clone())?;
         drop(admission); // The financial binding is sufficient after admission; the effect is durable in quorum state.
-        let cancel = self
-            .stops
-            .lock()
-            .await
-            .get(peer.subject.id())
-            .context("workload supervisor stop channel missing")?
-            .subscribe();
-        let slot = match backend
-            .provider
-            .acquire(inference.deadline_ms, cancel.clone())
-            .await
-        {
-            Ok(slot) => slot,
-            Err(error) => {
-                let executor = self.executor_subject.read().await.clone();
-                self.kernel
-                    .cancel_pending(
-                        &format!("not-dispatched-{}", message.request_id),
-                        &executor,
-                        &intent,
-                        error.to_string(),
-                    )
-                    .await?
-                    .require()?;
-                return Err(error);
-            }
-        };
         let dispatched = self
             .kernel
             .dispatch(
@@ -767,18 +756,6 @@ impl BrokerNode {
     ) -> Result<Value> {
         let intent = format!("tool-{}", message.request_id);
         let goal_id = peer.workload.goal.clone();
-        if self
-            .kernel
-            .state()
-            .await?
-            .effects
-            .get(&intent)
-            .is_some_and(|effect| effect.state == "done")
-        {
-            self.kernel
-                .validate_cached_effect(&peer.subject, &intent, &Self::leases(session))
-                .await?;
-        }
         let command = match tool.name.as_str() {
             "claim_task" => DomainCommand::ClaimTask {
                 goal_id,
@@ -838,11 +815,22 @@ impl BrokerNode {
             },
             "submit_attempt" => {
                 let state = self.kernel.state().await?;
-                let planning_round_id = state
-                    .domain
-                    .latest_planning_round(&goal_id, peer.subject.id())?
-                    .id
-                    .clone();
+                let planning_round_id = if let Some(effect) = state
+                    .effects
+                    .get(&intent)
+                    .filter(|effect| effect.state == "done")
+                {
+                    effect.payload["planning_round_id"]
+                        .as_str()
+                        .context("completed attempt lost its original planning round")?
+                        .into()
+                } else {
+                    state
+                        .domain
+                        .latest_planning_round(&goal_id, peer.subject.id())?
+                        .id
+                        .clone()
+                };
                 DomainCommand::SubmitAttempt {
                     goal_id,
                     attempt_id: message.request_id.clone(),
@@ -867,6 +855,19 @@ impl BrokerNode {
                 let after_index = args["after_index"].as_u64().unwrap_or(0);
                 let limit: usize = args["limit"].as_u64().unwrap_or(16).try_into()?;
                 let payload = json!({"goal_id":goal_id,"after_index":after_index,"limit":limit});
+                if let Some(cached) = self
+                    .kernel
+                    .cached_local_application(
+                        &peer.subject,
+                        &intent,
+                        &payload,
+                        (tool.kind, &tool.operation, &tool.resource),
+                        &Self::leases(session),
+                    )
+                    .await?
+                {
+                    return Ok(cached);
+                }
                 let request = self
                     .request(
                         session,
@@ -918,6 +919,19 @@ impl BrokerNode {
                 let limit = args["limit"].as_u64().unwrap_or(128) as usize;
                 let after_id = args["after_id"].as_str().map(str::to_owned);
                 let payload = json!({"goal_id":goal_id,"after_id":after_id,"limit":limit});
+                if let Some(cached) = self
+                    .kernel
+                    .cached_local_application(
+                        &peer.subject,
+                        &intent,
+                        &payload,
+                        (tool.kind, &tool.operation, &tool.resource),
+                        &Self::leases(session),
+                    )
+                    .await?
+                {
+                    return Ok(cached);
+                }
                 let request = self
                     .request(
                         session,
@@ -969,6 +983,19 @@ impl BrokerNode {
                 let limit = args["limit"].as_u64().unwrap_or(128) as usize;
                 let after_id = args["after_id"].as_str().map(str::to_owned);
                 let payload = json!({"goal_id":goal_id,"after_id":after_id,"limit":limit});
+                if let Some(cached) = self
+                    .kernel
+                    .cached_local_application(
+                        &peer.subject,
+                        &intent,
+                        &payload,
+                        (tool.kind, &tool.operation, &tool.resource),
+                        &Self::leases(session),
+                    )
+                    .await?
+                {
+                    return Ok(cached);
+                }
                 let request = self
                     .request(
                         session,
@@ -1061,6 +1088,19 @@ impl BrokerNode {
             }
         };
         let payload = serde_json::to_value(&command)?;
+        if let Some(cached) = self
+            .kernel
+            .cached_local_application(
+                &peer.subject,
+                &intent,
+                &payload,
+                (tool.kind, &tool.operation, &tool.resource),
+                &Self::leases(session),
+            )
+            .await?
+        {
+            return Ok(cached);
+        }
         let request = self
             .request(
                 session,

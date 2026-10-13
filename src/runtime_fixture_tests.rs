@@ -65,8 +65,11 @@ fn prepare_runtime_fixture() -> Result<()> {
     let api_model = if actual_local { "qwen3-4b" } else { "m1" };
     let model_resource = format!("provider/local/model/{api_model}");
     let ttl = if actual_local { 1800 } else { 600 };
-    let context_tokens = if actual_local { 16384 } else { 32768 };
-    let output_tokens = 1024;
+    // Complete Finding provenance plus the required Task-status step exceed 16k.
+    // Both profiles declare 32k; the actual CPU server uses two independent 32k slots.
+    let context_tokens = 32768;
+    // The complete two-call final response needs 1091 tokens with pretty JSON.
+    let output_tokens = if actual_local { 2048 } else { 1024 };
     let root = env_path("SOLOS_RUNTIME_SMOKE_ROOT")?;
     ensure!(!root.exists(), "fixture destination must be fresh");
     let run_name = root

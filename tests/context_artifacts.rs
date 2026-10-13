@@ -188,6 +188,40 @@ fn qwen4b_paired_assets_and_receiver_conformance_vectors() {
         json!({"name":"tools","messages":[{"role":"user","content":"Read the sample"}],"tools":[{"type":"function","function":{"name":"read","description":"Read only","parameters":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}}}]}),
         json!({"name":"tool-history","messages":[{"role":"user","content":"Read the sample"},{"role":"assistant","content":"","tool_calls":[{"id":"call1","type":"function","function":{"name":"read","arguments":"{\"id\":\"sample\"}"}}]},{"role":"tool","tool_call_id":"call1","content":"{\"answer\":42}"},{"role":"user","content":"What is the answer?"}],"tools":[{"type":"function","function":{"name":"read","parameters":{"type":"object","properties":{"id":{"type":"string"}}}}}]}),
     ];
+    let receiver_vectors: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/qwen-content-parts.json")).unwrap();
+    assert_eq!(
+        receiver_vectors["source"]["template_sha256"],
+        QWEN4B_GGUF_TEMPLATE_SHA256
+    );
+    for case in receiver_vectors["vectors"].as_array().unwrap() {
+        let prompt = qwen
+            .render_chat(
+                case["messages"].as_array().unwrap(),
+                case["tools"].as_array().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            prompt,
+            case["rendered_prompt"].as_str().unwrap(),
+            "{}",
+            case["name"]
+        );
+        assert_eq!(
+            format!(
+                "{:x}",
+                <sha2::Sha256 as sha2::Digest>::digest(prompt.as_bytes())
+            ),
+            case["rendered_prompt_sha256"].as_str().unwrap()
+        );
+    }
+    assert!(
+        qwen.render_chat(
+            &[json!({"role":"user","content":[{"type":"image_url","image_url":"private"}]})],
+            &[]
+        )
+        .is_err()
+    );
     let mut vectors = vec![];
     for mut case in cases {
         let messages = case["messages"].as_array().unwrap();

@@ -64,18 +64,25 @@ impl Harness {
         Self::open_with_tools(Arc::new(DenyTools), vec![]).await
     }
     pub(crate) async fn open_with_concurrency(concurrency: usize) -> Self {
-        Self::open_configured(Arc::new(DenyTools), vec![], concurrency).await
+        Self::open_configured(Arc::new(DenyTools), vec![], concurrency, None).await
+    }
+    pub(crate) async fn open_with_confirmation(
+        kind: CapabilityKind,
+        tier: crate::security::ConfirmationTier,
+    ) -> Self {
+        Self::open_configured(Arc::new(DenyTools), vec![], 1, Some((kind, tier))).await
     }
     pub(crate) async fn open_with_tools(
         tools: Arc<dyn ToolExecutor>,
         extra_tools: Vec<ToolDefinition>,
     ) -> Self {
-        Self::open_configured(tools, extra_tools, 1).await
+        Self::open_configured(tools, extra_tools, 1, None).await
     }
     async fn open_configured(
         tools: Arc<dyn ToolExecutor>,
         extra_tools: Vec<ToolDefinition>,
         concurrency: usize,
+        confirmation: Option<(CapabilityKind, crate::security::ConfirmationTier)>,
     ) -> Self {
         let mut f = test_support::fixture();
         let ca = IdentityAuthority::generate("test.local").unwrap();
@@ -152,6 +159,11 @@ impl Harness {
             .capability_ceiling
             .retain(|c| c.kind != CapabilityKind::PolicyRequest);
         for c in &mut f.posture.capability_ceiling {
+            if let Some((kind, tier)) = confirmation
+                && c.kind == kind
+            {
+                c.confirmation = tier;
+            }
             c.constraints.operations = operations.clone();
             c.constraints.resources = f
                 .posture
@@ -185,6 +197,22 @@ impl Harness {
                 )
                 .unwrap(),
         ];
+        if confirmation.is_some_and(|(_, tier)| tier == crate::security::ConfirmationTier::C3) {
+            f.approvals.push(
+                state
+                    .issue_approval(
+                        &f.operators[1],
+                        f.posture.registration_hash().unwrap(),
+                        [0; 32],
+                        0,
+                        Scope::Tenant { tenant: "t".into() },
+                        f.now + 600,
+                        &f.signer,
+                        f.now,
+                    )
+                    .unwrap(),
+            );
+        }
         let directory = std::env::temp_dir().join(format!("ss-node-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&directory).unwrap();
         let address = "127.0.0.1:0".parse().unwrap();
@@ -836,7 +864,7 @@ async fn actual_worker_claim_context_receipts_unknown_cancellation_and_stop() {
             .to_string()
             .contains("candidate A")
     );
-    // A queued request is reserved but cancelled before the provider can receive it.
+    // Cancellation while waiting for a local provider slot creates no funded intent.
     let (_slot_stop, rx) = watch::channel(false);
     let held_slot = h
         .provider
@@ -850,9 +878,9 @@ async fn actual_worker_claim_context_receipts_unknown_cancellation_and_stop() {
                 .state()
                 .await
                 .unwrap()
-                .ledger
-                .intents
-                .contains_key("model-cancel")
+                .security
+                .inputs
+                .contains_key("context/model-cancel")
             {
                 break;
             }
@@ -862,26 +890,12 @@ async fn actual_worker_claim_context_receipts_unknown_cancellation_and_stop() {
     };
     let ((status, result), ()) = tokio::join!(request, cancel);
     assert_eq!(status, 403, "{result}");
-    assert!(
-        h.kernel
-            .state()
-            .await
-            .unwrap()
-            .ledger
-            .intents
-            .contains_key("model-cancel"),
-        "{result}"
-    );
     drop(held_slot);
     let state = h.kernel.state().await.unwrap();
-    assert_eq!(
-        state.ledger.intents["model-cancel"].state,
-        IntentState::Released
-    );
-    assert_eq!(
-        state.quotas.reservations["model-cancel"].state,
-        "not_dispatched"
-    );
+    assert!(!state.effects.contains_key("model-cancel"));
+    assert!(!state.ledger.intents.contains_key("model-cancel"));
+    assert!(!state.quotas.reservations.contains_key("model-cancel"));
+    assert_eq!(state.ledger.accounts["global"].total.held, 0);
     assert_eq!(h.upstream.lock().await.len(), 2);
     h.worker_stop.send_replace(false);
     let (status, _) = h.send("lost", "/model", inference("LOSE_ACK")).await;
@@ -1243,5 +1257,47 @@ async fn fresh_verified_root_login_and_stop_use_control_headroom() {
                 goal: "g".into()
             })
     );
+    h.close().await;
+}
+
+#[tokio::test]
+async fn formatted_context_replay_retains_digest_and_exact_durable_request() {
+    let h = Harness::open().await;
+    assert_eq!(
+        h.send("compact-claim", "/tool/claim_task", json!({}))
+            .await
+            .0,
+        200
+    );
+    let text = "frozen-context-marker ".repeat(200);
+    let (status, completion) = h.send("compact-context", "/model", inference(&text)).await;
+    assert_eq!(status, 200, "{completion}");
+    let state = h.kernel.state().await.unwrap();
+    let effect = &state.effects["model-compact-context"];
+    let context = &effect.payload["context"];
+    assert_eq!(effect.payload, effect.request.action.arguments);
+    let replay = &state.replies["context-compact-context"].request;
+    assert_eq!(
+        replay[3],
+        json!(crate::audit::content_hash(&effect.payload).unwrap())
+    );
+    assert!(serde_json::to_vec(replay).unwrap().len() < 4096);
+    assert!(context.to_string().contains("frozen-context-marker"));
+    assert!(
+        state
+            .replies
+            .values()
+            .all(|reply| !reply.value.to_string().contains("frozen-context-marker"))
+    );
+    let before_contacts = h.upstream.lock().await.len();
+    assert_eq!(
+        h.send("compact-context", "/model", inference(&text))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(h.upstream.lock().await.len(), before_contacts);
+    assert_eq!(state.ledger.accounts["global"].total.spent, 7);
+    assert_eq!(state.ledger.accounts["global"].total.held, 0);
     h.close().await;
 }

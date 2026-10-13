@@ -114,6 +114,7 @@ impl Kernel {
         );
         let request = json!({"intent":intent,"parent_grant":parent_grant_id,"parent_envelope":parent_envelope_id,"context":context,"task":task});
         let request_hash = content_hash(&(subject.id(), &request))?;
+        let binding_id = format!("application-binding/{}", hex(&content_hash(&id)?));
         let _write = self.cluster.kernel_write(false).await;
         for _ in 0..16 {
             let view = self.cluster.view().await?;
@@ -135,6 +136,12 @@ impl Kernel {
                     revision: view.revision,
                 });
             }
+            if let Some(binding) = state.replies.get(&binding_id) {
+                ensure!(
+                    binding.actor == subject.id() && binding.request_hash == request_hash,
+                    "delegation application identity reused for different content"
+                );
+            }
             let now_ms = crate::cluster::now_ms();
             let mut next = state.clone();
             let staged = stage(
@@ -150,7 +157,10 @@ impl Kernel {
                 now_ms,
             );
             let (ok, value, mut ops) = match staged {
-                Ok((value, plan, spec)) => (true, value, placement_ops(&plan, &spec, now_ms)?),
+                Ok((value, Some((plan, spec)))) => {
+                    (true, value, placement_ops(&plan, &spec, now_ms)?)
+                }
+                Ok((confirmation, None)) => (true, confirmation, vec![]),
                 Err(error) => {
                     next = state;
                     (false, json!({"error":error.to_string()}), vec![])
@@ -162,8 +172,56 @@ impl Kernel {
                     .last()
                     .map_or(0, |event| event.timestamp),
             );
+            let record_id = if ok && value["status"] == "confirmation_required" {
+                let review: crate::security::ConfirmationReview =
+                    serde_json::from_value(value["review"].clone())?;
+                let selected = next.security.review_approvals(
+                    &review,
+                    next.action_approvals.values().cloned(),
+                    timestamp,
+                )?;
+                format!(
+                    "apply-phase/{}",
+                    hex(&content_hash(&(id, &review, &selected))?)
+                )
+            } else {
+                id.into()
+            };
+            if let Some(reply) = next.replies.get(&record_id) {
+                ensure!(
+                    reply.request_hash == request_hash,
+                    "delegation phase reused for different content"
+                );
+                return Ok(Reply {
+                    ok: reply.ok,
+                    value: reply.value.clone(),
+                    duplicate: true,
+                    revision: view.revision,
+                });
+            }
+            if record_id != id && !next.replies.contains_key(&binding_id) {
+                next.audit.append_committed(AuditEvent {
+                    id: binding_id.clone(),
+                    kind: "application_request_binding".into(),
+                    actor: subject.id().into(),
+                    goal: Some(task_goal(subject)?),
+                    timestamp,
+                    decision: "bound".into(),
+                    payload_hash: request_hash,
+                })?;
+                next.replies.insert(
+                    binding_id.clone(),
+                    RecordedReply {
+                        actor: subject.id().into(),
+                        request: json!({"request_hash":hex(&request_hash)}),
+                        request_hash,
+                        ok: true,
+                        value: json!({"status":"application_binding","intent":intent}),
+                    },
+                );
+            }
             next.audit.append_committed(AuditEvent {
-                id: format!("request/{id}"),
+                id: format!("request/{record_id}"),
                 kind: "kernel_request".into(),
                 actor: subject.id().into(),
                 goal: Some(task_goal(subject)?),
@@ -172,7 +230,7 @@ impl Kernel {
                 payload_hash: request_hash,
             })?;
             next.replies.insert(
-                id.into(),
+                record_id.clone(),
                 RecordedReply {
                     actor: subject.id().into(),
                     request: request.clone(),
@@ -182,7 +240,7 @@ impl Kernel {
                 },
             );
             next.validate()?;
-            next.checkpoint(id, subject.id(), timestamp)?;
+            next.checkpoint(&record_id, subject.id(), timestamp)?;
             let encoded = serde_json::to_vec(&next)?;
             crate::kernel::ensure_state_capacity(
                 &next,
@@ -244,7 +302,7 @@ fn stage(
     view: &crate::cluster::StateView,
     signer: &crate::audit::CryptoSigner,
     now_ms: u64,
-) -> Result<(Value, Plan, SwarmSpec)> {
+) -> Result<(Value, Option<(Plan, SwarmSpec)>)> {
     check_task(state, subject, Some(context), false)?;
     let workload = WorkloadId::parse(subject.id())?;
     let goal = workload.goal.clone();
@@ -315,6 +373,14 @@ fn stage(
             .is_subset(&state.domain.task(&goal, &context.id)?.spec.capabilities),
         "child Task widens current parent names"
     );
+    // A local permit has no external effect until this transaction. Refresh any
+    // changed observation/stop epochs under the current parent Task and leases.
+    if let Some(confirmation) =
+        crate::kernel::refresh_nonbillable_effect(state, subject, intent, signer, now_ms / 1000)?
+    {
+        return Ok((confirmation, None));
+    }
+    let effect = state.effects.get(intent).unwrap().clone();
     let (operator, mut swarm) = state
         .desired_swarms
         .get(&goal)
@@ -405,7 +471,7 @@ fn stage(
     let effect = state.effects.get_mut(intent).unwrap();
     effect.state = "done".into();
     effect.result = Some(value.clone());
-    Ok((value, plan, swarm))
+    Ok((value, Some((plan, swarm))))
 }
 fn placement_ops(plan: &Plan, spec: &SwarmSpec, now_ms: u64) -> Result<Vec<Mutation>> {
     let mut ops = vec![Mutation::Put {
@@ -878,6 +944,82 @@ mod tests {
             .unwrap()
             .require()
             .unwrap();
+        // Tighten the read-only stage fixture's consent ceiling after admission.
+        // The refreshed review may persist, but no child or money may be created.
+        let mut reviewed = kernel.state().await.unwrap();
+        reviewed
+            .security
+            .grants
+            .get_mut(&f.definition.id)
+            .unwrap()
+            .capabilities
+            .iter_mut()
+            .find(|cap| cap.id == "agent-cap-5")
+            .unwrap()
+            .confirmation = security::ConfirmationTier::C2;
+        reviewed.security.grant_epoch += 1;
+        let domain_before = content_hash(&reviewed.domain).unwrap();
+        let ledger_before = content_hash(&reviewed.ledger).unwrap();
+        let swarm_before = content_hash(&reviewed.desired_swarms).unwrap();
+        let grant_count = reviewed.security.grants.len();
+        let (confirmation, placement) = stage(
+            &mut reviewed,
+            &f.subject,
+            "child-intent",
+            &f.definition.id,
+            "parent-envelope",
+            &context,
+            &spec,
+            &cluster.view().await.unwrap(),
+            &kernel.signer,
+            crate::cluster::now_ms(),
+        )
+        .unwrap();
+        assert_eq!(confirmation["status"], "confirmation_required");
+        assert!(placement.is_none());
+        assert!(reviewed.pending_actions.contains_key("child-intent"));
+        assert_eq!(content_hash(&reviewed.domain).unwrap(), domain_before);
+        assert_eq!(content_hash(&reviewed.ledger).unwrap(), ledger_before);
+        assert_eq!(
+            content_hash(&reviewed.desired_swarms).unwrap(),
+            swarm_before
+        );
+        assert_eq!(reviewed.security.grants.len(), grant_count);
+        assert_eq!(reviewed.effects["child-intent"].state, "pending");
+
+        // A global epoch change without a parent authority change is rebased in
+        // the same real CAS that reserves the child. This fixture counter update
+        // is explicit test authority, not a production grant mutation API.
+        let mut intervening = kernel.state().await.unwrap();
+        intervening.security.grant_epoch += 1;
+        intervening
+            .security
+            .grants
+            .get_mut(&f.definition.id)
+            .unwrap()
+            .capabilities
+            .iter_mut()
+            .find(|cap| cap.id == "agent-cap-5")
+            .unwrap()
+            .confirmation = security::ConfirmationTier::C2;
+        let refreshed_epoch = intervening.security.grant_epoch;
+        intervening
+            .checkpoint(
+                "unrelated-epoch-fixture",
+                operator.id(),
+                crate::cluster::now_ms() / 1000,
+            )
+            .unwrap();
+        cluster
+            .transact(Transaction::new(
+                "unrelated-epoch-fixture",
+                vec![Mutation::Put {
+                    key: "kernel/state".into(),
+                    value: serde_json::to_value(intervening).unwrap(),
+                }],
+            ))
+            .await
+            .unwrap();
         let reply = kernel
             .delegate_current(
                 "apply-child",
@@ -892,6 +1034,111 @@ mod tests {
             .await
             .unwrap();
         assert!(reply.ok, "{:?}", reply.value);
+        assert_eq!(reply.value["status"], "confirmation_required");
+        assert_eq!(reply.value["review"]["required_humans"], 2);
+        let waiting = kernel.state().await.unwrap();
+        let original_waits: BTreeMap<_, _> = waiting
+            .replies
+            .iter()
+            .filter(|(_, reply)| reply.value["status"] == "confirmation_required")
+            .map(|(id, reply)| (id.clone(), content_hash(reply).unwrap()))
+            .collect();
+        let financial_before = content_hash(&waiting.ledger).unwrap();
+        let request = waiting.effects["child-intent"].request.clone();
+        let (action_hash, evidence_hash, scope, grant_version) = waiting
+            .security
+            .approval_binding(&f.subject, &request, crate::cluster::now_ms() / 1000)
+            .unwrap();
+        use crate::operator::OperatorKernel;
+        for human in 0..2 {
+            kernel
+                .apply_operator(
+                    f.operators[human].clone(),
+                    crate::operator::OperatorRequest {
+                        request_id: format!("child-human-{human}"),
+                        operation: crate::operator::OperatorCommand::Approve {
+                            action_hash,
+                            evidence_hash,
+                            grant_version,
+                            scope: scope.clone(),
+                            expiry: f.now + 100,
+                        },
+                    },
+                    &f.signer,
+                    crate::cluster::now_ms() / 1000,
+                )
+                .await
+                .unwrap();
+            let applied = kernel
+                .delegate_current(
+                    "apply-child",
+                    &f.subject,
+                    "child-intent",
+                    &f.definition.id,
+                    "parent-envelope",
+                    context.clone(),
+                    spec.clone(),
+                    checks.clone(),
+                )
+                .await
+                .unwrap();
+            assert!(applied.ok, "{:?}", applied.value);
+            if human == 0 {
+                assert_eq!(applied.value["status"], "confirmation_required");
+                assert!(
+                    !applied.duplicate,
+                    "a distinct approval must get its own immutable review phase"
+                );
+                let unchanged = kernel.state().await.unwrap();
+                assert!(unchanged.domain.task("g", "child-task").is_err());
+                assert_eq!(unchanged.desired_swarms["g"].1.agents.len(), 1);
+                assert_eq!(content_hash(&unchanged.ledger).unwrap(), financial_before);
+                let repeated = kernel
+                    .delegate_current(
+                        "apply-child",
+                        &f.subject,
+                        "child-intent",
+                        &f.definition.id,
+                        "parent-envelope",
+                        context.clone(),
+                        spec.clone(),
+                        checks.clone(),
+                    )
+                    .await
+                    .unwrap();
+                assert!(repeated.duplicate);
+                assert_eq!(repeated.value["status"], "confirmation_required");
+            } else {
+                assert!(applied.value.get("allocation").is_some());
+                assert!(
+                    kernel
+                        .state()
+                        .await
+                        .unwrap()
+                        .domain
+                        .task("g", "child-task")
+                        .is_ok()
+                );
+            }
+        }
+        let state = kernel.state().await.unwrap();
+        for (id, digest) in original_waits {
+            assert_eq!(content_hash(&state.replies[&id]).unwrap(), digest);
+        }
+        let reply = kernel
+            .delegate_current(
+                "apply-child",
+                &f.subject,
+                "child-intent",
+                &f.definition.id,
+                "parent-envelope",
+                context.clone(),
+                spec.clone(),
+                checks.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(reply.duplicate);
         assert!(
             kernel
                 .delegate_current(
@@ -909,6 +1156,10 @@ mod tests {
                 .duplicate
         );
         let state = kernel.state().await.unwrap();
+        assert_eq!(
+            state.effects["child-intent"].permit.payload.grant_epoch,
+            refreshed_epoch
+        );
         let child_id = reply.value["allocation"]["agent_id"].as_str().unwrap();
         let grant = &state.security.grants[reply.value["grant_id"].as_str().unwrap()];
         assert_eq!(grant.parent.as_deref(), Some(f.definition.id.as_str()));
@@ -928,6 +1179,43 @@ mod tests {
         let view = cluster.view().await.unwrap();
         assert!(view.kv.contains_key(&format!("allocations/{child_id}")));
         assert!(view.leases.contains_key(&format!("allocation/{child_id}")));
+        // Restore the test's original C0 ceiling for its separate capacity and
+        // final-selection regressions; the narrowed consent fixture is complete.
+        let mut restored = kernel.state().await.unwrap();
+        restored
+            .security
+            .grants
+            .get_mut(&f.definition.id)
+            .unwrap()
+            .capabilities
+            .iter_mut()
+            .find(|cap| cap.id == "agent-cap-5")
+            .unwrap()
+            .confirmation = f
+            .definition
+            .capabilities
+            .iter()
+            .find(|cap| cap.id == "agent-cap-5")
+            .unwrap()
+            .confirmation;
+        restored.security.grant_epoch += 1;
+        restored
+            .checkpoint(
+                "restore-test-ceiling",
+                operator.id(),
+                crate::cluster::now_ms() / 1000,
+            )
+            .unwrap();
+        cluster
+            .transact(Transaction::new(
+                "restore-test-ceiling",
+                vec![Mutation::Put {
+                    key: "kernel/state".into(),
+                    value: serde_json::to_value(restored).unwrap(),
+                }],
+            ))
+            .await
+            .unwrap();
         let second = child(&template, "too-many");
         kernel
             .admit(

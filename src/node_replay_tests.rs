@@ -223,6 +223,169 @@ async fn control_writer_bypasses_ten_queued_normal_writers() {
 }
 
 #[tokio::test]
+async fn queued_model_waits_without_funding_then_admits_current_unrelated_authority_epoch() {
+    use crate::provider::Provider;
+    let h = Harness::open().await;
+    assert_eq!(
+        h.send("queue-claim", "/tool/claim_task", json!({})).await.0,
+        200
+    );
+    let (_stop, receiver) = tokio::sync::watch::channel(false);
+    let slot = h
+        .provider
+        .acquire(crate::cluster::now_ms() + 10_000, receiver)
+        .await
+        .unwrap();
+    let id = format!("queued-model-{}", uuid::Uuid::new_v4().simple());
+    let intent = format!("model-{id}");
+    let payload = inference("wait for a local slot before any budget reservation");
+    let model = h.send(&id, "/model", payload.clone());
+    let release = async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let state = h.kernel.state().await.unwrap();
+                if state
+                    .security
+                    .inputs
+                    .contains_key(&format!("context/{intent}"))
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("queued model never prepared its immutable context");
+        let queued = h.kernel.state().await.unwrap();
+        assert!(!queued.effects.contains_key(&intent));
+        assert!(!queued.ledger.intents.contains_key(&intent));
+        assert!(!queued.quotas.reservations.contains_key(&intent));
+        assert_eq!(queued.ledger.accounts["global"].total.held, 0);
+        assert_eq!(queued.ledger.accounts["global"].total.spent, 0);
+        assert!(h.upstream.lock().await.is_empty());
+        let epoch = advance_authority(&h, &uuid::Uuid::new_v4().simple().to_string()).await;
+        let changed = h.kernel.state().await.unwrap();
+        assert!(!changed.effects.contains_key(&intent));
+        assert!(!changed.ledger.intents.contains_key(&intent));
+        assert!(!changed.quotas.reservations.contains_key(&intent));
+        assert_eq!(changed.ledger.accounts["global"].total.held, 0);
+        assert_eq!(changed.ledger.accounts["global"].total.spent, 0);
+        assert!(h.upstream.lock().await.is_empty());
+        drop(slot);
+        epoch
+    };
+    let ((status, completion), epoch) = tokio::join!(model, release);
+    assert_eq!(status, 200, "{completion}");
+    let state = h.kernel.state().await.unwrap();
+    assert_eq!(state.effects[&intent].permit.payload.grant_epoch, epoch);
+    assert_eq!(state.effects[&intent].request.intent_id, intent);
+    assert_eq!(
+        state.effects[&intent].payload["wire_hash"],
+        crate::kernel::hex(&crate::audit::content_hash(&payload).unwrap())
+    );
+    assert_eq!(state.ledger.intents[&intent].state, IntentState::Settled);
+    assert_eq!(state.ledger.accounts["global"].total.spent, 7);
+    assert_eq!(state.ledger.accounts["global"].total.held, 0);
+    assert_eq!(h.upstream.lock().await.len(), 1);
+    assert_eq!(h.send(&id, "/model", payload).await.0, 200);
+    assert_eq!(h.upstream.lock().await.len(), 1);
+    assert_eq!(
+        h.kernel.state().await.unwrap().ledger.accounts["global"]
+            .total
+            .spent,
+        7
+    );
+    h.close().await;
+}
+
+#[tokio::test]
+async fn queued_model_denied_by_current_stop_releases_local_slot_without_funding() {
+    use crate::{
+        operator::{OperatorCommand, OperatorKernel, OperatorRequest},
+        provider::Provider,
+        security::Scope,
+    };
+    let h = Harness::open().await;
+    assert_eq!(
+        h.send("queue-deny-claim", "/tool/claim_task", json!({}))
+            .await
+            .0,
+        200
+    );
+    let (_stop, receiver) = tokio::sync::watch::channel(false);
+    let held = h
+        .provider
+        .acquire(crate::cluster::now_ms() + 10_000, receiver)
+        .await
+        .unwrap();
+    let id = format!("queue-denied-{}", uuid::Uuid::new_v4().simple());
+    let intent = format!("model-{id}");
+    let model = h.send(
+        &id,
+        "/model",
+        inference("no reservation while waiting for a slot"),
+    );
+    let stop_and_release = async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if h.kernel
+                    .state()
+                    .await
+                    .unwrap()
+                    .security
+                    .inputs
+                    .contains_key(&format!("context/{intent}"))
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("queued model never prepared its context");
+        h.kernel
+            .apply_operator(
+                h.fixture.operators[0].clone(),
+                OperatorRequest {
+                    request_id: format!("stop-{id}"),
+                    operation: OperatorCommand::EngageStop {
+                        scope: Scope::Goal {
+                            tenant: "t".into(),
+                            goal: "g".into(),
+                        },
+                        reason: "deny before current admission".into(),
+                    },
+                },
+                &h.fixture.signer,
+                crate::cluster::now_ms() / 1000,
+            )
+            .await
+            .unwrap();
+        drop(held);
+    };
+    let ((status, response), ()) = tokio::join!(model, stop_and_release);
+    assert_eq!(status, 403, "{response}");
+    let state = h.kernel.state().await.unwrap();
+    assert!(!state.effects.contains_key(&intent));
+    assert!(!state.ledger.intents.contains_key(&intent));
+    assert!(!state.quotas.reservations.contains_key(&intent));
+    assert_eq!(state.ledger.accounts["global"].total.held, 0);
+    assert_eq!(state.ledger.accounts["global"].total.spent, 0);
+    assert!(h.upstream.lock().await.is_empty());
+    let (_stop, receiver) = tokio::sync::watch::channel(false);
+    let released = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        h.provider
+            .acquire(crate::cluster::now_ms() + 1000, receiver),
+    )
+    .await
+    .expect("denied model leaked its local provider slot")
+    .unwrap();
+    drop(released);
+    h.close().await;
+}
+
+#[tokio::test]
 async fn typed_authority_phase_retry_preserves_one_model_intent_contact_and_fee() {
     let h = Harness::open().await;
     assert_eq!(
@@ -275,6 +438,445 @@ async fn typed_authority_phase_retry_preserves_one_model_intent_contact_and_fee(
             .spent,
         7
     );
+    h.close().await;
+}
+
+#[tokio::test]
+async fn stale_c3_receiver_application_waits_for_two_fresh_humans_and_consumes_once() {
+    use crate::{
+        operator::{OperatorCommand, OperatorKernel, OperatorRequest},
+        security::{CapabilityKind, ConfirmationReview, ConfirmationTier},
+    };
+    let h = Harness::open_with_confirmation(CapabilityKind::BoardPost, ConfirmationTier::C3).await;
+    assert_eq!(
+        h.send("c3-claim", "/tool/claim_task", json!({})).await.0,
+        200
+    );
+    let id = format!("c3-application-{}", uuid::Uuid::new_v4().simple());
+    let intent = format!("tool-{id}");
+    let payload = json!({"topic":"approved-evidence","body":{"value":"one immutable application"}});
+    let (status, first) = h.send(&id, "/tool/board_post", payload.clone()).await;
+    assert_eq!(status, 200, "{first}");
+    assert_eq!(first["status"], "confirmation_required");
+    let review: ConfirmationReview = serde_json::from_value(first["review"].clone()).unwrap();
+    assert_eq!(review.tier, ConfirmationTier::C3);
+    assert_eq!(review.required_humans, 2);
+    for human in 0..2 {
+        h.kernel
+            .apply_operator(
+                h.fixture.operators[human].clone(),
+                OperatorRequest {
+                    request_id: format!("original-human-{human}-{id}"),
+                    operation: OperatorCommand::Approve {
+                        action_hash: review.action_hash,
+                        evidence_hash: review.evidence_hash,
+                        grant_version: review.grant_version,
+                        scope: review.scope.clone(),
+                        expiry: review.expiry,
+                    },
+                },
+                &h.fixture.signer,
+                crate::cluster::now_ms() / 1000,
+            )
+            .await
+            .unwrap();
+    }
+    let gate = crate::kernel::admission_sync::pause_once(format!("application:apply-{id}"));
+    let application = h.send(&id, "/tool/board_post", payload.clone());
+    let churn = async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_reviewed())
+            .await
+            .expect("receiver never reached local application boundary");
+        let before = h.kernel.state().await.unwrap();
+        let original = before.effects[&intent].permit.clone();
+        assert_eq!(before.effects[&intent].state, "pending");
+        assert_eq!(original.payload.confirmation, ConfirmationTier::C3);
+        assert!(before.domain.boards.get("g").is_none_or(Vec::is_empty));
+        assert!(!before.ledger.intents.contains_key(&intent));
+        assert_eq!(before.ledger.accounts["global"].total.held, 0);
+        advance_authority(&h, &uuid::Uuid::new_v4().simple().to_string()).await;
+        gate.release();
+        original
+    };
+    let ((status, refreshed), original) = tokio::join!(application, churn);
+    assert_eq!(status, 200, "{refreshed}");
+    assert_eq!(refreshed["status"], "confirmation_required");
+    let fresh: ConfirmationReview = serde_json::from_value(refreshed["review"].clone()).unwrap();
+    assert_eq!(fresh.tier, ConfirmationTier::C3);
+    assert_eq!(fresh.required_humans, 2);
+    assert_eq!(fresh.action_hash, original.payload.action_hash);
+    assert_eq!(fresh.evidence_hash, original.payload.evidence_hash);
+    assert!(fresh.grant_epoch > original.payload.grant_epoch);
+    assert_eq!(fresh.expiry, original.payload.expiry);
+    let reviews: std::collections::BTreeMap<_, _> = h
+        .kernel
+        .state()
+        .await
+        .unwrap()
+        .replies
+        .iter()
+        .filter(|(_, reply)| {
+            reply.value["status"] == "confirmation_required" && reply.value["intent"] == intent
+        })
+        .map(|(id, reply)| (id.clone(), crate::audit::content_hash(reply).unwrap()))
+        .collect();
+    assert!(!reviews.is_empty());
+    for human in 0..2 {
+        h.kernel
+            .apply_operator(
+                h.fixture.operators[human].clone(),
+                OperatorRequest {
+                    request_id: format!("fresh-human-{human}-{id}"),
+                    operation: OperatorCommand::Approve {
+                        action_hash: fresh.action_hash,
+                        evidence_hash: fresh.evidence_hash,
+                        grant_version: fresh.grant_version,
+                        scope: fresh.scope.clone(),
+                        expiry: fresh.expiry,
+                    },
+                },
+                &h.fixture.signer,
+                crate::cluster::now_ms() / 1000,
+            )
+            .await
+            .unwrap();
+        if human == 0 {
+            let (status, insufficient) = h.send(&id, "/tool/board_post", payload.clone()).await;
+            assert_eq!(status, 200, "{insufficient}");
+            assert_eq!(insufficient["status"], "confirmation_required");
+            let state = h.kernel.state().await.unwrap();
+            assert_eq!(state.effects[&intent].state, "pending");
+            assert!(state.domain.boards.get("g").is_none_or(Vec::is_empty));
+            let changed = json!({"topic":"changed-destination","body":{"value":"same id cannot change intent"}});
+            assert_eq!(h.send(&id, "/tool/board_post", changed).await.0, 403);
+            assert_eq!(
+                h.kernel.state().await.unwrap().effects[&intent].payload,
+                state.effects[&intent].payload
+            );
+            // Also reach the application's own replay identity guard through the authenticated
+            // Kernel API, independent of the receiver's earlier pending-admission check.
+            let view = h.kernel.cluster.view().await.unwrap();
+            let allocation = &view.leases["allocation/a1"];
+            let rejected = h
+                .kernel
+                .domain(
+                    &format!("apply-{id}"),
+                    &h.fixture.subject,
+                    &intent,
+                    crate::domain::DomainCommand::AppendBoard {
+                        goal_id: "g".into(),
+                        entry_id: id.clone(),
+                        topic: "changed-application".into(),
+                        body: json!({"value":"same application id cannot change its command"}),
+                        signature: String::new(),
+                    },
+                    "",
+                    vec![crate::cluster::LeaseCheck {
+                        id: "allocation/a1".into(),
+                        holder: allocation.holder.clone(),
+                        fence: allocation.fence,
+                    }],
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                rejected
+                    .to_string()
+                    .contains("application request identity reused for different content"),
+                "{rejected}"
+            );
+        }
+    }
+    let (status, completed) = h.send(&id, "/tool/board_post", payload.clone()).await;
+    assert_eq!(status, 200, "{completed}");
+    assert_ne!(completed["status"], "confirmation_required");
+    let state = h.kernel.state().await.unwrap();
+    assert_eq!(state.effects[&intent].state, "done");
+    assert_eq!(state.domain.boards["g"].len(), 1);
+    assert_eq!(state.domain.boards["g"][0].entry_id, id);
+    assert_eq!(
+        state.effects[&intent].permit.payload.action_hash,
+        original.payload.action_hash
+    );
+    assert_eq!(
+        state.effects[&intent].permit.payload.expiry,
+        original.payload.expiry
+    );
+    assert_eq!(
+        state.effects[&intent].permit.payload.grant_epoch,
+        fresh.grant_epoch
+    );
+    assert!(!state.pending_actions.contains_key(&intent));
+    assert!(!state.ledger.intents.contains_key(&intent));
+    assert_eq!(state.ledger.accounts["global"].total.held, 0);
+    assert_eq!(state.ledger.accounts["global"].total.spent, 0);
+    assert!(h.upstream.lock().await.is_empty());
+    let refreshed_audit = format!(
+        "permit-refresh/{intent}/{}",
+        crate::kernel::hex(&crate::audit::content_hash(&state.effects[&intent].permit).unwrap())
+    );
+    assert_eq!(
+        state
+            .audit
+            .events()
+            .iter()
+            .filter(|event| event.id == refreshed_audit)
+            .count(),
+        1
+    );
+    let observed = state.security.observed.get(h.fixture.subject.id()).cloned();
+    let (status, replay) = h.send(&id, "/tool/board_post", payload.clone()).await;
+    assert_eq!(status, 200, "{replay}");
+    assert_ne!(replay["status"], "confirmation_required");
+    let replayed = h.kernel.state().await.unwrap();
+    assert_eq!(replayed.domain.boards["g"].len(), 1);
+    assert!(!replayed.pending_actions.contains_key(&intent));
+    assert_eq!(
+        replayed
+            .security
+            .observed
+            .get(h.fixture.subject.id())
+            .cloned(),
+        observed
+    );
+    assert_eq!(replayed.ledger.accounts["global"].total.spent, 0);
+    assert_eq!(replayed.ledger.accounts["global"].total.held, 0);
+    for (id, hash) in &reviews {
+        assert_eq!(
+            crate::audit::content_hash(&replayed.replies[id]).unwrap(),
+            *hash
+        );
+    }
+    h.kernel
+        .apply_operator(
+            h.fixture.operators[0].clone(),
+            OperatorRequest {
+                request_id: format!("stop-c3-{id}"),
+                operation: OperatorCommand::EngageStop {
+                    scope: crate::security::Scope::Goal {
+                        tenant: "t".into(),
+                        goal: "g".into(),
+                    },
+                    reason: "stop must forbid cached local delivery".into(),
+                },
+            },
+            &h.fixture.signer,
+            crate::cluster::now_ms() / 1000,
+        )
+        .await
+        .unwrap();
+    assert_eq!(h.send(&id, "/tool/board_post", payload).await.0, 403);
+    assert_eq!(h.kernel.state().await.unwrap().domain.boards["g"].len(), 1);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn completed_attempt_replay_keeps_original_round_after_new_inference_and_denies_changes() {
+    let h = Harness::open().await;
+    assert_eq!(
+        h.send("attempt-replay-claim", "/tool/claim_task", json!({}))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        h.send(
+            "attempt-first-round",
+            "/model",
+            inference("prepare one candidate")
+        )
+        .await
+        .0,
+        200
+    );
+    let (status, finding) = h
+        .send(
+            "attempt-replay-finding",
+            "/tool/submit_finding",
+            json!({"body":{"evidence":"synthetic current evidence"}}),
+        )
+        .await;
+    assert_eq!(status, 200, "{finding}");
+    let finding_id = finding["id"].as_str().unwrap();
+    let packet = json!({"payload":{"candidate":"immutable candidate"},"finding_ids":[finding_id]});
+    let (status, attempt) = h
+        .send(
+            "attempt-replay-packet",
+            "/tool/submit_attempt",
+            packet.clone(),
+        )
+        .await;
+    assert_eq!(status, 200, "{attempt}");
+    let original_round = attempt["planning_round_id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        h.send(
+            "attempt-next-round",
+            "/model",
+            inference("compare the retained candidate in a new round")
+        )
+        .await
+        .0,
+        200
+    );
+    let next = h
+        .kernel
+        .state()
+        .await
+        .unwrap()
+        .domain
+        .latest_planning_round("g", h.fixture.subject.id())
+        .unwrap()
+        .id
+        .clone();
+    assert_ne!(next, original_round);
+    let (status, replay) = h
+        .send(
+            "attempt-replay-packet",
+            "/tool/submit_attempt",
+            packet.clone(),
+        )
+        .await;
+    assert_eq!(status, 200, "{replay}");
+    assert_eq!(replay["planning_round_id"], original_round);
+    let mut changed = packet;
+    changed["payload"]["candidate"] = json!("changed candidate under the same packet id");
+    assert_eq!(
+        h.send("attempt-replay-packet", "/tool/submit_attempt", changed)
+            .await
+            .0,
+        403
+    );
+    let state = h.kernel.state().await.unwrap();
+    assert_eq!(state.domain.attempts.len(), 1);
+    assert_eq!(
+        state
+            .domain
+            .attempt("g", "attempt-replay-packet")
+            .unwrap()
+            .planning_round_id,
+        original_round
+    );
+    assert_eq!(
+        state.domain.planning_rounds[&format!("g/{original_round}")]
+            .introduced
+            .len(),
+        1
+    );
+    assert!(
+        state.domain.planning_rounds[&format!("g/{next}")]
+            .introduced
+            .is_empty()
+    );
+    assert_eq!(h.upstream.lock().await.len(), 2);
+    assert_eq!(state.ledger.accounts["global"].total.spent, 14);
+    assert_eq!(state.ledger.accounts["global"].total.held, 0);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn identical_read_payload_cannot_replay_findings_as_task_status_under_same_id() {
+    use crate::{
+        kernel::TaskContext,
+        node::ToolDefinition,
+        security::{CapabilityKind, OperationClass},
+    };
+    let descriptor = ToolDefinition {
+        name: "declare_task_status".into(),
+        description: "explicit fixture Task metadata permission".into(),
+        parameters: json!({"type":"object"}),
+        operation: "task_status".into(),
+        kind: CapabilityKind::ToolCall,
+        resource: "task/g".into(),
+        class: OperationClass::ReadOnly,
+    };
+    let h = Harness::open_with_tools(
+        std::sync::Arc::new(super::receiver_tests::DenyTools),
+        vec![descriptor],
+    )
+    .await;
+    assert_eq!(
+        h.send("collision-claim", "/tool/claim_task", json!({}))
+            .await
+            .0,
+        200
+    );
+    let view = h.kernel.cluster.view().await.unwrap();
+    let allocation = &view.leases["allocation/a1"];
+    h.kernel
+        .observe_task_input(
+            "collision-input",
+            &h.fixture.subject,
+            "a1-1",
+            TaskContext {
+                id: "task-1".into(),
+                incarnation: 1,
+                fence: allocation.fence,
+            },
+            vec![crate::cluster::LeaseCheck {
+                id: "allocation/a1".into(),
+                holder: allocation.holder.clone(),
+                fence: allocation.fence,
+            }],
+        )
+        .await
+        .unwrap()
+        .require()
+        .unwrap();
+    let marker = "finding-body-is-not-task-status-metadata";
+    let (status, finding) = h
+        .send(
+            "collision-finding",
+            "/tool/submit_finding",
+            json!({"body":{"marker":marker}}),
+        )
+        .await;
+    assert_eq!(status, 200, "{finding}");
+    assert_eq!(
+        h.send(
+            "collision-status-authorized",
+            "/tool/task_status",
+            json!({})
+        )
+        .await
+        .0,
+        200
+    );
+    let id = "cross-operation-read";
+    let (status, findings) = h.send(id, "/tool/read_findings", json!({})).await;
+    assert_eq!(status, 200, "{findings}");
+    assert!(findings.to_string().contains(marker));
+    let before = h.kernel.state().await.unwrap();
+    let (status, collision) = h.send(id, "/tool/task_status", json!({})).await;
+    assert_eq!(status, 403, "{collision}");
+    assert!(!collision.to_string().contains(marker));
+    assert!(!collision.to_string().contains("task-1"));
+    let after = h.kernel.state().await.unwrap();
+    assert_eq!(after.effects.len(), before.effects.len());
+    assert_eq!(
+        after.effects["tool-cross-operation-read"]
+            .request
+            .action
+            .kind,
+        CapabilityKind::FindingRead
+    );
+    assert_eq!(
+        after.effects["tool-cross-operation-read"]
+            .request
+            .action
+            .operation,
+        "finding_read"
+    );
+    assert_eq!(
+        after.effects["tool-cross-operation-read"]
+            .request
+            .action
+            .resource,
+        "finding/g"
+    );
+    assert_eq!(after.security.observed, before.security.observed);
+    assert_eq!(after.ledger.accounts["global"].total.spent, 0);
+    assert_eq!(after.ledger.accounts["global"].total.held, 0);
+    assert!(h.upstream.lock().await.is_empty());
     h.close().await;
 }
 

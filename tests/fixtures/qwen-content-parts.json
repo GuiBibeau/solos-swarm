@@ -1,0 +1,123 @@
+{
+  "source": {
+    "implementation": "llama.cpp b11429",
+    "revision": "d81235049",
+    "template_sha256": "57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361",
+    "receiver": "POST /apply-template",
+    "inference_calls": 0,
+    "normalization": "Join text parts with newline, retaining empty parts; empty array becomes empty string. Assistant null content with tool_calls becomes empty string."
+  },
+  "vectors": [
+    {
+      "name": "one",
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "Alpha"
+            }
+          ]
+        }
+      ],
+      "tools": [],
+      "rendered_prompt": "<|im_start|>user\nAlpha<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "rendered_prompt_sha256": "912d509b009ac38be53198e540adfab4edd67621adce86563bf207cb16678c47",
+      "receiver_response_sha256": "8feb47b2550bf80b9bc271f7cbe01cf862f4527b5aadbe3e29c1f18f99952977"
+    },
+    {
+      "name": "two",
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "Alpha"
+            },
+            {
+              "type": "text",
+              "text": "Beta"
+            }
+          ]
+        }
+      ],
+      "tools": [],
+      "rendered_prompt": "<|im_start|>user\nAlpha\nBeta<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "rendered_prompt_sha256": "e69a7043a8437165f663cde80fd036ef670246f289fc2868ecd458d9df5672aa",
+      "receiver_response_sha256": "429e2c0f01ed3175b54dd5a866b2d878c5075dda4346b9f83843a70d5318bc97"
+    },
+    {
+      "name": "empty",
+      "messages": [
+        {
+          "role": "user",
+          "content": []
+        }
+      ],
+      "tools": [],
+      "rendered_prompt": "<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "rendered_prompt_sha256": "422679356522fe3125048c90cb8a3fc3c36033d365781caedd2e02644de1ce1e",
+      "receiver_response_sha256": "09a11c3f21f15e82c37f0474ca9b09a9e362ebe3472500ad97cad1558141dd9f"
+    },
+    {
+      "name": "empty-between",
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "Alpha"
+            },
+            {
+              "type": "text",
+              "text": ""
+            },
+            {
+              "type": "text",
+              "text": "Beta"
+            }
+          ]
+        }
+      ],
+      "tools": [],
+      "rendered_prompt": "<|im_start|>user\nAlpha\n\nBeta<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "rendered_prompt_sha256": "185dc4f9d07d0811b537c80be7eb7d1dc292b45920e41d0f4670b8defbd7b2f8",
+      "receiver_response_sha256": "a3fd95bcc639cde9a0cb6511a2627de37a30c09e40bd85c3091de7e262973c01"
+    },
+    {
+      "name": "assistant-null-tool-call",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Alpha"
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "c1",
+              "type": "function",
+              "function": {
+                "name": "claim_task",
+                "arguments": "{}"
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "c1",
+          "content": "Beta"
+        }
+      ],
+      "tools": [],
+      "rendered_prompt": "<|im_start|>user\nAlpha<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"claim_task\", \"arguments\": {}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nBeta\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "rendered_prompt_sha256": "096c2f4d24eb7360def90abcbef75843a343788f7dd2d29909e431cc42c3d6e9",
+      "receiver_response_sha256": "0825cc04db9ed18552f288a1e97cfda6dce74bff3c7aebf767d1e26b08a7f745"
+    }
+  ]
+}

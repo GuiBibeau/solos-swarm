@@ -38,6 +38,84 @@ pub struct Effect {
     pub result: Option<Value>,
     pub task_context: Option<TaskContext>,
 }
+fn effect_ack(effect: &Effect) -> Value {
+    json!({"intent":effect.request.intent_id,"state":effect.state,"permit":effect.permit,
+        "task_context":effect.task_context})
+}
+/// Refresh local application authority and apply it within the caller's same atomic commit.
+pub(crate) fn refresh_nonbillable_effect(
+    state: &mut KernelState,
+    subject: &AuthenticatedSubject,
+    intent: &str,
+    signer: &CryptoSigner,
+    now: u64,
+) -> Result<Option<Value>> {
+    let effect = state
+        .effects
+        .get(intent)
+        .context("local effect absent")?
+        .clone();
+    ensure!(
+        effect.state == "pending" && !effect.permit.payload.billable,
+        "only unused local effects may refresh application authority"
+    );
+    let approvals: Vec<_> = state.action_approvals.values().cloned().collect();
+    match state.security.refresh_nonbillable_permit(
+        subject,
+        &effect.request,
+        &effect.permit,
+        &approvals,
+        &mut state.ledger,
+        signer,
+        now,
+    )? {
+        security::NonbillablePermitRefresh::Ready { permit, audit } => {
+            if let Some(audit) = audit {
+                state.audit.append_committed(audit)?;
+            }
+            state.effects.get_mut(intent).unwrap().permit = permit;
+            state.pending_actions.remove(intent);
+            Ok(None)
+        }
+        security::NonbillablePermitRefresh::ConfirmationRequired(review) => {
+            state.pending_actions.insert(
+                intent.into(),
+                PendingAction {
+                    request: effect.request,
+                    payload: effect.payload,
+                    prices: None,
+                    quota: None,
+                    task: effect.task_context,
+                    review: review.clone(),
+                },
+            );
+            let event = AuditEvent {
+                id: format!("apply-review/{intent}/{}", hex(&content_hash(&review)?)),
+                kind: "confirmation_required".into(),
+                actor: subject.id().into(),
+                goal: Some(effect.permit.payload.goal_id),
+                timestamp: now,
+                decision: "pending_human_confirmation".into(),
+                payload_hash: content_hash(&review)?,
+            };
+            if let Some(existing) = state.audit.events().iter().find(|old| old.id == event.id) {
+                ensure!(
+                    existing.kind == event.kind
+                        && existing.actor == event.actor
+                        && existing.goal == event.goal
+                        && existing.decision == event.decision
+                        && existing.payload_hash == event.payload_hash,
+                    "application review audit identity reused for different content"
+                );
+            } else {
+                state.audit.append_committed(event)?;
+            }
+            Ok(Some(
+                json!({"status":"confirmation_required","intent":intent,"review":review}),
+            ))
+        }
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PendingAction {
@@ -155,8 +233,19 @@ pub struct Reply {
     pub duplicate: bool,
     pub revision: u64,
 }
+#[derive(Debug, Clone, Copy)]
+pub struct StateCapacityError;
+impl std::fmt::Display for StateCapacityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("deployment state admission limit reached; outstanding receipt and control capacity remain reserved")
+    }
+}
+impl std::error::Error for StateCapacityError {}
 impl Reply {
     pub fn require(self) -> Result<Value> {
+        if !self.ok && self.value["code"] == "state_capacity" {
+            return Err(StateCapacityError.into());
+        }
         ensure!(
             self.ok,
             "{}",
@@ -458,6 +547,39 @@ impl Kernel {
         );
         Ok(())
     }
+    pub(crate) async fn cached_local_application(
+        &self,
+        subject: &AuthenticatedSubject,
+        intent: &str,
+        payload: &Value,
+        capability: (security::CapabilityKind, &str, &str),
+        leases: &[LeaseCheck],
+    ) -> Result<Option<Value>> {
+        let _writer = self.cluster.kernel_write(false).await;
+        let state = self.state().await?;
+        let Some(effect) = state.effects.get(intent) else {
+            return Ok(None);
+        };
+        if effect.state != "done" {
+            return Ok(None);
+        }
+        ensure!(
+            !effect.permit.payload.billable
+                && effect.permit.payload.holder == subject.id()
+                && &effect.payload == payload
+                && effect.request.action.kind == capability.0
+                && effect.request.action.operation == capability.1
+                && effect.request.action.resource == capability.2,
+            "local tool request ID conflict"
+        );
+        let result = effect
+            .result
+            .clone()
+            .context("completed local effect result absent")?;
+        drop(state);
+        self.validate_cached_effect(subject, intent, leases).await?;
+        Ok(Some(result))
+    }
     pub(crate) async fn open_planning_round(
         &self,
         id: &str,
@@ -487,7 +609,7 @@ impl Kernel {
     ) -> Result<Reply> {
         check_allocation(&peer.subject, &leases)?;
         let now = crate::cluster::now_ms();
-        self.commit(id,peer.subject.id(),&(intent,batch),leases,|state| {
+        self.commit_local(id,&peer.subject,&(intent,batch),leases,|state| {
             let effect=state.effects.get(intent).context("evaluation lacks admitted compiled-grant intent")?.clone();
             ensure!(effect.state=="pending" && !effect.permit.payload.billable && effect.permit.payload.holder==peer.subject.id()
                 && effect.payload==serde_json::to_value(batch)? && effect.request.action.operation=="evaluate"
@@ -503,6 +625,8 @@ impl Kernel {
             for finding in &batch.result.payload.finding_ids {
                 ensure!(state.domain.findings[finding].markings.is_subset(&capability.constraints.read_markings),"evaluator evidence outside compiled clearance");
             }
+            if let Some(confirmation)=refresh_nonbillable_effect(state,&peer.subject,intent,&self.signer,now/1000)? {return Ok(confirmation);}
+            let effect=state.effects[intent].clone();
             state.security.consume_permit(&peer.subject,&effect.permit,&mut state.ledger,now/1000)?;
             let actor=Actor {id:peer.subject.id().into(),role:domain::Role::Evaluator};
             for signed in &batch.result.payload.commands {
@@ -624,7 +748,37 @@ impl Kernel {
         ca: &[u8],
         now: u64,
     ) -> Result<Reply> {
-        self.runtime_commit(id, runtime, &(grant_id, leaf), |state| {
+        self.register_workload_certificate_class(id, runtime, grant_id, leaf, ca, now, false)
+            .await
+    }
+    pub(crate) async fn register_workload_certificate_control(
+        &self,
+        id: &str,
+        runtime: &AuthenticatedSubject,
+        grant_id: &str,
+        leaf: &[u8],
+        ca: &[u8],
+        now: u64,
+    ) -> Result<Reply> {
+        self.register_workload_certificate_class(id, runtime, grant_id, leaf, ca, now, true)
+            .await
+    }
+    #[allow(clippy::too_many_arguments)] // The renewal class retains the same certificate authority and grant checks.
+    async fn register_workload_certificate_class(
+        &self,
+        id: &str,
+        runtime: &AuthenticatedSubject,
+        grant_id: &str,
+        leaf: &[u8],
+        ca: &[u8],
+        now: u64,
+        control: bool,
+    ) -> Result<Reply> {
+        self.commit_class(id, runtime.id(), &(grant_id, leaf), vec![], control, |state| {
+            let now = (crate::cluster::now_ms() / 1000).max(now);
+            runtime.ensure_current(now)?;
+            ensure!(state.security.policy.payload.trusted_components.contains(runtime.id()),
+                "certificate registration requires admitted runtime authority");
             let grant = state
                 .security
                 .grants
@@ -634,6 +788,18 @@ impl Kernel {
                 !grant.revoked && grant.lease.expiry > now,
                 "workload grant revoked or expired"
             );
+            if control {
+                let holder = grant.holder.uri()?;
+                let goal = state.domain.goal(&grant.goal_id)?;
+                ensure!(if holder == goal.spec.evaluator_id {
+                    matches!(goal.status.as_str(), "active" | "awaiting_evaluation")
+                } else { search_open(state, &grant.goal_id) }, "final selection closed workload renewal");
+                ensure!(state.workload_certificates.values().any(|old| {
+                    let Ok((_, certificate)) = x509_parser::parse_x509_certificate(old) else { return false };
+                    certificate.subject_alternative_name().is_ok_and(|san| san.is_some_and(|san|
+                        san.value.general_names.iter().any(|name| matches!(name, x509_parser::extensions::GeneralName::URI(uri) if *uri == holder))))
+                }), "control capacity is reserved for already enrolled workload renewal");
+            }
             crate::identity::verify_workload_certificate(leaf, ca, &grant.holder, now)?;
             if grant.holder.uri()? == state.domain.goal(&grant.goal_id)?.spec.evaluator_id {
                 ensure!(
@@ -727,6 +893,46 @@ impl Kernel {
     where
         F: Fn(&mut KernelState) -> Result<Value>,
     {
+        self.commit_transaction(id, actor, request, leases, (control, None), mutate)
+            .await
+    }
+    async fn commit_local<F>(
+        &self,
+        id: &str,
+        subject: &AuthenticatedSubject,
+        request: &impl Serialize,
+        leases: Vec<LeaseCheck>,
+        mutate: F,
+    ) -> Result<Reply>
+    where
+        F: Fn(&mut KernelState) -> Result<Value>,
+    {
+        #[cfg(test)]
+        admission_sync::after_review(&format!("application:{id}")).await;
+        self.commit_transaction(
+            id,
+            subject.id(),
+            request,
+            leases,
+            (false, Some(subject)),
+            mutate,
+        )
+        .await
+    }
+    async fn commit_transaction<F>(
+        &self,
+        id: &str,
+        actor: &str,
+        request: &impl Serialize,
+        leases: Vec<LeaseCheck>,
+        class: (bool, Option<&AuthenticatedSubject>),
+        mutate: F,
+    ) -> Result<Reply>
+    where
+        F: Fn(&mut KernelState) -> Result<Value>,
+    {
+        let (control, local_subject) = class;
+        let local_application = local_subject.is_some();
         ensure!(
             !id.is_empty() && id.len() <= 200 && !actor.is_empty(),
             "invalid request identity"
@@ -741,11 +947,76 @@ impl Kernel {
             };
             let old = read.value.context("deployment not initialized")?;
             let state: KernelState = serde_json::from_value(old.clone())?;
+            let binding_id = format!("application-binding/{}", hex(&content_hash(&id)?));
+            if local_application && let Some(binding) = state.replies.get(&binding_id) {
+                ensure!(
+                    binding.actor == actor && binding.request_hash == request_hash,
+                    "application request identity reused for different content"
+                );
+            }
             if let Some(reply) = state.replies.get(id) {
                 ensure!(
                     reply.request_hash == request_hash,
                     "request identity reused for different content"
                 );
+                if reply.ok
+                    && let Some(subject) = local_subject
+                {
+                    let binding = serde_json::to_value(request)?;
+                    let intent = binding[0]
+                        .as_str()
+                        .context("local application intent absent")?;
+                    let effect = state
+                        .effects
+                        .get(intent)
+                        .context("cached local effect absent")?;
+                    if effect.task_context.is_none()
+                        && effect.request.action.operation == "evaluate"
+                    {
+                        let goal = state.domain.goal(&effect.permit.payload.goal_id)?;
+                        ensure!(
+                            effect.state == "done"
+                                && effect.permit.payload.holder == subject.id()
+                                && goal.spec.evaluator_id == subject.id()
+                                && state
+                                    .security
+                                    .policy
+                                    .payload
+                                    .trusted_components
+                                    .contains(subject.id())
+                                && goal.spec.version == effect.request.grant_version
+                                && matches!(
+                                    goal.status.as_str(),
+                                    "active" | "awaiting_evaluation" | "completed"
+                                ),
+                            "cached evaluator acknowledgement authority retired"
+                        );
+                        action_service(&state.modules, &effect.request.action.operation)?;
+                        let now = crate::cluster::now_ms();
+                        state.security.confirmation_review(
+                            subject,
+                            &effect.request,
+                            &state.ledger,
+                            now / 1000,
+                        )?;
+                        check_allocation(subject, &leases)?;
+                        let view = self.cluster.view().await?;
+                        for check in &leases {
+                            ensure!(
+                                view.leases
+                                    .get(&check.id)
+                                    .is_some_and(|lease| !lease.revoked
+                                        && lease.holder == check.holder
+                                        && lease.fence == check.fence
+                                        && lease.expires_ms > now),
+                                "cached evaluator allocation fenced"
+                            );
+                        }
+                    } else {
+                        self.validate_cached_effect(subject, intent, &leases)
+                            .await?;
+                    }
+                }
                 return Ok(Reply {
                     ok: reply.ok,
                     value: reply.value.clone(),
@@ -761,13 +1032,68 @@ impl Kernel {
                 }
                 Err(error) => {
                     next = state;
-                    (false, json!({"error":error.to_string()}))
+                    let mut value = json!({"error":error.to_string()});
+                    if error.downcast_ref::<StateCapacityError>().is_some() {
+                        value["code"] = json!("state_capacity");
+                    }
+                    (false, value)
                 }
             };
             let timestamp = (crate::cluster::now_ms() / 1000)
                 .max(next.audit.events().last().map_or(0, |e| e.timestamp));
+            // Review replies stay immutable without trapping the stable intent in an old review.
+            // Successful application and terminal failures keep the base id for exact replay.
+            let record_id = if local_application && ok && value["status"] == "confirmation_required"
+            {
+                let review: security::ConfirmationReview =
+                    serde_json::from_value(value["review"].clone())?;
+                let selected = next.security.review_approvals(
+                    &review,
+                    next.action_approvals.values().cloned(),
+                    crate::cluster::now_ms() / 1000,
+                )?;
+                format!(
+                    "apply-phase/{}",
+                    hex(&content_hash(&(id, &review, &selected))?)
+                )
+            } else {
+                id.into()
+            };
+            if let Some(reply) = next.replies.get(&record_id) {
+                ensure!(
+                    reply.request_hash == request_hash,
+                    "application phase reused for different content"
+                );
+                return Ok(Reply {
+                    ok: reply.ok,
+                    value: reply.value.clone(),
+                    duplicate: true,
+                    revision: read.revision,
+                });
+            }
+            if local_application && record_id != id && !next.replies.contains_key(&binding_id) {
+                next.audit.append_committed(AuditEvent {
+                    id: format!("request/{binding_id}"),
+                    kind: "kernel_request".into(),
+                    actor: actor.into(),
+                    goal: None,
+                    timestamp,
+                    decision: "allow".into(),
+                    payload_hash: request_hash,
+                })?;
+                next.replies.insert(
+                    binding_id,
+                    RecordedReply {
+                        actor: actor.into(),
+                        request: serde_json::to_value(request)?,
+                        request_hash,
+                        ok: true,
+                        value: json!({"status":"application_bound"}),
+                    },
+                );
+            }
             next.audit.append_committed(AuditEvent {
-                id: format!("request/{id}"),
+                id: format!("request/{record_id}"),
                 kind: "kernel_request".into(),
                 actor: actor.into(),
                 goal: None,
@@ -776,7 +1102,7 @@ impl Kernel {
                 payload_hash: request_hash,
             })?;
             next.replies.insert(
-                id.into(),
+                record_id.clone(),
                 RecordedReply {
                     actor: actor.into(),
                     request: serde_json::to_value(request)?,
@@ -785,7 +1111,7 @@ impl Kernel {
                     value: value.clone(),
                 },
             );
-            next.checkpoint(id, actor, timestamp)?;
+            next.checkpoint(&record_id, actor, timestamp)?;
             let encoded = serde_json::to_vec(&next)?;
             ensure_state_capacity(&next, encoded.len(), self.max_state_bytes, control)?;
             let mut tx = Transaction::new(
@@ -956,7 +1282,14 @@ impl Kernel {
                         .commit(
                             &format!("{id}/{}", hex(&phase)),
                             subject.id(),
-                            &(&request, &payload, &prices, &approvals, &quota, &task),
+                            &(
+                                content_hash(&request)?,
+                                content_hash(&payload)?,
+                                content_hash(&prices)?,
+                                content_hash(&approvals)?,
+                                &quota,
+                                &task,
+                            ),
                             leases,
                             |_| Err(anyhow::anyhow!(reason.clone())),
                         )
@@ -975,7 +1308,7 @@ impl Kernel {
             drop(state); // The immutable review owns everything needed; do not queue a full deployment snapshot.
             #[cfg(test)]
             admission_sync::after_review(&request.intent_id).await;
-            let reply = self.commit(&phase_id, subject.id(), &(&request, &payload, &prices, &approvals, &quota, &task,&phase), leases.clone(), |state| {
+            let reply = self.commit(&phase_id, subject.id(), &(content_hash(&request)?, content_hash(&payload)?, content_hash(&prices)?, content_hash(&approvals)?, &quota, &task,&phase), leases.clone(), |state| {
                 let now=(crate::cluster::now_ms() / 1000).max(now);
             action_service(&state.modules,&request.action.operation)?;
             check_search_action(state,&request,&payload,task.as_ref(),crate::cluster::now_ms())?;
@@ -1007,12 +1340,12 @@ impl Kernel {
             } else { ensure!(request.action.operation != "inference", "inference requires shared quota"); }
             if let Some(existing) = state.effects.get(&request.intent_id) {
                 ensure!(existing.request == request && existing.payload == payload, "effect ID reused with different payload");
-                return Ok(serde_json::to_value(existing)?);
+                return Ok(effect_ack(existing));
             }
             state.pending_actions.remove(&request.intent_id);
             state.audit.append_committed(decision.audit)?;
             let effect = Effect { request: request.clone(), payload: payload.clone(), permit: decision.permit, state: "pending".into(), result: None, task_context: task.clone() };
-            state.effects.insert(request.intent_id.clone(), effect.clone()); Ok(serde_json::to_value(effect)?)
+            state.effects.insert(request.intent_id.clone(), effect.clone()); Ok(effect_ack(&effect))
         }).await?;
             if reply.ok && reply.value["status"] == "authority_changed" {
                 continue;
@@ -1170,7 +1503,7 @@ impl Kernel {
                 if retained["body_missing"] == true {
                     stop_result_retention(state, &effect, intent)?;
                 }
-                let value = serde_json::to_value(state.effects.get(intent).unwrap())?;
+                let value = effect_ack(state.effects.get(intent).unwrap());
                 if status == "done"
                     && effect.request.action.operation == "inference"
                     && !result["completion"].is_null()
@@ -1463,7 +1796,7 @@ impl Kernel {
     ) -> Result<Reply> {
         let now = crate::cluster::now_ms();
         check_allocation(subject, &leases)?;
-        self.commit(id, subject.id(), &(intent, &command), leases, |state| {
+        self.commit_local(id, subject, &(intent, &command), leases, |state| {
             let now = (crate::cluster::now_ms()).max(now);
             let mut command = command.clone();
             let effect = state
@@ -1496,6 +1829,12 @@ impl Kernel {
                 matches!(command, DomainCommand::ClaimTask { .. }),
             )?;
             validate_domain_action(&effect.request, &command)?;
+            if let Some(confirmation) =
+                refresh_nonbillable_effect(state, subject, intent, &self.signer, now / 1000)?
+            {
+                return Ok(confirmation);
+            }
+            let effect = state.effects[intent].clone();
             state.security.consume_permit(
                 subject,
                 &effect.permit,
@@ -1691,7 +2030,7 @@ impl Kernel {
     ) -> Result<Reply> {
         let now = crate::cluster::now_ms() / 1000;
         check_allocation(subject, &leases)?;
-        self.commit(id, subject.id(), &(intent, goal_id, &after_id, limit), leases, |state| {
+        self.commit_local(id, subject, &(intent, goal_id, &after_id, limit), leases, |state| {
                 let now=(crate::cluster::now_ms() / 1000).max(now);
             ensure!((1..=128).contains(&limit), "invalid Finding batch limit");
             let effect = state.effects.get(intent).context("read lacks admitted intent")?.clone();
@@ -1702,6 +2041,8 @@ impl Kernel {
             action_service(&state.modules,&effect.request.action.operation)?;
             check_search_action(state,&effect.request,&effect.payload,effect.task_context.as_ref(),crate::cluster::now_ms())?;
             check_task(state, subject, effect.task_context.as_ref(), false)?;
+            if let Some(confirmation) = refresh_nonbillable_effect(state, subject, intent, &self.signer, now)? { return Ok(confirmation); }
+            let effect = state.effects[intent].clone();
             state.security.consume_permit(subject, &effect.permit, &mut state.ledger, now)?;
             let grant = state.security.grants[&effect.request.grant_id].clone();
             let clearance = &grant.capabilities.iter().find(|c| c.id == effect.request.capability_id).context("read Capability absent")?.constraints.read_markings;
@@ -1734,7 +2075,7 @@ impl Kernel {
         leases: Vec<LeaseCheck>,
     ) -> Result<Reply> {
         check_allocation(subject, &leases)?;
-        self.commit(id, subject.id(), &(intent, goal_id, &after_id, limit), leases, |state| {
+        self.commit_local(id, subject, &(intent, goal_id, &after_id, limit), leases, |state| {
             ensure!((1..=128).contains(&limit) && after_id.as_ref().is_none_or(|after| after.len() <= 200), "invalid Task-status page bounds");
             let now = crate::cluster::now_ms() / 1000;
             let effect = state.effects.get(intent).context("Task status lacks admitted intent")?.clone();
@@ -1751,6 +2092,8 @@ impl Kernel {
                 .find(|cap| cap.id == effect.request.capability_id).context("Task-status Capability absent")?.constraints.read_markings.clone();
             let classification = state.security.policy.payload.classification.clone();
             ensure!(clearance.contains(&classification), "Task metadata exceeds read clearance");
+            if let Some(confirmation) = refresh_nonbillable_effect(state, subject, intent, &self.signer, now)? { return Ok(confirmation); }
+            let effect = state.effects[intent].clone();
             state.security.consume_permit(subject, &effect.permit, &mut state.ledger, now)?;
             let version = state.domain.goal(goal_id)?.spec.version;
             let mut rows = vec![];
@@ -1801,9 +2144,9 @@ impl Kernel {
         leases: Vec<LeaseCheck>,
     ) -> Result<Reply> {
         check_allocation(subject, &leases)?;
-        self.commit(
+        self.commit_local(
             id,
-            subject.id(),
+            subject,
             &(intent, goal_id, after_index, limit),
             leases,
             |state| {
@@ -1848,6 +2191,12 @@ impl Kernel {
                     "audit metadata exceeds read clearance"
                 );
                 let clearance = cap.constraints.read_markings.clone();
+                if let Some(confirmation) =
+                    refresh_nonbillable_effect(state, subject, intent, &self.signer, now)?
+                {
+                    return Ok(confirmation);
+                }
+                let effect = state.effects[intent].clone();
                 state
                     .security
                     .consume_permit(subject, &effect.permit, &mut state.ledger, now)?;
@@ -2094,7 +2443,7 @@ impl Kernel {
         self.commit(
             id,
             subject.id(),
-            &(grant_id, task_id, &source_id, &value),
+            &(grant_id, task_id, &source_id, content_hash(&value)?),
             leases,
             |state| {
                 let grant = state
@@ -2478,14 +2827,14 @@ pub(crate) fn ensure_state_capacity(
         max_bytes - max_bytes / 4
     };
     let stop_reserve = if control { 0 } else { max_bytes / 16 };
-    ensure!(
-        encoded_bytes <= limit
-            && encoded_bytes
-                .checked_add(reconciliation_credit(state)?)
-                .and_then(|bytes| bytes.checked_add(stop_reserve))
-                .is_some_and(|bytes| bytes <= max_bytes),
-        "deployment state admission limit reached; outstanding receipt and control capacity remain reserved"
-    );
+    if encoded_bytes > limit
+        || encoded_bytes
+            .checked_add(reconciliation_credit(state)?)
+            .and_then(|bytes| bytes.checked_add(stop_reserve))
+            .is_none_or(|bytes| bytes > max_bytes)
+    {
+        return Err(StateCapacityError.into());
+    }
     Ok(())
 }
 fn normalize_receipt(mut receipt: Receipt) -> Receipt {
@@ -3862,7 +4211,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let payload = json!({"bounded":"request"});
+        let payload = json!({"bounded":"request", "frozen_context": "x".repeat(32 * 1024)});
         let request = ActionRequest {
             intent_id: "effect-1".into(),
             grant_id: fixture.definition.id.clone(),
@@ -3907,12 +4256,37 @@ mod tests {
             }),
             task: None,
         };
-        kernel
+        let admission_reply = kernel
             .admit("admit", &fixture.subject, admission())
             .await
             .unwrap()
             .require()
             .unwrap();
+        assert!(
+            serde_json::to_vec(&admission_reply).unwrap().len() < MAX_RESULT_RECEIPT_BYTES,
+            "admission reply duplicated the complete frozen request"
+        );
+        let admitted = kernel.state().await.unwrap();
+        assert_eq!(admitted.effects["effect-1"].payload, payload);
+        assert_eq!(
+            admitted.effects["effect-1"].request.action.arguments,
+            payload
+        );
+        assert!(
+            serde_json::to_vec(
+                &admitted
+                    .replies
+                    .iter()
+                    .find(|(id, _)| id.starts_with("admit/"))
+                    .unwrap()
+                    .1
+                    .request
+            )
+            .unwrap()
+            .len()
+                < 4096,
+            "admission replay identity duplicated the complete frozen request"
+        );
         assert!(
             kernel
                 .admit("admit", &fixture.subject, admission())
