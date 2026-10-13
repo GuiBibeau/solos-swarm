@@ -2649,6 +2649,7 @@ impl SecurityState {
         now: u64,
     ) -> Result<AuditEvent> {
         Ok(AuditEvent {
+            correlation: None,
             id: format!("authorize/{}", permit.intent_id),
             kind: "dispatch_authorized".into(),
             actor: subject.id.clone(),

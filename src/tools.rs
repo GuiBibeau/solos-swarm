@@ -639,9 +639,11 @@ impl InstalledTools {
                     }
                     let mut url=reqwest::Url::parse(&endpoint.endpoint)?;url.set_path(&path);
                     let mut cancellation=stop.clone();
+                    let mut request=client.build()?.get(url);
+                    if let Some((parent,state))=crate::diagnostics::current_trace_headers(){request=request.header("traceparent",parent);if let Some(state)=state{request=request.header("tracestate",state);}}
                     let mut response=tokio::select! {
                         changed=cancellation.changed()=>{let _=changed;anyhow::bail!("target cancelled before response headers; delivery unknown")},
-                        response=tokio::time::timeout(std::time::Duration::from_millis(plan.deadline_ms.saturating_sub(crate::cluster::now_ms())),client.build()?.get(url).send())=>response??,
+                        response=tokio::time::timeout(std::time::Duration::from_millis(plan.deadline_ms.saturating_sub(crate::cluster::now_ms())),request.send())=>response??,
                     };
                     measured.contacted=true;
                     let status=response.status().as_u16();let mut bytes=Vec::new();

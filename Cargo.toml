@@ -8,7 +8,7 @@ publish = false
 anyhow = "=1.0.104"
 axum = "=0.8.9"
 clap = { version = "=4.6.7", features = ["derive"] }
-reqwest = { version = "=0.12.28", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "=0.12.28", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 serde_yaml = "=0.9.34"
@@ -40,6 +40,13 @@ minijinja-contrib = { version = "=2.24.0", features = ["pycompat"] }
 tokenizers = { version = "=0.22.2", default-features = false, features = ["fancy-regex"] }
 wasmtime = { version = "=49.0.0", default-features = false, features = ["anyhow", "cranelift", "runtime", "std", "wat"] }
 wasmtime-wasi = { version = "=49.0.0", default-features = false, features = ["p1"] }
+
+opentelemetry = { version = "=0.32.0", default-features = false, features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "=0.32.0", default-features = false, features = ["trace", "metrics"] }
+opentelemetry-proto = { version = "=0.32.0", default-features = false, features = ["gen-tonic-messages", "trace", "metrics", "with-serde"] }
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.22", default-features = false, features = ["registry", "std"] }
+tracing-opentelemetry = { version = "=0.33.0", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "=0.4.7"

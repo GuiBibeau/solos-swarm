@@ -192,6 +192,7 @@ impl ScopedToolIdentityFactory {
                 &self.kernel,
                 &format!("tool-spawn/{}", request.invocation_intent),
                 runtime.id(),
+                &request.invocation_intent,
                 now,
             )?;
             ops.push(Mutation::Put {
@@ -411,6 +412,7 @@ impl ScopedToolIdentityFactory {
                 &self.kernel,
                 &format!("tool-retire/{}", record.invocation_intent),
                 runtime.id(),
+                &record.invocation_intent,
                 now,
             )?;
             ops.push(Mutation::Put {
@@ -549,6 +551,7 @@ fn checkpoint(
     kernel: &Kernel,
     id: &str,
     actor: &str,
+    invocation_intent: &str,
     now: u64,
 ) -> Result<()> {
     state.validate()?;
@@ -559,11 +562,13 @@ fn checkpoint(
             .last()
             .map_or(0, |event| event.timestamp),
     );
+    let correlation = state.correlation_for(actor, None, None, Some(invocation_intent))?;
     state.audit.append_committed(AuditEvent {
+        goal: correlation.goal_id.clone(),
+        correlation: Some(correlation),
         id: id.into(),
         kind: "scoped_tool_lifecycle".into(),
         actor: actor.into(),
-        goal: None,
         timestamp,
         decision: "committed".into(),
         payload_hash: state.content_hash()?,
@@ -1104,6 +1109,7 @@ mod tests {
             "tool-test".into(),
         )
         .unwrap();
+        state.run_id = Some("native-tool-fixture-run".into());
         state
             .security
             .register_goal(
@@ -1361,6 +1367,7 @@ mod tests {
         state.effects.insert(
             request.invocation_intent.clone(),
             Effect {
+                correlation: None,
                 request: action,
                 payload,
                 permit: decision.permit,
@@ -1784,6 +1791,43 @@ mod tests {
         assert_eq!(state.ledger.accounts["global"].total.held, 10);
         assert!(state.security.observed[f.subject.id()].contains("sdk-private-result"));
         assert_eq!(state.security.inputs["sdk-private-result"].goal_id, "g");
+        for id in [
+            "tool_resources_reserved/native-intent",
+            "tool_resources_released/native-intent",
+            "tool-spawn/native-intent",
+            "tool-retire/native-intent",
+        ] {
+            let lifecycle = state
+                .audit
+                .events()
+                .iter()
+                .find(|event| event.id == id)
+                .unwrap();
+            let correlation = lifecycle.correlation.as_ref().unwrap();
+            assert_eq!(correlation.deployment_id, "tool-test");
+            assert_eq!(
+                correlation.run_id.as_deref(),
+                Some("native-tool-fixture-run")
+            );
+            assert_eq!(correlation.goal_id.as_deref(), Some("g"));
+            assert_eq!(correlation.task_id.as_deref(), Some("parent"));
+            assert_eq!(correlation.intent_id.as_deref(), Some("native-intent"));
+            assert_eq!(correlation.agent_id.as_deref(), Some("a1"));
+            assert_eq!(correlation.incarnation, Some(1));
+            assert_eq!(correlation.node_id.as_deref(), Some("n1"));
+            assert_eq!(correlation.execution_attempt, Some(1));
+            assert_eq!(
+                correlation.trace_context.as_ref().unwrap(),
+                &crate::telemetry::TraceContext::for_task("tool-test", "g", "parent")
+            );
+            let checkpoint = state
+                .audit
+                .events()
+                .iter()
+                .find(|event| event.id == format!("checkpoint/{id}"))
+                .unwrap();
+            assert_eq!(checkpoint.correlation.as_ref(), Some(correlation));
+        }
         let view = cluster.view().await.unwrap();
         assert!(
             !view

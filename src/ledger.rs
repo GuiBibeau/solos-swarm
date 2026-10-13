@@ -1,4 +1,21 @@
 //! One serializable ledger for placement allocations, action liabilities and all caps.
+#[derive(Clone, Debug)]
+pub struct BudgetExhausted {
+    pub category: &'static str,
+}
+impl std::fmt::Display for BudgetExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} budget cap exhausted", self.category)
+    }
+}
+impl std::error::Error for BudgetExhausted {}
+fn budget_check(allowed: bool, category: &'static str) -> anyhow::Result<()> {
+    if allowed {
+        Ok(())
+    } else {
+        Err(BudgetExhausted { category }.into())
+    }
+}
 use crate::audit::{Hash, Signed, content_hash};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -130,6 +147,8 @@ pub struct ReservationRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Reservation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation: Option<crate::telemetry::Correlation>,
     pub request: ReservationRequest,
     pub state: IntentState,
     pub hold: u64,
@@ -395,14 +414,15 @@ impl Ledger {
             "allocation identity mismatch or released"
         );
         let hold = prices.payload.cost(&request.usage_bound)?;
-        ensure!(self.free(&env.id)? >= hold, "Task envelope exhausted");
+        budget_check(self.free(&env.id)? >= hold, "Task envelope")?;
         let ancestors = self.ancestors(&env.id)?;
         for id in &ancestors {
             let env = &self.envelopes[id];
-            ensure!(
-                env.active && add(add(env.spent, env.held)?, hold)? <= env.allocation,
-                "ancestor envelope exhausted/released"
-            );
+            ensure!(env.active, "ancestor envelope released");
+            budget_check(
+                add(add(env.spent, env.held)?, hold)? <= env.allocation,
+                "ancestor envelope",
+            )?;
         }
         let accounts: BTreeSet<_> = env
             .accounts
@@ -419,27 +439,28 @@ impl Ledger {
             account.limits.validate()?;
             let tick = now / account.limits.tick_seconds;
             ticks.insert(id.clone(), tick);
-            ensure!(
+            budget_check(
                 hold <= account.limits.per_call
                     && add(liability(&account.total)?, hold)? <= account.limits.total,
-                "total/per-call cap exhausted"
-            );
-            ensure!(
+                "total/per-call",
+            )?;
+            budget_check(
                 add(
                     liability(account.ticks.get(&tick).unwrap_or(&Counter::default()))?,
-                    hold
+                    hold,
                 )? <= account.limits.per_tick,
-                "tick cap exhausted"
-            );
-            ensure!(
+                "tick",
+            )?;
+            budget_check(
                 add(
                     liability(account.days.get(&day).unwrap_or(&Counter::default()))?,
-                    hold
+                    hold,
                 )? <= account.limits.per_day,
-                "daily cap exhausted"
-            );
+                "daily",
+            )?;
         }
         let reservation = Reservation {
+            correlation: None,
             request: request.clone(),
             state: IntentState::Reserved,
             hold,

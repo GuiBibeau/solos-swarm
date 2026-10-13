@@ -354,6 +354,7 @@ mod tests {
         let mut log = AuditLog::new("log".into()).unwrap();
         for n in 1..=4 {
             log.append(AuditEvent {
+                correlation: None,
                 id: n.to_string(),
                 kind: "decision".into(),
                 actor: "operator".into(),

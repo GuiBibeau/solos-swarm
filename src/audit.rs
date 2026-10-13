@@ -90,6 +90,8 @@ impl<T: Serialize> Signed<T> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuditEvent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation: Option<crate::telemetry::Correlation>,
     pub id: String,
     pub kind: String,
     pub actor: String,
@@ -195,6 +197,9 @@ impl AuditLog {
         let mut ids = BTreeSet::new();
         let mut last = 0;
         for event in &self.events {
+            if let Some(correlation) = &event.correlation {
+                correlation.validate()?;
+            }
             ensure!(
                 ids.insert(&event.id) && !event.id.is_empty() && event.timestamp >= last,
                 "invalid audit ordering or duplicate identity"
@@ -224,11 +229,46 @@ impl AuditLog {
     }
     /// Broker-generated decisions retain their original signed time in the payload; the log uses commit order.
     pub(crate) fn append_committed(&mut self, mut event: AuditEvent) -> Result<u64> {
+        if event.correlation.is_none() {
+            let mut correlation =
+                crate::telemetry::Correlation::for_actor(&self.log_id, &event.actor);
+            if event.goal.is_some() {
+                correlation.goal_id = event.goal.clone();
+            }
+            event.correlation = Some(correlation);
+        }
         event.timestamp = event
             .timestamp
             .max(crate::cluster::now_ms() / 1000)
             .max(self.events.last().map_or(0, |previous| previous.timestamp));
         self.append(event)
+    }
+    /// Only uncommitted events created by this transaction receive richer trusted context.
+    pub(crate) fn correlate_new(
+        &mut self,
+        start: usize,
+        correlation: &crate::telemetry::Correlation,
+    ) {
+        self.correlate_new_fallback(start, correlation);
+    }
+    /// Custom transactions enrich fallback events without replacing explicit operation contexts.
+    pub(crate) fn correlate_new_fallback(
+        &mut self,
+        start: usize,
+        correlation: &crate::telemetry::Correlation,
+    ) {
+        for event in self.events.iter_mut().skip(start) {
+            if event.correlation.as_ref().is_some_and(|context| {
+                context.run_id.is_some() || context.task_id.is_some() || context.intent_id.is_some()
+            }) {
+                continue;
+            }
+            let mut context = correlation.clone();
+            if event.goal.is_some() {
+                context.goal_id = event.goal.clone();
+            }
+            event.correlation = Some(context);
+        }
     }
     pub fn events(&self) -> &[AuditEvent] {
         &self.events
@@ -457,6 +497,7 @@ mod tests {
         let mut log = AuditLog::new("concurrent-decisions".into()).unwrap();
         let now = crate::cluster::now_ms() / 1000;
         let event = |id: &str, time| AuditEvent {
+            correlation: None,
             id: id.into(),
             kind: "decision".into(),
             actor: "broker".into(),
@@ -494,6 +535,7 @@ mod tests {
             .enumerate()
         {
             log.append(AuditEvent {
+                correlation: None,
                 id: index.to_string(),
                 kind: "decision".into(),
                 actor: "actor".into(),
@@ -529,6 +571,7 @@ mod tests {
         let mut log = AuditLog::new("deployment-1".into()).unwrap();
         for n in 0..64 {
             log.append(AuditEvent {
+                correlation: None,
                 id: n.to_string(),
                 kind: "decision".into(),
                 actor: "operator".into(),

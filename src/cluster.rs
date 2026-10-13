@@ -31,15 +31,21 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     sync::{Mutex, Notify, RwLock, Semaphore},
     task::JoinHandle,
 };
+use tracing::Instrument;
 use zeroize::Zeroize;
+
+use crate::{
+    diagnostics::{self, Counter, Gauge, Outcome, Stage},
+    telemetry::TraceContext,
+};
 
 pub type NodeId = u64;
 pub const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
@@ -1201,6 +1207,11 @@ impl RaftStateMachine<TypeConfig> for Arc<Machine> {
         .map_err(storage_error)?;
         *data = next;
         self.notify.notify_waiters();
+        diagnostics::record_counter(Counter::RaftApplied, results.len() as u64);
+        diagnostics::record_counter(
+            Counter::RaftRejected,
+            results.iter().filter(|result| !result.applied).count() as u64,
+        );
         Ok(results)
     }
     async fn get_snapshot_builder(&mut self) -> Self {
@@ -1304,6 +1315,62 @@ impl Rpc {
 struct Wire {
     sender: NodeId,
     rpc: Rpc,
+    /// Diagnostic metadata never participates in peer admission or state comparisons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trace_context: Option<TraceContext>,
+}
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireReply {
+    trace_context: TraceContext,
+    result: std::result::Result<Value, String>,
+}
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum Reply {
+    Traced(WireReply),
+    Legacy(std::result::Result<Value, String>),
+}
+struct IncomingConnection {
+    peer: NodeId,
+    connection: Connection,
+    streams: Arc<Semaphore>,
+}
+/// Count only futures currently waiting; cancellation releases the observation too.
+struct Waiting<'a>(&'a AtomicU64);
+impl<'a> Waiting<'a> {
+    fn new(count: &'a AtomicU64) -> Self {
+        count.fetch_add(1, Ordering::Relaxed);
+        Self(count)
+    }
+}
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+/// Record actual wait even when the queued future is cancelled or rejected.
+struct HopQueueWait {
+    span: tracing::Span,
+    started: Instant,
+    prior_ms: u64,
+}
+impl HopQueueWait {
+    fn new(prior_ms: u64) -> Self {
+        Self {
+            span: tracing::Span::current(),
+            started: Instant::now(),
+            prior_ms,
+        }
+    }
+}
+impl Drop for HopQueueWait {
+    fn drop(&mut self) {
+        diagnostics::record_hop_queue_wait(
+            &self.span,
+            self.prior_ms.saturating_add(elapsed_ms(self.started)),
+        );
+    }
 }
 #[derive(Clone)]
 struct Transport {
@@ -1312,6 +1379,9 @@ struct Transport {
     node_id: NodeId,
     nodes: Arc<RwLock<BTreeMap<NodeId, NodeAddress>>>,
     connections: Arc<Mutex<BTreeMap<(NodeId, u8), Connection>>>,
+    incoming_connections: Arc<Mutex<BTreeMap<usize, IncomingConnection>>>,
+    connection_waiters: Arc<AtomicU64>,
+    next_trace_attempt: Arc<AtomicU64>,
     connect_locks: BTreeMap<(NodeId, u8), Arc<Mutex<()>>>,
     max_frame_bytes: usize,
     machine: Arc<Machine>,
@@ -1397,12 +1467,59 @@ impl Transport {
         Ok(())
     }
     async fn call(&self, node_id: NodeId, rpc: Rpc) -> Result<Value> {
+        let parent = diagnostics::current_trace_context().unwrap_or_else(TraceContext::fresh_root);
+        Ok(self.call_with_trace(node_id, rpc, parent).await?.0)
+    }
+    async fn call_with_trace(
+        &self,
+        node_id: NodeId,
+        rpc: Rpc,
+        parent: TraceContext,
+    ) -> Result<(Value, Option<TraceContext>)> {
+        parent.validate()?;
+        let attempt = self.next_trace_attempt.fetch_add(1, Ordering::Relaxed);
+        let trace = parent.child("quic", &node_id.to_string(), attempt);
+        ensure!(
+            self.connect_locks.contains_key(&(node_id, rpc.channel())),
+            "connection outside admitted inventory"
+        );
+        let span =
+            diagnostics::hop_span(&parent, &self.node_id.to_string(), &node_id.to_string(), 0);
+        let started = Instant::now();
+        let result = diagnostics::with_trace_context(
+            Some(trace.clone()),
+            async { self.exchange(node_id, rpc, trace).await }.instrument(span),
+        )
+        .await;
+        diagnostics::record(
+            Stage::Hop,
+            if result.is_ok() {
+                Outcome::Success
+            } else {
+                Outcome::Error
+            },
+            elapsed_ms(started),
+        );
+        result
+    }
+    async fn exchange(
+        &self,
+        node_id: NodeId,
+        rpc: Rpc,
+        trace: TraceContext,
+    ) -> Result<(Value, Option<TraceContext>)> {
         let cache_key = (node_id, rpc.channel());
         let connect_lock = self
             .connect_locks
             .get(&cache_key)
             .context("connection outside inventory")?;
+        let waited = Instant::now();
+        let waiting = Waiting::new(&self.connection_waiters);
+        let hop_wait = HopQueueWait::new(0);
         let connecting = connect_lock.lock().await;
+        drop(hop_wait);
+        drop(waiting);
+        diagnostics::record(Stage::State, Outcome::Success, elapsed_ms(waited));
         let node = self
             .nodes
             .read()
@@ -1453,13 +1570,29 @@ impl Transport {
         let body = serde_json::to_vec(&Wire {
             sender: self.node_id,
             rpc,
+            trace_context: Some(trace.clone()),
         })?;
         let exchange = async {
             let (mut send, mut recv) = connection.open_bi().await?;
             write_frame(&mut send, &body, self.max_frame_bytes).await?;
-            let result: std::result::Result<Value, String> =
-                serde_json::from_slice(&read_frame(&mut recv, self.max_frame_bytes).await?)?;
-            result.map_err(anyhow::Error::msg)
+            diagnostics::record_counter(Counter::TransportBytesSent, body.len() as u64 + 4);
+            let response = read_frame(&mut recv, self.max_frame_bytes).await?;
+            diagnostics::record_counter(Counter::TransportBytesReceived, response.len() as u64 + 4);
+            match serde_json::from_slice::<Reply>(&response)? {
+                Reply::Traced(reply) => {
+                    reply.trace_context.validate()?;
+                    ensure!(
+                        reply.trace_context.trace_id == trace.trace_id,
+                        "QUIC response trace changed"
+                    );
+                    Ok((
+                        reply.result.map_err(anyhow::Error::msg)?,
+                        Some(reply.trace_context),
+                    ))
+                }
+                // A pre-tracing peer ignores the optional request field and returns its original envelope.
+                Reply::Legacy(result) => Ok((result.map_err(anyhow::Error::msg)?, None)),
+            }
         };
         tokio::time::timeout(Duration::from_secs(5), exchange)
             .await
@@ -1577,6 +1710,70 @@ pub(crate) struct KernelWriteGuard<'a> {
     _writer: tokio::sync::MutexGuard<'a, ()>,
     _normal: Option<tokio::sync::MutexGuard<'a, ()>>,
 }
+/// Local diagnostics are observations, not a quorum read or a permission decision.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClusterDiagnosticSnapshot {
+    pub node_id: NodeId,
+    pub observed_ms: u64,
+    pub local_revision: u64,
+    pub raft_running: bool,
+    pub raft_state: String,
+    pub raft_term: u64,
+    pub raft_leader: Option<NodeId>,
+    pub raft_last_log_index: Option<u64>,
+    pub raft_applied_index: Option<u64>,
+    pub raft_snapshot_index: Option<u64>,
+    pub raft_quorum_ack_age_ms: Option<u64>,
+    pub bulk_available: usize,
+    pub bulk_capacity: usize,
+    pub control_available: usize,
+    pub control_capacity: usize,
+    pub incoming_connections_available: usize,
+    pub incoming_connections_capacity: usize,
+    pub kernel_normal_waiters: u64,
+    pub kernel_control_waiters: u64,
+    pub connection_waiters: u64,
+    pub connections: Vec<ConnectionDiagnostic>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConnectionDiagnostic {
+    pub peer_node_id: NodeId,
+    /// Outgoing dedicated channel: 0 Raft, 1 control, 2 bulk. Incoming is shared.
+    pub channel: Option<u8>,
+    pub incoming: bool,
+    pub stream_available: Option<usize>,
+    pub stream_capacity: Option<usize>,
+    pub rtt_micros: u64,
+    pub congestion_window_bytes: u64,
+    pub lost_packets: u64,
+    pub sent_packets: u64,
+    pub udp_bytes_sent: u64,
+    pub udp_bytes_received: u64,
+}
+fn connection_diagnostic(
+    peer: NodeId,
+    channel: Option<u8>,
+    connection: &Connection,
+    streams: Option<&Semaphore>,
+) -> ConnectionDiagnostic {
+    let stats = connection.stats();
+    ConnectionDiagnostic {
+        peer_node_id: peer,
+        channel,
+        incoming: streams.is_some(),
+        stream_available: streams.map(Semaphore::available_permits),
+        stream_capacity: streams.map(|_| 32),
+        rtt_micros: stats.path.rtt.as_micros().min(u64::MAX as u128) as u64,
+        congestion_window_bytes: stats.path.cwnd,
+        lost_packets: stats.path.lost_packets,
+        sent_packets: stats.path.sent_packets,
+        udp_bytes_sent: stats.udp_tx.bytes,
+        udp_bytes_received: stats.udp_rx.bytes,
+    }
+}
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u64::MAX as u128) as u64
+}
 pub struct Cluster {
     pub node_id: NodeId,
     raft: Raft,
@@ -1586,6 +1783,10 @@ pub struct Cluster {
     tasks: Mutex<Vec<JoinHandle<()>>>,
     bulk_slots: Arc<Semaphore>,
     control_slots: Arc<Semaphore>,
+    connection_slots: Arc<Semaphore>,
+    connection_capacity: usize,
+    kernel_normal_waiters: AtomicU64,
+    kernel_control_waiters: AtomicU64,
     kernel_normal_writers: Mutex<()>,
     kernel_writer: Mutex<()>,
     ready: AtomicBool,
@@ -1598,16 +1799,120 @@ pub fn now_ms() -> u64 {
 }
 impl Cluster {
     pub(crate) async fn kernel_write(&self, control: bool) -> KernelWriteGuard<'_> {
+        let started = Instant::now();
+        let waiting = Waiting::new(if control {
+            &self.kernel_control_waiters
+        } else {
+            &self.kernel_normal_waiters
+        });
         let normal = if control {
             None
         } else {
             Some(self.kernel_normal_writers.lock().await)
         };
         let writer = self.kernel_writer.lock().await;
+        drop(waiting);
+        diagnostics::record(Stage::State, Outcome::Success, elapsed_ms(started));
         KernelWriteGuard {
             _writer: writer,
             _normal: normal,
         }
+    }
+    pub async fn diagnostic_snapshot(&self) -> ClusterDiagnosticSnapshot {
+        let metrics = self.raft.metrics().borrow().clone();
+        let mut connections = Vec::new();
+        {
+            let mut retained = self.transport.connections.lock().await;
+            retained.retain(|_, connection| connection.close_reason().is_none());
+            for ((peer, channel), connection) in retained.iter() {
+                connections.push(connection_diagnostic(
+                    *peer,
+                    Some(*channel),
+                    connection,
+                    None,
+                ));
+            }
+        }
+        {
+            let mut retained = self.transport.incoming_connections.lock().await;
+            retained.retain(|_, entry| entry.connection.close_reason().is_none());
+            for entry in retained.values() {
+                connections.push(connection_diagnostic(
+                    entry.peer,
+                    None,
+                    &entry.connection,
+                    Some(&entry.streams),
+                ));
+            }
+        }
+        let snapshot = ClusterDiagnosticSnapshot {
+            node_id: self.node_id,
+            observed_ms: now_ms(),
+            local_revision: self.machine.data.read().await.view.revision,
+            raft_running: metrics.running_state.is_ok(),
+            raft_state: format!("{:?}", metrics.state),
+            raft_term: metrics.current_term,
+            raft_leader: metrics.current_leader,
+            raft_last_log_index: metrics.last_log_index,
+            raft_applied_index: metrics.last_applied.map(|id| id.index),
+            raft_snapshot_index: metrics.snapshot.map(|id| id.index),
+            raft_quorum_ack_age_ms: metrics.millis_since_quorum_ack,
+            bulk_available: self.bulk_slots.available_permits(),
+            bulk_capacity: self.limits.max_queue_items.min(16),
+            control_available: self.control_slots.available_permits(),
+            control_capacity: 4,
+            incoming_connections_available: self.connection_slots.available_permits(),
+            incoming_connections_capacity: self.connection_capacity,
+            kernel_normal_waiters: self.kernel_normal_waiters.load(Ordering::Relaxed),
+            kernel_control_waiters: self.kernel_control_waiters.load(Ordering::Relaxed),
+            connection_waiters: self.transport.connection_waiters.load(Ordering::Relaxed),
+            connections,
+        };
+        diagnostics::set_gauge(Gauge::IngressBulkAvailable, snapshot.bulk_available as u64);
+        diagnostics::set_gauge(
+            Gauge::IngressControlAvailable,
+            snapshot.control_available as u64,
+        );
+        diagnostics::set_gauge(
+            Gauge::RaftLeader,
+            u64::from(snapshot.raft_leader == Some(self.node_id)),
+        );
+        diagnostics::set_gauge(Gauge::RaftTerm, snapshot.raft_term);
+        if let Some(index) = snapshot.raft_last_log_index {
+            diagnostics::set_gauge(Gauge::RaftLogIndex, index);
+        }
+        if let Some(index) = snapshot.raft_applied_index {
+            diagnostics::set_gauge(Gauge::RaftAppliedIndex, index);
+        }
+        if let Some(age) = snapshot.raft_quorum_ack_age_ms {
+            diagnostics::set_gauge(Gauge::RaftQuorumAckAgeMillis, age);
+        }
+        diagnostics::set_gauge(
+            Gauge::TransportConnections,
+            snapshot.connections.len() as u64,
+        );
+        diagnostics::set_gauge(
+            Gauge::TransportRttMicros,
+            snapshot
+                .connections
+                .iter()
+                .map(|c| c.rtt_micros)
+                .max()
+                .unwrap_or(0),
+        );
+        let sum = |field: fn(&ConnectionDiagnostic) -> u64| {
+            snapshot
+                .connections
+                .iter()
+                .fold(0_u64, |total, c| total.saturating_add(field(c)))
+        };
+        diagnostics::set_gauge(Gauge::TransportLostPackets, sum(|c| c.lost_packets));
+        diagnostics::set_gauge(Gauge::TransportSentPackets, sum(|c| c.sent_packets));
+        diagnostics::set_gauge(
+            Gauge::TransportCongestionWindowBytes,
+            sum(|c| c.congestion_window_bytes),
+        );
+        snapshot
     }
     pub async fn open(config: ClusterConfig) -> Result<Arc<Self>> {
         Self::open_with_startup_admission(config, None).await
@@ -1693,6 +1998,9 @@ impl Cluster {
             node_id: config.node_id,
             nodes: Arc::new(RwLock::new(config.nodes.clone())),
             connections: Arc::new(Mutex::new(BTreeMap::new())),
+            incoming_connections: Arc::new(Mutex::new(BTreeMap::new())),
+            connection_waiters: Arc::new(AtomicU64::new(0)),
+            next_trace_attempt: Arc::new(AtomicU64::new(1)),
             connect_locks: config
                 .nodes
                 .keys()
@@ -1727,6 +2035,10 @@ impl Cluster {
         )
         .await?;
         let bulk_slots = Arc::new(Semaphore::new(config.max_queue_items.min(16)));
+        let connection_capacity = config
+            .max_queue_items
+            .max(config.nodes.len().saturating_mul(3));
+        let connection_slots = Arc::new(Semaphore::new(connection_capacity));
         let cluster = Arc::new(Self {
             node_id: config.node_id,
             raft,
@@ -1736,18 +2048,16 @@ impl Cluster {
             tasks: Mutex::new(vec![]),
             bulk_slots,
             control_slots: Arc::new(Semaphore::new(4)),
+            connection_slots: connection_slots.clone(),
+            connection_capacity,
+            kernel_normal_waiters: AtomicU64::new(0),
+            kernel_control_waiters: AtomicU64::new(0),
             kernel_normal_writers: Mutex::new(()),
             kernel_writer: Mutex::new(()),
             ready: AtomicBool::new(startup.is_none()),
         });
         let weak = Arc::downgrade(&cluster);
         let endpoint = cluster.transport.endpoint.clone();
-        let connection_slots = Arc::new(Semaphore::new(
-            cluster
-                .limits
-                .max_queue_items
-                .max(cluster.limits.nodes.len().saturating_mul(3)),
-        ));
         let handler = tokio::spawn(async move {
             let mut owned_connections = tokio::task::JoinSet::new();
             loop {
@@ -1764,15 +2074,18 @@ impl Cluster {
                     loop {
                         let stream=tokio::select! { stream=connection.accept_bi()=>stream, _=owned_streams.join_next(),if !owned_streams.is_empty()=>continue };
                         let Ok((mut send,mut recv))=stream else {break};
+                        let stream_wait = Instant::now();
                         let Ok(permit) = slots.clone().acquire_owned().await else { break };
-                        let weak = weak.clone(); let connection = connection.clone();
+                        let stream_wait_ms = elapsed_ms(stream_wait);
+                        let weak = weak.clone(); let connection = connection.clone(); let streams = slots.clone();
                         owned_streams.spawn(async move {
                             let _permit = permit; let Some(cluster) = weak.upgrade() else { return };
-                            let result = tokio::time::timeout(Duration::from_secs(6), cluster.handle(&connection, &mut recv)).await;
-                            let result = match result { Ok(value) => value.map_err(|error| error.to_string()), Err(_) => Err("ingress deadline".into()) };
-                            if let Ok(bytes) = serde_json::to_vec(&result) { let _ = write_frame(&mut send, &bytes, cluster.limits.max_frame_bytes).await; }
+                            let result = tokio::time::timeout(Duration::from_secs(6), cluster.handle(&connection, &mut recv, streams, stream_wait_ms)).await;
+                            let result = match result { Ok(Ok(value)) => value, Ok(Err(error)) => Reply::Legacy(Err(error.to_string())), Err(_) => Reply::Legacy(Err("ingress deadline".into())) };
+                            if let Ok(bytes) = serde_json::to_vec(&result) && write_frame(&mut send, &bytes, cluster.limits.max_frame_bytes).await.is_ok() { diagnostics::record_counter(Counter::TransportBytesSent, bytes.len() as u64 + 4); }
                         });
                     }
+                    if let Some(cluster) = weak.upgrade() { cluster.transport.incoming_connections.lock().await.remove(&connection.stable_id()); }
                 });
             }
         });
@@ -2359,37 +2672,117 @@ impl Cluster {
         }
         self.raft.shutdown().await?;
         self.transport.connections.lock().await.clear();
+        self.transport.incoming_connections.lock().await.clear();
         self.transport.endpoint.wait_idle().await;
         Ok(())
     }
-    async fn handle(&self, connection: &Connection, recv: &mut quinn::RecvStream) -> Result<Value> {
-        let wire: Wire =
-            serde_json::from_slice(&read_frame(recv, self.limits.max_frame_bytes).await?)?;
+    async fn handle(
+        &self,
+        connection: &Connection,
+        recv: &mut quinn::RecvStream,
+        streams: Arc<Semaphore>,
+        stream_wait_ms: u64,
+    ) -> Result<Reply> {
+        let bytes = read_frame(recv, self.limits.max_frame_bytes).await?;
+        diagnostics::record_counter(Counter::TransportBytesReceived, bytes.len() as u64 + 4);
+        let wire: Wire = serde_json::from_slice(&bytes)?;
         self.transport.peer_allowed(wire.sender, connection).await?;
-        self.process(wire.rpc).await
+        self.transport.incoming_connections.lock().await.insert(
+            connection.stable_id(),
+            IncomingConnection {
+                peer: wire.sender,
+                connection: connection.clone(),
+                streams,
+            },
+        );
+        let traced = wire.trace_context.is_some();
+        let parent = wire.trace_context.unwrap_or_else(TraceContext::fresh_root);
+        parent.validate()?;
+        let span = diagnostics::hop_span(
+            &parent,
+            &wire.sender.to_string(),
+            &self.node_id.to_string(),
+            stream_wait_ms,
+        );
+        let started = Instant::now();
+        let response = diagnostics::with_trace_context(
+            Some(parent.clone()),
+            async {
+                let result = match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    self.process_with_wait(wire.rpc, stream_wait_ms),
+                )
+                .await
+                {
+                    Ok(result) => result.map_err(|error| error.to_string()),
+                    Err(_) => Err("authenticated ingress operation deadline".into()),
+                };
+                diagnostics::record(
+                    Stage::Hop,
+                    if result.is_ok() {
+                        Outcome::Success
+                    } else {
+                        Outcome::Error
+                    },
+                    elapsed_ms(started),
+                );
+                let trace_context = diagnostics::current_trace_context()
+                    .unwrap_or_else(|| parent.child("quic_reply", &self.node_id.to_string(), 0));
+                if traced {
+                    Reply::Traced(WireReply {
+                        trace_context,
+                        result,
+                    })
+                } else {
+                    Reply::Legacy(result)
+                }
+            }
+            .instrument(span),
+        )
+        .await;
+        Ok(response)
     }
     async fn process(&self, rpc: Rpc) -> Result<Value> {
+        self.process_with_wait(rpc, 0).await
+    }
+    async fn process_with_wait(&self, rpc: Rpc, prior_wait_ms: u64) -> Result<Value> {
         ensure!(
             rpc.channel() == 0 || self.ready.load(Ordering::Acquire),
             "offline recovery blocks application traffic before quorum admission"
         );
-        let _admission = match rpc.channel() {
-            0 => None, // Raft protocol never waits behind application admission.
-            1 => Some(
-                tokio::time::timeout(
-                    Duration::from_millis(500),
-                    self.control_slots.clone().acquire_owned(),
-                )
-                .await
-                .context("control admission saturated")??,
-            ),
-            _ => Some(
-                self.bulk_slots
-                    .clone()
-                    .try_acquire_owned()
-                    .context("bulk admission saturated; retry with the same intent")?,
-            ),
-        };
+        let waited = Instant::now();
+        let hop_wait = HopQueueWait::new(prior_wait_ms);
+        let admission: Result<Option<tokio::sync::OwnedSemaphorePermit>> = async {
+            Ok(match rpc.channel() {
+                0 => None, // Raft protocol never waits behind application admission.
+                1 => Some(
+                    tokio::time::timeout(
+                        Duration::from_millis(500),
+                        self.control_slots.clone().acquire_owned(),
+                    )
+                    .await
+                    .context("control admission saturated")??,
+                ),
+                _ => Some(
+                    self.bulk_slots
+                        .clone()
+                        .try_acquire_owned()
+                        .context("bulk admission saturated; retry with the same intent")?,
+                ),
+            })
+        }
+        .await;
+        drop(hop_wait);
+        diagnostics::record(
+            Stage::State,
+            if admission.is_ok() {
+                Outcome::Success
+            } else {
+                Outcome::Denied
+            },
+            elapsed_ms(waited),
+        );
+        let _admission = admission?;
         match rpc {
             Rpc::RotationReady { key, digest } => {
                 let data = self.machine.data.read().await;
@@ -3054,6 +3447,218 @@ mod tests {
         assert!(DurableLog::open(&dir, [7; 32]).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
+    #[test]
+    fn trace_wire_preserves_legacy_and_traced_envelopes() {
+        let legacy = serde_json::json!({"sender": 1, "rpc": {"Ping": [1, 2]}});
+        assert!(
+            serde_json::from_value::<Wire>(legacy)
+                .unwrap()
+                .trace_context
+                .is_none()
+        );
+        let old: std::result::Result<Value, String> = Ok(Value::Bool(true));
+        assert!(matches!(
+            serde_json::from_slice::<Reply>(&serde_json::to_vec(&old).unwrap()).unwrap(),
+            Reply::Legacy(Ok(Value::Bool(true)))
+        ));
+        let trace = TraceContext::fresh_root();
+        let reply = Reply::Traced(WireReply {
+            trace_context: trace.clone(),
+            result: old,
+        });
+        let Reply::Traced(decoded) =
+            serde_json::from_slice::<Reply>(&serde_json::to_vec(&reply).unwrap()).unwrap()
+        else {
+            panic!("traced reply lost envelope")
+        };
+        assert_eq!(decoded.trace_context, trace);
+        decoded.trace_context.validate().unwrap();
+    }
+
+    async fn assert_real_quic_trace_and_diagnostic_observations(
+        follower: &Arc<Cluster>,
+        leader: &Arc<Cluster>,
+    ) {
+        let mut root = TraceContext::for_task("diagnostic-test", "goal", "task");
+        root.tracestate = Some("test=retained".into());
+        let (value, reply) = diagnostics::with_trace_context(Some(root.clone()), async {
+            let inherited = diagnostics::current_trace_context()
+                .expect("scope is available without an exporter");
+            follower
+                .transport
+                .call_with_trace(leader.node_id, Rpc::Ping(vec![7, 8]), inherited)
+                .await
+                .unwrap()
+        })
+        .await;
+        assert_eq!(value, serde_json::json!([7, 8]));
+        let reply = reply.expect("new receiver propagates W3C reply envelope");
+        reply.validate().unwrap();
+        assert_eq!(reply.trace_id, root.trace_id);
+        assert_eq!(reply.tracestate, root.tracestate);
+        assert!(
+            diagnostics::current_trace_context().is_none(),
+            "received request context cannot leak outside its future"
+        );
+
+        let connection = follower
+            .transport
+            .connections
+            .lock()
+            .await
+            .get(&(leader.node_id, 2))
+            .unwrap()
+            .clone();
+        // Use the actual authenticated receiver with malformed metadata; no state mutation may execute.
+        let mut invalid = root;
+        invalid.trace_id = "0".repeat(32);
+        let bad = Wire {
+            sender: follower.node_id,
+            rpc: Rpc::Transaction(Command {
+                transaction: Transaction::new(
+                    "invalid-trace-effect",
+                    vec![Mutation::Put {
+                        key: "invalid-trace-effect".into(),
+                        value: Value::Bool(true),
+                    }],
+                ),
+                now_ms: now_ms(),
+            }),
+            trace_context: Some(invalid),
+        };
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        write_frame(
+            &mut send,
+            &serde_json::to_vec(&bad).unwrap(),
+            follower.limits.max_frame_bytes,
+        )
+        .await
+        .unwrap();
+        let denial: Reply = serde_json::from_slice(
+            &read_frame(&mut recv, follower.limits.max_frame_bytes)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(denial, Reply::Legacy(Err(_))));
+        assert!(
+            leader
+                .read("invalid-trace-effect")
+                .await
+                .unwrap()
+                .value
+                .is_none()
+        );
+        let legacy = Wire {
+            sender: follower.node_id,
+            rpc: Rpc::Ping(vec![9]),
+            trace_context: None,
+        };
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        write_frame(
+            &mut send,
+            &serde_json::to_vec(&legacy).unwrap(),
+            follower.limits.max_frame_bytes,
+        )
+        .await
+        .unwrap();
+        let legacy_reply: std::result::Result<Value, String> = serde_json::from_slice(
+            &read_frame(&mut recv, follower.limits.max_frame_bytes)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(legacy_reply.unwrap(), serde_json::json!([9]));
+
+        assert!(
+            leader
+                .transact(Transaction::new(
+                    "diagnostic-observation",
+                    vec![Mutation::Put {
+                        key: "diagnostic-observation".into(),
+                        value: Value::Bool(true)
+                    }]
+                ))
+                .await
+                .unwrap()
+                .applied
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while follower
+                .cached_view()
+                .await
+                .kv
+                .get("diagnostic-observation")
+                != Some(&Value::Bool(true))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let snapshot = follower.diagnostic_snapshot().await;
+        assert_eq!(snapshot.raft_leader, Some(leader.node_id));
+        assert!(snapshot.raft_running && snapshot.raft_term > 0);
+        assert_eq!(
+            snapshot.local_revision,
+            follower.cached_view().await.revision
+        );
+        assert!(snapshot.raft_applied_index.is_some());
+        assert!(
+            snapshot
+                .connections
+                .iter()
+                .any(|c| c.peer_node_id == leader.node_id
+                    && c.udp_bytes_sent > 0
+                    && c.udp_bytes_received > 0
+                    && c.sent_packets > 0
+                    && c.rtt_micros > 0
+                    && c.congestion_window_bytes > 0)
+        );
+        assert!(
+            leader
+                .diagnostic_snapshot()
+                .await
+                .connections
+                .iter()
+                .any(|c| c.incoming
+                    && c.peer_node_id == follower.node_id
+                    && c.stream_available.is_some())
+        );
+        let permits = follower
+            .bulk_slots
+            .clone()
+            .acquire_many_owned(snapshot.bulk_capacity as u32)
+            .await
+            .unwrap();
+        let saturated = follower.diagnostic_snapshot().await;
+        assert_eq!(saturated.bulk_available, 0);
+        assert_eq!(saturated.control_available, saturated.control_capacity);
+        drop(permits);
+        assert_eq!(
+            follower.diagnostic_snapshot().await.bulk_available,
+            snapshot.bulk_capacity
+        );
+        let guard = follower.kernel_write(false).await;
+        let waiting_node = follower.clone();
+        let waiting = tokio::spawn(async move {
+            waiting_node.kernel_write(false).await;
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while follower.diagnostic_snapshot().await.kernel_normal_waiters != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        waiting.abort();
+        let _ = waiting.await;
+        assert_eq!(
+            follower.diagnostic_snapshot().await.kernel_normal_waiters,
+            0
+        );
+        drop(guard);
+    }
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn actual_raft_over_mtls_quic_survives_leader_loss_and_restart() {
         let root = std::env::temp_dir().join(format!("solos-raft-test-{}", now_ms()));
@@ -3131,6 +3736,7 @@ mod tests {
             .find(|node| node.node_id != leader)
             .unwrap()
             .clone();
+        assert_real_quic_trace_and_diagnostic_observations(&follower, leader_node).await;
         let granted = follower
             .transact(Transaction::new(
                 "saturation-lease",

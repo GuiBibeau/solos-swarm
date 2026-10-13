@@ -6,6 +6,7 @@ import { Type, lazyStream, openAICompletionsApi } from "@earendil-works/pi-ai/co
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const pending = new Map<string, { id: string; certificate: string; active: boolean }>();
+let taskTrace: {trace_id: string; span_id: string; trace_flags: number; tracestate?: string | null} | undefined;
 
 export async function broker(path: string, payload: unknown, signal?: AbortSignal, requestId = randomUUID()): Promise<Response> {
   const socketPath = process.env.SWARM_SOCKET;
@@ -26,14 +27,18 @@ export async function broker(path: string, payload: unknown, signal?: AbortSigna
   requestId = previous?.id ?? requestId;
   if (!previous && pending.size >= 64) throw new Error("Too many unresolved broker intents; operator reconciliation is required.");
   pending.set(binding, { id: requestId, certificate, active: true });
-  const signature = sign(null, Buffer.from(`solos-swarm-request-v1\n${requestId}\n${issued_ms}\n${path}\n${data}`), key).toString("base64");
-  const body = JSON.stringify({ request_id: requestId, issued_ms, path, payload: data, signature });
+  const span = createHash("sha256").update(`solos-worker-span-v1\n${taskTrace?.trace_id ?? ""}\n${path}\n${requestId}`).digest("hex").slice(0, 16);
+  const traceparent = taskTrace ? `00-${taskTrace.trace_id}-${span}-${taskTrace.trace_flags.toString(16).padStart(2, "0")}` : null;
+  const tracestate = taskTrace?.tracestate ?? null;
+  const signature = sign(null, Buffer.from(`solos-swarm-request-v2\n${requestId}\n${issued_ms}\n${path}\n${traceparent ?? ""}\n${tracestate ?? ""}\n${data}`), key).toString("base64");
+  const body = JSON.stringify({ request_id: requestId, issued_ms, path, traceparent, tracestate, payload: data, signature });
   return new Promise((resolve, reject) => {
     const failed = (error: Error) => { const entry = pending.get(binding); if (entry) entry.active = false; reject(error); };
     const req = request({ socketPath, servername: serverName, path, method: "POST", signal,
       rejectUnauthorized: true, ca: identity.ca_pem, cert: identity.certificate_pem, key: identity.private_key_pem,
       minVersion: "TLSv1.3", maxVersion: "TLSv1.3", agent: false,
-      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
+      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body),
+        ...(traceparent ? {traceparent, ...(tracestate ? {tracestate} : {})} : {}) },
     }, (res) => {
       const chunks: Buffer[] = []; let size = 0;
       res.on("data", (chunk: Buffer) => {
@@ -60,6 +65,11 @@ export default async function swarmMvp(pi: ExtensionAPI) {
   const response = await broker("/session", {});
   if (!response.ok) throw new Error(`Workload session denied: ${await response.text()}`);
   const session = await response.json();
+  if (session.trace_context) {
+    const trace = session.trace_context;
+    if (!/^[0-9a-f]{32}$/.test(trace.trace_id) || /^0+$/.test(trace.trace_id) || !/^[0-9a-f]{16}$/.test(trace.span_id) || /^0+$/.test(trace.span_id) || (!Number.isInteger(trace.trace_flags) || trace.trace_flags < 0 || trace.trace_flags > 255) || trace.tracestate != null && (typeof trace.tracestate !== "string" || trace.tracestate.length > 512 || /[\r\n]/.test(trace.tracestate))) throw new Error("Invalid broker Task trace context");
+    taskTrace = trace;
+  }
   if (!session.model?.id || !Array.isArray(session.tools) || session.tools.length === 0) throw new Error("Missing compiled agent definition");
   pi.registerProvider("swarm", {
     baseUrl: "https://broker.invalid/v1", api: "swarm-broker", apiKey: "workload-identity",

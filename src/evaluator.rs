@@ -1258,6 +1258,8 @@ impl ProtectedEvaluator {
         now_ms: u64,
     ) -> Result<SignedCommand> {
         let mut message = Message {
+            traceparent: None,
+            tracestate: None,
             request_id: format!(
                 "eval-{}-{index}",
                 &digest_bytes(request_id.as_bytes())[..24]
@@ -1564,6 +1566,8 @@ impl ProtectedEvaluator {
             result: result.clone(),
         };
         let mut message = Message {
+            traceparent: None,
+            tracestate: None,
             request_id: delivery.request_id.clone(),
             issued_ms: now,
             path: EVALUATOR_COMMAND_PATH.into(),
@@ -1578,6 +1582,7 @@ impl ProtectedEvaluator {
                 target.endpoint.trim_end_matches('/'),
                 EVALUATOR_COMMAND_PATH
             ))
+            .headers(message.trace_headers()?)
             .json(&message)
             .send()
             .await?;

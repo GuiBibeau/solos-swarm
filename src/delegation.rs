@@ -144,6 +144,7 @@ impl Kernel {
             }
             let now_ms = crate::cluster::now_ms();
             let mut next = state.clone();
+            let audit_start = next.audit.events().len();
             let staged = stage(
                 &mut next,
                 subject,
@@ -199,8 +200,12 @@ impl Kernel {
                     revision: view.revision,
                 });
             }
+            let goal = task_goal(subject)?;
+            let correlation =
+                next.correlation_for(subject.id(), Some(&goal), Some(&context), Some(intent))?;
             if record_id != id && !next.replies.contains_key(&binding_id) {
                 next.audit.append_committed(AuditEvent {
+                    correlation: Some(correlation.clone()),
                     id: binding_id.clone(),
                     kind: "application_request_binding".into(),
                     actor: subject.id().into(),
@@ -212,6 +217,7 @@ impl Kernel {
                 next.replies.insert(
                     binding_id.clone(),
                     RecordedReply {
+                        correlation: Some(correlation.clone()),
                         actor: subject.id().into(),
                         request: json!({"request_hash":hex(&request_hash)}),
                         request_hash,
@@ -221,6 +227,7 @@ impl Kernel {
                 );
             }
             next.audit.append_committed(AuditEvent {
+                correlation: Some(correlation.clone()),
                 id: format!("request/{record_id}"),
                 kind: "kernel_request".into(),
                 actor: subject.id().into(),
@@ -232,6 +239,7 @@ impl Kernel {
             next.replies.insert(
                 record_id.clone(),
                 RecordedReply {
+                    correlation: Some(correlation.clone()),
                     actor: subject.id().into(),
                     request: request.clone(),
                     request_hash,
@@ -239,6 +247,10 @@ impl Kernel {
                     value: value.clone(),
                 },
             );
+            next.audit.correlate_new_fallback(audit_start, &correlation);
+            if let Some(effect) = next.effects.get_mut(intent) {
+                effect.correlation = Some(correlation);
+            }
             next.validate()?;
             next.checkpoint(&record_id, subject.id(), timestamp)?;
             let encoded = serde_json::to_vec(&next)?;
@@ -747,6 +759,7 @@ mod tests {
             "delegation-test".into(),
         )
         .unwrap();
+        state.run_id = Some("delegation-current-run".into());
         state
             .security
             .register_goal(
@@ -1156,6 +1169,55 @@ mod tests {
                 .duplicate
         );
         let state = kernel.state().await.unwrap();
+        let correlation = state.replies["apply-child"].correlation.as_ref().unwrap();
+        assert_eq!(
+            correlation.run_id.as_deref(),
+            Some("delegation-current-run")
+        );
+        assert_eq!(correlation.goal_id.as_deref(), Some("g"));
+        assert_eq!(correlation.task_id.as_deref(), Some("parent"));
+        assert_eq!(correlation.intent_id.as_deref(), Some("child-intent"));
+        assert_eq!(correlation.agent_id.as_deref(), Some("a1"));
+        assert_eq!(correlation.node_id.as_deref(), Some("n1"));
+        assert_eq!(correlation.incarnation, Some(1));
+        let delegation_events = state.audit.events().iter().filter(|event| {
+            event.id == "request/apply-child"
+                || event.id.starts_with("permit-refresh/child-intent/")
+        });
+        for event in delegation_events {
+            assert_eq!(
+                event.correlation.as_ref().unwrap().intent_id.as_deref(),
+                Some("child-intent")
+            );
+            assert_eq!(
+                event.correlation.as_ref().unwrap().task_id.as_deref(),
+                Some("parent")
+            );
+            assert_eq!(
+                event.correlation.as_ref().unwrap().run_id.as_deref(),
+                Some("delegation-current-run")
+            );
+        }
+        let gang = state
+            .audit
+            .events()
+            .iter()
+            .find(|event| event.kind == "gang_reserved")
+            .unwrap();
+        let gang_context = gang.correlation.as_ref().unwrap();
+        assert_eq!(
+            gang_context.run_id.as_deref(),
+            Some("delegation-current-run")
+        );
+        assert_eq!(gang_context.goal_id.as_deref(), Some("g"));
+        assert!(gang_context.task_id.is_none());
+        assert!(
+            gang_context
+                .intent_id
+                .as_ref()
+                .unwrap()
+                .starts_with("placement/")
+        );
         assert_eq!(
             state.effects["child-intent"].permit.payload.grant_epoch,
             refreshed_epoch
@@ -1179,6 +1241,45 @@ mod tests {
         let view = cluster.view().await.unwrap();
         assert!(view.kv.contains_key(&format!("allocations/{child_id}")));
         assert!(view.leases.contains_key(&format!("allocation/{child_id}")));
+        let allocation: crate::scheduler::Allocation =
+            serde_json::from_value(view.kv[&format!("allocations/{child_id}")].clone()).unwrap();
+        use crate::scheduler::Unreserve as _;
+        let released = placement::Unreserve {
+            state: state.clone(),
+            max_state_bytes: kernel.max_state_bytes,
+        }
+        .mutations(&[allocation])
+        .unwrap();
+        let Mutation::Put { value, .. } = &released[0] else {
+            panic!("unreserve state mutation missing")
+        };
+        let released: KernelState = serde_json::from_value(value.clone()).unwrap();
+        let unreserve = released
+            .audit
+            .events()
+            .iter()
+            .rev()
+            .find(|event| event.kind == "gang_unreserved")
+            .unwrap();
+        let unreserve_context = unreserve.correlation.as_ref().unwrap();
+        assert_eq!(
+            unreserve_context.run_id.as_deref(),
+            Some("delegation-current-run")
+        );
+        assert_eq!(unreserve_context.goal_id.as_deref(), Some("g"));
+        assert!(unreserve_context.task_id.is_none());
+        assert!(unreserve_context.agent_id.is_none());
+        assert!(
+            unreserve_context
+                .intent_id
+                .as_ref()
+                .unwrap()
+                .starts_with("unreserve/")
+        );
+        assert_eq!(
+            released.audit.events().last().unwrap().correlation.as_ref(),
+            Some(unreserve_context)
+        );
         // Restore the test's original C0 ceiling for its separate capacity and
         // final-selection regressions; the narrowed consent fixture is complete.
         let mut restored = kernel.state().await.unwrap();

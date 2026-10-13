@@ -3,6 +3,26 @@ use crate::audit::{Hash, Signed};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaPauseKind {
+    RetryAfter,
+    Window,
+    Concurrent,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QuotaPaused {
+    pub scope: String,
+    /// Absolute UTC earliest recheck; zero means holdings must change, not clock expiry.
+    pub retry_after_ms: u64,
+    pub kind: QuotaPauseKind,
+}
+impl std::fmt::Display for QuotaPaused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "shared provider quota paused ({:?})", self.kind)
+    }
+}
+impl std::error::Error for QuotaPaused {}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuotaConfig {
@@ -39,6 +59,23 @@ pub struct Quotas {
     pub blocked_until_ms: BTreeMap<String, u64>,
 }
 impl Quotas {
+    /// A read-only check for new work. An existing intent never hides its own held allowance.
+    pub fn check_available(
+        &self,
+        request: &QuotaRequest,
+        provider: &str,
+        now_ms: u64,
+    ) -> Result<()> {
+        let mut probe = request.clone();
+        let mut suffix = 0_u64;
+        while self.reservations.contains_key(&probe.intent) {
+            probe.intent = format!("availability-check-{}-{suffix}", request.intent);
+            suffix = suffix
+                .checked_add(1)
+                .context("quota availability namespace overflow")?;
+        }
+        self.clone().reserve(probe, provider, now_ms)
+    }
     pub fn configure(
         &mut self,
         config: Signed<QuotaConfig>,
@@ -81,16 +118,24 @@ impl Quotas {
                 && c.providers.iter().any(|p| p == provider)
                 && request.input > 0
                 && request.output > 0
+                && request.input <= c.input_tokens
+                && request.output <= c.output_tokens
                 && now_ms < request.deadline_ms
                 && request.deadline_ms <= c.expiry_ms,
             "request exceeds provider quota posture"
         );
-        ensure!(
-            self.blocked_until_ms
-                .get(&request.scope)
-                .is_none_or(|time| *time <= now_ms),
-            "provider Retry-After active; agent must pause"
-        );
+        if let Some(until) = self
+            .blocked_until_ms
+            .get(&request.scope)
+            .filter(|time| **time > now_ms)
+        {
+            return Err(QuotaPaused {
+                scope: request.scope.clone(),
+                retry_after_ms: *until,
+                kind: QuotaPauseKind::RetryAfter,
+            }
+            .into());
+        }
         let window = now_ms / c.window_ms;
         let mut requests = 0u64;
         let mut input = 0u64;
@@ -125,17 +170,29 @@ impl Quotas {
                     .context("quota counter overflow")?;
             }
         }
-        ensure!(
-            requests < c.requests
-                && concurrent < c.concurrent
-                && input
-                    .checked_add(request.input)
-                    .is_some_and(|v| v <= c.input_tokens)
-                && output
-                    .checked_add(request.output)
-                    .is_some_and(|v| v <= c.output_tokens),
-            "shared provider quota exhausted; agent must pause"
-        );
+        if concurrent >= c.concurrent {
+            return Err(QuotaPaused {
+                scope: request.scope.clone(),
+                retry_after_ms: 0,
+                kind: QuotaPauseKind::Concurrent,
+            }
+            .into());
+        }
+        if !(requests < c.requests
+            && input
+                .checked_add(request.input)
+                .is_some_and(|v| v <= c.input_tokens)
+            && output
+                .checked_add(request.output)
+                .is_some_and(|v| v <= c.output_tokens))
+        {
+            return Err(QuotaPaused {
+                scope: request.scope.clone(),
+                retry_after_ms: window.saturating_add(1).saturating_mul(c.window_ms),
+                kind: QuotaPauseKind::Window,
+            }
+            .into());
+        }
         self.reservations.insert(
             request.intent.clone(),
             Reservation {
@@ -157,12 +214,18 @@ impl Quotas {
             reservation.state == "reserved" && now_ms < reservation.request.deadline_ms,
             "provider allowance stale or dispatched"
         );
-        ensure!(
-            self.blocked_until_ms
-                .get(&reservation.request.scope)
-                .is_none_or(|time| *time <= now_ms),
-            "provider Retry-After active"
-        );
+        if let Some(until) = self
+            .blocked_until_ms
+            .get(&reservation.request.scope)
+            .filter(|time| **time > now_ms)
+        {
+            return Err(QuotaPaused {
+                scope: reservation.request.scope.clone(),
+                retry_after_ms: *until,
+                kind: QuotaPauseKind::RetryAfter,
+            }
+            .into());
+        }
         reservation.state = "dispatched".into();
         Ok(())
     }
@@ -213,6 +276,136 @@ impl Quotas {
 mod tests {
     use super::*;
     use crate::audit::CryptoSigner;
+    fn configured(requests: u64, concurrent: u64) -> (Quotas, QuotaRequest) {
+        let signer = CryptoSigner::from_seed([23; 32]);
+        let mut quotas = Quotas::default();
+        quotas
+            .configure(
+                signer
+                    .sign(
+                        "provider-quota",
+                        QuotaConfig {
+                            scope: "shared/model".into(),
+                            providers: vec!["p".into()],
+                            version: "v1".into(),
+                            window_ms: 1000,
+                            requests,
+                            input_tokens: 100,
+                            output_tokens: 100,
+                            concurrent,
+                            expiry_ms: 10_000,
+                        },
+                    )
+                    .unwrap(),
+                &signer.public_key(),
+                1,
+            )
+            .unwrap();
+        (
+            quotas,
+            QuotaRequest {
+                intent: "first".into(),
+                scope: "shared/model".into(),
+                input: 40,
+                output: 40,
+                deadline_ms: 5000,
+            },
+        )
+    }
+    fn assert_pause(error: anyhow::Error, kind: QuotaPauseKind, retry_after_ms: u64) {
+        let pause = error
+            .downcast_ref::<QuotaPaused>()
+            .expect("typed quota pause");
+        assert_eq!(pause.scope, "shared/model");
+        assert_eq!(pause.kind, kind);
+        assert_eq!(pause.retry_after_ms, retry_after_ms);
+    }
+    #[test]
+    fn window_pause_resumes_only_in_fresh_window_without_mutating_checks() {
+        let (mut quotas, mut request) = configured(1, 2);
+        quotas.reserve(request.clone(), "p", 1).unwrap();
+        quotas.dispatch(&request.intent, 2).unwrap();
+        quotas
+            .finish(&request.intent, Some((20, 20)), false)
+            .unwrap();
+        request.intent = "other-node".into();
+        let original = serde_json::to_value(&quotas).unwrap();
+        assert_pause(
+            quotas.reserve(request.clone(), "p", 3).unwrap_err(),
+            QuotaPauseKind::Window,
+            1000,
+        );
+        assert_pause(
+            quotas.check_available(&request, "p", 999).unwrap_err(),
+            QuotaPauseKind::Window,
+            1000,
+        );
+        assert_eq!(serde_json::to_value(&quotas).unwrap(), original);
+        quotas.check_available(&request, "p", 1000).unwrap();
+        assert_eq!(serde_json::to_value(&quotas).unwrap(), original);
+        quotas.reserve(request, "p", 1000).unwrap();
+        assert_eq!(quotas.reservations.len(), 2);
+    }
+    #[test]
+    fn concurrent_unknown_hold_never_resumes_by_clock_or_same_intent_shortcut() {
+        let (mut quotas, request) = configured(10, 1);
+        quotas.reserve(request.clone(), "p", 1).unwrap();
+        quotas.dispatch(&request.intent, 2).unwrap();
+        quotas.finish(&request.intent, None, false).unwrap();
+        let original = serde_json::to_value(&quotas).unwrap();
+        let mut next = request.clone();
+        next.intent = "other-node".into();
+        for now in [3, 1001, 4000] {
+            assert_pause(
+                quotas.reserve(next.clone(), "p", now).unwrap_err(),
+                QuotaPauseKind::Concurrent,
+                0,
+            );
+            assert_pause(
+                quotas.check_available(&request, "p", now).unwrap_err(),
+                QuotaPauseKind::Concurrent,
+                0,
+            );
+        }
+        assert_eq!(serde_json::to_value(&quotas).unwrap(), original);
+        assert_eq!(quotas.reservations[&request.intent].state, "unknown");
+        quotas
+            .finish(&request.intent, Some((30, 20)), false)
+            .unwrap();
+        quotas.check_available(&next, "p", 4000).unwrap();
+        quotas.reserve(next, "p", 4000).unwrap();
+        assert_eq!(quotas.reservations.len(), 2);
+    }
+    #[test]
+    fn retry_after_pauses_reserve_and_dispatch_until_exact_current_boundary() {
+        let (mut quotas, request) = configured(10, 2);
+        quotas.reserve(request.clone(), "p", 1).unwrap();
+        quotas.retry_after(&request.scope, 2, 500).unwrap();
+        let original = serde_json::to_value(&quotas).unwrap();
+        assert_pause(
+            quotas.dispatch(&request.intent, 3).unwrap_err(),
+            QuotaPauseKind::RetryAfter,
+            502,
+        );
+        let mut next = request.clone();
+        next.intent = "other-node".into();
+        assert_pause(
+            quotas.reserve(next.clone(), "p", 501).unwrap_err(),
+            QuotaPauseKind::RetryAfter,
+            502,
+        );
+        assert_pause(
+            quotas.check_available(&next, "p", 501).unwrap_err(),
+            QuotaPauseKind::RetryAfter,
+            502,
+        );
+        assert_eq!(serde_json::to_value(&quotas).unwrap(), original);
+        quotas.check_available(&next, "p", 502).unwrap();
+        assert_eq!(serde_json::to_value(&quotas).unwrap(), original);
+        quotas.dispatch(&request.intent, 502).unwrap();
+        quotas.reserve(next, "p", 502).unwrap();
+        assert_eq!(quotas.reservations.len(), 2);
+    }
     #[test]
     fn quota_is_shared_across_nodes_unknown_holds_and_receipts() {
         let signer = CryptoSigner::from_seed([23; 32]);

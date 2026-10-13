@@ -44,7 +44,9 @@ impl ToolExecutor for DenyTools {
         Box::pin(async { anyhow::bail!("fixture has no external tools") })
     }
 }
+type CapturedTraceHeaders = Arc<Mutex<Vec<(Option<String>, Option<String>)>>>;
 pub(crate) struct Harness {
+    pub(crate) runtime_subject: AuthenticatedSubject,
     pub(crate) kernel: Arc<Kernel>,
     pub(crate) fixture: test_support::Fixture,
     pub(crate) socket: PathBuf,
@@ -52,6 +54,7 @@ pub(crate) struct Harness {
     pub(crate) client: reqwest::Client,
     pub(crate) provider: Arc<OpenAiProvider>,
     pub(crate) upstream: Arc<Mutex<Vec<Value>>>,
+    pub(crate) upstream_trace_headers: CapturedTraceHeaders,
     pub(crate) worker_stop: watch::Sender<bool>,
     pub(crate) server_stop: watch::Sender<bool>,
     pub(crate) server: JoinHandle<Result<()>>,
@@ -64,27 +67,52 @@ impl Harness {
         Self::open_with_tools(Arc::new(DenyTools), vec![]).await
     }
     pub(crate) async fn open_with_concurrency(concurrency: usize) -> Self {
-        Self::open_configured(Arc::new(DenyTools), vec![], concurrency, None).await
+        Self::open_configured(Arc::new(DenyTools), vec![], concurrency, None, None, None).await
     }
     pub(crate) async fn open_with_confirmation(
         kind: CapabilityKind,
         tier: crate::security::ConfirmationTier,
     ) -> Self {
-        Self::open_configured(Arc::new(DenyTools), vec![], 1, Some((kind, tier))).await
+        Self::open_configured(
+            Arc::new(DenyTools),
+            vec![],
+            1,
+            Some((kind, tier)),
+            None,
+            None,
+        )
+        .await
     }
     pub(crate) async fn open_with_tools(
         tools: Arc<dyn ToolExecutor>,
         extra_tools: Vec<ToolDefinition>,
     ) -> Self {
-        Self::open_configured(tools, extra_tools, 1, None).await
+        Self::open_configured(tools, extra_tools, 1, None, None, None).await
+    }
+    pub(crate) async fn open_with_funding_cap(total: u64) -> Self {
+        Self::open_configured(Arc::new(DenyTools), vec![], 1, None, Some(total), None).await
+    }
+    pub(crate) async fn open_with_quota_concurrency(concurrent: u64) -> Self {
+        Self::open_configured(Arc::new(DenyTools), vec![], 1, None, None, Some(concurrent)).await
     }
     async fn open_configured(
         tools: Arc<dyn ToolExecutor>,
         extra_tools: Vec<ToolDefinition>,
         concurrency: usize,
         confirmation: Option<(CapabilityKind, crate::security::ConfirmationTier)>,
+        financial_cap: Option<u64>,
+        quota_concurrent: Option<u64>,
     ) -> Self {
         let mut f = test_support::fixture();
+        if let Some(cap) = financial_cap {
+            f.posture.limits.total = cap;
+            f.posture.limits.per_call = cap;
+            f.posture.limits.per_tick = cap;
+            f.posture.limits.per_day = cap;
+            for capability in &mut f.posture.capability_ceiling {
+                capability.budget = f.posture.limits.clone();
+            }
+        }
         let ca = IdentityAuthority::generate("test.local").unwrap();
         f.identity = ca.issue(f.definition.holder.clone(), f.now, 900).unwrap();
         f.subject = AuthenticatedSubject::workload(
@@ -293,7 +321,7 @@ impl Harness {
                     requests: 100,
                     input_tokens: 1_000_000,
                     output_tokens: 10000,
-                    concurrent: 10,
+                    concurrent: quota_concurrent.unwrap_or(10),
                     expiry_ms: (f.now + 600) * 1000,
                 },
             )
@@ -369,7 +397,7 @@ impl Harness {
                     input: json!({"assignment":"inspect synthetic evidence"}),
                     required_capabilities: BTreeSet::new(),
                     capabilities: spec.capabilities.clone(),
-                    budget_microusd: 900_000,
+                    budget_microusd: financial_cap.unwrap_or(900_000),
                     expiry_ms: (f.now + 300) * 1000,
                 },
                 resources,
@@ -478,13 +506,16 @@ impl Harness {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}/chat/completions", listener.local_addr().unwrap());
         let upstream = Arc::new(Mutex::new(vec![]));
+        let upstream_trace_headers = Arc::new(Mutex::new(vec![]));
         let seen = upstream.clone();
+        let trace_seen = upstream_trace_headers.clone();
         let receiver = tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     break;
                 };
                 let seen = seen.clone();
+                let trace_seen = trace_seen.clone();
                 tokio::spawn(async move {
                     let mut bytes = vec![];
                     let mut chunk = [0; 4096];
@@ -518,6 +549,18 @@ impl Harness {
                     let body: Value =
                         serde_json::from_slice(&bytes[end.unwrap()..end.unwrap() + length])
                             .unwrap();
+                    let raw_headers = String::from_utf8_lossy(&bytes[..end.unwrap()]);
+                    let header = |name: &str| {
+                        raw_headers.lines().find_map(|line| {
+                            line.split_once(':')
+                                .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+                                .map(|(_, value)| value.trim().to_owned())
+                        })
+                    };
+                    trace_seen
+                        .lock()
+                        .await
+                        .push((header("traceparent"), header("tracestate")));
                     let lost = body.to_string().contains("LOSE_ACK");
                     let malformed = body
                         .to_string()
@@ -616,7 +659,7 @@ impl Harness {
         let broker = BrokerNode {
             ca_der: service.ca_der.clone(),
             kernel: kernel.clone(),
-            executor_subject: Arc::new(tokio::sync::RwLock::new(executor)),
+            executor_subject: Arc::new(tokio::sync::RwLock::new(executor.clone())),
             sessions: Arc::new(Mutex::new([(f.subject.id().into(), session)].into())),
             backends: [(
                 "local/m1".into(),
@@ -687,6 +730,7 @@ impl Harness {
         }
         let client = client(&socket, &f.identity);
         Self {
+            runtime_subject: executor,
             kernel,
             fixture: f,
             socket,
@@ -694,6 +738,7 @@ impl Harness {
             client,
             provider,
             upstream,
+            upstream_trace_headers,
             worker_stop,
             server_stop,
             server,
@@ -704,6 +749,38 @@ impl Harness {
     }
     pub(crate) async fn send(&self, id: &str, path: &str, payload: Value) -> (u16, Value) {
         self.send_as(id, path, path, payload, None).await
+    }
+    pub(crate) async fn send_traced(
+        &self,
+        id: &str,
+        path: &str,
+        payload: Value,
+        trace: &crate::telemetry::TraceContext,
+        tamper_after_signing: bool,
+    ) -> (u16, Value) {
+        let key = SigningKey::from_pkcs8_der(&self.fixture.identity.private_key_der).unwrap();
+        let mut message = Message {
+            traceparent: Some(trace.traceparent()),
+            tracestate: trace.tracestate.clone(),
+            request_id: id.into(),
+            issued_ms: crate::cluster::now_ms(),
+            path: path.into(),
+            payload: serde_json::to_string(&payload).unwrap(),
+            signature: String::new(),
+        };
+        message.signature = STANDARD.encode(key.sign(&message.signing_bytes().unwrap()).to_bytes());
+        if tamper_after_signing {
+            message.traceparent = Some(trace.child("tampered", id, 1).traceparent());
+        }
+        let response = self
+            .client
+            .post(format!("https://node-n1{path}"))
+            .headers(message.trace_headers().unwrap())
+            .json(&message)
+            .send()
+            .await
+            .unwrap();
+        (response.status().as_u16(), response.json().await.unwrap())
     }
     async fn send_as(
         &self,
@@ -717,6 +794,8 @@ impl Harness {
             SigningKey::from_pkcs8_der(&self.fixture.identity.private_key_der).unwrap()
         });
         let mut message = Message {
+            traceparent: None,
+            tracestate: None,
             request_id: id.into(),
             issued_ms: crate::cluster::now_ms(),
             path: signed_path.into(),
@@ -727,6 +806,7 @@ impl Harness {
         let response = self
             .client
             .post(format!("https://node-n1{path}"))
+            .headers(message.trace_headers().unwrap())
             .json(&message)
             .send()
             .await

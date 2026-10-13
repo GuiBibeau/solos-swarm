@@ -679,6 +679,8 @@ fn prepare_runtime_fixture() -> Result<()> {
         request_timeout_ms: 60_000,
     };
     let runtime = RuntimeConfig {
+        diagnostics: None,
+        run_id: Some(deployment_id.clone()),
         egress: crate::flow::FlowConfig::default(),
         deployment_id,
         node: Node {

@@ -4,6 +4,7 @@ pub mod audit;
 pub mod cluster;
 pub mod context;
 pub mod delegation;
+pub mod diagnostics;
 pub mod domain;
 pub mod evaluator;
 pub mod evaluator_runtime;
@@ -27,6 +28,7 @@ pub mod scheduler;
 #[cfg(all(test, target_os = "linux"))]
 mod sdk_integration_tests;
 pub mod security;
+pub mod telemetry;
 pub mod tool_identity;
 pub mod tools;
 pub mod transport;

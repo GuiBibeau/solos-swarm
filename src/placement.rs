@@ -315,8 +315,16 @@ pub(crate) fn reserve_state(
             task.budget_envelope_ref = allocation.budget_envelope_ref.clone();
         }
     }
+    let id = format!("placement/{}/{}", plan.gang_id, plan.expected_revision);
+    // This record describes a gang, not one selected worker or Task.
+    let mut correlation = crate::telemetry::Correlation::for_actor(&state.audit.log_id, &actor.id);
+    correlation.run_id = state.run_id.clone();
+    correlation.goal_id = Some(spec.goal_id.clone());
+    correlation.intent_id = Some(id.clone());
+    correlation.validate()?;
     state.audit.append_committed(crate::audit::AuditEvent {
-        id: format!("placement/{}/{}", plan.gang_id, plan.expected_revision),
+        correlation: Some(correlation),
+        id,
         kind: "gang_reserved".into(),
         actor: actor.id.clone(),
         goal: Some(spec.goal_id.clone()),
@@ -426,19 +434,44 @@ impl scheduler::Unreserve for Unreserve {
                 state.security.revoke_grant(&id)?;
             }
         }
-        state.validate()?;
-        state.checkpoint(
-            &format!(
+        let id = format!(
+            "unreserve/{}",
+            allocations
+                .iter()
+                .map(|a| a.placement_intent_id.as_str())
+                .collect::<Vec<_>>()
+                .join("+")
+        );
+        let goals: BTreeSet<_> = allocations.iter().map(|a| a.goal_id.as_str()).collect();
+        let mut correlation =
+            crate::telemetry::Correlation::for_actor(&state.audit.log_id, "trusted-scheduler");
+        correlation.run_id = state.run_id.clone();
+        correlation.goal_id = (goals.len() == 1).then(|| goals.first().unwrap().to_string());
+        correlation.intent_id = Some(id.clone());
+        // Aggregate identifiers can exceed the individual action-field bound.
+        if correlation
+            .intent_id
+            .as_ref()
+            .is_some_and(|intent| intent.len() > 256)
+        {
+            correlation.intent_id = Some(format!(
                 "unreserve/{}",
-                allocations
-                    .iter()
-                    .map(|a| a.placement_intent_id.as_str())
-                    .collect::<Vec<_>>()
-                    .join("+")
-            ),
-            "trusted-scheduler",
-            crate::cluster::now_ms() / 1000,
-        )?;
+                crate::kernel::hex(&content_hash(&id)?)
+            ));
+        }
+        correlation.validate()?;
+        state.audit.append_committed(crate::audit::AuditEvent {
+            correlation: Some(correlation),
+            id: id.clone(),
+            kind: "gang_unreserved".into(),
+            actor: "trusted-scheduler".into(),
+            goal: (goals.len() == 1).then(|| goals.first().unwrap().to_string()),
+            timestamp: crate::cluster::now_ms() / 1000,
+            decision: "release_unused".into(),
+            payload_hash: content_hash(&allocations)?,
+        })?;
+        state.validate()?;
+        state.checkpoint(&id, "trusted-scheduler", crate::cluster::now_ms() / 1000)?;
         crate::kernel::ensure_state_capacity(
             &state,
             serde_json::to_vec(&state)?.len(),

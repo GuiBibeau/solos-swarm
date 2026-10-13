@@ -154,6 +154,10 @@ fn default_operator_max_request_bytes() -> usize {
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
     pub deployment_id: String,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub diagnostics: Option<crate::diagnostics::DiagnosticsConfig>,
     pub node: Node,
     pub cluster: ClusterFiles,
     pub runtime_identity: IdentityFiles,
@@ -267,6 +271,7 @@ async fn record_runtime_attestation(
                     .runtime_instances
                     .insert(measurement.node_id.clone(), measurement.clone());
                 state.audit.append_committed(crate::audit::AuditEvent {
+                    correlation: None,
                     id: format!(
                         "runtime-instance/{}/{}",
                         measurement.node_id, measurement.started_ms
@@ -1407,6 +1412,15 @@ fn persist_identity_files(files: &IdentityFiles, issued: &IssuedIdentity) -> Res
 
 impl RuntimeConfig {
     pub fn validate(&self) -> Result<()> {
+        if let Some(config) = &self.diagnostics {
+            config.validate()?;
+        }
+        if let Some(run) = &self.run_id {
+            ensure!(
+                !run.is_empty() && run.len() <= 128 && !run.contains(['\r', '\n', '\0']),
+                "invalid declared run identity"
+            );
+        }
         ensure!(
             cfg!(target_os = "linux") && uid() != 0,
             "runtime requires an unprivileged Linux service account"
@@ -1799,6 +1813,8 @@ fn prompt_scope_active(
         return false;
     };
     crate::kernel::search_open(state, &allocation.goal_id)
+        && !state.budget_paused(&allocation.goal_id, &scope.task_id)
+        && !state.rate_paused(&allocation.goal_id, &scope.task_id, now_ms)
         && goal.spec.expiry_ms > now_ms
         && goal_retraction_epoch(state, &allocation.goal_id) <= scope.retraction_epoch
         && state
@@ -2484,7 +2500,17 @@ async fn start_worker(
         drop(current);
         drop(current_view);
         if !already_claimed {
-            bootstrap_claim(&socket, issued, &format!("node-{}", server.workload.node)).await?;
+            bootstrap_claim(
+                &socket,
+                issued,
+                &format!("node-{}", server.workload.node),
+                Some(&crate::telemetry::TraceContext::for_task(
+                    &config.deployment_id,
+                    &spec.goal_id,
+                    &agent.task.id,
+                )),
+            )
+            .await?;
         }
         let subject = AuthenticatedSubject::workload(
             &issued.certificate_der,
@@ -2742,6 +2768,7 @@ async fn stop_worker(
     runtime_subject: &AuthenticatedSubject,
     reason: &str,
 ) -> Result<()> {
+    let cleanup_started = Instant::now();
     let holder = control_state(kernel).await.ok().and_then(|s| {
         s.security
             .grants
@@ -2851,6 +2878,25 @@ async fn stop_worker(
         )
         .await?
         .require()?;
+    crate::diagnostics::record(
+        crate::diagnostics::Stage::Cleanup,
+        if cleanup.is_ok() {
+            crate::diagnostics::Outcome::Success
+        } else {
+            crate::diagnostics::Outcome::Failure
+        },
+        cleanup_started.elapsed().as_millis() as u64,
+    );
+    record_runtime_reason(
+        kernel,
+        runtime_subject,
+        &worker.allocation.goal_id,
+        Some(&worker.task_id),
+        crate::telemetry::DiagnosticReason::Cleanup {
+            completed: cleanup.is_ok(),
+        },
+    )
+    .await?;
     cleanup
 }
 struct WitnessConnection {
@@ -3032,6 +3078,44 @@ async fn recovered_cleanup(
     }
     Ok(())
 }
+async fn record_runtime_reason(
+    kernel: &Kernel,
+    subject: &AuthenticatedSubject,
+    goal: &str,
+    task: Option<&str>,
+    reason: crate::telemetry::DiagnosticReason,
+) -> Result<()> {
+    let revision = kernel.cluster.view_control().await?.revision;
+    kernel
+        .record_diagnostic(
+            &format!("runtime-reason-{}", uuid::Uuid::new_v4()),
+            subject,
+            goal,
+            task,
+            reason,
+            revision,
+        )
+        .await?
+        .require()?;
+    Ok(())
+}
+fn runtime_correlation(
+    config: &RuntimeConfig,
+    spec: &placement::SwarmSpec,
+    agent: &placement::DesiredAgent,
+    allocation: &Allocation,
+) -> crate::telemetry::Correlation {
+    let mut correlation =
+        crate::telemetry::Correlation::for_actor(&config.deployment_id, "runtime-scheduler")
+            .with_task(&spec.goal_id, &agent.task.id);
+    correlation.run_id = config.run_id.clone();
+    correlation.agent_id = Some(allocation.agent_id.clone());
+    correlation.incarnation = Some(allocation.incarnation);
+    correlation.node_id = Some(allocation.node_id.clone());
+    correlation.intent_id = Some(allocation.placement_intent_id.clone());
+    correlation.execution_attempt = Some(allocation.incarnation);
+    correlation
+}
 async fn renew_worker(
     config: &RuntimeConfig,
     kernel: &Kernel,
@@ -3158,6 +3242,11 @@ pub async fn serve(path: &Path) -> Result<()> {
 pub async fn serve_with_tools(path: &Path, tools: Arc<dyn ToolExecutor>) -> Result<()> {
     let config: RuntimeConfig = public_json(path, 2_097_152)?;
     config.validate()?;
+    let diagnostics = config
+        .diagnostics
+        .as_ref()
+        .map(|settings| crate::diagnostics::initialize(settings, &config.node.id))
+        .transpose()?;
     private_dir(&config.workers.directory)?;
     let daemon_lock = OpenOptions::new()
         .create(true)
@@ -3226,6 +3315,8 @@ pub async fn serve_with_tools(path: &Path, tools: Arc<dyn ToolExecutor>) -> Resu
     });
     let mut operator_task: Option<(watch::Sender<bool>, JoinHandle<Result<()>>)> = None;
     let mut workers = BTreeMap::<String, Worker>::new();
+    let mut task_traces = BTreeMap::<String, tracing::Span>::new();
+    let mut task_trace_seen = BTreeSet::<String>::new();
     let mut startup_identities = BTreeMap::<String, Option<StartupIdentity>>::new();
     let mut capacity_backoff = CapacityBackoff::default();
     let measurement = runtime_attestation(&config)?;
@@ -3263,17 +3354,17 @@ pub async fn serve_with_tools(path: &Path, tools: Arc<dyn ToolExecutor>) -> Resu
     let result=async {
         if let Some(voters)=&config.cluster.initialize_voters{cluster.initialize(voters.clone()).await?;}
         let mut ready=false;for _ in 0..150{if cluster.view_control().await.is_ok(){ready=true;break;}tokio::time::sleep(Duration::from_millis(200)).await;}ensure!(ready,"control plane quorum unavailable at startup");
-        if cluster.read("kernel/state").await?.value.is_none(){kernel.bootstrap(KernelState::new(policy.clone(),&trust,crate::cluster::now_ms()/1000,config.deployment_id.clone())?).await?;}
-        let state=control_state(&kernel).await?;ensure!(state.security.policy.signer==trust && state.audit.log_id==config.deployment_id,"stored deployment authority or identity differs");drop(state);record_runtime_attestation(&kernel,&runtime_subject,&measurement).await?;kernel.configure_egress(&runtime_subject,&config.egress).await?;bootstrap_modules(&config,&kernel,&runtime_subject).await?;recovered_cleanup(&config,&kernel,&runtime_subject).await?;let view=cluster.view_control().await?;let recovery=placement::snapshot(&view)?;let tools=sdk_allocations(&view)?;drop(view);let recovery_state=control_state(&kernel).await?;for allocation in recovery.allocations.values().filter(|a|a.node_id==config.node.id && !tools.contains(&a.agent_id) && !evaluator_agents.contains(&a.agent_id)){let task_id=recovery_state.desired_swarms.get(&allocation.goal_id).and_then(|(_,s)|s.agents.iter().find(|a|a.id==allocation.agent_id)).map(|a|a.task.id.as_str());retire_allocation(&kernel,&runtime_subject,allocation,task_id,"daemon restart fences prior incarnation").await?;}drop(recovery_state);drop(recovery);
+        if cluster.read("kernel/state").await?.value.is_none(){let mut initial=KernelState::new(policy.clone(),&trust,crate::cluster::now_ms()/1000,config.deployment_id.clone())?;initial.run_id=config.run_id.clone();kernel.bootstrap(initial).await?;}
+        let state=control_state(&kernel).await?;ensure!(state.security.policy.signer==trust && state.audit.log_id==config.deployment_id && state.run_id==config.run_id,"stored deployment authority, run or identity differs");drop(state);record_runtime_attestation(&kernel,&runtime_subject,&measurement).await?;kernel.configure_egress(&runtime_subject,&config.egress).await?;bootstrap_modules(&config,&kernel,&runtime_subject).await?;recovered_cleanup(&config,&kernel,&runtime_subject).await?;let view=cluster.view_control().await?;let recovery=placement::snapshot(&view)?;let tools=sdk_allocations(&view)?;drop(view);let recovery_state=control_state(&kernel).await?;for allocation in recovery.allocations.values().filter(|a|a.node_id==config.node.id && !tools.contains(&a.agent_id) && !evaluator_agents.contains(&a.agent_id)){let task_id=recovery_state.desired_swarms.get(&allocation.goal_id).and_then(|(_,s)|s.agents.iter().find(|a|a.id==allocation.agent_id)).map(|a|a.task.id.as_str());retire_allocation(&kernel,&runtime_subject,allocation,task_id,"daemon restart fences prior incarnation").await?;}drop(recovery_state);drop(recovery);
         if let Some(factory)=&tool_factory{factory.recover().await?;}
         let existing=cluster.read(&format!("nodes/{}",config.node.id)).await?;let mut node=config.node.clone();node.healthy=true;if let Some(value)=&existing.value{node.used=serde_json::from_value::<Node>(value.clone())?.used;}
         let mut tx=Transaction::new(format!("node-admit-{}",uuid::Uuid::new_v4()),vec![Mutation::Put{key:format!("nodes/{}",config.node.id),value:serde_json::to_value(node)?},Mutation::GrantLease{id:format!("node/{}",config.node.id),holder:config.node.id.clone(),expires_ms:crate::cluster::now_ms()+config.lease_safety_ms*3}]);tx.compares.push(crate::cluster::Compare{key:format!("nodes/{}",config.node.id),expected:existing.value});ensure!(cluster.transact(tx).await?.applied,"node registration raced another runtime");
         if config.operator.is_some() && control_state(&kernel).await?.modules.modules["operator"].active {operator_task=Some(launch_operator(&config,kernel.clone(),signer.clone(),&runtime_subject).await?);}
 
         let mut witness=WitnessConnection::open(config.witness.clone(),&signer.public_key(),&config.deployment_id).await?;let scheduler=Scheduler::new(500)?;let mut tick=tokio::time::interval(Duration::from_millis(config.reconcile_ms));tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);let mut last_clock=crate::cluster::now_ms();let mut service_identity_expiry=crate::cluster::now_ms()/1000;
-        loop{tokio::select!{_=shutdown_signal()=>break,_=tick.tick()=>{let now=crate::cluster::now_ms();ensure!(now.saturating_add(5000)>=last_clock,"clock moved backward beyond safety window");last_clock=now;renew_cluster_identity(&config.cluster,config.workers.identity_ttl_seconds,&cluster,&authority).await?;if now/1000+config.workers.identity_ttl_seconds/3>=service_identity_expiry{let issued=authority.issue(config.runtime_identity.workload.clone(),now/1000,config.workers.identity_ttl_seconds)?;runtime_subject=AuthenticatedSubject::workload(&issued.certificate_der,&issued.ca_der,issued.identity.clone(),now/1000)?;service_identity_expiry=issued.expires_unix;*broker.executor_subject.write().await=runtime_subject.clone();persist_identity_files(&config.runtime_identity,&issued)?;}
+        loop{tokio::select!{_=shutdown_signal()=>break,_=tick.tick()=>{let reconcile_started=Instant::now();let now=crate::cluster::now_ms();ensure!(now.saturating_add(5000)>=last_clock,"clock moved backward beyond safety window");last_clock=now;renew_cluster_identity(&config.cluster,config.workers.identity_ttl_seconds,&cluster,&authority).await?;if now/1000+config.workers.identity_ttl_seconds/3>=service_identity_expiry{let issued=authority.issue(config.runtime_identity.workload.clone(),now/1000,config.workers.identity_ttl_seconds)?;runtime_subject=AuthenticatedSubject::workload(&issued.certificate_der,&issued.ca_der,issued.identity.clone(),now/1000)?;service_identity_expiry=issued.expires_unix;*broker.executor_subject.write().await=runtime_subject.clone();persist_identity_files(&config.runtime_identity,&issued)?;}
 if operator_task.as_ref().is_some_and(|(_,task)|task.is_finished()){anyhow::bail!("protected operator listener stopped");}
-            let state=tokio::time::timeout(Duration::from_millis(config.lease_safety_ms),control_state(&kernel)).await.context("quorum state unavailable inside lease margin")??;heartbeat(&config,&cluster).await?;if let Some(factory)=&tool_factory{factory.recover().await?;}
+            let state=tokio::time::timeout(Duration::from_millis(config.lease_safety_ms),control_state(&kernel)).await.context("quorum state unavailable inside lease margin")??;task_traces.retain(|key,_|state.domain.tasks.get(key).is_some_and(|task| !matches!(task.state,TaskState::Completed|TaskState::Failed) && task.spec.expiry_ms>now && state.domain.goals.get(&task.goal_id).is_some_and(|goal|goal.spec.expiry_ms>now && goal.status!="stopped")));crate::diagnostics::set_active_workers(workers.len() as u64);crate::diagnostics::record_money(state.ledger.intents.values().filter(|intent|WorkloadId::parse(&intent.request.holder).is_ok_and(|holder|holder.node==config.node.id)).fold(0u64,|sum,intent|sum.saturating_add(intent.settled)),state.ledger.intents.values().filter(|intent|WorkloadId::parse(&intent.request.holder).is_ok_and(|holder|holder.node==config.node.id) && matches!(intent.state,crate::ledger::IntentState::Reserved|crate::ledger::IntentState::Dispatched|crate::ledger::IntentState::Unknown)).fold(0u64,|sum,intent|sum.saturating_add(intent.hold)));heartbeat(&config,&cluster).await?;let _=cluster.diagnostic_snapshot().await;if let Some(factory)=&tool_factory{factory.recover().await?;}
             if state.modules.modules.get("operator").is_some_and(|module|!module.active){if let Some((signal,task))=operator_task.take(){stop_operator(&kernel,&runtime_subject,signal,task).await?;}}
             else if config.operator.is_some() && operator_task.is_none(){operator_task=Some(launch_operator(&config,kernel.clone(),signer.clone(),&runtime_subject).await?);}
 
@@ -3301,24 +3392,31 @@ if operator_task.as_ref().is_some_and(|(_,task)|task.is_finished()){anyhow::bail
                 }
             }
             let ids:Vec<_>=workers.keys().cloned().collect();for id in ids{let worker=workers.get_mut(&id).unwrap();let task_done=state.domain.tasks.values().any(|t|t.spec.id==worker.task_id && t.goal_id==worker.allocation.goal_id && matches!(t.state,TaskState::Completed|TaskState::Failed|TaskState::Expired));let mut stopped=goal_retraction_epoch(&state,&worker.allocation.goal_id)>worker.goal_retraction_epoch || state.modules.modules.get("workers").is_some_and(|m|!m.active) || worker.task.is_finished() || worker.broker.is_finished() || task_done;
-if !stopped && (search_closed(&state,&worker.allocation.goal_id)
-    || renew_worker(&config,&kernel,&runtime_subject,&authority,worker).await.is_err()) {
-    stopped = !drain_worker(&config,&kernel,worker).await?;
+if !stopped {
+    let closed=search_closed(&state,&worker.allocation.goal_id);
+    let renewal=if closed { Ok(()) } else { renew_worker(&config,&kernel,&runtime_subject,&authority,worker).await };
+    crate::diagnostics::record(crate::diagnostics::Stage::Lease,if renewal.is_ok(){crate::diagnostics::Outcome::Success}else{crate::diagnostics::Outcome::Failure},0);
+    if renewal.is_err(){record_runtime_reason(&kernel,&runtime_subject,&worker.allocation.goal_id,Some(&worker.task_id),crate::telemetry::DiagnosticReason::LeaseSafety).await?;}
+    if closed || renewal.is_err(){stopped = !drain_worker(&config,&kernel,worker).await?;}
 }
 if stopped{let worker=workers.remove(&id).unwrap();stop_worker(worker,&broker,&kernel,&runtime_subject,"worker stopped, fenced, completed or lease unavailable").await?;}}
             if cluster.leader().await==Some(config.cluster.node_id){retire_lost_allocations(&kernel,&runtime_subject).await?;for(operator,spec)in state.desired_swarms.values(){let capacity_key=format!("placement/{}",spec.goal_id);if !capacity_backoff.ready(&capacity_key,Instant::now()){continue;}
-if search_closed(&state,&spec.goal_id) || now>=spec.expiry_ms || state.security.stopped(&Scope::Goal{tenant:spec.tenant.clone(),goal:spec.goal_id.clone()}){continue;}let mut spec=spec.clone();spec.agents.retain(|a|!state.domain.task(&spec.goal_id,&a.task.id).is_ok_and(|t|matches!(t.state,TaskState::Completed|TaskState::Failed)));if spec.agents.is_empty(){continue;}let _write=cluster.kernel_write(false).await;let view=cluster.view_control().await?;let snapshot=placement::snapshot(&view)?;spec.agents.retain(|agent|!snapshot.allocations.contains_key(&agent.id));if spec.agents.is_empty(){continue;}let planning_state:KernelState=serde_json::from_value(view.kv.get("kernel/state").context("planning state absent")?.clone())?;let gang=spec.gang(view.revision,&next_incarnations(&planning_state,&spec)?)?;if gang.bundles.iter().all(|b|snapshot.allocations.contains_key(&b.agent_id)){continue;}
-if let Ok(plan)=scheduler.plan(&gang,&snapshot){let reserve=placement::Reserve{max_state_bytes:kernel.max_state_bytes,state:planning_state,spec:spec.clone(),operator:Actor{id:operator.clone(),role:DomainRole::Operator},now_ms:now};let result=scheduler.bind_while_locked(&cluster,&plan,&reserve,spec.lease_ms).await;let _=capacity_backoff.result(&capacity_key,result,Instant::now())?;}}}
+if search_closed(&state,&spec.goal_id) || now>=spec.expiry_ms || state.security.stopped(&Scope::Goal{tenant:spec.tenant.clone(),goal:spec.goal_id.clone()}){continue;}let mut spec=spec.clone();spec.agents.retain(|a|!state.budget_paused(&spec.goal_id,&a.task.id) && !state.rate_paused(&spec.goal_id,&a.task.id,now) && !state.domain.task(&spec.goal_id,&a.task.id).is_ok_and(|t|matches!(t.state,TaskState::Completed|TaskState::Failed)));if spec.agents.is_empty(){continue;}let _write=cluster.kernel_write(false).await;let view=cluster.view_control().await?;let snapshot=placement::snapshot(&view)?;spec.agents.retain(|agent|!snapshot.allocations.contains_key(&agent.id));if spec.agents.is_empty(){continue;}let planning_state:KernelState=serde_json::from_value(view.kv.get("kernel/state").context("planning state absent")?.clone())?;let gang=spec.gang(view.revision,&next_incarnations(&planning_state,&spec)?)?;if gang.bundles.iter().all(|b|snapshot.allocations.contains_key(&b.agent_id)){continue;}
+let scheduling_started=Instant::now();match scheduler.plan(&gang,&snapshot){Ok(plan)=>{let spans:Vec<_>=plan.allocations.iter().filter_map(|allocation|spec.agents.iter().find(|agent|agent.id==allocation.agent_id).map(|agent|crate::diagnostics::operation_span(&runtime_correlation(&config,&spec,agent,allocation),crate::diagnostics::Stage::Scheduling,allocation.incarnation))).collect();let reserve=placement::Reserve{max_state_bytes:kernel.max_state_bytes,state:planning_state,spec:spec.clone(),operator:Actor{id:operator.clone(),role:DomainRole::Operator},now_ms:now};let result=scheduler.bind_while_locked(&cluster,&plan,&reserve,spec.lease_ms).await;drop(spans);crate::diagnostics::record(crate::diagnostics::Stage::Scheduling,if result.is_ok(){crate::diagnostics::Outcome::Success}else{crate::diagnostics::Outcome::Denied},scheduling_started.elapsed().as_millis() as u64);let capacity_failure=result.as_ref().err().is_some_and(|error|error.downcast_ref::<crate::kernel::StateCapacityError>().is_some());let _=capacity_backoff.result(&capacity_key,result,Instant::now())?;drop(_write);if capacity_failure{record_runtime_reason(&kernel,&runtime_subject,&spec.goal_id,None,crate::telemetry::DiagnosticReason::StateCapacity).await?;}},Err(_)=>{drop(_write);crate::diagnostics::record(crate::diagnostics::Stage::Scheduling,crate::diagnostics::Outcome::Denied,scheduling_started.elapsed().as_millis() as u64);record_runtime_reason(&kernel,&runtime_subject,&spec.goal_id,None,crate::telemetry::DiagnosticReason::AllocationWaiting).await?;}}}}
             let view=cluster.view_control().await?;let snapshot=placement::snapshot(&view)?;let state=control_state(&kernel).await?;
             let allocation_ids:BTreeSet<_>=snapshot.allocations.values().map(|allocation|format!("{}-{}",allocation.agent_id,allocation.incarnation)).collect();
             startup_identities.retain(|id,_|allocation_ids.contains(id) && !workers.contains_key(id));
             capacity_backoff.retain(|id|id.strip_prefix("worker/").is_some_and(|worker|allocation_ids.contains(worker)) || id.strip_prefix("placement/").is_some_and(|goal|state.desired_swarms.contains_key(goal)) || id.strip_prefix("evaluator/").is_some_and(|goal|profiles.contains_key(goal)));
             for allocation in snapshot.allocations.values().filter(|a|a.node_id==config.node.id){let id=format!("{}-{}",allocation.agent_id,allocation.incarnation);if search_closed(&state,&allocation.goal_id) || evaluator_agents.contains(&allocation.agent_id){continue;}
-if workers.contains_key(&id) || state.modules.modules.get("workers").is_some_and(|m|!m.active){continue;}let Some((_,spec))=state.desired_swarms.get(&allocation.goal_id)else{continue};let Some(agent)=spec.agents.iter().find(|a|a.id==allocation.agent_id)else{continue};let task=state.domain.task(&spec.goal_id,&agent.task.id)?;if matches!(task.state,TaskState::Completed|TaskState::Failed) || task.spec.expiry_ms<=now.saturating_add(config.lease_safety_ms){continue;}
+if workers.contains_key(&id) || state.modules.modules.get("workers").is_some_and(|m|!m.active){continue;}let Some((_,spec))=state.desired_swarms.get(&allocation.goal_id)else{continue};let Some(agent)=spec.agents.iter().find(|a|a.id==allocation.agent_id)else{continue};let task=state.domain.task(&spec.goal_id,&agent.task.id)?;if state.budget_paused(&spec.goal_id,&agent.task.id) || state.rate_paused(&spec.goal_id,&agent.task.id,now) || matches!(task.state,TaskState::Completed|TaskState::Failed) || task.spec.expiry_ms<=now.saturating_add(config.lease_safety_ms){continue;}
 let capacity_key=format!("worker/{id}");if !capacity_backoff.ready(&capacity_key,Instant::now()){continue;}
-let result=start_worker(&config,kernel.clone(),&broker,&authority,&runtime_subject,allocation.clone(),spec,agent,startup_identities.entry(id.clone()).or_default()).await;
+let started=Instant::now();let correlation=runtime_correlation(&config,spec,agent,allocation);let trace_key=format!("{}/{}",spec.goal_id,agent.task.id);if task_trace_seen.insert(trace_key.clone()){task_traces.insert(trace_key,crate::diagnostics::task_span(&correlation));}let span=crate::diagnostics::operation_span(&correlation,crate::diagnostics::Stage::Scheduling,allocation.incarnation);
+let result={use tracing::Instrument;start_worker(&config,kernel.clone(),&broker,&authority,&runtime_subject,allocation.clone(),spec,agent,startup_identities.entry(id.clone()).or_default()).instrument(span).await};
+crate::diagnostics::record(crate::diagnostics::Stage::Scheduling,if result.is_ok(){crate::diagnostics::Outcome::Success}else{crate::diagnostics::Outcome::Failure},started.elapsed().as_millis() as u64);
+if result.as_ref().err().is_some_and(|error|error.downcast_ref::<crate::kernel::StateCapacityError>().is_some()){record_runtime_reason(&kernel,&runtime_subject,&spec.goal_id,Some(&agent.task.id),crate::telemetry::DiagnosticReason::StateCapacity).await?;}
 if let Some(worker)=capacity_backoff.result(&capacity_key,result,Instant::now())?{startup_identities.remove(&id);workers.insert(id,worker);}}
             for worker in workers.values(){worker.start.send_replace(true);}
+            crate::diagnostics::record(crate::diagnostics::Stage::Reconcile,crate::diagnostics::Outcome::Success,reconcile_started.elapsed().as_millis() as u64);
         }}}
         Ok::<_,anyhow::Error>(())
     }.await;
@@ -3340,6 +3438,7 @@ if let Some(worker)=capacity_backoff.result(&capacity_key,result,Instant::now())
     {
         cleanup_errors.push(error.to_string());
     }
+    drop(task_traces);
     let shutdown = cluster.shutdown().await;
     ensure!(
         cleanup_errors.is_empty(),
@@ -3352,6 +3451,9 @@ if let Some(worker)=capacity_backoff.result(&capacity_key,result,Instant::now())
         cleanup_errors.join("; ")
     );
     shutdown?;
+    if let Some(diagnostics) = diagnostics {
+        diagnostics.shutdown()?;
+    }
     result
 }
 
@@ -3370,6 +3472,7 @@ async fn bootstrap_claim(
     socket: &Path,
     identity: &IssuedIdentity,
     server_name: &str,
+    trace: Option<&crate::telemetry::TraceContext>,
 ) -> Result<()> {
     use base64::{Engine, engine::general_purpose::STANDARD};
     use ed25519_dalek::{Signer, pkcs8::DecodePrivateKey};
@@ -3380,6 +3483,8 @@ async fn bootstrap_claim(
         path: "/tool/claim_task".into(),
         payload: "{}".into(),
         signature: String::new(),
+        traceparent: trace.map(crate::telemetry::TraceContext::traceparent),
+        tracestate: trace.and_then(|context| context.tracestate.clone()),
     };
     message.signature = STANDARD.encode(key.sign(&message.signing_bytes()?).to_bytes());
     let pem = Zeroizing::new(format!(
@@ -3396,6 +3501,7 @@ async fn bootstrap_claim(
         .build()?;
     let mut response = client
         .post(format!("https://{server_name}/tool/claim_task"))
+        .headers(message.trace_headers()?)
         .json(&message)
         .send()
         .await?;
@@ -3458,6 +3564,38 @@ async fn retire_allocation(
                 .contains(subject.id()),
             "retirement authority no longer admitted"
         );
+        let audit_start = state.audit.events().len();
+        let grant_id = format!("{}-{}", allocation.agent_id, allocation.incarnation);
+        let holder = state
+            .security
+            .grants
+            .get(&grant_id)
+            .map(|grant| grant.holder.uri())
+            .transpose()?
+            .unwrap_or_else(|| subject.id().into());
+        let context = task_id
+            .map(|id| {
+                state
+                    .domain
+                    .task(&allocation.goal_id, id)
+                    .map(|task| crate::kernel::TaskContext {
+                        id: id.into(),
+                        incarnation: task.incarnation,
+                        fence: task.fencing_token,
+                    })
+            })
+            .transpose()?;
+        let mut correlation = state.correlation_for(
+            &holder,
+            Some(&allocation.goal_id),
+            context.as_ref(),
+            Some(&allocation.placement_intent_id),
+        )?;
+        correlation.agent_id = Some(allocation.agent_id.clone());
+        correlation.incarnation = Some(allocation.incarnation);
+        correlation.node_id = Some(allocation.node_id.clone());
+        correlation.execution_attempt = Some(1);
+        correlation.validate()?;
         let proof = crate::audit::content_hash(&(allocation, reason))?;
         let reserved: Vec<_> = state
             .ledger
@@ -3542,6 +3680,7 @@ async fn retire_allocation(
             .context("node resource release underflow")?;
         let id = format!("retire-{}-{}", allocation.agent_id, allocation.fence);
         state.audit.append_committed(crate::audit::AuditEvent {
+            correlation: Some(correlation.clone()),
             id: id.clone(),
             kind: "allocation_retired".into(),
             actor: subject.id().into(),
@@ -3550,6 +3689,7 @@ async fn retire_allocation(
             decision: "release_unused".into(),
             payload_hash: proof,
         })?;
+        state.audit.correlate_new(audit_start, &correlation);
         state.checkpoint(&id, subject.id(), crate::cluster::now_ms() / 1000)?;
         state.validate()?;
         crate::kernel::ensure_state_capacity(
@@ -3886,16 +4026,18 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        bootstrap_claim(&socket, &worker, "node-n1").await.unwrap();
+        bootstrap_claim(&socket, &worker, "node-n1", None)
+            .await
+            .unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 1);
         assert!(
-            bootstrap_claim(&socket, &worker, "node-other")
+            bootstrap_claim(&socket, &worker, "node-other", None)
                 .await
                 .is_err()
         );
         assert_eq!(count.load(Ordering::SeqCst), 1);
         capacity.store(true, Ordering::SeqCst);
-        let error = bootstrap_claim(&socket, &worker, "node-n1")
+        let error = bootstrap_claim(&socket, &worker, "node-n1", None)
             .await
             .unwrap_err();
         assert!(
@@ -4230,6 +4372,76 @@ mod cluster_rotation_tests {
 mod final_drain_tests {
     use super::*;
     #[tokio::test]
+    async fn normal_retirement_correlates_the_exact_allocation_without_a_provider_contact() {
+        use crate::node::receiver_tests::Harness;
+        let h = Harness::open().await;
+        h.kernel
+            .runtime_control_commit(
+                "retirement-run",
+                &h.runtime_subject,
+                &"retirement-run",
+                |state| {
+                    state.run_id = Some("retirement-run".into());
+                    Ok(json!({"run_id":"retirement-run"}))
+                },
+            )
+            .await
+            .unwrap()
+            .require()
+            .unwrap();
+        assert_eq!(
+            h.send("retirement-claim", "/tool/claim_task", json!({}))
+                .await
+                .0,
+            200
+        );
+        let view = h.kernel.cluster.view_control().await.unwrap();
+        let allocation: Allocation =
+            serde_json::from_value(view.kv["allocations/a1"].clone()).unwrap();
+        retire_allocation(
+            &h.kernel,
+            &h.runtime_subject,
+            &allocation,
+            Some("task-1"),
+            "recorded retirement fixture",
+        )
+        .await
+        .unwrap();
+        let state = h.kernel.state().await.unwrap();
+        let events: Vec<_> = state
+            .audit
+            .events()
+            .iter()
+            .filter(|event| {
+                event.kind == "allocation_retired"
+                    || event.id == format!("checkpoint/retire-a1-{}", allocation.fence)
+            })
+            .collect();
+        assert_eq!(events.len(), 2);
+        for event in events {
+            let context = event.correlation.as_ref().unwrap();
+            assert_eq!(context.run_id.as_deref(), Some("retirement-run"));
+            assert_eq!(context.goal_id.as_deref(), Some("g"));
+            assert_eq!(context.task_id.as_deref(), Some("task-1"));
+            assert_eq!(context.agent_id.as_deref(), Some("a1"));
+            assert_eq!(context.incarnation, Some(allocation.incarnation));
+            assert_eq!(context.node_id.as_deref(), Some("n1"));
+            assert_eq!(
+                context.intent_id.as_deref(),
+                Some(allocation.placement_intent_id.as_str())
+            );
+            assert_eq!(context.execution_attempt, Some(1));
+        }
+        assert_eq!(
+            state.domain.task("g", "task-1").unwrap().state,
+            TaskState::Expired
+        );
+        assert!(h.upstream.lock().await.is_empty());
+        assert_eq!(state.ledger.accounts["goal/g"].total.held, 0);
+        assert_eq!(state.ledger.accounts["goal/g"].total.spent, 0);
+        h.close().await;
+    }
+    #[tokio::test]
     async fn initial_watch_barrier_rechecks_real_authority_before_body_and_reaps_child() {
         use crate::{node::receiver_tests::Harness, operator::OperatorKernel};
         use std::{
@@ -4498,6 +4710,13 @@ mod final_drain_tests {
         };
         let now = crate::cluster::now_ms();
         assert!(prompt_scope_active(&state, &view, &scope, now));
+        let mut paused = state.clone();
+        let version = paused.domain.goal("g").unwrap().spec.version;
+        paused.budget_pauses.insert("g/task-1".into(), version);
+        assert!(!prompt_scope_active(&paused, &view, &scope, now));
+        // A diagnostic cache is optional; deleting it cannot resume an authoritative pause.
+        paused.diagnostic_reasons.clear();
+        assert!(!prompt_scope_active(&paused, &view, &scope, now));
         let mut fenced = view.clone();
         fenced.leases.get_mut("allocation/a1").unwrap().fence += 1;
         assert!(!prompt_scope_active(&state, &fenced, &scope, now));

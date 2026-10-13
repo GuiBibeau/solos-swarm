@@ -7,6 +7,328 @@ fn inference(text: &str) -> Value {
     json!({"model":"m1","messages":[{"role":"user","content":text}],"max_tokens":16})
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn signed_task_trace_reaches_real_provider_and_explain_is_current_read_only() {
+    use crate::telemetry::{DiagnosticReason, TraceContext};
+    let h = Harness::open().await;
+    let (status, session) = h.send("trace-session", "/session", json!({})).await;
+    assert_eq!(status, 200);
+    let trace: TraceContext = serde_json::from_value(session["trace_context"].clone()).unwrap();
+    let state = h.kernel.state().await.unwrap();
+    assert_eq!(
+        trace,
+        TraceContext::for_task(
+            &state.audit.log_id,
+            "g",
+            session["task_id"].as_str().unwrap()
+        )
+    );
+    assert_eq!(
+        h.send_traced("trace-claim", "/tool/claim_task", json!({}), &trace, false)
+            .await
+            .0,
+        200
+    );
+    let task_id = session["task_id"].as_str().unwrap();
+    let view = h.kernel.cluster.view_control().await.unwrap();
+    let before = h.kernel.state().await.unwrap();
+    let unknown = h
+        .send_traced(
+            "trace-explain-unknown",
+            "/tool/explain",
+            json!({}),
+            &trace,
+            false,
+        )
+        .await;
+    assert_eq!(unknown.0, 200);
+    assert_eq!(unknown.1["reason"]["kind"], "unknown");
+    assert_eq!(unknown.1["revision"], view.revision);
+    assert_eq!(
+        crate::audit::content_hash(&h.kernel.state().await.unwrap()).unwrap(),
+        crate::audit::content_hash(&before).unwrap()
+    );
+    h.kernel
+        .record_diagnostic(
+            "trace-reason",
+            &h.runtime_subject,
+            "g",
+            Some(task_id),
+            DiagnosticReason::AllocationWaiting,
+            view.revision,
+        )
+        .await
+        .unwrap()
+        .require()
+        .unwrap();
+    let recorded = h.kernel.cluster.view_control().await.unwrap().revision;
+    let diagnostic_state = h.kernel.state().await.unwrap();
+    let diagnostic_reply = diagnostic_state.replies["trace-reason"]
+        .correlation
+        .as_ref()
+        .unwrap();
+    assert_eq!(diagnostic_reply.goal_id.as_deref(), Some("g"));
+    assert_eq!(diagnostic_reply.task_id.as_deref(), Some(task_id));
+    assert_eq!(
+        diagnostic_reply.trace_context.as_ref().unwrap().trace_id,
+        trace.trace_id
+    );
+    let explained = h
+        .send_traced(
+            "trace-explain-recorded",
+            "/tool/explain",
+            json!({}),
+            &trace,
+            false,
+        )
+        .await;
+    assert_eq!(explained.0, 200);
+    assert_eq!(explained.1["reason"]["kind"], "allocation_waiting");
+    assert_eq!(explained.1["revision"], recorded);
+    h.kernel
+        .record_diagnostic(
+            "trace-reason-repeated",
+            &h.runtime_subject,
+            "g",
+            Some(task_id),
+            DiagnosticReason::AllocationWaiting,
+            recorded,
+        )
+        .await
+        .unwrap()
+        .require()
+        .unwrap();
+    assert_eq!(
+        h.kernel.cluster.view_control().await.unwrap().revision,
+        recorded,
+        "Identical diagnostic observation must not append audit or advance revision"
+    );
+    assert_eq!(
+        h.send_traced(
+            "trace-model",
+            "/model",
+            inference("real traced inference"),
+            &trace,
+            false
+        )
+        .await
+        .0,
+        200
+    );
+    let headers = h.upstream_trace_headers.lock().await.clone();
+    assert_eq!(headers.len(), 1);
+    let upstream = TraceContext::parse(
+        headers[0]
+            .0
+            .as_deref()
+            .expect("provider traceparent missing with exporter disabled"),
+        headers[0].1.as_deref(),
+    )
+    .unwrap();
+    assert_eq!(upstream.trace_id, trace.trace_id);
+    let settled = h.kernel.state().await.unwrap();
+    let effect = &settled.effects["model-trace-model"];
+    let context = effect.correlation.as_ref().unwrap();
+    assert_eq!(context.goal_id.as_deref(), Some("g"));
+    assert_eq!(context.task_id.as_deref(), Some(task_id));
+    assert_eq!(context.intent_id.as_deref(), Some("model-trace-model"));
+    assert_eq!(context.agent_id.as_deref(), Some("a1"));
+    assert_eq!(context.node_id.as_deref(), Some("n1"));
+    assert_eq!(context.incarnation, Some(1));
+    assert_eq!(
+        context.trace_context.as_ref().unwrap().trace_id,
+        trace.trace_id
+    );
+    assert_eq!(
+        settled.ledger.intents["model-trace-model"]
+            .correlation
+            .as_ref()
+            .unwrap()
+            .intent_id,
+        context.intent_id
+    );
+    let revision = h.kernel.cluster.view_control().await.unwrap().revision;
+    assert_eq!(
+        h.send_traced(
+            "trace-signed-tamper",
+            "/model",
+            inference("forged diagnostic parent"),
+            &trace,
+            true
+        )
+        .await
+        .0,
+        403
+    );
+    let other = TraceContext::for_task(&settled.audit.log_id, "g", "other-task");
+    assert_eq!(
+        h.send_traced(
+            "trace-other-task",
+            "/model",
+            inference("wrong Task trace"),
+            &other,
+            false
+        )
+        .await
+        .0,
+        403
+    );
+    let after_denial = h.kernel.state().await.unwrap();
+    assert_eq!(h.upstream.lock().await.len(), 1);
+    assert!(h.kernel.cluster.view_control().await.unwrap().revision >= revision);
+    assert_eq!(after_denial.ledger.accounts["goal/g"].total.held, 0);
+    assert_eq!(
+        crate::audit::content_hash(&after_denial.effects).unwrap(),
+        crate::audit::content_hash(&settled.effects).unwrap()
+    );
+    assert_eq!(
+        crate::audit::content_hash(&after_denial.ledger).unwrap(),
+        crate::audit::content_hash(&settled.ledger).unwrap()
+    );
+    assert_eq!(
+        crate::audit::content_hash(&after_denial.domain).unwrap(),
+        crate::audit::content_hash(&settled.domain).unwrap()
+    );
+    assert_eq!(
+        after_denial.security.grant_epoch,
+        settled.security.grant_epoch
+    );
+    let denial = after_denial
+        .audit
+        .events()
+        .iter()
+        .rev()
+        .find(|event| event.kind == "workload_request_denied")
+        .expect("A validly signed wrong-Task request must retain its denial audit");
+    assert_eq!(denial.actor, h.fixture.subject.id());
+    let denied = denial.correlation.as_ref().unwrap();
+    assert_eq!(denied.goal_id.as_deref(), Some("g"));
+    assert_eq!(denied.task_id.as_deref(), Some(task_id));
+    assert_eq!(denied.agent_id.as_deref(), Some("a1"));
+    assert_eq!(denied.node_id.as_deref(), Some("n1"));
+    assert_eq!(denied.incarnation, Some(1));
+    assert_eq!(
+        denied.trace_context.as_ref().unwrap().trace_id,
+        trace.trace_id
+    );
+    assert!(
+        denied.intent_id.is_none(),
+        "A refused never-admitted request has no existing intent to report"
+    );
+    h.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn typed_budget_denial_pauses_before_contact_and_other_diagnostics_cannot_resume() {
+    use crate::telemetry::DiagnosticReason;
+    let h = Harness::open_with_funding_cap(1).await;
+    assert_eq!(
+        h.send("budget-pause-claim", "/tool/claim_task", json!({}))
+            .await
+            .0,
+        200
+    );
+    let (status, denied) = h
+        .send(
+            "budget-pause-model",
+            "/model",
+            inference("over the registered bounded budget"),
+        )
+        .await;
+    assert_eq!(status, 403);
+    assert_eq!(denied["code"], "budget_exhausted", "{denied}");
+    let paused = h.kernel.state().await.unwrap();
+    assert!(paused.budget_paused("g", "task-1"));
+    assert_eq!(paused.ledger.accounts["goal/g"].total.held, 0);
+    assert_eq!(paused.ledger.accounts["goal/g"].total.spent, 0);
+    assert!(h.upstream.lock().await.is_empty());
+    assert!(!paused.effects.contains_key("model-budget-pause-model"));
+    assert!(paused.quotas.reservations.is_empty());
+    for (index, reason) in [
+        DiagnosticReason::LeaseSafety,
+        DiagnosticReason::Cleanup { completed: true },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let revision = h.kernel.cluster.view_control().await.unwrap().revision;
+        h.kernel
+            .record_diagnostic(
+                &format!("budget-other-reason-{index}"),
+                &h.runtime_subject,
+                "g",
+                Some("task-1"),
+                reason,
+                revision,
+            )
+            .await
+            .unwrap()
+            .require()
+            .unwrap();
+        assert!(h.kernel.state().await.unwrap().budget_paused("g", "task-1"));
+    }
+    assert_eq!(
+        h.send("budget-pause-repeat", "/model", inference("still paused"))
+            .await
+            .0,
+        403
+    );
+    assert!(h.upstream.lock().await.is_empty());
+    let retained: crate::kernel::KernelState =
+        serde_json::from_value(serde_json::to_value(h.kernel.state().await.unwrap()).unwrap())
+            .unwrap();
+    assert!(retained.budget_paused("g", "task-1"));
+    h.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn typed_rate_pause_checks_new_work_without_reviving_expired_unknown_intent() {
+    let h = Harness::open_with_quota_concurrency(1).await;
+    assert_eq!(
+        h.send("rate-pause-claim", "/tool/claim_task", json!({}))
+            .await
+            .0,
+        200
+    );
+    let first = h
+        .send("rate-unknown", "/model", inference("LOSE_ACK"))
+        .await;
+    assert!(matches!(first.0, 403 | 502), "{}", first.1);
+    assert!(first.1.get("choices").is_none());
+    let before = h.kernel.state().await.unwrap();
+    assert_eq!(
+        before.ledger.intents["model-rate-unknown"].state,
+        IntentState::Unknown
+    );
+    let held = before.ledger.accounts["goal/g"].total.held;
+    assert!(held > 0);
+    let (status, denied) = h
+        .send(
+            "rate-denied",
+            "/model",
+            inference("shared unknown holds prevent new work"),
+        )
+        .await;
+    assert_eq!(status, 403);
+    assert_eq!(denied["code"], "provider_paused");
+    let paused = h.kernel.state().await.unwrap();
+    let original = paused.rate_pauses["g/task-1"].request.clone();
+    assert!(paused.rate_paused("g", "task-1", crate::cluster::now_ms()));
+    let after_original_deadline = original.deadline_ms + 1;
+    let hash = crate::audit::content_hash(&paused).unwrap();
+    assert!(
+        paused.rate_paused("g", "task-1", after_original_deadline),
+        "Unknown holdings cannot time out or hide behind the original intent's idempotency shortcut"
+    );
+    assert_eq!(crate::audit::content_hash(&paused).unwrap(), hash);
+    assert_eq!(paused.rate_pauses["g/task-1"].request, original);
+    assert_eq!(paused.ledger.accounts["goal/g"].total.held, held);
+    assert_eq!(h.upstream.lock().await.len(), 1);
+    assert!(!paused.effects.contains_key("model-rate-denied"));
+    assert_eq!(paused.quotas.reservations.len(), 1);
+    h.close().await;
+}
+
 async fn advance_authority(h: &Harness, suffix: &str) -> u64 {
     let state = h.kernel.state().await.unwrap();
     let original = &state.security.grants["a1-1"];

@@ -74,6 +74,8 @@ pub struct EvaluationContract {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NeedDecision {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation: Option<crate::telemetry::Correlation>,
     pub satisfied: bool,
     pub finding_ids: Vec<String>,
     pub contract: EvaluationContract,
@@ -142,6 +144,8 @@ pub struct Task {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BoardEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation: Option<crate::telemetry::Correlation>,
     pub schema_version: u32,
     pub goal_id: String,
     pub entry_id: String,
@@ -175,6 +179,8 @@ pub struct Provenance {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Finding {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation: Option<crate::telemetry::Correlation>,
     pub id: String,
     pub schema_version: u32,
     pub goal_id: String,
@@ -211,6 +217,8 @@ pub struct Score {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Attempt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation: Option<crate::telemetry::Correlation>,
     pub id: String,
     pub goal_id: String,
     pub goal_version: u64,
@@ -912,6 +920,7 @@ impl DomainState {
                 ensure!(need.accepted, "Need not accepted");
                 need.satisfied = satisfied;
                 need.decisions.push(NeedDecision {
+                    correlation: None,
                     satisfied,
                     finding_ids,
                     contract,
@@ -1315,6 +1324,7 @@ impl DomainState {
                     return Ok(serde_json::to_value(existing)?);
                 }
                 let entry = BoardEntry {
+                    correlation: None,
                     schema_version: 1,
                     goal_id,
                     entry_id,
@@ -1419,6 +1429,7 @@ impl DomainState {
                     return Ok(serde_json::to_value(existing)?);
                 }
                 let finding = Finding {
+                    correlation: None,
                     id: id.clone(),
                     schema_version: 1,
                     goal_id,
@@ -1559,6 +1570,7 @@ impl DomainState {
                 );
                 round.introduced.insert(attempt_id.clone());
                 let attempt = Attempt {
+                    correlation: None,
                     id: attempt_id.clone(),
                     goal_id: goal_id.clone(),
                     goal_version: goal.version,

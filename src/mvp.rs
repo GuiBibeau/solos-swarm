@@ -260,10 +260,37 @@ pub async fn execute(command: MvpCommand) -> Result<()> {
             println!("{}", json!({"verified":true,"domain":domain}));
         }
         MvpCommand::Inspect { snapshot, kind, id } => {
-            let state: KernelState = serde_json::from_slice(&fs::read(snapshot)?)?;
+            let packet: Value = serde_json::from_slice(&fs::read(snapshot)?)?;
+            let saved_revision = packet
+                .get("snapshot")
+                .and_then(|_| packet.get("revision"))
+                .and_then(Value::as_u64);
+            let state: KernelState =
+                serde_json::from_value(packet.get("snapshot").unwrap_or(&packet).clone())?;
             state.validate()?;
             let value = match kind.as_str() {
                 "goal" => serde_json::to_value(state.domain.goal(&id)?)?,
+                "explain" => {
+                    let (goal, task) = id
+                        .split_once('/')
+                        .map_or((id.as_str(), None), |(goal, task)| (goal, Some(task)));
+                    let current = state.domain.goal(goal)?;
+                    let fence = task
+                        .map(|id| state.domain.task(goal, id).map(|task| task.fencing_token))
+                        .transpose()?;
+                    let key = format!("{goal}/{}", task.unwrap_or("@goal"));
+                    let record = state
+                        .diagnostic_reasons
+                        .get(&key)
+                        .or_else(|| state.diagnostic_reasons.get(&format!("{goal}/@goal")))
+                        .filter(|record| {
+                            record.goal_version == current.spec.version
+                                && record
+                                    .task_fence
+                                    .is_none_or(|recorded| Some(recorded) == fence)
+                        });
+                    json!({"goal_id":goal,"task_id":task,"reason":record.map(|record|record.reason.clone()).unwrap_or(solos_swarm::telemetry::DiagnosticReason::Unknown),"record":record,"recorded_authoritative_revision":saved_revision})
+                }
                 "board" => serde_json::to_value(
                     state
                         .domain
@@ -315,7 +342,7 @@ pub async fn execute(command: MvpCommand) -> Result<()> {
             };
             println!(
                 "{}",
-                json!({"domain_revision":state.domain.revision,"authoritative_revision":null,"object":value,"source":"saved snapshot; authoritative readback revision must be retained separately; no effects replayed"})
+                json!({"domain_revision":state.domain.revision,"authoritative_revision":saved_revision,"object":value,"source":"saved snapshot/readback, not a fresh query; supplied revision metadata requires separately verified signed evidence; no effects replayed"})
             );
         }
         MvpCommand::Verify {
@@ -663,6 +690,7 @@ mod permit_history_tests {
             refreshed.issued = 101;
             let current = signer.sign("dispatch-permit", refreshed).unwrap();
             let reply = RecordedReply {
+                correlation: None,
                 actor: original.payload.holder.clone(),
                 request: json!({"immutable_request_hash":"fixture-only"}),
                 request_hash: [0; 32],
@@ -673,6 +701,7 @@ mod permit_history_tests {
             reply.request_hash = content_hash(&(&reply.actor, &reply.request)).unwrap();
             let events = vec![
                 AuditEvent {
+                    correlation: None,
                     id: "authorize/local-intent".into(),
                     kind: "dispatch_authorized".into(),
                     actor: original.payload.holder.clone(),
@@ -682,6 +711,7 @@ mod permit_history_tests {
                     payload_hash: content_hash(&original.payload).unwrap(),
                 },
                 AuditEvent {
+                    correlation: None,
                     id: "request/admit-local/phase".into(),
                     kind: "kernel_request".into(),
                     actor: reply.actor.clone(),
@@ -691,6 +721,7 @@ mod permit_history_tests {
                     payload_hash: reply.request_hash,
                 },
                 AuditEvent {
+                    correlation: None,
                     id: format!(
                         "permit-refresh/local-intent/{}",
                         hex(&content_hash(&current).unwrap())

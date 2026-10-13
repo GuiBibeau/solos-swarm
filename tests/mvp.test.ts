@@ -31,7 +31,7 @@ test("MVP extension binds mTLS signatures and preserves unresolved intents acros
       assert.equal(req.socket.authorized, true);
       const certificate = req.socket.getPeerCertificate();
       const pem = `-----BEGIN CERTIFICATE-----\n${certificate.raw.toString("base64").match(/.{1,64}/g)!.join("\n")}\n-----END CERTIFICATE-----\n`;
-      assert.ok(verify(null, Buffer.from(`solos-swarm-request-v1\n${message.request_id}\n${message.issued_ms}\n${message.path}\n${message.payload}`), createPublicKey(pem), Buffer.from(message.signature, "base64")));
+      assert.ok(verify(null, Buffer.from(`solos-swarm-request-v2\n${message.request_id}\n${message.issued_ms}\n${message.path}\n${message.traceparent ?? ""}\n${message.tracestate ?? ""}\n${message.payload}`), createPublicKey(pem), Buffer.from(message.signature, "base64")));
       const history = ids.get(message.path) ?? []; history.push(message.request_id); ids.set(message.path, history);
       res.setHeader("Content-Type", "application/json");
       if ((message.path === "/tool/confirm" || message.path === "/tool/rotate") && history.length === 1) return res.end(JSON.stringify({status: "confirmation_required", intent: message.request_id}));
@@ -100,20 +100,26 @@ test("pinned Pi preserves iterative attempts and executes the final scoped batch
       const certificate = req.socket.getPeerCertificate();
       assert.ok(certificate.subjectaltname?.includes("URI:spiffe://fixture.test/tenant/t/goal/g/node/n/agent/worker/incarnation/1"));
       const pem = `-----BEGIN CERTIFICATE-----\n${certificate.raw.toString("base64").match(/.{1,64}/g)!.join("\n")}\n-----END CERTIFICATE-----\n`;
-      assert.ok(verify(null, Buffer.from(`solos-swarm-request-v1\n${message.request_id}\n${message.issued_ms}\n${message.path}\n${message.payload}`), createPublicKey(pem), Buffer.from(message.signature, "base64")));
+      assert.ok(verify(null, Buffer.from(`solos-swarm-request-v2\n${message.request_id}\n${message.issued_ms}\n${message.path}\n${message.traceparent ?? ""}\n${message.tracestate ?? ""}\n${message.payload}`), createPublicKey(pem), Buffer.from(message.signature, "base64")));
       assert.equal(req.headers.authorization, undefined, "The broker is authenticated by the workload key, not a provider credential");
       const payload = JSON.parse(message.payload);
       calls.push({path: message.path, id: message.request_id, payload});
       res.setHeader("Content-Type", "application/json");
       if (message.path === "/session") {
         assert.deepEqual(payload, {});
-        return res.end(JSON.stringify({goal_id: "g", task_id: "task-1", tools, model: {
+        assert.equal(message.traceparent, null);
+        assert.equal(req.headers.traceparent, undefined);
+        return res.end(JSON.stringify({goal_id: "g", task_id: "task-1", trace_context: {trace_id: "0123456789abcdef0123456789abcdef", span_id: "0123456789abcdef", trace_flags: 1, tracestate: "solos=fixture"}, tools, model: {
           id: modelId, name: "Scoped fixture model", reasoning: false, input: ["text"], contextWindow: 32768, maxTokens: 1024,
           cost: {input: 0, output: 0, cacheRead: 0, cacheWrite: 0},
           compat: {supportsStore: false, supportsDeveloperRole: false, maxTokensField: "max_tokens", supportsStrictMode: false},
         }}));
       }
       if (message.path === "/model") {
+        assert.match(message.traceparent, /^00-0123456789abcdef0123456789abcdef-[0-9a-f]{16}-01$/);
+        assert.equal(req.headers.traceparent, message.traceparent);
+        assert.equal(req.headers.tracestate, "solos=fixture");
+        assert.equal(message.tracestate, req.headers.tracestate);
         modelCalls++;
         assert.equal(payload.model, modelId);
         assert.equal(payload.stream, false);

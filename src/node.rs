@@ -21,6 +21,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::{Mutex, watch};
+use tracing::Instrument;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolDefinition {
@@ -229,6 +230,60 @@ impl BrokerNode {
         );
         let session = self.session(&peer).await?;
         self.kernel.record_certificate(&peer).await?;
+        let state = self.kernel.state().await?;
+        let action_intent = if path == "/model" {
+            Some(format!("model-{}", message.request_id))
+        } else if path.starts_with("/tool/") {
+            Some(format!("tool-{}", message.request_id))
+        } else if path == crate::evaluator::EVALUATOR_COMMAND_PATH {
+            Some(format!("evaluation-{}", message.request_id))
+        } else {
+            None
+        };
+        let correlation = state.correlation_for(
+            peer.subject.id(),
+            Some(&peer.workload.goal),
+            Self::task_context(&session).as_ref(),
+            action_intent.as_deref(),
+        )?;
+        drop(state);
+        let span =
+            crate::diagnostics::operation_span(&correlation, crate::diagnostics::Stage::Message, 1);
+        if let Some(parent) = &message.traceparent {
+            let incoming =
+                crate::telemetry::TraceContext::parse(parent, message.tracestate.as_deref())?;
+            ensure!(
+                correlation
+                    .trace_context
+                    .as_ref()
+                    .is_some_and(|expected| expected.trace_id == incoming.trace_id
+                        && expected.tracestate == incoming.tracestate),
+                "diagnostic Task trace differs from assigned Task"
+            );
+            crate::diagnostics::attach_parent(&span, &incoming)?;
+        }
+        let wait_ms = crate::cluster::now_ms().saturating_sub(message.issued_ms);
+        crate::diagnostics::record(
+            crate::diagnostics::Stage::Message,
+            crate::diagnostics::Outcome::Success,
+            wait_ms,
+        );
+        crate::diagnostics::with_trace_context(
+            correlation.trace_context.clone(),
+            self.route_session(peer, path, message, payload, session, correlation)
+                .instrument(span),
+        )
+        .await
+    }
+    async fn route_session(
+        &self,
+        peer: Peer,
+        path: String,
+        message: Message,
+        payload: Value,
+        session: Session,
+        mut correlation: crate::telemetry::Correlation,
+    ) -> Result<Value> {
         if path == crate::evaluator::EVALUATOR_COMMAND_PATH {
             let state = self.kernel.state().await?;
             ensure!(
@@ -302,6 +357,7 @@ impl BrokerNode {
             let features = backend.provider.features();
             return Ok(
                 json!({"workload":session.workload,"goal_id":session.workload.goal,"task_id":session.task_id,
+                "trace_context":correlation.trace_context,
                 "tools":session.tools,"model":{"id":session.model,"name":format!("Brokered {}",session.model),"reasoning":false,"input":["text"],
                     "contextWindow":features.context_tokens,"maxTokens":features.output_tokens,
                     "cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},
@@ -309,7 +365,37 @@ impl BrokerNode {
             );
         }
         if path == "/model" {
-            return self.infer(&peer, &session, &message, payload).await;
+            correlation.intent_id = Some(format!("model-{}", message.request_id));
+            let span = crate::diagnostics::operation_span(
+                &correlation,
+                crate::diagnostics::Stage::Provider,
+                1,
+            );
+            return self
+                .infer(&peer, &session, &message, payload)
+                .instrument(span)
+                .await;
+        }
+        if path == "/tool/explain" {
+            validate_arguments(
+                &json!({"type":"object","properties":{},"additionalProperties":false}),
+                &payload,
+            )?;
+            let span = crate::diagnostics::operation_span(
+                &correlation,
+                crate::diagnostics::Stage::Tool,
+                1,
+            );
+            return self
+                .kernel
+                .explain(
+                    &peer.subject,
+                    &peer.workload.goal,
+                    &Self::task_context(&session).context("assigned Task absent")?,
+                    &Self::leases(&session),
+                )
+                .instrument(span)
+                .await;
         }
         let name = path.strip_prefix("/tool/").context("unknown broker path")?;
         let definition = session
@@ -319,7 +405,11 @@ impl BrokerNode {
             .context("tool not in approved definition")?
             .clone();
         validate_arguments(&definition.parameters, &payload)?;
+        correlation.intent_id = Some(format!("tool-{}", message.request_id));
+        let span =
+            crate::diagnostics::operation_span(&correlation, crate::diagnostics::Stage::Tool, 1);
         self.tool(&peer, &session, &message, definition, payload)
+            .instrument(span)
             .await
     }
     async fn infer(
@@ -381,6 +471,20 @@ impl BrokerNode {
             );
         }
         let task = state.domain.task(&peer.workload.goal, &session.task_id)?;
+        ensure!(
+            !state.rate_paused(
+                &peer.workload.goal,
+                &session.task_id,
+                crate::cluster::now_ms()
+            ),
+            "Task is paused until shared provider quota is available"
+        );
+        if state.budget_paused(&peer.workload.goal, &session.task_id) {
+            return Err(crate::ledger::BudgetExhausted {
+                category: "Task paused until an authorized Goal budget amendment",
+            }
+            .into());
+        }
         ensure!(
             crate::kernel::search_open(&state, &peer.workload.goal),
             "final selection closed search; inspect the signed final evaluation"
@@ -588,10 +692,21 @@ impl BrokerNode {
             .subscribe();
         // A local slot is not spend authority. Wait before creating any funded intent, then
         // derive and consume current quorum authority without a provider queue between them.
-        let slot = backend
+        let queue_started = std::time::Instant::now();
+        let slot_result = backend
             .provider
             .acquire(inference.deadline_ms, cancel.clone())
-            .await?;
+            .await;
+        crate::diagnostics::record(
+            crate::diagnostics::Stage::ProviderQueue,
+            if slot_result.is_ok() {
+                crate::diagnostics::Outcome::Success
+            } else {
+                crate::diagnostics::Outcome::Denied
+            },
+            queue_started.elapsed().as_millis() as u64,
+        );
+        let slot = slot_result?;
         backend
             .provider
             .validate(&inference, crate::cluster::now_ms())?;
@@ -649,7 +764,21 @@ impl BrokerNode {
             "dispatch result already consumed; recover its recorded outcome"
         );
         dispatched.require()?;
+        let provider_started = std::time::Instant::now();
         let outcome = backend.provider.dispatch(inference, cancel, slot).await;
+        crate::diagnostics::record(
+            crate::diagnostics::Stage::Provider,
+            match outcome.outcome {
+                Outcome::Completed => crate::diagnostics::Outcome::Success,
+                Outcome::ReceiptWithoutCompletion => crate::diagnostics::Outcome::Failure,
+                Outcome::DefinitelyNotDispatched => crate::diagnostics::Outcome::Denied,
+                Outcome::Unknown => crate::diagnostics::Outcome::Unknown,
+            },
+            provider_started.elapsed().as_millis() as u64,
+        );
+        if let Some(usage) = &outcome.usage {
+            crate::diagnostics::record_tokens(usage.input_tokens, usage.output_tokens);
+        }
         let observed_flow = outcome.flow.as_ref().map(|flow| crate::flow::ObservedFlow {
             intent_id: flow.intent_id.clone(),
             goal_id: flow.goal_id.clone(),
@@ -686,6 +815,13 @@ impl BrokerNode {
                 .as_ref()
                 .context("complete inference lacks usage")?;
             let amount = frozen_price.cost(&usage.categories)?;
+            crate::diagnostics::provider_attributes(
+                &session.provider,
+                &session.model,
+                usage.input_tokens,
+                usage.output_tokens,
+                amount,
+            );
             if let Some(value) = &mut completion {
                 value["swarm_cost_microusd"] = json!(amount);
             }
@@ -717,6 +853,23 @@ impl BrokerNode {
             .require()?;
         if let Some(flow) = observed_flow {
             self.kernel.observe_flow(&executor, flow).await?;
+        }
+        if outcome.outcome != Outcome::Completed {
+            let observed_revision = self.kernel.cluster.view_control().await?.revision;
+            self.kernel
+                .record_diagnostic(
+                    &format!("provider-reason-{intent}"),
+                    &executor,
+                    &peer.workload.goal,
+                    Some(&session.task_id),
+                    crate::telemetry::DiagnosticReason::ProviderOutcome {
+                        intent_id: intent.clone(),
+                        outcome: outcome.outcome.clone(),
+                    },
+                    observed_revision,
+                )
+                .await?
+                .require()?;
         }
         self.kernel
             .validate_cached_effect(&peer.subject, &intent, &Self::leases(session))
@@ -1361,6 +1514,7 @@ impl BrokerNode {
         if let Some(flow) = &target_flow {
             self.kernel.observe_flow(&executor, flow.clone()).await?;
         }
+        let tool_started = std::time::Instant::now();
         let execution = match self.tools.execute(plan, stop).await {
             Ok(result) => result,
             Err(error) => crate::tools::ToolExecution {
@@ -1373,6 +1527,15 @@ impl BrokerNode {
         };
         let executor = self.executor_subject.read().await.clone();
         let completed = execution.completed;
+        crate::diagnostics::record(
+            crate::diagnostics::Stage::Tool,
+            if completed {
+                crate::diagnostics::Outcome::Success
+            } else {
+                crate::diagnostics::Outcome::Unknown
+            },
+            tool_started.elapsed().as_millis() as u64,
+        );
         let target_flow = target_flow.map(|mut flow| {
             flow.closed_ms = Some(crate::cluster::now_ms());
             flow.outcome = if completed {
@@ -1558,6 +1721,14 @@ pub fn make_tools(grant: &crate::security::Grant) -> Vec<ToolDefinition> {
                 json!({"scope":loose(),"trigger":text(),"reason_hash":{"type":"array","items":{"type":"integer","minimum":0,"maximum":255},"maxItems":32},"confidence_milli":{"type":"integer","minimum":0,"maximum":1000}}),
                 vec!["scope", "trigger", "reason_hash", "confidence_milli"],
             ),
+        ),
+        (
+            "explain",
+            "Read the recorded reason for this Task at the authoritative revision; an absent reason is unknown.",
+            CapabilityKind::ToolCall,
+            "task_work",
+            format!("task/{goal}"),
+            object(json!({}), vec![]),
         ),
     ];
     entries

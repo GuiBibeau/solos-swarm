@@ -39,6 +39,10 @@ use x509_parser::{extensions::GeneralName, prelude::*};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Message {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traceparent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracestate: Option<String>,
     pub request_id: String,
     pub issued_ms: u64,
     pub path: String,
@@ -46,7 +50,24 @@ pub struct Message {
     pub signature: String,
 }
 impl Message {
+    pub fn trace_headers(&self) -> Result<reqwest::header::HeaderMap> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(parent) = &self.traceparent {
+            crate::telemetry::TraceContext::parse(parent, self.tracestate.as_deref())?;
+            headers.insert("traceparent", parent.parse()?);
+        }
+        if let Some(state) = &self.tracestate {
+            ensure!(self.traceparent.is_some(), "tracestate lacks traceparent");
+            headers.insert("tracestate", state.parse()?);
+        }
+        Ok(headers)
+    }
     pub fn signing_bytes(&self) -> Result<Vec<u8>> {
+        if let Some(parent) = &self.traceparent {
+            crate::telemetry::TraceContext::parse(parent, self.tracestate.as_deref())?;
+        } else {
+            ensure!(self.tracestate.is_none(), "tracestate lacks traceparent");
+        }
         ensure!(
             !self.request_id.is_empty()
                 && self.request_id.len() <= 128
@@ -58,8 +79,13 @@ impl Message {
             "invalid signed operation path"
         );
         Ok(format!(
-            "solos-swarm-request-v1\n{}\n{}\n{}\n{}",
-            self.request_id, self.issued_ms, self.path, self.payload
+            "solos-swarm-request-v2\n{}\n{}\n{}\n{}\n{}\n{}",
+            self.request_id,
+            self.issued_ms,
+            self.path,
+            self.traceparent.as_deref().unwrap_or(""),
+            self.tracestate.as_deref().unwrap_or(""),
+            self.payload
         )
         .into_bytes())
     }
@@ -71,7 +97,23 @@ impl Message {
             "request stale or oversized"
         );
         let signature = Signature::from_slice(&STANDARD.decode(&self.signature)?)?;
-        VerifyingKey::from_bytes(key)?.verify_strict(&self.signing_bytes()?, &signature)?;
+        let verifier = VerifyingKey::from_bytes(key)?;
+        if verifier
+            .verify_strict(&self.signing_bytes()?, &signature)
+            .is_err()
+        {
+            // Historical trace-free packets retain their exact original signature bytes.
+            // A signed diagnostic context never falls back to the legacy format.
+            ensure!(
+                self.traceparent.is_none() && self.tracestate.is_none(),
+                "signed trace context verification failed"
+            );
+            let legacy = format!(
+                "solos-swarm-request-v1\n{}\n{}\n{}\n{}",
+                self.request_id, self.issued_ms, self.path, self.payload
+            );
+            verifier.verify_strict(legacy.as_bytes(), &signature)?;
+        }
         Ok(serde_json::from_str(&self.payload)?)
     }
 }
@@ -242,6 +284,16 @@ pub async fn serve(
 fn rejection(error: &anyhow::Error) -> Value {
     let mut value = serde_json::json!({"error":error.to_string()});
     if error
+        .downcast_ref::<crate::ledger::BudgetExhausted>()
+        .is_some()
+    {
+        value["code"] = serde_json::json!("budget_exhausted");
+    }
+    if let Some(paused) = error.downcast_ref::<crate::quota::QuotaPaused>() {
+        value["code"] = serde_json::json!("provider_paused");
+        value["retry_after_ms"] = serde_json::json!(paused.retry_after_ms);
+    }
+    if error
         .downcast_ref::<crate::kernel::StateCapacityError>()
         .is_some()
     {
@@ -267,6 +319,16 @@ async fn process(
         "only signed POST messages are accepted"
     );
     let path = request.uri().path().to_owned();
+    let traceparent = request
+        .headers()
+        .get("traceparent")
+        .map(|value| value.to_str().map(str::to_owned))
+        .transpose()?;
+    let tracestate = request
+        .headers()
+        .get("tracestate")
+        .map(|value| value.to_str().map(str::to_owned))
+        .transpose()?;
     ensure!(path.len() <= 128, "path exceeds ingress ceiling");
     if let Some(size) = request.headers().get("Content-Length") {
         ensure!(
@@ -288,6 +350,10 @@ async fn process(
     }
     let message: Message = serde_json::from_slice(&bytes)?;
     ensure!(
+        traceparent == message.traceparent && tracestate == message.tracestate,
+        "trace headers differ from signed context"
+    );
+    ensure!(
         message.path == path,
         "signed operation differs from requested path"
     );
@@ -302,6 +368,42 @@ async fn process(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn historical_trace_free_signature_is_preserved_without_context_downgrade() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let key = SigningKey::from_bytes(&[11; 32]);
+        let mut message = super::Message {
+            traceparent: None,
+            tracestate: None,
+            request_id: "historical".into(),
+            issued_ms: 10_000,
+            path: "/tool/board_read".into(),
+            payload: "{}".into(),
+            signature: String::new(),
+        };
+        let legacy = format!(
+            "solos-swarm-request-v1\n{}\n{}\n{}\n{}",
+            message.request_id, message.issued_ms, message.path, message.payload
+        );
+        message.signature = super::STANDARD.encode(key.sign(legacy.as_bytes()).to_bytes());
+        assert_eq!(
+            message
+                .verify(&key.verifying_key().to_bytes(), 10_000, 1024)
+                .unwrap(),
+            serde_json::json!({})
+        );
+        let serialized = serde_json::to_value(&message).unwrap();
+        assert!(serialized.get("traceparent").is_none());
+        assert!(serialized.get("tracestate").is_none());
+        message.traceparent =
+            Some(crate::telemetry::TraceContext::for_task("d", "g", "t").traceparent());
+        assert!(
+            message
+                .verify(&key.verifying_key().to_bytes(), 10_000, 1024)
+                .is_err(),
+            "Legacy fallback cannot authenticate a diagnostic context that was not signed"
+        );
+    }
+    #[test]
     fn only_typed_capacity_rejections_carry_a_retriable_code() {
         let typed: anyhow::Error = crate::kernel::StateCapacityError.into();
         assert_eq!(super::rejection(&typed)["code"], "state_capacity");
@@ -314,6 +416,8 @@ mod tests {
     fn signed_payload_binds_identity_id_time_and_exact_bytes() {
         let key = SigningKey::from_bytes(&[11; 32]);
         let mut message = Message {
+            traceparent: None,
+            tracestate: None,
             request_id: "stable-1".into(),
             issued_ms: 10_000,
             path: "/tool/board_post".into(),

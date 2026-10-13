@@ -23,6 +23,8 @@ const STATE_KEY: &str = "kernel/state";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RecordedReply {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation: Option<crate::telemetry::Correlation>,
     pub actor: String,
     pub request: Value,
     pub request_hash: Hash,
@@ -31,6 +33,8 @@ pub struct RecordedReply {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Effect {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation: Option<crate::telemetry::Correlation>,
     pub request: ActionRequest,
     pub payload: Value,
     pub permit: Signed<DispatchPermit>,
@@ -90,6 +94,7 @@ pub(crate) fn refresh_nonbillable_effect(
                 },
             );
             let event = AuditEvent {
+                correlation: None,
                 id: format!("apply-review/{intent}/{}", hex(&content_hash(&review)?)),
                 kind: "confirmation_required".into(),
                 actor: subject.id().into(),
@@ -141,9 +146,235 @@ pub struct Admission {
     pub quota: Option<crate::quota::QuotaRequest>,
     pub task: Option<TaskContext>,
 }
+fn diagnostic_key(goal: &str, task: Option<&str>) -> String {
+    format!("{goal}/{}", task.unwrap_or("@goal"))
+}
+fn store_diagnostic(
+    state: &mut KernelState,
+    key: String,
+    record: crate::telemetry::DiagnosticRecord,
+) {
+    const MAX_DIAGNOSTICS: usize = 8192;
+    if !state.diagnostic_reasons.contains_key(&key)
+        && state.diagnostic_reasons.len() >= MAX_DIAGNOSTICS
+        && let Some(oldest) = state
+            .diagnostic_reasons
+            .iter()
+            .min_by_key(|(_, r)| r.recorded_ms)
+            .map(|(k, _)| k.clone())
+    {
+        state.diagnostic_reasons.remove(&oldest);
+    }
+    state.diagnostic_reasons.insert(key, record);
+}
+fn diagnostic_markings(
+    state: &KernelState,
+    goal: &str,
+    task: Option<&str>,
+) -> Result<BTreeSet<String>> {
+    let mut markings = BTreeSet::from([state.security.policy.payload.classification.clone()]);
+    let mut pending: Vec<_> = task
+        .and_then(|id| state.task_input_sources.get(&format!("{goal}/{id}")))
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect();
+    if let Some(holder) = task
+        .and_then(|id| state.domain.task(goal, id).ok())
+        .and_then(|record| record.claimed_by.as_ref())
+        && let Some(observed) = state.security.observed.get(holder)
+    {
+        pending.extend(observed.iter().cloned());
+    }
+    let mut seen = BTreeSet::new();
+    while let Some(source) = pending.pop() {
+        if !seen.insert(source.clone()) {
+            continue;
+        }
+        if let Some(input) = state.security.inputs.get(&source) {
+            markings.extend(input.markings.iter().cloned());
+            pending.extend(input.parents.iter().cloned());
+        } else if let Some(finding) = state.security.findings.get(&source) {
+            markings.extend(finding.payload.markings.iter().cloned());
+            pending.extend(finding.payload.inputs.iter().cloned());
+        } else {
+            anyhow::bail!("diagnostic input lineage missing");
+        }
+    }
+    Ok(markings)
+}
+#[derive(Serialize, Deserialize)]
+#[serde(
+    tag = "kernel_metadata",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+enum ActionCorrelationMetadata {
+    DiagnosticObservation {
+        correlation: crate::telemetry::Correlation,
+        reason: crate::telemetry::DiagnosticReason,
+        observed_revision: u64,
+    },
+    AuthenticatedWorkloadDenial {
+        correlation: crate::telemetry::Correlation,
+        proof_hash: Hash,
+        reason_hash: Hash,
+    },
+}
+fn committed_correlation(
+    state: &KernelState,
+    actor: &str,
+    request: &Value,
+) -> Result<crate::telemetry::Correlation> {
+    if state
+        .security
+        .policy
+        .payload
+        .trusted_components
+        .contains(actor)
+        && matches!(
+            request.get("kernel_metadata").and_then(Value::as_str),
+            Some("diagnostic_observation" | "authenticated_workload_denial")
+        )
+        && let Ok(metadata) = serde_json::from_value::<ActionCorrelationMetadata>(request.clone())
+    {
+        let correlation = match metadata {
+            ActionCorrelationMetadata::DiagnosticObservation { correlation, .. }
+            | ActionCorrelationMetadata::AuthenticatedWorkloadDenial { correlation, .. } => {
+                correlation
+            }
+        };
+        correlation.validate()?;
+        ensure!(
+            correlation.deployment_id == state.audit.log_id && correlation.run_id == state.run_id,
+            "trusted action correlation deployment or run mismatch"
+        );
+        return Ok(correlation);
+    }
+    if let Some(values) = request.as_array()
+        && matches!(values.len(), 8 | 9)
+        && values[0].as_array().is_some_and(|v| v.len() == 32)
+        && let Ok(context) =
+            serde_json::from_value::<crate::telemetry::Correlation>(values[7].clone())
+    {
+        context.validate()?;
+        ensure!(
+            context.deployment_id == state.audit.log_id,
+            "admission correlation deployment mismatch"
+        );
+        return Ok(context);
+    }
+    let first = request
+        .as_array()
+        .and_then(|values| values.first())
+        .unwrap_or(request);
+    let intent = first.get("intent_id").and_then(Value::as_str).or_else(|| {
+        first
+            .as_str()
+            .filter(|id| state.effects.contains_key(*id) || state.pending_actions.contains_key(*id))
+    });
+    let grant = first
+        .get("grant_id")
+        .and_then(Value::as_str)
+        .or_else(|| first.as_str())
+        .and_then(|id| state.security.grants.get(id));
+    let goal = grant
+        .map(|g| g.goal_id.as_str())
+        .or_else(|| first.get("goal_id").and_then(Value::as_str))
+        .filter(|id| state.domain.goals.contains_key(*id));
+    let explicit = if first
+        .as_str()
+        .is_some_and(|id| state.security.grants.contains_key(id))
+    {
+        request
+            .as_array()
+            .and_then(|values| values.get(1))
+            .and_then(|v| serde_json::from_value::<TaskContext>(v.clone()).ok())
+    } else {
+        None
+    };
+    let inferred = if explicit.is_none() {
+        let mut owned = state.domain.tasks.values().filter(|t| {
+            t.claimed_by.as_deref() == Some(actor)
+                && matches!(
+                    t.state,
+                    domain::TaskState::Claimed | domain::TaskState::Running
+                )
+        });
+        let first = owned.next();
+        if owned.next().is_none() {
+            first.map(|t| TaskContext {
+                id: t.spec.id.clone(),
+                incarnation: t.incarnation,
+                fence: t.fencing_token,
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let context = explicit.as_ref().or(inferred.as_ref());
+    let fallback_goal = crate::identity::WorkloadId::parse(actor)
+        .ok()
+        .map(|id| id.goal)
+        .filter(|id| state.domain.goals.contains_key(id));
+    state.correlation_for(actor, goal.or(fallback_goal.as_deref()), context, intent)
+}
+fn correlate_action_records(
+    old: &Value,
+    next: &mut KernelState,
+    correlation: &crate::telemetry::Correlation,
+) {
+    for (id, effect) in &mut next.effects {
+        if old["effects"].get(id).is_none() || correlation.intent_id.as_deref() == Some(id.as_str())
+        {
+            effect.correlation = Some(correlation.clone());
+        }
+    }
+    for (id, reservation) in &mut next.ledger.intents {
+        if old["ledger"]["intents"].get(id).is_none()
+            || correlation.intent_id.as_deref() == Some(id.as_str())
+        {
+            reservation.correlation = Some(correlation.clone());
+        }
+    }
+    for (goal, entries) in &mut next.domain.boards {
+        let before = old["domain"]["boards"][goal].as_array().map_or(0, Vec::len);
+        for entry in entries.iter_mut().skip(before) {
+            entry.correlation = Some(correlation.clone());
+        }
+    }
+    for (id, finding) in &mut next.domain.findings {
+        if old["domain"]["findings"].get(id).is_none() {
+            finding.correlation = Some(correlation.clone());
+        }
+    }
+    for (id, attempt) in &mut next.domain.attempts {
+        if old["domain"]["attempts"].get(id).is_none() {
+            attempt.correlation = Some(correlation.clone());
+        }
+    }
+    for (id, need) in &mut next.domain.needs {
+        let before = old["domain"]["needs"][id]["decisions"]
+            .as_array()
+            .map_or(0, Vec::len);
+        for decision in need.decisions.iter_mut().skip(before) {
+            decision.correlation = Some(correlation.clone());
+        }
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KernelState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub diagnostic_reasons: BTreeMap<String, crate::telemetry::DiagnosticRecord>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub budget_pauses: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rate_pauses: BTreeMap<String, crate::telemetry::RatePause>,
     pub domain: DomainState,
     pub security: SecurityState,
     pub ledger: Ledger,
@@ -169,6 +400,81 @@ pub struct KernelState {
     pub egress: crate::flow::FlowMonitor,
 }
 impl KernelState {
+    pub fn rate_paused(&self, goal: &str, task: &str, now_ms: u64) -> bool {
+        self.domain.goal(goal).is_ok_and(|g| {
+            self.rate_pauses
+                .get(&diagnostic_key(goal, Some(task)))
+                .filter(|pause| pause.goal_version == g.spec.version)
+                .is_some_and(|pause| {
+                    let Some(quota) = self.quotas.configs.get(&pause.request.scope) else {
+                        return true;
+                    };
+                    let deadline = now_ms
+                        .saturating_add(1)
+                        .min(g.spec.expiry_ms)
+                        .min(quota.payload.expiry_ms);
+                    if deadline <= now_ms {
+                        return true;
+                    }
+                    // This read-only probe asks whether new work fits; it never revives the denied intent.
+                    let mut probe = pause.request.clone();
+                    probe.intent = format!(
+                        "rate-check-{}",
+                        hex(&crate::audit::hash(pause.request.intent.as_bytes()))
+                    );
+                    probe.deadline_ms = deadline;
+                    self.quotas
+                        .check_available(&probe, &pause.provider, now_ms)
+                        .is_err()
+                })
+        })
+    }
+    pub fn budget_paused(&self, goal: &str, task: &str) -> bool {
+        self.domain.goal(goal).is_ok_and(|g| {
+            [diagnostic_key(goal, Some(task)), diagnostic_key(goal, None)]
+                .iter()
+                .any(|key| self.budget_pauses.get(key) == Some(&g.spec.version))
+        })
+    }
+    pub fn correlation_for(
+        &self,
+        actor: &str,
+        goal: Option<&str>,
+        task: Option<&TaskContext>,
+        intent: Option<&str>,
+    ) -> Result<crate::telemetry::Correlation> {
+        let effect = intent.and_then(|id| self.effects.get(id));
+        if let Some(effect) = effect
+            && let Some(saved) = &effect.correlation
+        {
+            let mut correlation = saved.clone();
+            correlation.execution_attempt =
+                matches!(effect.state.as_str(), "dispatched" | "done" | "unknown").then_some(1);
+            correlation.validate()?;
+            return Ok(correlation);
+        }
+        let holder = effect.map_or(actor, |e| e.permit.payload.holder.as_str());
+        let mut correlation = crate::telemetry::Correlation::for_actor(&self.audit.log_id, holder);
+        correlation.run_id = self.run_id.clone();
+        if let Some(goal) = effect.map(|e| e.permit.payload.goal_id.as_str()).or(goal) {
+            self.domain.goal(goal)?;
+            correlation.goal_id = Some(goal.into());
+            if let Some(task) = effect.and_then(|e| e.task_context.as_ref()).or(task) {
+                let registered = self.domain.task(goal, &task.id)?;
+                ensure!(
+                    registered.goal_id == goal,
+                    "correlation Task belongs to another Goal"
+                );
+                correlation = correlation.with_task(goal, &task.id);
+            }
+        }
+        correlation.intent_id = intent.map(str::to_owned);
+        correlation.execution_attempt = effect
+            .filter(|e| matches!(e.state.as_str(), "dispatched" | "done" | "unknown"))
+            .map(|_| 1);
+        correlation.validate()?;
+        Ok(correlation)
+    }
     pub fn new(
         policy: Signed<DeploymentPolicy>,
         trusted_key: &Hash,
@@ -176,6 +482,10 @@ impl KernelState {
         deployment: String,
     ) -> Result<Self> {
         Ok(Self {
+            run_id: None,
+            diagnostic_reasons: BTreeMap::new(),
+            budget_pauses: BTreeMap::new(),
+            rate_pauses: BTreeMap::new(),
             domain: DomainState::new(),
             security: SecurityState::new(policy, trusted_key, now)?,
             ledger: Ledger::new("microusd".into())?,
@@ -215,6 +525,11 @@ impl KernelState {
                 .map_or(0, |event| event.timestamp),
         );
         self.audit.append_committed(AuditEvent {
+            correlation: self
+                .audit
+                .events()
+                .last()
+                .and_then(|event| event.correlation.clone()),
             id: format!("checkpoint/{id}"),
             kind: "state_checkpoint".into(),
             actor: actor.into(),
@@ -246,6 +561,18 @@ impl Reply {
         if !self.ok && self.value["code"] == "state_capacity" {
             return Err(StateCapacityError.into());
         }
+        if !self.ok && self.value["code"] == "budget_exhausted" {
+            return Err(crate::ledger::BudgetExhausted {
+                category: "registered",
+            }
+            .into());
+        }
+        if !self.ok && self.value["code"] == "provider_paused" {
+            return Err(serde_json::from_value::<crate::quota::QuotaPaused>(
+                self.value["quota_pause"].clone(),
+            )?
+            .into());
+        }
         ensure!(
             self.ok,
             "{}",
@@ -267,6 +594,219 @@ pub struct Kernel {
     pub response_store: Option<Arc<tokio::sync::Mutex<crate::artifacts::ArtifactStore>>>,
 }
 impl Kernel {
+    pub async fn correlation_for(
+        &self,
+        actor: &str,
+        goal: Option<&str>,
+        task: Option<&TaskContext>,
+        intent: Option<&str>,
+    ) -> Result<crate::telemetry::Correlation> {
+        self.control_state()
+            .await?
+            .correlation_for(actor, goal, task, intent)
+    }
+    pub async fn record_diagnostic(
+        &self,
+        id: &str,
+        subject: &AuthenticatedSubject,
+        goal: &str,
+        task: Option<&str>,
+        reason: crate::telemetry::DiagnosticReason,
+        observed_revision: u64,
+    ) -> Result<Reply> {
+        let read = self.cluster.read_control(STATE_KEY).await?;
+        ensure!(
+            observed_revision <= read.revision,
+            "diagnostic observation revision is not committed"
+        );
+        let state: KernelState = serde_json::from_value(read.value.context("deployment absent")?)?;
+        subject.ensure_current(crate::cluster::now_ms() / 1000)?;
+        ensure!(
+            state
+                .security
+                .policy
+                .payload
+                .trusted_components
+                .contains(subject.id()),
+            "diagnostic recorder is not trusted runtime"
+        );
+        let version = state.domain.goal(goal)?.spec.version;
+        let fence = task
+            .map(|id| state.domain.task(goal, id).map(|t| t.fencing_token))
+            .transpose()?;
+        let key = diagnostic_key(goal, task);
+        if let Some(previous) = state.diagnostic_reasons.get(&key)
+            && previous.reason == reason
+            && previous.goal_version == version
+            && previous.task_fence == fence
+        {
+            return Ok(Reply {
+                ok: true,
+                value: serde_json::to_value(previous)?,
+                duplicate: true,
+                revision: read.revision,
+            });
+        }
+        let context = task
+            .map(|id| {
+                state.domain.task(goal, id).map(|record| TaskContext {
+                    id: id.into(),
+                    incarnation: record.incarnation,
+                    fence: record.fencing_token,
+                })
+            })
+            .transpose()?;
+        let intent = match &reason {
+            crate::telemetry::DiagnosticReason::ProviderOutcome { intent_id, .. } => {
+                Some(intent_id.as_str())
+            }
+            _ => None,
+        };
+        let metadata = ActionCorrelationMetadata::DiagnosticObservation {
+            correlation: state.correlation_for(
+                subject.id(),
+                Some(goal),
+                context.as_ref(),
+                intent,
+            )?,
+            reason: reason.clone(),
+            observed_revision,
+        };
+        self.runtime_control_commit(id, subject, &metadata, |state| {
+            let version = state.domain.goal(goal)?.spec.version;
+            let context = task
+                .map(|id| {
+                    state.domain.task(goal, id).map(|record| TaskContext {
+                        id: id.into(),
+                        incarnation: record.incarnation,
+                        fence: record.fencing_token,
+                    })
+                })
+                .transpose()?;
+            let correlated_intent =
+                if let crate::telemetry::DiagnosticReason::ProviderOutcome { intent_id, outcome } =
+                    &reason
+                {
+                    let effect = state
+                        .effects
+                        .get(intent_id)
+                        .context("provider diagnostic effect absent")?;
+                    ensure!(
+                        effect.permit.payload.goal_id == goal
+                            && effect.task_context.as_ref().map(|task| task.id.as_str()) == task,
+                        "provider diagnostic scope differs from original intent"
+                    );
+                    let expected = match outcome {
+                        crate::provider::Outcome::Completed
+                        | crate::provider::Outcome::ReceiptWithoutCompletion => "done",
+                        crate::provider::Outcome::Unknown => "unknown",
+                        crate::provider::Outcome::DefinitelyNotDispatched => "not_dispatched",
+                    };
+                    ensure!(
+                        effect.state == expected
+                            && effect
+                                .result
+                                .as_ref()
+                                .is_some_and(|result| result["outcome"]["outcome"]
+                                    == serde_json::to_value(outcome).unwrap_or(Value::Null)),
+                        "provider diagnostic outcome differs from durable receipt metadata"
+                    );
+                    Some(intent_id.as_str())
+                } else {
+                    None
+                };
+            let correlation = state.correlation_for(
+                subject.id(),
+                Some(goal),
+                context.as_ref(),
+                correlated_intent,
+            )?;
+            let markings = diagnostic_markings(state, goal, task)?;
+            if let crate::telemetry::DiagnosticReason::MissingDependency { service } = &reason {
+                ensure!(
+                    !service.is_empty()
+                        && service.len() <= 128
+                        && !service.contains(['\r', '\n', '\0']),
+                    "invalid diagnostic dependency"
+                );
+            }
+            let record = crate::telemetry::DiagnosticRecord {
+                goal_id: goal.into(),
+                goal_version: version,
+                task_id: task.map(str::to_owned),
+                task_fence: context.as_ref().map(|t| t.fence),
+                reason: reason.clone(),
+                observed_revision,
+                recorded_ms: crate::cluster::now_ms(),
+                markings,
+                correlation,
+            };
+            store_diagnostic(state, key.clone(), record.clone());
+            Ok(serde_json::to_value(record)?)
+        })
+        .await
+    }
+    /// Fresh authenticated scoped inspection; no replay, admission, observation or revision write.
+    pub async fn explain(
+        &self,
+        subject: &AuthenticatedSubject,
+        goal: &str,
+        task: &TaskContext,
+        leases: &[LeaseCheck],
+    ) -> Result<Value> {
+        let view = self.cluster.view_control().await?;
+        let state: KernelState =
+            serde_json::from_value(view.kv.get(STATE_KEY).context("deployment absent")?.clone())?;
+        let now = crate::cluster::now_ms();
+        subject.ensure_current(now / 1000)?;
+        check_allocation(subject, leases)?;
+        check_task(&state, subject, Some(task), false)?;
+        for check in leases {
+            ensure!(
+                view.leases
+                    .get(&check.id)
+                    .is_some_and(|lease| !lease.revoked
+                        && lease.holder == check.holder
+                        && lease.fence == check.fence
+                        && lease.expires_ms > now),
+                "diagnostic allocation fenced"
+            );
+        }
+        let markings = diagnostic_markings(&state, goal, Some(&task.id))?;
+        let grant = state
+            .security
+            .grants
+            .values()
+            .filter(|grant| {
+                grant.goal_id == goal && grant.holder.uri().ok().as_deref() == Some(subject.id())
+            })
+            .find_map(|grant| state.security.live_grant(&grant.id, now / 1000).ok())
+            .context("diagnostic current grant absent")?;
+        ensure!(
+            grant
+                .capabilities
+                .iter()
+                .any(|cap| cap.kind == security::CapabilityKind::ToolCall
+                    && cap.resource.matches(&format!("task/{goal}"))
+                    && cap.constraints.operations.contains("task_work")
+                    && cap.not_before <= now / 1000
+                    && cap.expiry > now / 1000
+                    && markings.is_subset(&cap.constraints.read_markings)),
+            "diagnostic read clearance denied"
+        );
+        let version = state.domain.goal(goal)?.spec.version;
+        let record = state
+            .diagnostic_reasons
+            .get(&diagnostic_key(goal, Some(&task.id)))
+            .or_else(|| state.diagnostic_reasons.get(&diagnostic_key(goal, None)))
+            .filter(|record| {
+                record.goal_version == version
+                    && record.task_fence.is_none_or(|fence| fence == task.fence)
+            });
+        Ok(
+            json!({"revision":view.revision,"goal_id":goal,"task_id":task.id,"record":record,"reason":record.map(|r|r.reason.clone()).unwrap_or(crate::telemetry::DiagnosticReason::Unknown)}),
+        )
+    }
     pub async fn bootstrap(&self, state: KernelState) -> Result<()> {
         state.validate()?;
         let mut tx = Transaction::new(
@@ -378,6 +918,7 @@ impl Kernel {
                 let flags = state.egress.record(flow.clone(), now)?;
                 for flag in flags {
                     state.audit.append_committed(AuditEvent {
+                        correlation: None,
                         id: format!("egress-flag/{}", flag.id),
                         kind: "egress_anomaly".into(),
                         actor: flag.holder.clone(),
@@ -711,30 +1252,65 @@ impl Kernel {
             "workload-denial-{}",
             hex(&content_hash(&(proof_hash, reason_hash))?)
         );
-        self.runtime_commit(
-            &id,
-            executor,
-            &(peer.subject.id(), proof_hash, reason_hash),
-            |state| {
-                let timestamp = (crate::cluster::now_ms() / 1000).max(
-                    state
-                        .audit
-                        .events()
-                        .last()
-                        .map_or(0, |event| event.timestamp),
-                );
-                state.audit.append_committed(AuditEvent {
-                    id: format!("denial/{id}"),
-                    kind: "workload_request_denied".into(),
-                    actor: peer.subject.id().into(),
-                    goal: Some(peer.workload.goal.clone()),
-                    timestamp,
-                    decision: "deny".into(),
-                    payload_hash: content_hash(&(proof_hash, reason_hash))?,
-                })?;
-                Ok(json!({"denial_recorded":true}))
-            },
-        )
+        let state = self.control_state().await?;
+        let mut assigned = state.domain.tasks.values().filter(|task| {
+            task.goal_id == peer.workload.goal
+                && task.claimed_by.as_deref() == Some(peer.subject.id())
+        });
+        let first = assigned.next();
+        let task = if assigned.next().is_none() {
+            first.map(|record| TaskContext {
+                id: record.spec.id.clone(),
+                incarnation: record.incarnation,
+                fence: record.fencing_token,
+            })
+        } else {
+            None
+        };
+        let proposed_intent = if message.path == "/model" {
+            Some(format!("model-{}", message.request_id))
+        } else if message.path.starts_with("/tool/") {
+            Some(format!("tool-{}", message.request_id))
+        } else {
+            None
+        };
+        let intent = proposed_intent.as_deref().filter(|intent| {
+            state
+                .effects
+                .get(*intent)
+                .is_some_and(|effect| effect.permit.payload.holder == peer.subject.id())
+        });
+        let correlation = state.correlation_for(
+            peer.subject.id(),
+            Some(&peer.workload.goal),
+            task.as_ref(),
+            intent,
+        )?;
+        let metadata = ActionCorrelationMetadata::AuthenticatedWorkloadDenial {
+            correlation: correlation.clone(),
+            proof_hash,
+            reason_hash,
+        };
+        self.runtime_commit(&id, executor, &metadata, |state| {
+            let timestamp = (crate::cluster::now_ms() / 1000).max(
+                state
+                    .audit
+                    .events()
+                    .last()
+                    .map_or(0, |event| event.timestamp),
+            );
+            state.audit.append_committed(AuditEvent {
+                correlation: Some(correlation.clone()),
+                id: format!("denial/{id}"),
+                kind: "workload_request_denied".into(),
+                actor: peer.subject.id().into(),
+                goal: Some(peer.workload.goal.clone()),
+                timestamp,
+                decision: "deny".into(),
+                payload_hash: content_hash(&(proof_hash, reason_hash))?,
+            })?;
+            Ok(json!({"denial_recorded":true}))
+        })
         .await?
         .require()?;
         Ok(())
@@ -938,6 +1514,7 @@ impl Kernel {
             "invalid request identity"
         );
         let request_hash = content_hash(&(actor, request))?;
+        let request_metadata = serde_json::to_value(request)?;
         let _writer = self.cluster.kernel_write(control).await;
         for _ in 0..16 {
             let read = if control {
@@ -1025,6 +1602,7 @@ impl Kernel {
                 });
             }
             let mut next = state.clone();
+            let audit_start = next.audit.events().len();
             let (ok, value) = match mutate(&mut next) {
                 Ok(value) => {
                     next.validate()?;
@@ -1033,6 +1611,91 @@ impl Kernel {
                 Err(error) => {
                     next = state;
                     let mut value = json!({"error":error.to_string()});
+                    if let Some(paused) = error.downcast_ref::<crate::quota::QuotaPaused>() {
+                        value["code"] = json!("provider_paused");
+                        value["retry_after_ms"] = json!(paused.retry_after_ms);
+                        value["quota_pause"] = serde_json::to_value(paused)?;
+                        let correlation = committed_correlation(&next, actor, &request_metadata)?;
+                        if let (Some(goal), Some(task), Some(values)) = (
+                            &correlation.goal_id,
+                            &correlation.task_id,
+                            request_metadata.as_array(),
+                        ) && values.len() == 9
+                        {
+                            let request: crate::quota::QuotaRequest =
+                                serde_json::from_value(values[4].clone())?;
+                            let provider = values[8]
+                                .as_str()
+                                .context("quota pause provider absent")?
+                                .to_owned();
+                            let version = next.domain.goal(goal)?.spec.version;
+                            next.rate_pauses.insert(
+                                diagnostic_key(goal, Some(task)),
+                                crate::telemetry::RatePause {
+                                    goal_version: version,
+                                    request,
+                                    provider,
+                                    pause: paused.clone(),
+                                },
+                            );
+                            let record = crate::telemetry::DiagnosticRecord {
+                                goal_id: goal.clone(),
+                                goal_version: version,
+                                task_id: Some(task.clone()),
+                                task_fence: next
+                                    .domain
+                                    .task(goal, task)
+                                    .ok()
+                                    .map(|t| t.fencing_token),
+                                reason: crate::telemetry::DiagnosticReason::RateLimited {
+                                    retry_after_ms: paused.retry_after_ms,
+                                    quota_kind: paused.kind,
+                                },
+                                observed_revision: read.revision,
+                                recorded_ms: crate::cluster::now_ms(),
+                                markings: diagnostic_markings(&next, goal, Some(task))?,
+                                correlation: correlation.clone(),
+                            };
+                            store_diagnostic(&mut next, diagnostic_key(goal, Some(task)), record);
+                        }
+                    }
+                    if error
+                        .downcast_ref::<crate::ledger::BudgetExhausted>()
+                        .is_some()
+                    {
+                        value["code"] = json!("budget_exhausted");
+                        let correlation = committed_correlation(&next, actor, &request_metadata)?;
+                        if let Some(goal) = &correlation.goal_id
+                            && let Ok(registered) = next.domain.goal(goal)
+                        {
+                            let record = crate::telemetry::DiagnosticRecord {
+                                goal_id: goal.clone(),
+                                goal_version: registered.spec.version,
+                                task_id: correlation.task_id.clone(),
+                                task_fence: correlation.task_id.as_ref().and_then(|id| {
+                                    next.domain.task(goal, id).ok().map(|t| t.fencing_token)
+                                }),
+                                reason: crate::telemetry::DiagnosticReason::BudgetExhausted,
+                                observed_revision: read.revision,
+                                recorded_ms: crate::cluster::now_ms(),
+                                markings: diagnostic_markings(
+                                    &next,
+                                    goal,
+                                    correlation.task_id.as_deref(),
+                                )?,
+                                correlation: correlation.clone(),
+                            };
+                            next.budget_pauses.insert(
+                                diagnostic_key(goal, correlation.task_id.as_deref()),
+                                record.goal_version,
+                            );
+                            store_diagnostic(
+                                &mut next,
+                                diagnostic_key(goal, correlation.task_id.as_deref()),
+                                record,
+                            );
+                        }
+                    }
                     if error.downcast_ref::<StateCapacityError>().is_some() {
                         value["code"] = json!("state_capacity");
                     }
@@ -1073,6 +1736,7 @@ impl Kernel {
             }
             if local_application && record_id != id && !next.replies.contains_key(&binding_id) {
                 next.audit.append_committed(AuditEvent {
+                    correlation: None,
                     id: format!("request/{binding_id}"),
                     kind: "kernel_request".into(),
                     actor: actor.into(),
@@ -1082,8 +1746,9 @@ impl Kernel {
                     payload_hash: request_hash,
                 })?;
                 next.replies.insert(
-                    binding_id,
+                    binding_id.clone(),
                     RecordedReply {
+                        correlation: None,
                         actor: actor.into(),
                         request: serde_json::to_value(request)?,
                         request_hash,
@@ -1093,6 +1758,7 @@ impl Kernel {
                 );
             }
             next.audit.append_committed(AuditEvent {
+                correlation: None,
                 id: format!("request/{record_id}"),
                 kind: "kernel_request".into(),
                 actor: actor.into(),
@@ -1104,6 +1770,7 @@ impl Kernel {
             next.replies.insert(
                 record_id.clone(),
                 RecordedReply {
+                    correlation: None,
                     actor: actor.into(),
                     request: serde_json::to_value(request)?,
                     request_hash,
@@ -1111,6 +1778,15 @@ impl Kernel {
                     value: value.clone(),
                 },
             );
+            let correlation = committed_correlation(&next, actor, &request_metadata)?;
+            next.audit.correlate_new(audit_start, &correlation);
+            correlate_action_records(&old, &mut next, &correlation);
+            if let Some(reply) = next.replies.get_mut(&record_id) {
+                reply.correlation = Some(correlation.clone());
+            }
+            if let Some(reply) = next.replies.get_mut(&binding_id) {
+                reply.correlation = Some(correlation.clone());
+            }
             next.checkpoint(&record_id, actor, timestamp)?;
             let encoded = serde_json::to_vec(&next)?;
             ensure_state_capacity(&next, encoded.len(), self.max_state_bytes, control)?;
@@ -1305,10 +1981,19 @@ impl Kernel {
                 &selected,
             ))?;
             let phase_id = format!("{id}/{}", hex(&phase));
+            let mut admission_correlation = state.correlation_for(
+                subject.id(),
+                Some(&state.security.grants[&request.grant_id].goal_id),
+                task.as_ref(),
+                Some(&request.intent_id),
+            )?;
+            // Admission describes the frozen pre-execution action. Later dispatch/receipt
+            // observation must not alter this exact replay binding.
+            admission_correlation.execution_attempt = None;
             drop(state); // The immutable review owns everything needed; do not queue a full deployment snapshot.
             #[cfg(test)]
             admission_sync::after_review(&request.intent_id).await;
-            let reply = self.commit(&phase_id, subject.id(), &(content_hash(&request)?, content_hash(&payload)?, content_hash(&prices)?, content_hash(&approvals)?, &quota, &task,&phase), leases.clone(), |state| {
+            let reply = self.commit(&phase_id, subject.id(), &(content_hash(&request)?, content_hash(&payload)?, content_hash(&prices)?, content_hash(&approvals)?, &quota, &task,&phase,&admission_correlation,&prices.as_ref().map(|price|price.payload.provider.clone())), leases.clone(), |state| {
                 let now=(crate::cluster::now_ms() / 1000).max(now);
             action_service(&state.modules,&request.action.operation)?;
             check_search_action(state,&request,&payload,task.as_ref(),crate::cluster::now_ms())?;
@@ -1316,6 +2001,9 @@ impl Kernel {
             if matches!(request.action.operation.as_str(),"inference"|"attempt_submit"){ensure!(search_open(state,&state.security.grants[&request.grant_id].goal_id),"final selection closed paid search for this Goal version");}
             ensure!(request.action.arguments == payload, "admitted payload differs from authorized arguments");
             check_task(state, subject, task.as_ref(), payload["kind"] == "claim_task")?;
+            if request.envelope_id.is_some() && task.as_ref().is_some_and(|task|state.budget_paused(&state.security.grants[&request.grant_id].goal_id,&task.id)) {
+                return Err(crate::ledger::BudgetExhausted{category:"paused Task"}.into());
+            }
             let mut review=state.security.confirmation_review(subject,&request,&state.ledger,now)?;
             if let Some(price)=&prices { review.expiry=review.expiry.min(price.payload.expires); }
             if let Some(quota)=&quota { review.expiry=review.expiry.min(quota.deadline_ms/1000); }
@@ -1330,7 +2018,7 @@ impl Kernel {
             if !state.security.review_confirmed(&review,&selected,now)? {
                 let pending=PendingAction{request:request.clone(),payload:payload.clone(),prices:prices.clone(),quota:quota.clone(),task:task.clone(),review:review.clone()};
                 state.pending_actions.insert(request.intent_id.clone(),pending);
-                state.audit.append_committed(AuditEvent{id:format!("review/{}/{}",request.intent_id,hex(&phase)),kind:"confirmation_required".into(),actor:subject.id().into(),goal:Some(state.security.grants[&request.grant_id].goal_id.clone()),timestamp:now,decision:"pending_human_confirmation".into(),payload_hash:content_hash(&review)?})?;
+                state.audit.append_committed(AuditEvent{ correlation: None,id:format!("review/{}/{}",request.intent_id,hex(&phase)),kind:"confirmation_required".into(),actor:subject.id().into(),goal:Some(state.security.grants[&request.grant_id].goal_id.clone()),timestamp:now,decision:"pending_human_confirmation".into(),payload_hash:content_hash(&review)?})?;
                 return Ok(json!({"status":"confirmation_required","intent":request.intent_id,"review":review}));
             }
             let decision = state.security.authorize(subject, request.clone(), &selected, prices.as_ref(), &mut state.ledger, &self.signer, now)?;
@@ -1344,7 +2032,7 @@ impl Kernel {
             }
             state.pending_actions.remove(&request.intent_id);
             state.audit.append_committed(decision.audit)?;
-            let effect = Effect { request: request.clone(), payload: payload.clone(), permit: decision.permit, state: "pending".into(), result: None, task_context: task.clone() };
+            let effect = Effect { correlation: None, request: request.clone(), payload: payload.clone(), permit: decision.permit, state: "pending".into(), result: None, task_context: task.clone() };
             state.effects.insert(request.intent_id.clone(), effect.clone()); Ok(effect_ack(&effect))
         }).await?;
             if reply.ok && reply.value["status"] == "authority_changed" {
@@ -2658,7 +3346,7 @@ impl Kernel {
             };
             state.audit.append_committed(decision.audit)?;
             if !stop {
-                state.audit.append_committed(AuditEvent {
+                state.audit.append_committed(AuditEvent { correlation: None,
                     id: format!("policy-flag/{}", request.intent_id),
                     kind: "policy_flag".into(),
                     actor: subject.id().into(),
@@ -2669,7 +3357,7 @@ impl Kernel {
                 })?;
             }
             let result = json!({"scope":request.action.arguments["scope"],"flagged":!stop,"engaged":stop,"epoch":state.security.stop_epoch});
-            state.effects.insert(request.intent_id.clone(), Effect { request: request.clone(), payload: request.action.arguments.clone(), permit: decision.permit, state: "done".into(), result: Some(result.clone()), task_context: None });
+            state.effects.insert(request.intent_id.clone(), Effect { correlation: None, request: request.clone(), payload: request.action.arguments.clone(), permit: decision.permit, state: "done".into(), result: Some(result.clone()), task_context: None });
             Ok(result)
         }).await
     }
@@ -3983,6 +4671,7 @@ impl Kernel {
                 }
                 let signed = signer.sign("operator-authentication", outcome.clone())?;
                 state.audit.append_committed(AuditEvent {
+                    correlation: None,
                     id: format!("authentication/{id}"),
                     kind: "authentication".into(),
                     actor: actor.clone(),
@@ -4008,6 +4697,86 @@ impl Kernel {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_empty_telemetry_fields_preserve_snapshot_and_checkpoint_hashes() {
+        let fixture = crate::security::test_support::fixture();
+        let mut state = KernelState::new(
+            fixture.policy.clone(),
+            &fixture.signer.public_key(),
+            fixture.now,
+            "legacy-snapshot".into(),
+        )
+        .unwrap();
+        let checkpoint = state.content_hash().unwrap();
+        state
+            .audit
+            .append(AuditEvent {
+                correlation: None,
+                id: "checkpoint/original".into(),
+                kind: "state_checkpoint".into(),
+                actor: "legacy-operator".into(),
+                goal: None,
+                timestamp: fixture.now,
+                decision: "committed".into(),
+                payload_hash: checkpoint,
+            })
+            .unwrap();
+        let original = serde_json::to_value(&state).unwrap();
+        for field in [
+            "run_id",
+            "diagnostic_reasons",
+            "budget_pauses",
+            "rate_pauses",
+        ] {
+            assert!(original.get(field).is_none());
+        }
+        assert!(original["audit"]["events"][0].get("correlation").is_none());
+        let restored: KernelState = serde_json::from_value(original.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&restored).unwrap(), original);
+        assert_eq!(restored.content_hash().unwrap(), checkpoint);
+        assert_eq!(
+            restored
+                .audit
+                .signed_head(&fixture.signer, fixture.now)
+                .unwrap()
+                .payload,
+            state
+                .audit
+                .signed_head(&fixture.signer, fixture.now)
+                .unwrap()
+                .payload
+        );
+    }
+    /// Only the diagnostic cache is manipulated on a retained test copy; authority was created normally.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn diagnostic_cache_eviction_cannot_clear_a_normally_registered_budget_pause() {
+        let h = crate::node::receiver_tests::Harness::open_with_funding_cap(1).await;
+        assert_eq!(
+            h.send("eviction-claim", "/tool/claim_task", json!({}))
+                .await
+                .0,
+            200
+        );
+        let denied=h.send("eviction-budget","/model",json!({"model":"m1","messages":[{"role":"user","content":"declared budget is too small"}],"max_tokens":16})).await;
+        assert_eq!(denied.1["code"], "budget_exhausted");
+        let mut retained = h.kernel.state().await.unwrap();
+        assert!(retained.budget_paused("g", "task-1"));
+        let record = retained.diagnostic_reasons["g/task-1"].clone();
+        for index in 0..8193 {
+            let mut diagnostic = record.clone();
+            diagnostic.task_id = Some(format!("cache-only-{index}"));
+            diagnostic.recorded_ms = record.recorded_ms + index as u64 + 1;
+            diagnostic.reason = crate::telemetry::DiagnosticReason::Unknown;
+            store_diagnostic(&mut retained, format!("g/cache-only-{index}"), diagnostic);
+        }
+        assert_eq!(retained.diagnostic_reasons.len(), 8192);
+        assert!(!retained.diagnostic_reasons.contains_key("g/task-1"));
+        assert!(retained.budget_paused("g", "task-1"));
+        let decoded: KernelState =
+            serde_json::from_slice(&serde_json::to_vec(&retained).unwrap()).unwrap();
+        assert!(decoded.budget_paused("g", "task-1"));
+        h.close().await;
+    }
     use super::*;
     use crate::{
         cluster::{ClusterConfig, NodeAddress},
@@ -4306,6 +5075,23 @@ mod tests {
             .unwrap();
         assert!(!first.duplicate);
         first.require().unwrap();
+        let dispatched_state = kernel.state().await.unwrap();
+        let dispatched_revision = cluster.view_control().await.unwrap().revision;
+        assert!(
+            kernel
+                .admit("admit", &fixture.subject, admission())
+                .await
+                .unwrap()
+                .duplicate
+        );
+        assert_eq!(
+            cluster.view_control().await.unwrap().revision,
+            dispatched_revision
+        );
+        assert_eq!(
+            kernel.state().await.unwrap().content_hash().unwrap(),
+            dispatched_state.content_hash().unwrap()
+        );
         assert!(
             kernel
                 .dispatch("dispatch", &fixture.subject, "effect-1", checks.clone())
@@ -4329,6 +5115,18 @@ mod tests {
         assert_eq!(
             kernel.state().await.unwrap().ledger.intents["effect-1"].state,
             IntentState::Unknown
+        );
+        let unknown_state = kernel.state().await.unwrap();
+        assert!(
+            kernel
+                .admit("admit", &fixture.subject, admission())
+                .await
+                .unwrap()
+                .duplicate
+        );
+        assert_eq!(
+            kernel.state().await.unwrap().content_hash().unwrap(),
+            unknown_state.content_hash().unwrap()
         );
         let state = kernel.state().await.unwrap();
         let request_hash = state.ledger.intents["effect-1"].request.request_hash;
@@ -4394,6 +5192,26 @@ mod tests {
         let state = kernel.state().await.unwrap();
         assert_eq!(state.ledger.accounts["global"].total.spent, 7);
         assert_eq!(state.ledger.accounts["global"].total.held, 0);
+        let settled_hash = state.content_hash().unwrap();
+        assert!(
+            kernel
+                .admit("admit", &fixture.subject, admission())
+                .await
+                .unwrap()
+                .duplicate
+        );
+        assert_eq!(
+            kernel.state().await.unwrap().content_hash().unwrap(),
+            settled_hash
+        );
+        assert_eq!(
+            state.effects["effect-1"]
+                .correlation
+                .as_ref()
+                .unwrap()
+                .execution_attempt,
+            Some(1)
+        );
         assert_eq!(
             state.audit.events().last().unwrap().payload_hash,
             state.content_hash().unwrap()

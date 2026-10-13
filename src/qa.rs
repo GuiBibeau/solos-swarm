@@ -931,6 +931,8 @@ impl QaClient for AuthenticatedClient {
                         .get(session)
                         .context("admitted agent session missing")?;
                     let mut message = Message {
+                        traceparent: None,
+                        tracestate: None,
                         request_id: request_id.into(),
                         issued_ms: crate::cluster::now_ms(),
                         path: path.clone(),
@@ -946,6 +948,7 @@ impl QaClient for AuthenticatedClient {
                             session.endpoint.trim_end_matches('/'),
                             path
                         ))
+                        .headers(message.trace_headers()?)
                         .json(&message)
                         .send()
                         .await?;

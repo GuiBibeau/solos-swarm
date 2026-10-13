@@ -199,11 +199,13 @@ fn append(
             .map_or(0, |event| event.timestamp),
     );
     let id = format!("{kind}/{}", record.intent);
+    let correlation = state.correlation_for(actor, None, None, Some(&record.intent))?;
     state.audit.append_committed(AuditEvent {
+        goal: correlation.goal_id.clone(),
+        correlation: Some(correlation),
         id: id.clone(),
         kind: kind.into(),
         actor: actor.into(),
-        goal: None,
         timestamp,
         decision: "committed".into(),
         payload_hash: content_hash(record)?,

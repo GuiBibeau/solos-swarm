@@ -389,6 +389,7 @@ mod tests {
         state.attempts.insert(
             format!("goal/{id}"),
             Attempt {
+                correlation: None,
                 planning_round_id: "test-historical-round".into(),
                 id: id.clone(),
                 goal_id: "goal".into(),

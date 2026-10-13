@@ -438,6 +438,12 @@ impl Provider for OpenAiProvider {
                     request.deadline_ms.saturating_sub(now_ms()),
                 ))
                 .json(&body(&request, &features));
+            if let Some((parent, state)) = crate::diagnostics::current_trace_headers() {
+                http = http.header("traceparent", parent);
+                if let Some(state) = state {
+                    http = http.header("tracestate", state);
+                }
+            }
             if let Some(key) = &credential {
                 http = http.bearer_auth(key.as_str());
             }
