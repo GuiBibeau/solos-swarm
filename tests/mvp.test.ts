@@ -61,7 +61,7 @@ test("MVP extension binds mTLS signatures and preserves unresolved intents acros
   assert.deepEqual(ids.get("/tool/confirm"), ["original", "original", "fresh-intent"]);
 });
 
-test("default MVP extension in pinned Pi registers its authenticated session and completes the scoped tool loop", {timeout: 30_000}, async (t) => {
+test("pinned Pi preserves iterative attempts and executes the final scoped batch sequentially without another model call", {timeout: 30_000}, async (t) => {
   assert.equal(JSON.parse(await readFile(resolve("node_modules/@earendil-works/pi-coding-agent/package.json"), "utf8")).version, "1.1.0");
   const dir = await mkdtemp(join(tmpdir(), "solos-mvp-pi-"));
   const openssl = (...args: string[]) => execFileSync("openssl", args, {cwd: dir, stdio: "ignore"});
@@ -78,11 +78,15 @@ test("default MVP extension in pinned Pi registers its authenticated session and
   const tools = [
     {name: "claim_task", description: "Claim the admitted Task", parameters: {type: "object", properties: {}, additionalProperties: false}},
     {name: "submit_finding", description: "Submit the assigned evidence", parameters: {type: "object", properties: {body: {type: "object", properties: {}, additionalProperties: true}}, required: ["body"], additionalProperties: false}},
+    {name: "submit_attempt", description: "Submit a candidate for evaluation", parameters: {type: "object", properties: {payload: {type: "object", additionalProperties: true}}, required: ["payload"], additionalProperties: false}},
+    {name: "complete_task", description: "Complete the assigned Task using its own Finding", parameters: {type: "object", properties: {result_ref: {type: "string"}}, required: ["result_ref"], additionalProperties: false}},
   ];
   const calls: Array<{path: string; id: string; payload: any}> = [];
   const serverFailures: Error[] = [];
   let modelCalls = 0;
   let claimed = false;
+  let finalSubmitted = false;
+  let completed = false;
   const server = createServer({key: await readFile(join(dir, "server.key")), cert: await readFile(join(dir, "server.pem")), ca, requestCert: true, rejectUnauthorized: true, minVersion: "TLSv1.3", maxVersion: "TLSv1.3"}, async (req, res) => {
     try {
       const chunks: Buffer[] = []; for await (const chunk of req) chunks.push(chunk);
@@ -115,6 +119,9 @@ test("default MVP extension in pinned Pi registers its authenticated session and
         const claim = {id: "claim-1", type: "function", function: {name: "claim_task", arguments: "{}"}};
         const finding = {id: "finding-1", type: "function", function: {name: "submit_finding", arguments: JSON.stringify({body: {fact: "Verified Ω\u2028 from task-1"}})}};
         const forged = {id: "forged-1", type: "function", function: {name: "bash", arguments: JSON.stringify({command: "touch forbidden-side-effect"})}};
+        const attempt = {id: "attempt-search", type: "function", function: {name: "submit_attempt", arguments: JSON.stringify({payload: {phase: "search"}})}};
+        const finalAttempt = {id: "attempt-final", type: "function", function: {name: "submit_attempt", arguments: JSON.stringify({payload: {phase: "final"}})}};
+        const complete = {id: "complete-final", type: "function", function: {name: "complete_task", arguments: JSON.stringify({result_ref: "finding-result-1"})}};
         if (modelCalls > 1) {
           assert.ok(payload.messages.some((message: any) => message.role === "tool" && message.tool_call_id === "claim-1" && message.content.includes("task-1")));
         }
@@ -122,7 +129,9 @@ test("default MVP extension in pinned Pi registers its authenticated session and
           assert.ok(payload.messages.some((message: any) => message.role === "tool" && message.tool_call_id === "finding-1" && message.content.includes("accepted")));
           assert.ok(payload.messages.some((message: any) => message.role === "tool" && message.tool_call_id === "forged-1" && /not found|compiled definition/i.test(message.content)));
         }
-        const selected = modelCalls === 1 ? [claim] : modelCalls === 2 ? [finding, forged] : null;
+        if (modelCalls === 4) assert.ok(payload.messages.some((message: any) => message.role === "tool" && message.tool_call_id === "attempt-search" && message.content.includes("accepted")));
+        assert.ok(modelCalls <= 5, "The final batch must settle without a sixth model request");
+        const selected = modelCalls === 1 ? [claim] : modelCalls === 2 ? [finding, forged] : modelCalls === 3 ? [attempt] : modelCalls === 5 ? [finalAttempt, complete] : null;
         return res.end(JSON.stringify({id: `mvp-receipt-${modelCalls}`, created: 1, model: modelId, swarm_cost_microusd: 7,
           choices: [{index: 0, message: selected ? {role: "assistant", content: null, tool_calls: selected} : {role: "assistant", content: "MVP finished Ω\u2028 with scoped evidence."}, finish_reason: selected ? "tool_calls" : "stop"}],
           usage: {prompt_tokens: 20, completion_tokens: 3, total_tokens: 23, prompt_cache_hit_tokens: 2},
@@ -134,6 +143,27 @@ test("default MVP extension in pinned Pi registers its authenticated session and
         assert.equal(message.request_id, "tool-claim-1");
         claimed = true;
         return res.end(JSON.stringify({task_id: "task-1", input: {fact: "synthetic scoped input"}}));
+      }
+      if (message.path === "/tool/submit_attempt") {
+        assert.equal(claimed, true);
+        if (message.request_id === "tool-attempt-final") {
+          assert.deepEqual(payload, {payload: {phase: "final"}});
+          // Pi defaults to parallel tools. The extension must wait for this reply
+          // before executing CompleteTask from the same assistant message.
+          await new Promise((done) => setTimeout(done, 100));
+          finalSubmitted = true;
+        } else {
+          assert.equal(message.request_id, "tool-attempt-search");
+          assert.deepEqual(payload, {payload: {phase: "search"}});
+        }
+        return res.end(JSON.stringify({accepted: true}));
+      }
+      if (message.path === "/tool/complete_task") {
+        assert.equal(finalSubmitted, true, "CompleteTask must follow the committed final submission");
+        assert.deepEqual(payload, {result_ref: "finding-result-1"});
+        assert.equal(message.request_id, "tool-complete-final");
+        completed = true;
+        return res.end(JSON.stringify({accepted: true}));
       }
       assert.equal(message.path, "/tool/submit_finding");
       assert.equal(claimed, true);
@@ -157,7 +187,9 @@ test("default MVP extension in pinned Pi registers its authenticated session and
   let stderr = "";
   child.stderr.setEncoding("utf8"); child.stderr.on("data", (chunk) => {stderr += chunk;});
   const records: any[] = [];
-  const settled = new Promise<void>((done, reject) => {
+  let pending: {done: () => void; reject: (error: unknown) => void} | undefined;
+  const waitForSettled = () => new Promise<void>((done, reject) => {pending = {done, reject};});
+  {
     let buffer = "";
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
@@ -168,22 +200,23 @@ test("default MVP extension in pinned Pi registers its authenticated session and
         if (!line) continue;
         try {
           const record = JSON.parse(line); records.push(record);
-          if (record.type === "response" && record.success === false) reject(new Error(JSON.stringify(record)));
-          if (record.type === "extension_error") reject(new Error(JSON.stringify(record)));
-          if (record.type === "agent_settled") done();
-        } catch (error) {reject(error);}
+          if (record.type === "response" && record.success === false) pending?.reject(new Error(JSON.stringify(record)));
+          if (record.type === "extension_error") pending?.reject(new Error(JSON.stringify(record)));
+          if (record.type === "agent_settled") {pending?.done(); pending = undefined;}
+        } catch (error) {pending?.reject(error);}
       }
     });
-    child.on("error", reject);
-    child.on("exit", (code) => reject(new Error(`MVP Pi exited ${code}: ${stderr}`)));
-  });
+    child.on("error", (error) => pending?.reject(error));
+    child.on("exit", (code) => pending?.reject(new Error(`MVP Pi exited ${code}: ${stderr}`)));
+  }
   try {
+    const settled = waitForSettled();
     child.stdin.write(`${JSON.stringify({id: "mvp-prompt", type: "prompt", message: "Claim your admitted task, submit its evidence, then finish."})}\n`);
     await settled;
     assert.deepEqual(serverFailures, [], stderr);
-    assert.equal(modelCalls, 3, `${stderr}\n${JSON.stringify(records.filter((record) => record.type === "message_end"))}`);
+    assert.equal(modelCalls, 4, `${stderr}\n${JSON.stringify(records.filter((record) => record.type === "message_end"))}`);
     assert.equal(calls[0].path, "/session");
-    assert.deepEqual(calls.filter((call) => call.path.startsWith("/tool/")).map((call) => call.path), ["/tool/claim_task", "/tool/submit_finding"]);
+    assert.deepEqual(calls.filter((call) => call.path.startsWith("/tool/")).map((call) => call.path), ["/tool/claim_task", "/tool/submit_finding", "/tool/submit_attempt"]);
     assert.equal(new Set(calls.map((call) => call.id)).size, calls.length);
     await assert.rejects(access(join(dir, "forbidden-side-effect")));
     const final = records.filter((record) => record.type === "message_end" && record.message.role === "assistant").at(-1)?.message;
@@ -191,6 +224,14 @@ test("default MVP extension in pinned Pi registers its authenticated session and
     assert.equal(final?.content[0].text, "MVP finished Ω\u2028 with scoped evidence.");
     assert.equal(final?.usage.cost.total, 0.000007);
     assert.equal(final?.usage.cacheRead, 2);
+    const finalSettled = waitForSettled();
+    child.stdin.write(`${JSON.stringify({id: "mvp-final", type: "prompt", message: "Submit the final candidate and complete the Task in one ordered assistant batch."})}\n`);
+    await finalSettled;
+    assert.deepEqual(serverFailures, [], stderr);
+    assert.equal(modelCalls, 5, "The final two-tool batch must not request another model completion");
+    assert.equal(finalSubmitted, true);
+    assert.equal(completed, true);
+    assert.deepEqual(calls.filter((call) => call.path.startsWith("/tool/")).slice(-2).map((call) => call.path), ["/tool/submit_attempt", "/tool/complete_task"]);
   } finally {
     child.kill("SIGKILL");
     server.closeAllConnections();

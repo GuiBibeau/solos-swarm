@@ -75,6 +75,14 @@ fn save(path: &Path, value: &impl Serialize) -> Result<()> {
 pub fn worker_entry(policy_path: &Path) -> Result<()> {
     let policy: InnerPolicy = serde_json::from_slice(&fs::read(policy_path)?)?;
     crate::sandbox::install_inner_guard(&policy, false)?;
+    // WASI exposes memory streams and timers, so its host executor needs no signal/network I/O.
+    // Build after sealing: every executor thread inherits the same filesystem/syscall guard.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_time()
+        .build()
+        .context("WASI timer executor startup failed")?;
+    let _runtime_scope = runtime.enter();
     let mut bytes = Vec::new();
     std::io::stdin()
         .take(8 * 1024 * 1024 + 1)
@@ -382,17 +390,46 @@ async fn run_with_path(
         stdin.shutdown().await?;
         drop(stdin);
         let status = child.wait().await?;
-        ensure!(
-            status.success(),
-            "isolated WASI worker failed or exceeded resource limits"
-        );
-        let response: Response = serde_json::from_slice(&stdout.await??)?;
-        let _ = stderr.await??;
-        ensure!(
-            response.ok,
-            "{}",
-            response.error.as_deref().unwrap_or("WASI worker refused")
-        );
+        let raw_stdout = stdout.await??;
+        let raw_stderr = stderr.await??;
+        if !status.success() {
+            let digest = retain_failure(
+                owned_dir,
+                "worker_exit",
+                status.code(),
+                &raw_stdout,
+                &raw_stderr,
+                None,
+            )?;
+            anyhow::bail!(
+                "isolated WASI worker failed or exceeded resource limits; private evidence {digest}"
+            );
+        }
+        let response: Response = match serde_json::from_slice(&raw_stdout) {
+            Ok(response) => response,
+            Err(error) => {
+                let digest = retain_failure(
+                    owned_dir,
+                    "worker_protocol",
+                    status.code(),
+                    &raw_stdout,
+                    &raw_stderr,
+                    Some(&error.to_string()),
+                )?;
+                anyhow::bail!("isolated WASI worker response invalid; private evidence {digest}");
+            }
+        };
+        if !response.ok {
+            let digest = retain_failure(
+                owned_dir,
+                "worker_execution",
+                status.code(),
+                &raw_stdout,
+                &raw_stderr,
+                response.error.as_deref(),
+            )?;
+            anyhow::bail!("isolated WASI worker refused execution; private evidence {digest}");
+        }
         let output = STANDARD.decode(response.stdout)?;
         let error = STANDARD.decode(response.stderr)?;
         ensure!(
@@ -414,4 +451,66 @@ async fn run_with_path(
     cleanup(&plan).await?;
     guard.done = true;
     result
+}
+
+fn retain_failure(
+    owned_dir: &Path,
+    phase: &str,
+    exit_code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+    worker_error: Option<&str>,
+) -> Result<String> {
+    let evidence = json!({
+        "schema_version":1,"phase":phase,"exit_code":exit_code,
+        "stdout_sha256":hex(&crate::audit::hash(stdout)),"stdout_bytes":stdout.len(),
+        "stderr_sha256":hex(&crate::audit::hash(stderr)),"stderr_base64":STANDARD.encode(stderr),
+        "worker_error":worker_error.map(|error| error.chars().take(8192).collect::<String>())
+    });
+    let digest = hex(&crate::audit::content_hash(&evidence)?);
+    save(&owned_dir.join("failure.json"), &evidence)?;
+    Ok(digest)
+}
+
+#[cfg(all(test, unix))]
+mod failure_evidence_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn private_failure_is_bounded_immutable_and_does_not_return_payload() {
+        let root =
+            std::env::temp_dir().join(format!("solos-wasi-failure-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let sensitive = b"synthetic-private-output";
+        let message = "synthetic-private-error".repeat(1000);
+        let digest = retain_failure(
+            &root,
+            "worker_exit",
+            Some(101),
+            sensitive,
+            b"synthetic-stderr",
+            Some(&message),
+        )
+        .unwrap();
+        assert_eq!(digest.len(), 64);
+        assert!(!digest.contains("synthetic"));
+        let path = root.join("failure.json");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let bytes = fs::read(&path).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("synthetic-private-output"));
+        let evidence: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            evidence["worker_error"].as_str().unwrap().chars().count(),
+            8192
+        );
+        assert_eq!(digest, hex(&crate::audit::content_hash(&evidence).unwrap()));
+        assert!(retain_failure(&root, "replace", None, b"changed", b"", None).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

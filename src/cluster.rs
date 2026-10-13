@@ -547,15 +547,24 @@ enum LogRecord {
     Truncate(LogId<NodeId>),
     Purge(LogId<NodeId>),
     Checkpoint(LogData),
+    IndexCheckpoint(LogIndex),
 }
-impl LogData {
+/// Payloads live in independently authenticated encrypted files, never in the retained log index.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct LogIndex {
+    vote: Option<Vote<NodeId>>,
+    committed: Option<LogId<NodeId>>,
+    purged: Option<LogId<NodeId>>,
+    entries: BTreeMap<u64, LogId<NodeId>>,
+}
+impl LogIndex {
     fn apply(&mut self, record: LogRecord) {
         match record {
             LogRecord::Vote(value) => self.vote = Some(value),
             LogRecord::Committed(value) => self.committed = value,
             LogRecord::Append(entries) => {
                 for entry in entries {
-                    self.entries.insert(entry.log_id.index, entry);
+                    self.entries.insert(entry.log_id.index, entry.log_id);
                 }
             }
             LogRecord::Truncate(id) => {
@@ -565,7 +574,17 @@ impl LogData {
                 self.entries = self.entries.split_off(&(id.index + 1));
                 self.purged = Some(id);
             }
-            LogRecord::Checkpoint(value) => *self = value,
+            LogRecord::Checkpoint(value) => {
+                self.vote = value.vote;
+                self.committed = value.committed;
+                self.purged = value.purged;
+                self.entries = value
+                    .entries
+                    .into_iter()
+                    .map(|(index, entry)| (index, entry.log_id))
+                    .collect();
+            }
+            LogRecord::IndexCheckpoint(value) => *self = value,
         }
     }
 }
@@ -640,7 +659,7 @@ fn record_bytes(key: &[u8; 32], record: &LogRecord) -> Result<Vec<u8>> {
 struct DurableLog {
     path: PathBuf,
     storage_key: [u8; 32],
-    data: Arc<Mutex<LogData>>,
+    data: Arc<Mutex<LogIndex>>,
 }
 impl Drop for DurableLog {
     fn drop(&mut self) {
@@ -651,7 +670,7 @@ impl Drop for DurableLog {
 impl DurableLog {
     fn open(directory: &Path, storage_key: [u8; 32]) -> Result<Self> {
         let path = directory.join("raft.wal");
-        let mut data = LogData::default();
+        let mut data = LogIndex::default();
         if path.exists() {
             let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
             let mut valid_length = 0;
@@ -676,11 +695,10 @@ impl DurableLog {
                     Sha256::digest(&body).as_slice() == hash,
                     "WAL checksum corruption"
                 );
-                data.apply(serde_json::from_slice(&unseal(
-                    &storage_key,
-                    b"raft-wal",
-                    &body,
-                )?)?);
+                let record: LogRecord =
+                    serde_json::from_slice(&unseal(&storage_key, b"raft-wal", &body)?)?;
+                Self::store_record_entries(&path, &storage_key, &record)?;
+                data.apply(record);
                 valid_length += 4 + length as u64 + 32;
             }
             // An incomplete final write was never acknowledged; discard only that tail.
@@ -694,14 +712,67 @@ impl DurableLog {
             }
             previous = Some(*index);
         }
-        Ok(Self {
+        for id in data.entries.values() {
+            Self::read_entry(&path, &storage_key, *id)?;
+        }
+        let log = Self {
             path,
             storage_key,
             data: Arc::new(Mutex::new(data)),
-        })
+        };
+        Ok(log)
+    }
+    fn entry_path(path: &Path, id: LogId<NodeId>) -> Result<PathBuf> {
+        let digest = format!("{:x}", Sha256::digest(serde_json::to_vec(&id)?));
+        Ok(path
+            .with_extension("entries")
+            .join(format!("{}-{digest}.sealed", id.index)))
+    }
+    fn entry_domain(id: LogId<NodeId>) -> Result<Vec<u8>> {
+        Ok([b"raft-entry:".as_slice(), &serde_json::to_vec(&id)?].concat())
+    }
+    fn read_entry(path: &Path, key: &[u8; 32], id: LogId<NodeId>) -> Result<Entry<TypeConfig>> {
+        let file = Self::entry_path(path, id)?;
+        ensure!(
+            fs::metadata(&file)?.len() <= MAX_STORAGE_RECORD_BYTES as u64,
+            "encrypted log entry exceeds bound"
+        );
+        let entry: Entry<TypeConfig> =
+            serde_json::from_slice(&unseal(key, &Self::entry_domain(id)?, &fs::read(file)?)?)?;
+        ensure!(entry.log_id == id, "encrypted log entry identity mismatch");
+        Ok(entry)
+    }
+    fn store_record_entries(path: &Path, key: &[u8; 32], record: &LogRecord) -> Result<()> {
+        let entries: Vec<&Entry<TypeConfig>> = match record {
+            LogRecord::Append(entries) => entries.iter().collect(),
+            LogRecord::Checkpoint(data) => data.entries.values().collect(),
+            _ => return Ok(()),
+        };
+        let directory = path.with_extension("entries");
+        fs::create_dir_all(&directory)?;
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+        for entry in entries {
+            let file = Self::entry_path(path, entry.log_id)?;
+            let bytes = serde_json::to_vec(entry)?;
+            ensure!(
+                bytes.len() <= MAX_STORAGE_RECORD_BYTES,
+                "log entry exceeds storage bound"
+            );
+            if file.exists() {
+                ensure!(
+                    unseal(key, &Self::entry_domain(entry.log_id)?, &fs::read(&file)?)? == bytes,
+                    "log ID reused for differing payload"
+                );
+            } else {
+                sealed_write(&file, key, &Self::entry_domain(entry.log_id)?, &bytes)?;
+            }
+        }
+        Ok(())
     }
     async fn persist(&self, record: LogRecord) -> Result<()> {
         let mut data = self.data.lock().await;
+        Self::store_record_entries(&self.path, &self.storage_key, &record)?;
         let bytes = record_bytes(&self.storage_key, &record)?;
         let mut file = OpenOptions::new()
             .create(true)
@@ -720,14 +791,13 @@ impl openraft::RaftLogReader<TypeConfig> for DurableLog {
         &mut self,
         range: R,
     ) -> std::result::Result<Vec<Entry<TypeConfig>>, StorageError<NodeId>> {
-        Ok(self
-            .data
-            .lock()
-            .await
-            .entries
-            .range(range)
-            .map(|(_, entry)| entry.clone())
-            .collect())
+        let data = self.data.lock().await;
+        let mut entries = Vec::new();
+        for (_, id) in data.entries.range(range) {
+            entries
+                .push(Self::read_entry(&self.path, &self.storage_key, *id).map_err(storage_error)?);
+        }
+        Ok(entries)
     }
 }
 impl RaftLogStorage<TypeConfig> for DurableLog {
@@ -741,7 +811,7 @@ impl RaftLogStorage<TypeConfig> for DurableLog {
             last_log_id: data
                 .entries
                 .last_key_value()
-                .map(|(_, entry)| entry.log_id)
+                .map(|(_, id)| *id)
                 .or(data.purged),
         })
     }
@@ -813,10 +883,30 @@ impl RaftLogStorage<TypeConfig> for DurableLog {
         let data = self.data.lock().await;
         atomic_write(
             &self.path,
-            &record_bytes(&self.storage_key, &LogRecord::Checkpoint(data.clone()))
+            &record_bytes(&self.storage_key, &LogRecord::IndexCheckpoint(data.clone()))
                 .map_err(storage_error)?,
         )
-        .map_err(storage_error)
+        .map_err(storage_error)?;
+        let retained = data
+            .entries
+            .values()
+            .map(|id| Self::entry_path(&self.path, *id))
+            .collect::<Result<BTreeSet<_>>>()
+            .map_err(storage_error)?;
+        let directory = self.path.with_extension("entries");
+        if directory.exists() {
+            for entry in fs::read_dir(&directory).map_err(storage_error)? {
+                let path = entry.map_err(storage_error)?.path();
+                if !retained.contains(&path) {
+                    fs::remove_file(path).map_err(storage_error)?;
+                }
+            }
+            File::open(directory)
+                .map_err(storage_error)?
+                .sync_all()
+                .map_err(storage_error)?;
+        }
+        Ok(())
     }
 }
 
@@ -1621,8 +1711,9 @@ impl Cluster {
                 heartbeat_interval: 200,
                 election_timeout_min: 800,
                 election_timeout_max: 1400,
-                snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(500),
-                max_in_snapshot_log_to_keep: 100,
+                snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(8),
+                max_in_snapshot_log_to_keep: 0,
+                max_payload_entries: 1,
                 ..Default::default()
             }
             .validate()?,
@@ -2401,6 +2492,144 @@ impl Cluster {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct OwnedLogTestDir(PathBuf);
+    impl OwnedLogTestDir {
+        fn create() -> Self {
+            let path = std::env::temp_dir().join(format!("solos-log-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for OwnedLogTestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    #[tokio::test]
+    async fn retained_raft_payloads_are_off_heap_authenticated_and_purged_with_restart() {
+        let dir = OwnedLogTestDir::create();
+        let log = DurableLog::open(dir.path(), [7; 32]).unwrap();
+        let payload = "PRIVATE_RETAINED_BODY".repeat(4096);
+        for index in 0..128 {
+            let entry = Entry {
+                log_id: LogId::new(openraft::CommittedLeaderId::new(1, 1), index),
+                payload: EntryPayload::Normal(Command {
+                    transaction: Transaction::new(
+                        format!("large-{index}"),
+                        vec![Mutation::Put {
+                            key: "kernel/state".into(),
+                            value: Value::String(payload.clone()),
+                        }],
+                    ),
+                    now_ms: index,
+                }),
+            };
+            log.persist(LogRecord::Append(vec![entry])).await.unwrap();
+        }
+        let index_bytes = serde_json::to_vec(&*log.data.lock().await).unwrap();
+        assert!(
+            index_bytes.len() < 16 * 1024,
+            "historical body entered memory index"
+        );
+        assert!(
+            !String::from_utf8_lossy(&fs::read(&log.path).unwrap())
+                .contains("PRIVATE_RETAINED_BODY")
+        );
+        let mut reader = log.clone();
+        let entries = openraft::RaftLogReader::try_get_log_entries(&mut reader, 127..128)
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        let EntryPayload::Normal(command) = &entries[0].payload else {
+            panic!("normal entry missing")
+        };
+        assert_eq!(
+            command.transaction.ops[0],
+            Mutation::Put {
+                key: "kernel/state".into(),
+                value: Value::String(payload)
+            }
+        );
+        let purge_id = LogId::new(openraft::CommittedLeaderId::new(1, 1), 126);
+        openraft::storage::RaftLogStorage::purge(&mut reader, purge_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_dir(log.path.with_extension("entries"))
+                .unwrap()
+                .count(),
+            1
+        );
+        let reopened = DurableLog::open(dir.path(), [7; 32]).unwrap();
+        assert_eq!(reopened.data.lock().await.entries.len(), 1);
+        assert_eq!(reopened.data.lock().await.purged, Some(purge_id));
+        let id = LogId::new(openraft::CommittedLeaderId::new(1, 1), 127);
+        let file = DurableLog::entry_path(&log.path, id).unwrap();
+        let mut corrupt = fs::read(&file).unwrap();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 1;
+        fs::write(file, corrupt).unwrap();
+        assert!(DurableLog::open(dir.path(), [7; 32]).is_err());
+    }
+
+    #[tokio::test]
+    async fn retained_float_entry_restarts_without_decode_drift() {
+        let dir = OwnedLogTestDir::create();
+        let log = DurableLog::open(dir.path(), [7; 32]).unwrap();
+        let id = LogId::new(openraft::CommittedLeaderId::new(1, 1), 0);
+        let entry = Entry {
+            log_id: id,
+            payload: EntryPayload::Normal(Command {
+                transaction: Transaction::new(
+                    "float",
+                    vec![Mutation::Put {
+                        key: "float".into(),
+                        value: Value::from(51.248178375505404),
+                    }],
+                ),
+                now_ms: 1,
+            }),
+        };
+        log.persist(LogRecord::Append(vec![entry])).await.unwrap();
+        DurableLog::open(dir.path(), [7; 32]).expect("floating log body changed during decoding");
+    }
+
+    #[test]
+    fn old_payload_checkpoint_replays_into_small_authenticated_index() {
+        let dir = OwnedLogTestDir::create();
+        let id = LogId::new(openraft::CommittedLeaderId::new(1, 1), 0);
+        let entry = Entry {
+            log_id: id,
+            payload: EntryPayload::Normal(Command {
+                transaction: Transaction::new(
+                    "legacy",
+                    vec![Mutation::Put {
+                        key: "legacy".into(),
+                        value: serde_json::json!({"kept":true}),
+                    }],
+                ),
+                now_ms: 1,
+            }),
+        };
+        let mut old = LogData::default();
+        old.entries.insert(0, entry);
+        fs::write(
+            dir.path().join("raft.wal"),
+            record_bytes(&[7; 32], &LogRecord::Checkpoint(old)).unwrap(),
+        )
+        .unwrap();
+        let log = DurableLog::open(dir.path(), [7; 32]).unwrap();
+        assert!(DurableLog::read_entry(&log.path, &[7; 32], id).is_ok());
+        assert!(
+            !serde_json::to_string(&*log.data.blocking_lock())
+                .unwrap()
+                .contains("kept")
+        );
+    }
+
     #[test]
     fn transactions_are_atomic_fenced_idempotent_and_watch_history_compacts() {
         let mut state = StateData::default();

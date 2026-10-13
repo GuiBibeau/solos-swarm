@@ -174,6 +174,10 @@ pub(crate) fn reserve_state(
     );
     let goal = state.domain.goal(&spec.goal_id)?.spec.clone();
     ensure!(
+        crate::kernel::search_open(state, &spec.goal_id),
+        "final selection closed fresh placement"
+    );
+    ensure!(
         spec.tenant == state.security.policy.payload.tenant && spec.expiry_ms <= goal.expiry_ms,
         "swarm widens tenant/Goal expiry"
     );

@@ -113,7 +113,7 @@ if (mode==='serve') {
   const attestation=initial.snapshot?.runtime_instances?.n1;
   if(!attestation || Buffer.from(attestation.binary_sha256).toString('hex')!==expected || Buffer.from(attestation.config_sha256).toString('hex')!==manifest.configuration_sha256)throw new Error('runtime measurement differs from frozen fixture before admission');
   const ownedUnits = ()=>{
-    const code=`import json,pathlib,subprocess,sys,time\nroot=pathlib.Path(sys.argv[1]);out=[]\nfor p in root.glob('*/process-plan.json'):\n d=json.loads(p.read_text());u=d['unit'];assert u.startswith('solos-agent-') and u.endswith('.service')\n observed=time.monotonic_ns()//1000\n r=subprocess.run(['systemctl','--user','show',u,'--property=ActiveState','--property=SubState','--property=ExecMainPID','--property=ExecMainStartTimestampMonotonic','--property=ActiveExitTimestampMonotonic','--property=ControlGroup'],capture_output=True,text=True)\n x=dict(line.split('=',1)for line in r.stdout.splitlines()if '=' in line);c=x.get('ControlGroup','');populated=None\n if c:\n  events=pathlib.Path('/sys/fs/cgroup'+c+'/cgroup.events')\n  if events.exists():populated=dict(line.split()for line in events.read_text().splitlines()).get('populated')\n out.append({'workspace':p.parent.name,'unit':u,'active':x.get('ActiveState','unknown'),'sub':x.get('SubState','unknown'),'pid':int(x.get('ExecMainPID')or 0),'started_mono_us':int(x.get('ExecMainStartTimestampMonotonic')or 0),'exited_mono_us':int(x.get('ActiveExitTimestampMonotonic')or 0),'populated':populated,'observed_mono_us':observed})\nprint(json.dumps(out))`;
+    const code=`import json,pathlib,subprocess,sys,time\nroot=pathlib.Path(sys.argv[1]);out=[]\nfor p in root.glob('*/process-plan.json'):\n d=json.loads(p.read_text());u=d['unit'];assert u.startswith('solos-agent-') and u.endswith('.service')\n observed=time.monotonic_ns()//1000\n r=subprocess.run(['systemctl','--user','show',u,'--property=ActiveState','--property=SubState','--property=MainPID','--property=ExecMainPID','--property=ExecMainStartTimestampMonotonic','--property=ActiveExitTimestampMonotonic','--property=ControlGroup'],capture_output=True,text=True)\n x=dict(line.split('=',1)for line in r.stdout.splitlines()if '=' in line);c=x.get('ControlGroup','');populated=None\n if c:\n  events=pathlib.Path('/sys/fs/cgroup'+c+'/cgroup.events')\n  if events.exists():populated=dict(line.split()for line in events.read_text().splitlines()).get('populated')\n out.append({'workspace':p.parent.name,'unit':u,'active':x.get('ActiveState','unknown'),'sub':x.get('SubState','unknown'),'pid':int(x.get('MainPID')or 0),'exec_main_pid':int(x.get('ExecMainPID')or 0),'started_mono_us':int(x.get('ExecMainStartTimestampMonotonic')or 0),'exited_mono_us':int(x.get('ActiveExitTimestampMonotonic')or 0),'populated':populated,'observed_mono_us':observed})\nprint(json.dumps(out))`;
     return JSON.parse(execFileSync('sudo',['-u','swarm-lab-cp','env','XDG_RUNTIME_DIR=/run/user/999','DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/999/bus','python3','-c',code,path.join(root,'cp/workers')],{encoding:'utf8',stdio:['ignore','pipe','pipe'],timeout:10000,maxBuffer:1048576}));
   };
   let overlap;
@@ -135,15 +135,18 @@ if (mode==='serve') {
     try{execFileSync(binary,['mvp','verify-signature','--input',input,'--trusted-key',key,'--domain',domain],{stdio:['ignore','pipe','pipe'],timeout:30000});return true;}catch{return false;}
   };
   const publicCase=readJson('issuer/public-case.json');
-  let final;const deadline=Date.now()+(manifest.actual_local?600000:240000);
+  let final;let finalObservedMs;const deadline=Date.now()+(manifest.actual_local?600000:240000);
   while(Date.now()<deadline){
-    await new Promise((resolve)=>setTimeout(resolve,3000));
+    await new Promise((resolve)=>setTimeout(resolve,finalObservedMs===undefined?3000:250));
     const packet=await command({command:'read_state',scope:{scope:'global'}});write('issuer/latest-readback.json',packet);const state=packet.snapshot;
     observeOverlap();
     const completed=Object.values(state.domain.tasks).filter((task)=>task.goal_id==='g'&&task.spec.id.startsWith('task-')&&task.state==='completed').length;
     const finalVerdict=state.final_evaluations?.['g/1'];
     if(completed===10 && finalVerdict){final=packet;break;}
-    if(finalVerdict || Object.values(state.domain.tasks).some((task)=>task.goal_id==='g'&&task.state==='failed')){final=packet;break;}
+    if(finalVerdict)finalObservedMs??=Date.now();
+    // Observe the bounded completion drain; this read-only wait grants no new lease
+    // or search authority and a missing tenth completion still fails the grade.
+    if((finalObservedMs!==undefined&&Date.now()-finalObservedMs>=5000) || Object.values(state.domain.tasks).some((task)=>task.goal_id==='g'&&task.state==='failed')){final=packet;break;}
   }
   if(!final)final=await command({command:'read_state',scope:{scope:'global'}});
   clearInterval(overlapTimer);

@@ -1161,13 +1161,22 @@ impl DomainState {
                 fencing_token,
                 result_ref,
             } => {
-                self.active(&goal_id, now_ms)?;
+                let goal = self.goal(&goal_id)?;
+                ensure!(
+                    goal.spec.expiry_ms > now_ms
+                        && matches!(
+                            goal.status.as_str(),
+                            "active" | "awaiting_evaluation" | "completed"
+                        ),
+                    "Task completion Goal is stopped or expired"
+                );
                 let finding = self
                     .findings
                     .get(&result_ref)
                     .context("Task result must reference Finding")?;
                 ensure!(
                     finding.goal_id == goal_id
+                        && finding.goal_version == goal.spec.version
                         && finding.provenance.producer_id == actor.id
                         && finding.task_id.as_deref() == Some(&task_id)
                         && self.finding_eligible(&result_ref),

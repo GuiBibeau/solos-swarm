@@ -327,6 +327,13 @@ fn prepare_runtime_fixture() -> Result<()> {
     };
     let mut agents = vec![];
     for index in 0..10 {
+        // The scripted provider prices conservative UTF-8 input bounds at one unit/token.
+        // Its coordinator reads all ten proofs; the actual-local fractional price stays unchanged.
+        let budget = if index == 9 && !actual_local {
+            100_000
+        } else {
+            50_000
+        };
         let id = format!("agent-{index:02}");
         let mut workload = base.clone();
         workload.agent = id.clone();
@@ -349,7 +356,7 @@ fn prepare_runtime_fixture() -> Result<()> {
                 let mut cap = cap.clone();
                 cap.id = format!("{id}-cap-{j}");
                 cap.holder = workload.uri().unwrap();
-                cap.budget.total = 50_000;
+                cap.budget.total = budget;
                 cap.constraints.operations.remove("task_status");
                 if index == 9 && cap.kind == CapabilityKind::ToolCall {
                     cap.constraints.operations.insert("task_status".into());
@@ -395,7 +402,7 @@ fn prepare_runtime_fixture() -> Result<()> {
                 input,
                 required_capabilities: BTreeSet::new(),
                 capabilities: goal.capabilities.clone(),
-                budget_microusd: 50_000,
+                budget_microusd: budget,
                 expiry_ms: goal.expiry_ms,
             },
             resources,

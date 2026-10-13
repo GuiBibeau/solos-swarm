@@ -322,6 +322,7 @@ impl Kernel {
                 .clone(),
         )?;
         let effect = state.effects.get(intent).context("cached effect missing")?;
+        action_service(&state.modules, &effect.request.action.operation)?;
         ensure!(
             effect.state == "done" && effect.permit.payload.holder == subject.id(),
             "cached effect holder or state changed"
@@ -332,8 +333,16 @@ impl Kernel {
             .get(&effect.request.grant_id)
             .context("cached effect grant absent")?;
         let goal = state.domain.goal(&grant.goal_id)?;
+        let final_completion = final_task_completion(
+            &state,
+            &effect.request,
+            &effect.payload,
+            effect.task_context.as_ref(),
+            now,
+        );
         ensure!(
-            matches!(goal.status.as_str(), "active" | "awaiting_evaluation")
+            (matches!(goal.status.as_str(), "active" | "awaiting_evaluation")
+                || goal.status == "completed" && final_completion)
                 && grant.version == goal.spec.version
                 && grant.version == effect.request.grant_version
                 && grant.holder.uri()? == subject.id()
@@ -344,6 +353,13 @@ impl Kernel {
                 }),
             "cached effect Goal or authority retired"
         );
+        check_search_action(
+            &state,
+            &effect.request,
+            &effect.payload,
+            effect.task_context.as_ref(),
+            now,
+        )?;
         if effect.request.action.operation == "inference" {
             ensure!(
                 search_open(&state, &grant.goal_id),
@@ -455,6 +471,8 @@ impl Kernel {
             let effect=state.effects.get(inference_intent).context("planning round lacks completed inference")?;
             ensure!(effect.state=="done" && effect.request.action.operation=="inference" && effect.permit.payload.holder==subject.id(),"planning round requires producer's recorded successful inference");
             let effect=effect.clone();
+            action_service(&state.modules,&effect.request.action.operation)?;
+            check_search_action(state,&effect.request,&effect.payload,effect.task_context.as_ref(),crate::cluster::now_ms())?;
             Ok(open_completed_round(state,&effect,inference_intent,now).unwrap_or_else(||json!({"planning_round":null,"status":"completion-retained-search-not-eligible"})))
         }).await
     }
@@ -933,6 +951,7 @@ impl Kernel {
                         &payload,
                     ))?;
                     let reason = error.to_string();
+                    drop(state);
                     return self
                         .commit(
                             &format!("{id}/{}", hex(&phase)),
@@ -953,11 +972,13 @@ impl Kernel {
                 &selected,
             ))?;
             let phase_id = format!("{id}/{}", hex(&phase));
+            drop(state); // The immutable review owns everything needed; do not queue a full deployment snapshot.
             #[cfg(test)]
             admission_sync::after_review(&request.intent_id).await;
             let reply = self.commit(&phase_id, subject.id(), &(&request, &payload, &prices, &approvals, &quota, &task,&phase), leases.clone(), |state| {
                 let now=(crate::cluster::now_ms() / 1000).max(now);
             action_service(&state.modules,&request.action.operation)?;
+            check_search_action(state,&request,&payload,task.as_ref(),crate::cluster::now_ms())?;
             if let Some(price)=&prices { ensure!(price.payload.provider.len()<=128 && price.payload.provider.bytes().all(|byte|byte.is_ascii_alphanumeric() || b"_./-".contains(&byte)) && price.payload.rates.len()<=64 && price.payload.rates.keys().all(|key| !key.is_empty() && key.len()<=128 && key.bytes().all(|byte|byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))),"price category metadata exceeds bounded receipt contract"); }
             if matches!(request.action.operation.as_str(),"inference"|"attempt_submit"){ensure!(search_open(state,&state.security.grants[&request.grant_id].goal_id),"final selection closed paid search for this Goal version");}
             ensure!(request.action.arguments == payload, "admitted payload differs from authorized arguments");
@@ -1014,6 +1035,13 @@ impl Kernel {
             let now = (crate::cluster::now_ms() / 1000).max(now);
             let effect = state.effects.get(intent).context("unknown effect")?.clone();
             action_service(&state.modules, &effect.request.action.operation)?;
+            check_search_action(
+                state,
+                &effect.request,
+                &effect.payload,
+                effect.task_context.as_ref(),
+                crate::cluster::now_ms(),
+            )?;
             if effect.request.action.operation == "inference" {
                 ensure!(
                     search_open(state, &effect.permit.payload.goal_id),
@@ -1453,6 +1481,14 @@ impl Kernel {
                 effect.payload == serde_json::to_value(&command)?,
                 "command differs from admitted payload"
             );
+            action_service(&state.modules, &effect.request.action.operation)?;
+            check_search_action(
+                state,
+                &effect.request,
+                &effect.payload,
+                effect.task_context.as_ref(),
+                now,
+            )?;
             check_task(
                 state,
                 subject,
@@ -1467,6 +1503,16 @@ impl Kernel {
                 now / 1000,
             )?;
             let actor = domain_actor(state, subject, &command)?;
+            if let DomainCommand::CompleteTask { result_ref, .. } = &command {
+                let source = state
+                    .finding_sources
+                    .get(result_ref)
+                    .context("Task result lacks broker-recorded provenance")?;
+                ensure!(
+                    lineage_live(state, &BTreeSet::from([source.clone()])),
+                    "Task result lineage retired"
+                );
+            }
             let mut produced_source = None;
             if let DomainCommand::AppendFinding {
                 goal_id,
@@ -1653,6 +1699,8 @@ impl Kernel {
                 && effect.request.action.operation == "finding_read" && effect.permit.payload.goal_id == goal_id,
                 "Finding read Capability/scope mismatch");
             ensure!(effect.payload == json!({"goal_id":goal_id,"after_id":after_id,"limit":limit}), "read differs from admitted payload");
+            action_service(&state.modules,&effect.request.action.operation)?;
+            check_search_action(state,&effect.request,&effect.payload,effect.task_context.as_ref(),crate::cluster::now_ms())?;
             check_task(state, subject, effect.task_context.as_ref(), false)?;
             state.security.consume_permit(subject, &effect.permit, &mut state.ledger, now)?;
             let grant = state.security.grants[&effect.request.grant_id].clone();
@@ -1696,6 +1744,8 @@ impl Kernel {
                 && effect.request.action.resource == format!("task/{goal_id}")
                 && effect.permit.payload.goal_id == goal_id, "Task-status Capability/scope mismatch");
             ensure!(effect.payload == json!({"goal_id":goal_id,"after_id":after_id,"limit":limit}), "Task-status read differs from admitted payload");
+            action_service(&state.modules,&effect.request.action.operation)?;
+            check_search_action(state,&effect.request,&effect.payload,effect.task_context.as_ref(),crate::cluster::now_ms())?;
             check_task(state, subject, effect.task_context.as_ref(), false)?;
             let clearance = state.security.grants[&effect.request.grant_id].capabilities.iter()
                 .find(|cap| cap.id == effect.request.capability_id).context("Task-status Capability absent")?.constraints.read_markings.clone();
@@ -1777,6 +1827,14 @@ impl Kernel {
                         == json!({"goal_id":goal_id,"after_index":after_index,"limit":limit}),
                     "audit read differs from admitted payload"
                 );
+                action_service(&state.modules, &effect.request.action.operation)?;
+                check_search_action(
+                    state,
+                    &effect.request,
+                    &effect.payload,
+                    effect.task_context.as_ref(),
+                    crate::cluster::now_ms(),
+                )?;
                 check_task(state, subject, effect.task_context.as_ref(), false)?;
                 let cap = state.security.grants[&effect.request.grant_id]
                     .capabilities
@@ -2584,6 +2642,14 @@ impl Kernel {
         subject.ensure_current(crate::cluster::now_ms() / 1000)?;
         let state = self.state().await?;
         let effect = state.effects.get(intent).context("effect absent")?;
+        action_service(&state.modules, &effect.request.action.operation)?;
+        check_search_action(
+            &state,
+            &effect.request,
+            &effect.payload,
+            effect.task_context.as_ref(),
+            crate::cluster::now_ms(),
+        )?;
         ensure!(
             effect.permit.payload.holder == subject.id(),
             "result holder mismatch"
@@ -2782,6 +2848,82 @@ pub(crate) fn search_open(state: &KernelState, goal_id: &str) -> bool {
                     }
                 )
         })
+}
+/// A held-out selection closes work immediately; only completion of the existing Task drains.
+pub(crate) fn final_bookkeeping_deadline(state: &KernelState, goal_id: &str) -> Option<u64> {
+    let goal = state.domain.goal(goal_id).ok()?;
+    state
+        .evaluation_jobs
+        .values()
+        .filter(|job| {
+            job.request.payload.goal_id == goal_id
+                && job.request.payload.contract.goal_version == goal.spec.version
+                && matches!(
+                    job.request.payload.action,
+                    crate::evaluator::EvaluationAction::Candidate {
+                        phase: crate::evaluator::EvaluationPhase::HeldOut,
+                        ..
+                    }
+                )
+        })
+        .map(|job| {
+            job.request
+                .payload
+                .issued_ms
+                .saturating_add(5_000)
+                .min(job.request.payload.deadline_ms)
+                .min(goal.spec.expiry_ms)
+        })
+        .min()
+}
+fn final_task_completion(
+    state: &KernelState,
+    request: &ActionRequest,
+    payload: &Value,
+    task: Option<&TaskContext>,
+    now_ms: u64,
+) -> bool {
+    let Some(task) = task else { return false };
+    let Some(grant) = state.security.grants.get(&request.grant_id) else {
+        return false;
+    };
+    if request.action.kind != security::CapabilityKind::ToolCall
+        || request.action.operation != "task_work"
+        || request.budget_capability_id.is_some()
+        || request.envelope_id.is_some()
+        || !request.usage_bound.is_empty()
+        || final_bookkeeping_deadline(state, &grant.goal_id)
+            .is_none_or(|deadline| now_ms >= deadline)
+    {
+        return false;
+    }
+    matches!(
+        serde_json::from_value::<DomainCommand>(payload.clone()),
+        Ok(DomainCommand::CompleteTask { goal_id, task_id, fencing_token, .. })
+            if goal_id == grant.goal_id && task_id == task.id && fencing_token == task.fence
+    )
+}
+fn check_search_action(
+    state: &KernelState,
+    request: &ActionRequest,
+    payload: &Value,
+    task: Option<&TaskContext>,
+    now_ms: u64,
+) -> Result<()> {
+    if task.is_none() {
+        return Ok(()); // Protected service operations still use their separate authority checks.
+    }
+    let grant = state
+        .security
+        .grants
+        .get(&request.grant_id)
+        .context("action grant absent")?;
+    ensure!(
+        search_open(state, &grant.goal_id)
+            || final_task_completion(state, request, payload, task, now_ms),
+        "final selection closed work; only bounded existing Task completion may drain"
+    );
+    Ok(())
 }
 pub(crate) fn check_allocation(
     subject: &AuthenticatedSubject,
@@ -4203,3 +4345,7 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "kernel_final_tests.rs"]
+mod final_tests;

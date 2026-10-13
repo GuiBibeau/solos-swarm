@@ -1906,6 +1906,32 @@ pub struct EvaluatorProcess {
     maximum: usize,
     timeout_ms: u64,
 }
+
+#[cfg(target_os = "linux")]
+fn checked_user_bus(uid: u32, directory: &Path) -> Result<Option<PathBuf>> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let metadata = match fs::symlink_metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(
+        metadata.is_dir() && metadata.uid() == uid && metadata.mode() & 0o777 == 0o700,
+        "evaluator user runtime directory is not private and owned"
+    );
+    let bus = directory.join("bus");
+    let metadata = match fs::symlink_metadata(&bus) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(
+        metadata.file_type().is_socket() && metadata.uid() == uid,
+        "evaluator user bus is not an owned Unix socket"
+    );
+    Ok(Some(bus))
+}
+
 impl EvaluatorProcess {
     pub fn spawn(config: EvaluatorProcessConfig) -> Result<Self> {
         #[cfg(unix)]
@@ -1969,6 +1995,18 @@ impl EvaluatorProcess {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        #[cfg(target_os = "linux")]
+        {
+            // Derive only the intended child UID's local bus; ambient environment stays cleared.
+            let uid = config.uid.unwrap_or_else(process_uid);
+            let directory = PathBuf::from(format!("/run/user/{uid}"));
+            if let Some(bus) = checked_user_bus(uid, &directory)? {
+                command.env("XDG_RUNTIME_DIR", directory).env(
+                    "DBUS_SESSION_BUS_ADDRESS",
+                    format!("unix:path={}", bus.display()),
+                );
+            }
+        }
         #[cfg(unix)]
         {
             if let Some(gid) = config.gid {
@@ -2131,4 +2169,32 @@ fn child_running(io: &mut ProcessIo) -> Result<bool> {
         Some(child) => child.try_wait()?.is_none(),
         None => true,
     })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod user_bus_tests {
+    use super::*;
+    use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+
+    #[test]
+    fn launch_bus_context_requires_private_directory_and_owned_socket() {
+        let root = std::env::temp_dir().join(format!("solos-user-bus-{}", uuid::Uuid::new_v4()));
+        assert!(checked_user_bus(process_uid(), &root).unwrap().is_none());
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(checked_user_bus(process_uid(), &root).unwrap().is_none());
+        fs::write(root.join("bus"), b"regular file is not a bus").unwrap();
+        assert!(checked_user_bus(process_uid(), &root).is_err());
+        fs::remove_file(root.join("bus")).unwrap();
+        let listener = UnixListener::bind(root.join("bus")).unwrap();
+        assert_eq!(
+            checked_user_bus(process_uid(), &root).unwrap(),
+            Some(root.join("bus"))
+        );
+        assert!(checked_user_bus(process_uid().wrapping_add(1), &root).is_err());
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(checked_user_bus(process_uid(), &root).is_err());
+        drop(listener);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

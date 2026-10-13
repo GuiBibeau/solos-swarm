@@ -96,11 +96,18 @@ export default async function swarmMvp(pi: ExtensionAPI) {
   const tools = session.tools.map((tool: { name: string; description: string; parameters: object }) => ({
     name: tool.name, label: tool.name, description: tool.description, parameters: Type.Unsafe(tool.parameters),
   }));
-  for (const tool of tools) pi.registerTool({ ...tool,
-    async execute(id, params, signal) {
+  for (const tool of tools) pi.registerTool({ ...tool, executionMode: "sequential",
+    async execute(id, params, signal, _onUpdate, ctx) {
       const response = await broker(`/tool/${tool.name}`, params, signal, `tool-${id}`);
       if (!response.ok) throw new Error(`Broker denied ${tool.name}: ${await response.text()}`);
-      const result = await response.json(); return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
+      const result = await response.json();
+      if (result.status === "confirmation_required") throw new Error(`Operator confirmation required for intent ${result.intent}. The broker retained the exact action without dispatching it.`);
+      const assistant = ctx.sessionManager.getBranch().findLast((entry) => entry.type === "message" && entry.message.role === "assistant")?.message;
+      const batch = assistant?.content.filter((part) => part.type === "toolCall") ?? [];
+      const finalBatch = batch.length === 2 && batch[0].id === id && batch[0].name === "submit_attempt"
+        && batch[1].name === "complete_task" && typeof batch[1].arguments.result_ref === "string" && batch[1].arguments.result_ref.length > 0;
+      return { content: [{ type: "text", text: JSON.stringify(result) }], details: result,
+        terminate: tool.name === "complete_task" || (tool.name === "submit_attempt" && finalBatch) };
     },
   });
   pi.on("session_start", () => pi.setActiveTools(tools.map((tool: { name: string }) => tool.name)));

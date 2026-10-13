@@ -249,6 +249,10 @@ fn stage(
     let workload = WorkloadId::parse(subject.id())?;
     let goal = workload.goal.clone();
     ensure!(
+        crate::kernel::search_open(state, &goal),
+        "final selection closed child delegation"
+    );
+    ensure!(
         task.parent_task_id.as_deref() == Some(&context.id),
         "delegation must name current parent Task"
     );
@@ -942,9 +946,9 @@ mod tests {
                 "overcapacity",
                 &f.definition.id,
                 "parent-envelope",
-                context,
+                context.clone(),
                 second,
-                checks,
+                checks.clone(),
             )
             .await
             .unwrap();
@@ -954,6 +958,82 @@ mod tests {
         assert!(state.domain.task("g", "too-many").is_err());
         assert_eq!(
             state
+                .domain
+                .task("g", "parent")
+                .unwrap()
+                .allocated_to_children_microusd,
+            100_000
+        );
+        // Admission can happen before final selection; creation must recheck fresh authority.
+        let late = child(&template, "after-final");
+        kernel
+            .admit(
+                "admit-before-final",
+                &f.subject,
+                admit("before-final", &late),
+            )
+            .await
+            .unwrap()
+            .require()
+            .unwrap();
+        let mut closed = kernel.state().await.unwrap();
+        let result = crate::evaluator::EvaluationResult {
+            request_id: "final-fixture".into(),
+            goal_id: "g".into(),
+            evaluator_id: "protected-fixture".into(),
+            contract: closed.domain.current_contract("g").unwrap(),
+            state_revision: closed.domain.revision,
+            attempt_id: Some("final".into()),
+            candidate_hash: Some("frozen".into()),
+            finding_ids: vec![],
+            phase: Some(crate::evaluator::EvaluationPhase::HeldOut),
+            score: None,
+            measurements: BTreeMap::new(),
+            verdict: crate::scenarios::Verdict::Pass,
+            commands: vec![],
+            protected_set_digest: "fixture".into(),
+            evaluation_scope: "trusted-test-fixture".into(),
+            measured_ms: crate::cluster::now_ms(),
+        };
+        closed.final_evaluations.insert(
+            "g/1".into(),
+            f.signer.sign("protected-evaluation-v1", result).unwrap(),
+        );
+        cluster
+            .transact(Transaction::new(
+                "close-search-fixture",
+                vec![Mutation::Put {
+                    key: "kernel/state".into(),
+                    value: serde_json::to_value(closed).unwrap(),
+                }],
+            ))
+            .await
+            .unwrap();
+        let denied = kernel
+            .delegate_current(
+                "apply-after-final",
+                &f.subject,
+                "before-final",
+                &f.definition.id,
+                "parent-envelope",
+                context,
+                late,
+                checks,
+            )
+            .await
+            .unwrap();
+        assert!(!denied.ok);
+        assert!(
+            denied.value["error"]
+                .as_str()
+                .unwrap()
+                .contains("final selection closed")
+        );
+        let unchanged = kernel.state().await.unwrap();
+        assert!(unchanged.domain.task("g", "after-final").is_err());
+        assert_eq!(unchanged.desired_swarms["g"].1.agents.len(), 2);
+        assert_eq!(
+            unchanged
                 .domain
                 .task("g", "parent")
                 .unwrap()

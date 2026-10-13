@@ -339,6 +339,7 @@ impl BrokerNode {
                 "model request ID conflict"
             );
             if effect.state == "done" {
+                drop(state);
                 self.kernel
                     .validate_cached_effect(&peer.subject, &intent, &Self::leases(session))
                     .await?;
@@ -574,6 +575,7 @@ impl BrokerNode {
                 Some(quota),
             )
         };
+        drop(state); // Retain the frozen request, not the whole deployment, while awaiting provider/commit slots.
         backend
             .provider
             .validate(&inference, crate::cluster::now_ms())?;
@@ -604,6 +606,7 @@ impl BrokerNode {
         }
         let funded_request_hash =
             serde_json::from_value(admission["permit"]["payload"]["action_hash"].clone())?;
+        drop(admission); // The financial binding is sufficient after admission; the effect is durable in quorum state.
         let cancel = self
             .stops
             .lock()
