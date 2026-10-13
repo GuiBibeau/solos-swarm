@@ -157,7 +157,7 @@ if (mode==='serve') {
     && canonical(held.payload.contract)===canonical(expectedContract)&&verifySigned(held,'protected-evaluation-v1',manifest.evaluator_key);
   const reservations=Object.values(beforeStop.ledger.intents).filter((reservation)=>reservation.request.goal_id==='g');
   const settled=reservations.filter((reservation)=>reservation.state==='settled');
-  const onceReceipts=settled.every((reservation)=>reservation.receipt?.intent_id===reservation.request.intent_id&&!reservation.overrun)
+  const onceReceipts=settled.every((reservation)=>reservation.receipt?.intent_id===reservation.request.intent_id&&Buffer.from(reservation.receipt?.request_hash??[]).toString('hex')===Buffer.from(reservation.request.request_hash).toString('hex')&&!reservation.overrun)
     &&new Set(settled.map((reservation)=>reservation.receipt?.id)).size===settled.length;
   const liabilities=reservations.filter((reservation)=>['reserved','dispatched','unknown'].includes(reservation.state)).reduce((sum,reservation)=>sum+reservation.hold,0);
   const qualification={scope:manifest.scope,production_oidc:'PENDING',live_inference_release:manifest.actual_local?'ACTUAL_LOCAL_FUNCTIONAL_ONLY':'NOT_QUALIFIED',physical_host_independence:'PENDING',binary_sha256:expected,configuration_sha256:manifest.configuration_sha256,
@@ -168,7 +168,7 @@ if (mode==='serve') {
     ledger_spent:beforeStop.ledger.accounts.global.total.spent,settled_receipts:settled.length,once_receipts_verified:onceReceipts,outstanding_liability:liabilities,
     held_out:held?.payload?.verdict??null,independent_final_verified:!!finalVerified,goal_status:beforeStop.domain.goals.g.status,
     final_signature:held?{trusted_key:manifest.evaluator_key,signature:held.signature,request_id:held.payload.request_id,candidate_hash:held.payload.candidate_hash,contract:held.payload.contract,protected_set_digest:held.payload.protected_set_digest}:null,
-    board_entries:Object.values(beforeStop.domain.boards??{}).reduce((sum,board)=>sum+(board.entries?.length??0),0),needs:Object.values(beforeStop.domain.needs).filter((need)=>need.goal_id==='g').map((need)=>({id:need.spec.id,version:need.spec.version,satisfied:need.satisfied})),
+    board_entries:Object.values(beforeStop.domain.boards??{}).reduce((sum,board)=>sum+(Array.isArray(board)?board.length:board.entries?.length??0),0),needs:Object.values(beforeStop.domain.needs).filter((need)=>need.goal_id==='g').map((need)=>({id:need.spec.id,version:need.spec.version,satisfied:need.satisfied})),
     runtime_functional_verdict:'INCONCLUSIVE',cleanup_verdict:'PENDING'};
   const countsPass=qualification.distinct_pi_workloads===10&&qualification.distinct_model_tasks===10&&qualification.useful_contributors===10&&qualification.tasks_completed===10;
   qualification.scripted_counts_verdict=countsPass?'PASS':'FAIL';
