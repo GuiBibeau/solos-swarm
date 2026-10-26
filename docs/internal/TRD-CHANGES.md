@@ -1,3 +1,5 @@
+Historical TRD amendment log. Not an operator runbook. Normative text: [../TRD.md](../TRD.md).
+
 # TRD change log: verification, remote QA and release qualification
 
 Base: PR #1, branch `trd-v1`, commit `45ae3f4`. Source of the change: `solos-swarm-verification-research-handoff.md` (prepared 2026-10-12). Status: proposed amendment for review. It is not committed.

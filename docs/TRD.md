@@ -593,7 +593,7 @@ Implementation starts with one family. The rotating release profile is ready onl
 - https://developer.hashicorp.com/nomad/docs/concepts/scheduling/how-scheduling-works
 - https://docs.ray.io/en/latest/ray-core/scheduling/placement-group.html
 - https://docs.rs/openraft/latest/openraft/
-- https://docs.rs/openraft/latest/openraft/docs/getting_started/index.html — application state machine, durable storage and snapshots are supplied by the application.
+- https://docs.rs/openraft/latest/openraft/docs/getting_started/index.html: application state machine, durable storage and snapshots are supplied by the application.
 - https://etcd.io/docs/v3.5/learning/api/
 - https://www.rfc-editor.org/rfc/rfc9000.html
 - https://docs.rs/quinn/latest/quinn/
@@ -602,10 +602,10 @@ Implementation starts with one family. The rotating release profile is ready onl
 - https://docs.rs/ractor/latest/ractor/
 - https://docs.rs/kameo/latest/kameo/
 - https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html
-- https://docs.temporal.io/activity-definition — retries can repeat an effect after a worker loses its completion response; the receiver enforces idempotency.
-- https://www.rfc-editor.org/rfc/rfc9110.html#section-9.2.2 — non-idempotent requests need proven safe semantics or proof that the original was not applied before automatic retry.
-- https://platform.claude.com/docs/en/api/rate-limits — organization/workspace scope, request and token limits, and retry headers; node-local quotas alone do not enforce shared limits.
-- https://github.com/google-deepmind/opro/blob/main/opro/optimization/opt_utils.py — OPRO selects a bounded set of scored instructions for its meta-prompt rather than injecting every archived entry.
+- https://docs.temporal.io/activity-definition: retries can repeat an effect after a worker loses its completion response; the receiver enforces idempotency.
+- https://www.rfc-editor.org/rfc/rfc9110.html#section-9.2.2: non-idempotent requests need proven safe semantics or proof that the original was not applied before automatic retry.
+- https://platform.claude.com/docs/en/api/rate-limits: organization/workspace scope, request and token limits, and retry headers; node-local quotas alone do not enforce shared limits.
+- https://github.com/google-deepmind/opro/blob/main/opro/optimization/opt_utils.py: OPRO selects a bounded set of scored instructions for its meta-prompt rather than injecting every archived entry.
 - https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/ (page says the GenAI conventions moved to a separate repo)
 - https://kafka.apache.org/41/design/design/ (Consumer Position section)
 - https://docs.nats.io/nats-concepts/jetstream/consumers
@@ -1111,29 +1111,29 @@ The PoC passes the security gate when all of the following hold on a cluster of 
 
 Only sources that were fetched while writing this section are listed.
 
-- https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/SPECIFICATION.md — Firecracker's tested specification: 8 CPU ms VMM start, ≤125 ms to guest init, ≤5 MiB VMM overhead, >95% compute.
-- https://gvisor.dev/docs/architecture_guide/security/ — gVisor threat model: the Sentry intercepts syscalls, has a minimal host surface, and no side-channel protection.
-- https://gvisor.dev/docs/architecture_guide/performance/ — gVisor structural and implementation costs (syscalls, network, VFS); startup overhead is mostly Docker.
-- https://katacontainers.io/ — Kata overview: lightweight VMs behind OCI/CRI, supports QEMU, Cloud Hypervisor and Firecracker.
-- https://docs.kernel.org/userspace-api/landlock.html — Landlock: unprivileged, stackable file-system, TCP/UDP and IPC restrictions; 16-layer limit; known gaps.
-- https://www.kernel.org/doc/html/latest/userspace-api/seccomp_filter.html — seccomp-BPF: reduces kernel surface, "isn't a sandbox" alone, needs no_new_privs, check arch.
-- https://docs.wasmtime.dev/security.html — wasmtime: Wasm isolation, guard regions, capability-based WASI, partial Spectre mitigations.
-- https://spiffe.io/docs/latest/spiffe-about/overview/ — SPIFFE short-lived SVIDs; SPIRE supports attestation, the Workload API with rotation, and bare metal.
-- https://developer.hashicorp.com/vault/docs/secrets/databases — Vault dynamic secrets: unique, leased, revocable credentials per consumer, which helps attribution.
-- https://kubernetes.io/docs/reference/access-authn-authz/rbac/ — Kubernetes RBAC: additive roles, immutable roleRef, escalate/bind escalation prevention, least privilege.
-- https://genai.owasp.org/llm-top-10/ — OWASP Top 10 for LLM Applications 2025, list of risks.
-- https://genai.owasp.org/llmrisk/llm01-prompt-injection/ — LLM01: direct and indirect injection, no fool-proof prevention, mitigations 1–7.
-- https://genai.owasp.org/llmrisk/llm062025-excessive-agency/ — LLM06: excessive functionality, permissions and autonomy; complete mediation; human approval.
-- https://datatracker.ietf.org/doc/html/rfc6962 — Certificate Transparency: Merkle tree log, signed tree heads, inclusion and consistency proofs.
-- https://research.google/pubs/macaroons-cookies-with-contextual-caveats-for-decentralized-authorization-in-the-cloud/ — Macaroons (NDSS 2014): chained-MAC credentials whose caveats attenuate and confine delegated authority.
-- https://raw.githubusercontent.com/ucan-wg/spec/main/README.md — UCAN 1.0 spec: each delegation must restate or attenuate; least authority; no confinement; revocation.
-- https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/docs/security.md — Pi's process permissions, limits of project trust and observation, and executable extension risks.
-- https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/docs/settings.md — Pi's built-in tools, merged resource configuration, and install/update telemetry default.
-- https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/docs/skills.md — Skills are instructions and supporting files, not an execution boundary.
-- https://arxiv.org/abs/1506.02629 — Dwork et al., adaptive reuse can overfit a hidden holdout; evaluator separation does not establish generalization.
-- https://doc.biscuitsec.org/getting-started/introduction — Biscuit: signed bearer token with offline attenuation that "will never gain more rights"; Datalog policies.
-- https://docs.sigstore.dev/logging/overview/ — Sigstore Rekor: tamper-resistant transparency log; auditors monitor that it stays append-only.
-- https://metr.org/blog/2026-08-26-openai-hugging-face-incident-investigation/ — METR investigation: about 1,200 agents meant to be isolated built a shared message board and a coordinator.
+- https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/SPECIFICATION.md: Firecracker's tested specification: 8 CPU ms VMM start, ≤125 ms to guest init, ≤5 MiB VMM overhead, >95% compute.
+- https://gvisor.dev/docs/architecture_guide/security/: gVisor threat model: the Sentry intercepts syscalls, has a minimal host surface, and no side-channel protection.
+- https://gvisor.dev/docs/architecture_guide/performance/: gVisor structural and implementation costs (syscalls, network, VFS); startup overhead is mostly Docker.
+- https://katacontainers.io/: Kata overview: lightweight VMs behind OCI/CRI, supports QEMU, Cloud Hypervisor and Firecracker.
+- https://docs.kernel.org/userspace-api/landlock.html: Landlock: unprivileged, stackable file-system, TCP/UDP and IPC restrictions; 16-layer limit; known gaps.
+- https://www.kernel.org/doc/html/latest/userspace-api/seccomp_filter.html: seccomp-BPF: reduces kernel surface, "isn't a sandbox" alone, needs no_new_privs, check arch.
+- https://docs.wasmtime.dev/security.html: wasmtime: Wasm isolation, guard regions, capability-based WASI, partial Spectre mitigations.
+- https://spiffe.io/docs/latest/spiffe-about/overview/: SPIFFE short-lived SVIDs; SPIRE supports attestation, the Workload API with rotation, and bare metal.
+- https://developer.hashicorp.com/vault/docs/secrets/databases: Vault dynamic secrets: unique, leased, revocable credentials per consumer, which helps attribution.
+- https://kubernetes.io/docs/reference/access-authn-authz/rbac/: Kubernetes RBAC: additive roles, immutable roleRef, escalate/bind escalation prevention, least privilege.
+- https://genai.owasp.org/llm-top-10/: OWASP Top 10 for LLM Applications 2025, list of risks.
+- https://genai.owasp.org/llmrisk/llm01-prompt-injection/: LLM01: direct and indirect injection, no fool-proof prevention, mitigations 1–7.
+- https://genai.owasp.org/llmrisk/llm062025-excessive-agency/: LLM06: excessive functionality, permissions and autonomy; complete mediation; human approval.
+- https://datatracker.ietf.org/doc/html/rfc6962: Certificate Transparency: Merkle tree log, signed tree heads, inclusion and consistency proofs.
+- https://research.google/pubs/macaroons-cookies-with-contextual-caveats-for-decentralized-authorization-in-the-cloud/: Macaroons (NDSS 2014): chained-MAC credentials whose caveats attenuate and confine delegated authority.
+- https://raw.githubusercontent.com/ucan-wg/spec/main/README.md: UCAN 1.0 spec: each delegation must restate or attenuate; least authority; no confinement; revocation.
+- https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/docs/security.md: Pi's process permissions, limits of project trust and observation, and executable extension risks.
+- https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/docs/settings.md: Pi's built-in tools, merged resource configuration, and install/update telemetry default.
+- https://raw.githubusercontent.com/earendil-works/pi/main/packages/coding-agent/docs/skills.md: Skills are instructions and supporting files, not an execution boundary.
+- https://arxiv.org/abs/1506.02629: Dwork et al., adaptive reuse can overfit a hidden holdout; evaluator separation does not establish generalization.
+- https://doc.biscuitsec.org/getting-started/introduction: Biscuit: signed bearer token with offline attenuation that "will never gain more rights"; Datalog policies.
+- https://docs.sigstore.dev/logging/overview/: Sigstore Rekor: tamper-resistant transparency log; auditors monitor that it stays append-only.
+- https://metr.org/blog/2026-08-26-openai-hugging-face-incident-investigation/: METR investigation: about 1,200 agents meant to be isolated built a shared message board and a coordinator.
 
 Design precedent (internal, not an external source): Solos Engine, for the bounds, cap ledger, scoped kill switches, fail-closed execute tier, and the registration-as-consent pattern.
 
@@ -1191,7 +1191,7 @@ R-EVD-1 through R-EVD-3 describe the first-class Finding object in §5. Need sat
 
 **Non-functional.** Performance targets are the proposed targets in §6. Security targets are §7. This section adds no numeric targets.
 
-**Verification delivery map.** The requirement families R-OBS, R-VER, R-QA, R-RUN, R-REL and R-EVAL (§§6.11, 6.15–6.19), with SEC-F-48 and SEC-NF-29 (§7), are delivered through the stories below. The story text is `docs/QA-BACKLOG.md`. The story IDs are suggested backlog IDs, and estimates wait for the repository audit. The requirement IDs are provisional until checked against the repository.
+**Verification delivery map.** The requirement families R-OBS, R-VER, R-QA, R-RUN, R-REL and R-EVAL (§§6.11, 6.15–6.19), with SEC-F-48 and SEC-NF-29 (§7), are delivered through the stories below. The story text is `docs/internal/QA-BACKLOG.md`. The story IDs are suggested backlog IDs, and estimates wait for the repository audit. The requirement IDs are provisional until checked against the repository.
 
 | Story | Priority | Requirements | First evidence |
 |---|---|---|---|
@@ -1295,52 +1295,52 @@ Remaining deployment decisions:
 Sources for §§1–5 and §§8–12 are listed below, with the verification and QA tooling sources that serve §4.8 and §§6.16–6.19. Other sources specific to §§6–7 remain there. Critical research and harness references were checked on 2026-10-11. Versioned papers and commit links identify the reviewed evidence, not selected runtime dependency versions. Live documentation must be rechecked when implementing it. Retrieval verifies attribution; it does not reproduce research results or certify the implementation.
 
 - https://github.com/agent-substrate/substrate
-- https://raw.githubusercontent.com/agent-substrate/substrate/b73ee7f91c84ffe0ec3f153ecb5f56e8f76fbc21/README.md — reviewed lifecycle and placement comparison.
+- https://raw.githubusercontent.com/agent-substrate/substrate/b73ee7f91c84ffe0ec3f153ecb5f56e8f76fbc21/README.md: reviewed lifecycle and placement comparison.
 - https://kubernetes.io/docs/concepts/overview/
 - https://www.ray.io/
 - https://docs.ray.io/en/latest/ray-overview/index.html
 - https://temporal.io/
 - https://docs.temporal.io/evaluate/understanding-temporal
 - https://firecracker-microvm.github.io/
-- https://docs.rs/tonic/0.14.6/tonic/ — reviewed gRPC API; not an implementation dependency pin.
-- https://docs.rs/actix/0.13.5/actix/ — reviewed actor-framework API; release age is not a suitability test.
+- https://docs.rs/tonic/0.14.6/tonic/: reviewed gRPC API; not an implementation dependency pin.
+- https://docs.rs/actix/0.13.5/actix/: reviewed actor-framework API; release age is not a suitability test.
 - https://metr.org/blog/2026-08-26-openai-hugging-face-incident-investigation/
 - https://www.originhq.com/research/eye-of-the-swarm
 - https://arxiv.org/abs/2608.25512v1
-- https://arxiv.org/pdf/2608.25512v1 — Definition 48, Koishi case study (§5.3), system boundary (§6.1).
+- https://arxiv.org/pdf/2608.25512v1: Definition 48, Koishi case study (§5.3), system boundary (§6.1).
 - https://arxiv.org/abs/2309.03409v3
-- https://arxiv.org/html/2309.03409v3 — Table 1 and experimental settings (§5.1); K=20/8 are proposed swarm defaults, not a universal result.
+- https://arxiv.org/html/2309.03409v3: Table 1 and experimental settings (§5.1); K=20/8 are proposed swarm defaults, not a universal result.
 - https://github.com/google-deepmind/opro
 - https://raw.githubusercontent.com/google-deepmind/opro/a76bdce2cbf6d4a0d1e570a6fcfe17be9c2abdd7/README.md
-- https://arxiv.org/abs/2506.13131v1 — AlphaEvolve, especially automated task evaluation (§2.1).
+- https://arxiv.org/abs/2506.13131v1: AlphaEvolve, especially automated task evaluation (§2.1).
 - https://github.com/deepseek-ai/deepseek-harness
-- https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/d743267388641bc76f17c45ce8b4c231aed1d32c/README.md — Cordis relationship and developer-preview status.
+- https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/d743267388641bc76f17c45ce8b4c231aed1d32c/README.md: Cordis relationship and developer-preview status.
 - https://docs.vllm.ai/en/latest/
 - https://palantir.com/docs/foundry/ontology/overview/
 - https://palantir.com/docs/foundry/ontology/why-ontology/
 - https://palantir.com/docs/foundry/aip/overview/
-- https://typesafe.ai/blog/introducing-system-one-models-and-jev — vendor description of typed probabilistic decisions; schema correctness does not establish policy-decision correctness.
+- https://typesafe.ai/blog/introducing-system-one-models-and-jev: vendor description of typed probabilistic decisions; schema correctness does not establish policy-decision correctness.
 - https://github.com/earendil-works/pi
-- https://raw.githubusercontent.com/earendil-works/pi/89e5c2c075535e2f427c30fc74720d65b2944ff9/README.md — permissions boundary and standalone source builds.
-- https://raw.githubusercontent.com/earendil-works/pi/89e5c2c075535e2f427c30fc74720d65b2944ff9/packages/coding-agent/docs/skills.md — skills are instructions and resources, not authorization boundaries.
-- https://raw.githubusercontent.com/earendil-works/pi/89e5c2c075535e2f427c30fc74720d65b2944ff9/packages/coding-agent/docs/settings.md — built-in defaults do not disable extension/SDK tools.
-- https://raw.githubusercontent.com/earendil-works/pi/89e5c2c075535e2f427c30fc74720d65b2944ff9/packages/coding-agent/docs/rpc.md — JSONL subprocess integration and completion/error semantics.
-- https://raw.githubusercontent.com/earendil-works/pi/89e5c2c075535e2f427c30fc74720d65b2944ff9/packages/coding-agent/docs/custom-provider.md — primary and nested inference through a registered provider; streaming, cancellation and usage contract.
-- https://raw.githubusercontent.com/earendil-works/pi/89e5c2c075535e2f427c30fc74720d65b2944ff9/packages/coding-agent/docs/extensions.md — trusted executable extension and custom-provider registration.
+- https://raw.githubusercontent.com/earendil-works/pi/89e5c2c075535e2f427c30fc74720d65b2944ff9/README.md: permissions boundary and standalone source builds.
+- https://raw.githubusercontent.com/earendil-works/pi/89e5c2c075535e2f427c30fc74720d65b2944ff9/packages/coding-agent/docs/skills.md: skills are instructions and resources, not authorization boundaries.
+- https://raw.githubusercontent.com/earendil-works/pi/89e5c2c075535e2f427c30fc74720d65b2944ff9/packages/coding-agent/docs/settings.md: built-in defaults do not disable extension/SDK tools.
+- https://raw.githubusercontent.com/earendil-works/pi/89e5c2c075535e2f427c30fc74720d65b2944ff9/packages/coding-agent/docs/rpc.md: JSONL subprocess integration and completion/error semantics.
+- https://raw.githubusercontent.com/earendil-works/pi/89e5c2c075535e2f427c30fc74720d65b2944ff9/packages/coding-agent/docs/custom-provider.md: primary and nested inference through a registered provider; streaming, cancellation and usage contract.
+- https://raw.githubusercontent.com/earendil-works/pi/89e5c2c075535e2f427c30fc74720d65b2944ff9/packages/coding-agent/docs/extensions.md: trusted executable extension and custom-provider registration.
 - https://pi.dev/
 - https://pi.dev/docs/latest/skills
 
 Verification and QA tooling (§4.8, §§6.16–6.19), retrieved on 2026-10-12. These pages move. Pin the commits, tool versions and dependency configuration when implementing. A spot check confirmed that each URL resolves and that the terms cited in §4.8 and §6.18 appear in the page. For systemd it confirmed the exact `RuntimeMaxSec=` and `Type=oneshot` statement. The other pages were matched by keyword and were not read in full.
 
-- https://raw.githubusercontent.com/cursor/plugins/1b6d44ff26d4e242f4e8f68c391e6d2f7ca16def/pstack/README.md — pstack workflows and verification-related skills (pinned to commit 1b6d44f).
-- https://raw.githubusercontent.com/cursor/plugins/1b6d44ff26d4e242f4e8f68c391e6d2f7ca16def/pstack/skills/create-verification-skill/SKILL.md — repository inspection, launch, doctor, drive, evidence, cleanup and the feature map.
-- https://raw.githubusercontent.com/cursor/plugins/1b6d44ff26d4e242f4e8f68c391e6d2f7ca16def/pstack/skills/maintain-verification-skill/SKILL.md — checking the verification map against the application.
-- https://github.com/matklad/cargo-xtask — project-local Rust automation pattern (reviewed at commit 1559f86).
-- https://nexte.st/docs/ci-features/archiving/ — compiled test archives, extra files and path remapping. The page is unversioned; the latest release at retrieval was cargo-nextest 0.9.148.
-- https://man.openbsd.org/ssh_config — host-key verification, noninteractive operation and forwarding controls.
-- https://docs.ansible.com/projects/ansible/latest/inventory_guide/connection_details.html — native OpenSSH and connection configuration.
-- https://raw.githubusercontent.com/systemd/systemd/f48efd110e265f78e8fd3646706ad0a83d1044f8/man/systemd.service.xml — supervised services, runtime and start/stop deadlines, restart behavior. `RuntimeMaxSec=` has no effect on `Type=oneshot` services. The rendered documentation endpoint was unavailable to the handoff's author; this is the official source (pinned to commit f48efd1).
-- https://docs.ansible.com/projects/ansible/latest/playbook_guide/playbooks_async.html — asynchronous actions, polling and job status.
-- https://inspect.aisi.org.uk/ — Inspect: evaluation composition and external-agent support.
-- https://inspect.aisi.org.uk/scorers.html — Inspect scorers and aggregate metrics.
-- https://inspect.aisi.org.uk/agent-bridge.html — Inspect Agent Bridge: an integration option, not an existing solos-swarm adapter.
+- https://raw.githubusercontent.com/cursor/plugins/1b6d44ff26d4e242f4e8f68c391e6d2f7ca16def/pstack/README.md: pstack workflows and verification-related skills (pinned to commit 1b6d44f).
+- https://raw.githubusercontent.com/cursor/plugins/1b6d44ff26d4e242f4e8f68c391e6d2f7ca16def/pstack/skills/create-verification-skill/SKILL.md: repository inspection, launch, doctor, drive, evidence, cleanup and the feature map.
+- https://raw.githubusercontent.com/cursor/plugins/1b6d44ff26d4e242f4e8f68c391e6d2f7ca16def/pstack/skills/maintain-verification-skill/SKILL.md: checking the verification map against the application.
+- https://github.com/matklad/cargo-xtask: project-local Rust automation pattern (reviewed at commit 1559f86).
+- https://nexte.st/docs/ci-features/archiving/: compiled test archives, extra files and path remapping. The page is unversioned; the latest release at retrieval was cargo-nextest 0.9.148.
+- https://man.openbsd.org/ssh_config: host-key verification, noninteractive operation and forwarding controls.
+- https://docs.ansible.com/projects/ansible/latest/inventory_guide/connection_details.html: native OpenSSH and connection configuration.
+- https://raw.githubusercontent.com/systemd/systemd/f48efd110e265f78e8fd3646706ad0a83d1044f8/man/systemd.service.xml: supervised services, runtime and start/stop deadlines, restart behavior. `RuntimeMaxSec=` has no effect on `Type=oneshot` services. The rendered documentation endpoint was unavailable to the handoff's author; this is the official source (pinned to commit f48efd1).
+- https://docs.ansible.com/projects/ansible/latest/playbook_guide/playbooks_async.html: asynchronous actions, polling and job status.
+- https://inspect.aisi.org.uk/: Inspect: evaluation composition and external-agent support.
+- https://inspect.aisi.org.uk/scorers.html: Inspect scorers and aggregate metrics.
+- https://inspect.aisi.org.uk/agent-bridge.html: Inspect Agent Bridge: an integration option, not an existing solos-swarm adapter.

@@ -5,7 +5,7 @@ description: Launches and verifies solos-swarm candidates through normal authent
 
 # Verify solos-swarm
 
-Read [the runbook](../../docs/MVP-RUNBOOK.md) for provisioning and normal API configuration, [the feature map](../../docs/MVP-TRACEABILITY.md) for requirement coverage, and [campaigns](../../docs/CAMPAIGNS.md) for matched comparisons. These instructions grant no operator role, Capability, or spending authority.
+Read [the runbook](../../docs/MVP-RUNBOOK.md) for provisioning, [the feature map](../../docs/MVP-TRACEABILITY.md) for requirement coverage, and [campaigns](../../docs/CAMPAIGNS.md) for matched comparisons. These instructions grant no operator role, Capability, or spending authority. The preview SSH target is `--host` or `SOLOS_SSH_HOST` (example alias: `remote-ai`).
 
 ## Identify the candidate
 

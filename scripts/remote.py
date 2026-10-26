@@ -21,7 +21,9 @@ import tempfile
 import time
 
 REPO = Path(__file__).resolve().parent.parent
-SSH = ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ForwardAgent=no", "-o", "ConnectTimeout=15", "remote-ai"]
+# Example SSH config alias. Override with --host or SOLOS_SSH_HOST.
+EXAMPLE_SSH_HOST = "remote-ai"
+SSH_HOST = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@:-]{0,127}\Z")
 NODE_SOURCE = Path.home() / ".local/opt/node-v24.18.0-linux-x64"
 DATA = Path.home() / ".local/share/solos-swarm"
 STATE = Path.home() / ".local/state/solos-swarm"
@@ -298,16 +300,26 @@ def host_main(action):
     print(json.dumps(result))
 
 
-def ssh_command(action):
+def default_ssh_host():
+    return os.environ.get("SOLOS_SSH_HOST", EXAMPLE_SSH_HOST)
+
+
+def ssh_argv(host):
+    if not isinstance(host, str) or not SSH_HOST.fullmatch(host):
+        raise ValueError("SSH host must be an alias or user@host")
+    return ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ForwardAgent=no", "-o", "ConnectTimeout=15", host]
+
+
+def ssh_command(action, host):
     source = base64.b64encode(Path(__file__).read_bytes()).decode()
     loader = ("import base64, sys\nns={'__name__':'remote_host','__file__':'/remote.py'}\ntry:\n"
               f" exec(base64.b64decode('{source}'), ns)\n ns['host_main']({action!r})\n"
               "except Exception as error:\n print('remote-host: ' + str(error), file=sys.stderr)\n sys.exit(2)")
-    return [*SSH, "python3 -c " + shlex.quote(loader)]
+    return [*ssh_argv(host), "python3 -c " + shlex.quote(loader)]
 
 
-def call_host(action, payload):
-    result = subprocess.run(ssh_command(action), input=json.dumps(payload).encode(), capture_output=True)
+def call_host(action, payload, host):
+    result = subprocess.run(ssh_command(action, host), input=json.dumps(payload).encode(), capture_output=True)
     if result.returncode:
         raise RuntimeError(result.stderr.decode(errors="replace").strip() or "Remote operation failed")
     return json.loads(result.stdout)
@@ -347,9 +359,11 @@ def read_deepseek_key(auth_file):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--host", default=None, help="SSH alias or user@host. Example default: remote-ai. Override with SOLOS_SSH_HOST.")
     subparsers = parser.add_subparsers(dest="action", required=True)
-    subparsers.add_parser("deploy", help="Build once on the approved host; freeze installed artifacts")
-    start = subparsers.add_parser("start", help="Freeze one case and start ten live agents as a bounded systemd service")
+    subparsers.add_parser("deploy", parents=[common], help="Build once on the selected host; freeze installed artifacts")
+    start = subparsers.add_parser("start", parents=[common], help="Freeze one case and start ten live agents as a bounded systemd service")
     start.add_argument("--candidate", required=True)
     start.add_argument("--run-id", required=True)
     start.add_argument("--seed", required=True, type=int)
@@ -357,7 +371,7 @@ def main():
     start.add_argument("--idle-probe", action="store_true", help="Exercise lifecycle with no paid model calls; never qualifies")
     start.add_argument("--deadline-seconds", type=int, help="Shortened deadline for an idle lifecycle probe only")
     for action in ("status", "cancel", "collect"):
-        command = subparsers.add_parser(action)
+        command = subparsers.add_parser(action, parents=[common])
         command.add_argument("--run-id", required=True)
         if action == "collect":
             command.add_argument("--output", required=True, type=Path)
@@ -370,8 +384,9 @@ def main():
         if args.action == "_finalize":
             finalize_host(args.run_id, args.candidate, args.credential_file)
             return
+        host = args.host or default_ssh_host()
         if args.action == "deploy":
-            result = subprocess.run(ssh_command("deploy"), input=source_archive(), capture_output=True)
+            result = subprocess.run(ssh_command("deploy", host), input=source_archive(), capture_output=True)
             if result.returncode:
                 raise RuntimeError(result.stderr.decode(errors="replace").strip())
             print(result.stdout.decode().strip())
@@ -382,13 +397,13 @@ def main():
             candidate_path(args.candidate)
             request.update(candidate_id=args.candidate, seed=args.seed)
             request.update(idle_probe=args.idle_probe, deadline_seconds=args.deadline_seconds)
-            result = call_host("start", request)
+            result = call_host("start", request, host)
             if result.get("needs_credential"):
                 request["api_key"] = "non-live-lifecycle-probe" if args.idle_probe else read_deepseek_key(args.auth_file)
-                result = call_host("start", request)
+                result = call_host("start", request, host)
             print(json.dumps(result, indent=2))
         elif args.action == "collect":
-            result = subprocess.run(ssh_command("collect"), input=json.dumps(request).encode(), capture_output=True)
+            result = subprocess.run(ssh_command("collect", host), input=json.dumps(request).encode(), capture_output=True)
             if result.returncode:
                 raise RuntimeError(result.stderr.decode(errors="replace").strip())
             args.output.mkdir(parents=True, exist_ok=False)
@@ -399,7 +414,7 @@ def main():
                 bundle.extractall(args.output, filter="data")
             print(json.dumps({"run_id": args.run_id, "evidence": str(args.output.resolve())}))
         else:
-            print(json.dumps(call_host(args.action, request), indent=2))
+            print(json.dumps(call_host(args.action, request, host), indent=2))
     except (OSError, ValueError, KeyError, RuntimeError, subprocess.CalledProcessError) as error:
         parser.exit(2, f"remote: {error}\n")
 

@@ -1,3 +1,5 @@
+Historical delivery stories. Not an operator runbook. Requirements: [../TRD.md](../TRD.md).
+
 # Verification and QA backlog
 
 Status: proposed. This file is the story text for the delivery map in `docs/TRD.md` §9. The requirements are in §§6.11 and 6.15–6.19 and in §7 (SEC-F-48, SEC-NF-29). Story IDs are suggested backlog IDs. Estimates wait for the repository audit (QA-00).
@@ -25,7 +27,7 @@ Priority P0. Dependencies: none. Requirements: all families.
 
 As an implementation agent, I identify the actual CLI and operator surfaces, the build and release pipeline, provider adapters, fixtures, telemetry, the audit verifier and the deployment scripts. I map the existing requirements to available behavior and to explicit gaps.
 
-**Acceptance.** A revised editable TRD and a focused diff and change log. The existing requirement IDs are preserved. The release and QA requirements and the story mapping are added. Owner decisions are distinguished from proposals. The open contradictions are resolved or tracked (`docs/TRD-CHANGES.md`). No unimplemented command is claimed to work.
+**Acceptance.** A revised editable TRD and a focused diff and change log. The existing requirement IDs are preserved. The release and QA requirements and the story mapping are added. Owner decisions are distinguished from proposals. The open contradictions are resolved or tracked (`docs/internal/TRD-CHANGES.md`). No unimplemented command is claimed to work.
 
 **Status.** The TRD amendment is delivered for review. The repository at `45ae3f4` holds only `README.md` and `docs/TRD.md`. There is no code, CLI, CI or deployment script to map, so the gap map is the whole implementation.
 
