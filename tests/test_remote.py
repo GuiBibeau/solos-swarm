@@ -17,18 +17,18 @@ spec.loader.exec_module(remote)
 
 
 class RemoteTests(unittest.TestCase):
-    def test_ssh_host_defaults_to_example_alias_and_rejects_shell_syntax(self):
-        self.assertEqual(remote.EXAMPLE_SSH_HOST, "remote-ai")
-        self.assertEqual(remote.ssh_argv("remote-ai")[-1], "remote-ai")
+    def test_ssh_host_defaults_to_placeholder_and_rejects_shell_syntax(self):
+        self.assertEqual(remote.EXAMPLE_SSH_HOST, "solos-node")
+        self.assertEqual(remote.ssh_argv("solos-node")[-1], "solos-node")
         self.assertEqual(remote.ssh_argv("ops@cluster.example")[-1], "ops@cluster.example")
-        self.assertEqual(remote.ssh_command("status", "lab-a")[-2], "lab-a")
-        for value in ("remote-ai;rm", "host name", "", "-oProxyCommand=x"):
+        self.assertEqual(remote.ssh_command("status", "worker-node-01")[-2], "worker-node-01")
+        for value in ("solos-node;rm", "host name", "", "-oProxyCommand=x"):
             with self.assertRaises(ValueError):
                 remote.ssh_argv(value)
-        with patch.dict(os.environ, {"SOLOS_SSH_HOST": "lab-a"}):
-            self.assertEqual(remote.default_ssh_host(), "lab-a")
+        with patch.dict(os.environ, {"SOLOS_SWARM_SSH_TARGET": "worker-node-01"}):
+            self.assertEqual(remote.default_ssh_host(), "worker-node-01")
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(remote.default_ssh_host(), "remote-ai")
+            self.assertEqual(remote.default_ssh_host(), "solos-node")
 
     def test_run_ids_cannot_escape_owned_paths(self):
         for value in ("../another-service", "a/b", "UPPER", "", "a" * 49):

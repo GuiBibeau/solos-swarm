@@ -21,8 +21,8 @@ import tempfile
 import time
 
 REPO = Path(__file__).resolve().parent.parent
-# Example SSH config alias. Override with --host or SOLOS_SSH_HOST.
-EXAMPLE_SSH_HOST = "remote-ai"
+# Neutral SSH alias. Override with --host or SOLOS_SWARM_SSH_TARGET.
+EXAMPLE_SSH_HOST = "solos-node"
 SSH_HOST = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@:-]{0,127}\Z")
 NODE_SOURCE = Path.home() / ".local/opt/node-v24.18.0-linux-x64"
 DATA = Path.home() / ".local/share/solos-swarm"
@@ -301,7 +301,7 @@ def host_main(action):
 
 
 def default_ssh_host():
-    return os.environ.get("SOLOS_SSH_HOST", EXAMPLE_SSH_HOST)
+    return os.environ.get("SOLOS_SWARM_SSH_TARGET", EXAMPLE_SSH_HOST)
 
 
 def ssh_argv(host):
@@ -360,7 +360,7 @@ def read_deepseek_key(auth_file):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--host", default=None, help="SSH alias or user@host. Example default: remote-ai. Override with SOLOS_SSH_HOST.")
+    common.add_argument("--host", default=None, help="SSH alias or user@host. Default: solos-node. Override with SOLOS_SWARM_SSH_TARGET.")
     subparsers = parser.add_subparsers(dest="action", required=True)
     subparsers.add_parser("deploy", parents=[common], help="Build once on the selected host; freeze installed artifacts")
     start = subparsers.add_parser("start", parents=[common], help="Freeze one case and start ten live agents as a bounded systemd service")

@@ -1,88 +1,99 @@
-# Evaluation campaigns
+# Campaigns
 
-`solos-swarm mvp campaign` runs a frozen plan through the authenticated operator and broker. It does not mint operator identities, create approvals, read an evaluator key, or bypass a Capability.
+Matched 2x2 experimental design for comparing worker parallelism and planner context policies.
 
-```sh
-solos-swarm mvp campaign --config /absolute/path/campaign.json --output /absolute/path/campaign-run
+
+## 1. 2x2 matrix
+
+Each trial seed runs four cells under identical budgets, token limits, and model parameters:
+
+| Cell | `workers` | `history_mode` | Context policy |
+|---|---:|---|---|
+| `C1` | `1` | `scored_history` | Top-K scored attempts + retractions |
+| `C2` | `1` | `single_draft_refinement` | Best single draft + retractions |
+| `C3` | `10` | `scored_history` | Shared board + top-K scored attempts |
+| `C4` | `10` | `single_draft_refinement` | Shared board + best single draft |
+
+
+## 2. Invariants
+
+1. **Frozen trial catalog**: Seeds, caps, and model parameters lock before trial `0`.
+2. **Matched cell envelopes**: Every cell gets identical `budget_microusd`, `max_calls`, `max_input_tokens`, `max_output_tokens`, and `deadline_ms`.
+3. **Holdout isolation**: Iterative proposals score on `search`; `evaluator-serve` scores `final_holdout` once at cell completion.
+4. **Goal-scoped IPC**: Evaluator socket binds per `goal_id` under UID `995` (`0710` dir, `0660` socket).
+5. **Pre-dispatch token gate**: Contexts exceeding `max_input_tokens` under `VerifiedTokenizer` fail closed before spend.
+
+
+## 3. Command
+
+```bash
+./target/release/solos-swarm mvp campaign \
+  --config /path/to/campaign.json \
+  --output /path/to/campaign-report.json
 ```
 
-## Plan
 
-| Rule | Value |
+## 4. `CampaignConfig`
+
+```json
+{
+  "id": "campaign-reconcile-01",
+  "seed": 20260412,
+  "family": "synthetic_reconciliation",
+  "trials": 5,
+  "model": "deepseek-chat",
+  "temperature_millis": 0,
+  "budget_microusd": 1000000,
+  "max_calls": 20,
+  "max_input_tokens": 8192,
+  "max_output_tokens": 2048,
+  "deadline_ms": 600000,
+  "evaluator_endpoint": "https://127.0.0.1:9445",
+  "evaluator_socket_root": "/var/lib/solos-swarm/evaluator/ipc",
+  "evaluator_identity": {
+    "certificate_path": "/var/lib/solos-swarm/cp/cp.der",
+    "private_key_path": "/var/lib/solos-swarm/cp/cp.key.der",
+    "ca_certificate_path": "/var/lib/solos-swarm/shared/ca.der",
+    "expected_spiffe_id": "spiffe://solos.local/ns/prod/sa/evaluator-01"
+  },
+  "provider": {
+    "id": "deepseek",
+    "kind": "openai_compatible",
+    "endpoint": "https://api.deepseek.com/v1/chat/completions",
+    "model": "deepseek-chat",
+    "credential": { "kind": "file", "path": "/run/credentials/deepseek.key" },
+    "input_price_microusd_per_million": 300000,
+    "output_price_microusd_per_million": 1200000,
+    "max_output_tokens": 2048,
+    "tokenizer": {
+      "format": "huggingface_json",
+      "path": "work/tokenizers/deepseek-v4.1-flash/tokenizer.json",
+      "sha256": "c2fd98e9fc2bd49fd7fcce7fb8fd2ca6fb9fa065ff4dc124e2d8d594bf9610b7"
+    }
+  }
+}
+```
+
+
+## 5. Scenario families (`CatalogFamily`)
+
+| Family | Task |
 |---|---|
-| Cases | At least two independent catalog cases |
-| Cells per case | 1 worker and 10 workers, each with scored history and single-draft refinement |
-| Shared across cells | Total budget, public inputs, model, dataset/template version, worker policy, scorer key and version |
-| Per cell | Own Goal and Goal-scoped evaluator URI |
-| Service agents | Excluded from the worker count; still need grants, leases, and resources |
+| `synthetic_reconciliation` | 10-shard record mismatch synthesis |
+| `wasm_transform` | WASI binary synthesis under fuel caps |
+| `policy_repair` | ABAC and capability constraint repair |
+| `log_triage` | Multi-shard incident lineage correlation |
 
-## `CampaignConfig`
 
-| Field | Content |
+## 6. Output fields (`CampaignReport`)
+
+| Field | Meaning |
 |---|---|
-| `client` | `QaConfig`: controller identity, operator session, receiver probes, evidence key file |
-| `plan` | `CampaignPlan`: `TrialPlan`s, stop rules, deadlines, regression thresholds |
-| `trials` | Trial ID to `FrozenTrial` |
-| `controlplane_public_key` | Expected audit signer |
-| `evidence_directory` | Fresh directory; encryption key stays outside it |
-
-Each `TrialPlan` has `scorer_id` and `scorer_public_key`. The URI is Goal-scoped. The key and version identify the scorer pool.
-
-Each `FrozenTrial` supplies:
-
-| Field | Use |
-|---|---|
-| `goal_id` | Admitted Goal |
-| Public case | Worker-visible catalog input |
-| `setup` | Normal operator commands |
-| Supervisor units | Owned unit names |
-| Evaluator certificate and CA | Public only |
-| Receiver name and JSON pointers | Unsafe and successful effect counters |
-| `runtime_node` | Expected node |
-| `runtime_configuration_sha256` | 32-byte config digest |
-
-## Freeze
-
-1. One `RegisterGoal` with real approvals and one `ApplySwarm` per trial.
-2. `security::bind_goal_contract` before approval.
-3. Pin the evaluator public key.
-4. Required Need predicate: `{"kind":"catalog-final"}`.
-5. Oracle fixtures and evaluator keys stay in the evaluator's owner-only files.
-
-Worker inputs: `qa::campaign_task_inputs(public_case, agent_count)`. Ten workers get one shard each. One worker gets the combined public records. Policy fingerprint: `qa::campaign_agent_config_digest(swarm)`.
-
-| Cell | History |
-|---|---|
-| Scored history | `history.mode="scored_history"` |
-| Refinement | `history.mode="single_draft_refinement"`, `new_candidates=1` |
-
-Both keep the full archive and the retraction barrier. A model completion opens one planning round from its admitted context.
-
-## Evaluator
-
-One Goal-scoped evaluator service per trial. Capability `evaluate/<goal>`, nonbillable, with an allocation lease. The service owns its Unix socket, checks the control-plane UID, and signs results with its SVID. The protected bundle pins the broker mTLS socket and origin. The control plane does not read the private key or oracle.
-
-## Verdict
-
-The driver waits for a signed final evaluation and checks:
-
-| Check | Required |
-|---|---|
-| Evaluator key | Approved key |
-| Contract and lineage | Current |
-| Audit | Signed checkpoint |
-| Definitions | Exact frozen Goal and Swarm |
-| Workers | Each declared worker has a settled inference and a Finding in the final lineage |
-| Receiver | Positive permitted effect |
-| Runtime measurement | Signed packet matches frozen executable and config hashes |
-| Cost | Matched measured spend; equal caps alone are not equal spend |
-
-Software measurement is not hardware attestation.
-
-Failures, timeouts, and unknown outcomes stay in the report. Cleanup is Goal-owned and bounded. The driver does not kill ambient processes and does not drop a failed cell.
-
-| State | Meaning |
-|---|---|
-| Production campaign | Unrun |
-| Preview in [POC-RESULTS.md](POC-RESULTS.md) | Frozen preview binary only |
-| OIDC/MFA, separate hosts, GPU, TRD scale targets | Separate qualifications |
+| `trials[].cells[].workers` | `1` or `10` |
+| `trials[].cells[].history_mode` | `scored_history` or `single_draft_refinement` |
+| `trials[].cells[].search_attempts` | Candidate evaluations on `search` split |
+| `trials[].cells[].best_search_score_millis` | Peak `search` score (`0..1000`) |
+| `trials[].cells[].final_holdout_score_millis` | Signed `final_holdout` score (`0..1000`) |
+| `trials[].cells[].settled_microusd` | Total settled cell spend |
+| `trials[].cells[].elapsed_ms` | Cell wall-clock runtime |
+| `summary` | Win/tie/loss counts and median scores |
