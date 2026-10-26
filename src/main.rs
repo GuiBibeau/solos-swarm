@@ -1,12 +1,15 @@
-mod broker;
 mod mvp;
 
+use solos_swarm::{broker, code::CodeExecutor};
+
 use anyhow::{Context, Result, ensure};
-use broker::{Broker, DeepSeek, Goal, Store, file_digest, now_ms, router, write_json};
+use broker::{
+    Broker, Goal, OpenAiCompatible, Store, Upstream, file_digest, now_ms, router, write_json,
+};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -15,7 +18,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::UnixListener,
     process::{Child, ChildStdin, Command},
     sync::{Mutex, Semaphore, mpsc},
@@ -55,6 +58,8 @@ enum Action {
         pi_root: PathBuf,
         #[arg(long)]
         node: PathBuf,
+        #[arg(long, value_parser = ["deepseek", "venice"])]
+        provider: Option<String>,
         #[arg(long)]
         credential_file: Option<PathBuf>,
         #[arg(long)]
@@ -69,15 +74,30 @@ enum Action {
         #[arg(long)]
         node: PathBuf,
     },
+    /// Probe the sandboxed worker path without spending a token: launch one Pi
+    /// worker inside bubblewrap and have it call `fetch_url`.
+    FetchProbe {
+        #[arg(long)]
+        pi_root: PathBuf,
+        #[arg(long)]
+        node: PathBuf,
+        #[arg(long)]
+        url: String,
+    },
 }
 
+// Eight arguments are deliberate: this is the single documented worker
+// isolation boundary, and every one is a distinct mount or identity input.
+#[allow(clippy::too_many_arguments)]
 fn sandbox(
     node: &Path,
     root: &Path,
     socket: &Path,
     settings: &Path,
+    grants: &str,
     token: &str,
     id: &str,
+    model: &str,
 ) -> Command {
     let mut cmd = Command::new("bwrap");
     cmd.env_clear()
@@ -89,11 +109,20 @@ fn sandbox(
             "--ro-bind",
             "/usr",
             "/usr",
-            "--symlink",
-            "usr/lib",
+            // Name resolution and CA material are a read-only binding rather than
+            // a borrowing from the host environment, so a clearenv worker still
+            // resolves and verifies a live target.
+            "--ro-bind-try",
+            "/etc",
+            "/etc",
+            // The loader directories are bound rather than symlinked: on a usr-merged
+            // host /lib is itself a symlink, so replacing it with one would hide the
+            // real libraries from a dynamically linked node and fail as ENOENT.
+            "--ro-bind-try",
             "/lib",
-            "--symlink",
-            "usr/lib64",
+            "/lib",
+            "--ro-bind-try",
+            "/lib64",
             "/lib64",
             "--proc",
             "/proc",
@@ -108,8 +137,11 @@ fn sandbox(
             "--dir",
             "/runtime",
         ])
+        // `node` is the binary path; its install root is what gets bound, so the
+        // worker can exec an absolute binary path and still resolve node_modules
+        // beside it under the same /runtime/node prefix.
         .arg("--ro-bind")
-        .arg(node)
+        .arg(node.parent().and_then(Path::parent).unwrap_or(node))
         .arg("/runtime/node")
         .arg("--ro-bind")
         .arg(root.join("node_modules"))
@@ -147,10 +179,15 @@ fn sandbox(
         } else {
             "worker"
         })
+        .args(["--setenv", "SWARM_GRANTS"])
+        .arg(grants)
         .args([
             "--chdir",
             "/work",
-            "/runtime/node",
+            // The explicit binary path, not the directory: a directory exec needs
+            // the kernel to resolve the name through PATH inside the mount
+            // namespace, which fails EACCES on some host/container kernels.
+            "/runtime/node/bin/node",
             "/runtime/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
             "--offline",
             "--mode",
@@ -158,7 +195,9 @@ fn sandbox(
             "--provider",
             "swarm",
             "--model",
-            "deepseek-flash",
+        ])
+        .arg(model)
+        .args([
             "--thinking",
             "off",
             "--no-session",
@@ -231,6 +270,84 @@ async fn rpc(worker: &mut Worker, store: &Arc<Mutex<Store>>, prompt: &str) -> Re
     Ok(())
 }
 
+/// Two escalation points, counted PER AGENT. A cohort-wide round counter let a
+/// fast worker (agent-07 in math-swarm-20261025-02) make 58 calls and exhaust
+/// its envelope before the cohort ever reached the mandatory round, so the one
+/// instruction that could have saved the run was sent only after every call was
+/// already denied.
+const NUDGE_FILING_AT: usize = 16;
+const NUDGE_MANDATORY_AT: usize = 32;
+
+/// The exact filing call this Task admits. Built from the Task's own
+/// `output_contract`, never from a guessed shape or a fabricated record.
+fn filing_contract(task: Option<&broker::Task>) -> Option<(String, String, String)> {
+    let task = task?;
+    let contract = task.input.get("output_contract")?;
+    let key = contract.get("result_key").and_then(Value::as_str)?;
+    let required = contract
+        .get("required_fields")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let severities = contract
+        .get("severities")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    Some((
+        task.id.clone(),
+        key.to_owned(),
+        format!("{required}; severity one of {severities}"),
+    ))
+}
+
+/// The escalating instruction sent to a worker that has not filed. Earlier
+/// rounds still allow exploration; later rounds make the tool call mandatory and
+/// name the exact call, because the most common failure is a worker that keeps
+/// researching and never submits.
+fn nudge(round: usize, id: &str, task: Option<&broker::Task>) -> String {
+    if round < NUDGE_FILING_AT {
+        format!(
+            "You are {id}. Keep researching. Use fetch_url to read the actual sources in your \
+             assigned block: the manuscript map, the paper README, and the LaTeX sections under \
+             build/sections/. Read several papers before you decide. Post useful intermediates to \
+             the Board. Do not file yet unless you have already covered your block and have at \
+             least three well-evidenced records. Keep going."
+        )
+    } else if round < NUDGE_MANDATORY_AT {
+        format!(
+            "You are {id}. You have enough evidence to begin assembling your records. Post your \
+             top candidates to the Board now, then prepare one submit_finding call. Filing becomes \
+             mandatory in a few turns; do not open a new line of inquiry."
+        )
+    } else {
+        match filing_contract(task) {
+            Some((task_id, key, fields)) => format!(
+                "You are {id}. Filing is now the ONLY remaining action. Call submit_finding exactly \
+                 once, now:\n\
+                 submit_finding({{\"task_id\":\"{task_id}\",\"result\":{{\"{key}\":[]}}}})\n\
+                 Replace the empty list with one object per paper you have already read in this \
+                 conversation. Each object needs {fields}. Every file must be one of your seed \
+                 URLs. Never invent a paper and never copy this instruction into a record. If you \
+                 have no defensible record, submit the empty list: an empty finding is \
+                 recoverable, a missing one blocks the whole Goal. Do not call fetch_url again. \
+                 After submit_finding returns accepted, call board_post once and end the turn."
+            ),
+            None => format!(
+                "You are {id}. Filing is now the ONLY remaining action. Call claim_task if you \
+                 have not already, then call submit_finding exactly once with your claimed task_id \
+                 and the result object your worker prompt defines, built from evidence already in \
+                 this conversation. A filing with no records is better than no filing; never invent \
+                 a record. Do not call fetch_url again. After submit_finding returns accepted, end \
+                 the turn."
+            ),
+        }
+    }
+}
 async fn settled(
     rx: &mut mpsc::Receiver<(String, Result<Value>)>,
     required: &BTreeSet<String>,
@@ -269,30 +386,167 @@ async fn work(
         );
         rpc(worker, store, &prompt).await?;
     }
-    let ids = workers.iter().map(|w| w.id.clone()).collect();
-    settled(rx, &ids).await?;
+    let ids: BTreeSet<String> = workers.iter().map(|w| w.id.clone()).collect();
+    // Nudge rounds recover a turn that ended without the required tool call. The
+    // count is per worker and the events are consumed as they arrive: a worker
+    // that has already used many turns must be steered to file even while the
+    // rest of the cohort is still early, because its own budget is what runs out.
+    // The bound exists only so a worker that never complies cannot livelock the
+    // run; the broker's own call ceiling is the hard stop.
+    let mut pending = ids.clone();
+    let mut nudges: BTreeMap<String, usize> = ids.iter().map(|id| (id.clone(), 0)).collect();
+    while !pending.is_empty() {
+        let (who, event) = rx
+            .recv()
+            .await
+            .context("worker observation channel closed")?;
+        let event = event.with_context(|| format!("{who} RPC failed"))?;
+        if event["type"] == "response" && event["success"] == false {
+            anyhow::bail!("{who} RPC rejected command: {}", event["error"]);
+        }
+        if event["type"] != "agent_settled" || !pending.contains(&who) {
+            continue;
+        }
+        let (filed, task, terminal) = {
+            let store = store.lock().await;
+            (
+                store.findings.iter().any(|finding| finding.agent_id == who),
+                store
+                    .tasks
+                    .iter()
+                    .find(|task| task.claimed_by.as_deref() == Some(who.as_str()))
+                    .cloned(),
+                store
+                    .agents
+                    .get(&who)
+                    .and_then(|agent| agent.terminal.clone()),
+            )
+        };
+        if filed {
+            pending.remove(&who);
+            continue;
+        }
+        // A denied provider call cannot be fixed by another prompt: the model
+        // turn that would read the prompt is itself refused. File the contract's
+        // defer row from the control plane and retire this worker instead of
+        // spending the next two hundred rounds on identical denials.
+        if let Some(reason) = terminal {
+            let mut store = store.lock().await;
+            store.defer_task(goal, &who, &reason)?;
+            pending.remove(&who);
+            continue;
+        }
+        let count = nudges
+            .get_mut(&who)
+            .context("settled worker was not admitted")?;
+        if *count >= 200 {
+            // Stop steering a worker that never complies; the finding-count
+            // check below turns this into a clean, reported failure.
+            pending.remove(&who);
+            continue;
+        }
+        *count += 1;
+        let prompt = nudge(*count, &who, task.as_ref());
+        let worker = workers
+            .iter_mut()
+            .find(|worker| worker.id == who)
+            .context("settled worker has no process")?;
+        rpc(worker, store, &prompt).await?;
+    }
+    // An agent that never filed (nudges exhausted) still has a claimed Task:
+    // file its partial summary from the host so synthesis can proceed.
+    store
+        .lock()
+        .await
+        .file_partial_findings(goal, "agent ended without filing")?;
     ensure!(
         store.lock().await.findings.len() == goal.agent_count,
         "not all agents submitted a Finding"
     );
     rpc(&mut workers[0], store, &goal.synthesis_prompt).await?;
-    settled(rx, &["agent-00".to_owned()].into_iter().collect()).await?;
+    pending = BTreeSet::from(["agent-00".to_owned()]);
+    for _ in 0..12 {
+        settled(rx, &pending).await?;
+        if store.lock().await.artifact.is_some() {
+            pending.clear();
+            break;
+        }
+        let prompt = "Continue synthesis. You have NOT yet submitted the artifact. Call \
+                      read_findings, then submit_artifact exactly as the Goal instructs. Do \
+                      not end this turn without the submit_artifact tool call."
+            .to_owned();
+        rpc(&mut workers[0], store, &prompt).await?;
+        pending = BTreeSet::from(["agent-00".to_owned()]);
+    }
+    if !pending.is_empty() {
+        settled(rx, &pending).await?;
+    }
+    // The coordinator failed to submit (it never called read_findings or
+    // submit_artifact in several runs). The artifact is mechanically the exact
+    // union of the findings, so build it host-side under the same guard.
+    store
+        .lock()
+        .await
+        .synthesize_artifact("coordinator did not submit the artifact")?;
     ensure!(
         store.lock().await.artifact.is_some(),
-        "coordinator did not submit the artifact"
+        "no artifact could be synthesized"
     );
     Ok(())
 }
 
-async fn run(
+/// The admitted endpoint of each shipped provider profile. A profile's dialect
+/// is fixed here rather than read from the Goal, so a Goal cannot make the
+/// transport speak a dialect its provider does not.
+fn endpoint(provider: &str) -> Result<&'static str> {
+    match provider {
+        "deepseek" => Ok("https://api.deepseek.com/chat/completions"),
+        "venice" => Ok("https://api.venice.ai/api/v1/chat/completions"),
+        other => anyhow::bail!("provider outside the deployment allowlist: {other}"),
+    }
+}
+/// The model revision recorded in the manifest and evidence. An API alias has
+/// no weights digest to publish, so the admitted provider and model name it.
+fn model_revision(upstream: &Upstream) -> String {
+    format!(
+        "{}/{} (API alias, weights unavailable)",
+        upstream.provider, upstream.model
+    )
+}
+/// Build the transport for a resolved upstream, so both shipped profiles share
+/// one receipt, bound and error path.
+fn provider_for(upstream: &Upstream, client: reqwest::Client, key: String) -> OpenAiCompatible {
+    OpenAiCompatible {
+        endpoint: endpoint(&upstream.provider).expect("resolved upstream endpoint"),
+        dialect: upstream.dialect,
+        client,
+        key,
+    }
+}
+
+/// One legacy preview run: a frozen Goal, the pinned Pi tree and one credential.
+struct RunOptions {
     config: PathBuf,
     run_dir: PathBuf,
     root: PathBuf,
     node: PathBuf,
+    provider: Option<String>,
     credential_file: Option<PathBuf>,
     deadline: Option<u64>,
     idle: bool,
-) -> Result<()> {
+}
+
+async fn run(options: RunOptions) -> Result<()> {
+    let RunOptions {
+        config,
+        run_dir,
+        root,
+        node,
+        provider,
+        credential_file,
+        deadline,
+        idle,
+    } = options;
     // Consume the one-use credential before any launch or config error can retain it.
     let key = if let Some(path) = credential_file {
         let result = fs::read_to_string(&path);
@@ -304,12 +558,25 @@ async fn run(
     } else {
         String::new()
     };
-    let goal: Goal = serde_yaml::from_slice(&fs::read(&config)?).context("invalid Goal YAML")?;
+    let mut goal: Goal =
+        serde_yaml::from_slice(&fs::read(&config)?).context("invalid Goal YAML")?;
+    // A Goal that declares an upstream is complete on its own; the flag lets an
+    // operator select a shipped profile for a Goal that does not, and restating
+    // a declared upstream identically is accepted.
+    let resolved = match (&goal.upstream, &provider) {
+        (Some(upstream), Some(supplied)) => {
+            ensure!(
+                &upstream.provider == supplied,
+                "Goal upstream and --provider disagree"
+            );
+            upstream.clone()
+        }
+        (Some(upstream), None) => upstream.clone(),
+        (None, Some(supplied)) => broker::upstream_profile(supplied, &goal.model)?,
+        (None, None) => broker::Upstream::deepseek(&goal.model),
+    };
+    goal.upstream = Some(resolved.clone());
     goal.validate()?;
-    ensure!(
-        idle || !key.is_empty(),
-        "DeepSeek broker credential required"
-    );
     ensure!(
         std::env::consts::OS == "linux",
         "agent isolation requires Linux"
@@ -328,7 +595,17 @@ async fn run(
         fs::copy(&config, &config_path)?;
     }
     let executable = std::env::current_exe()?;
-    let manifest = json!({"schema_version":1,"live":!idle,"provider":"deepseek","model":goal.model,"model_revision":"DeepSeek-V4.1-Flash (API alias, weights unavailable)","pi_version":"1.1.0","topology":"single-host","isolation":"bubblewrap-unshare-all","runtime_sha256":file_digest(&executable)?,"extension_sha256":file_digest(&root.join("extensions/broker.ts"))?,"package_lock_sha256":file_digest(&root.join("package-lock.json"))?,"artifacts":{"config.yaml":file_digest(&config_path)?},"seed":goal.seed,"catalog_version":goal.catalog_version,"scorer_version":goal.scorer_version,"started_ms":now_ms(),"price_table":{"revision":"deepseek-2026-10-12-conservative-peak","input_microusd_per_million":goal.input_price_microusd_per_million,"output_microusd_per_million":goal.output_price_microusd_per_million},"deadline_seconds":deadline,"deferred":["Raft/QUIC and multi-host HA","500-agent acceptance","SVID and signed audit witness","Firecracker tools/full Tier P","local provider and air gap","policy actors/module unloading/retractions","history optimization and three-family rotation"]});
+    let upstream = goal.upstream.clone().context("resolved upstream absent")?;
+    // A Goal frozen before `upstream` existed carries neither the extra key nor
+    // the derived revision, so its digest and manifest are unchanged; a Goal
+    // that names its upstream records both.
+    let mut manifest = json!({"schema_version":1,"live":!idle,"provider":upstream.provider,"model":goal.model,"model_revision":model_revision(&upstream),"pi_version":"1.1.0","topology":"single-host","isolation":"bubblewrap-unshare-all","runtime_sha256":file_digest(&executable)?,"extension_sha256":file_digest(&root.join("extensions/broker.ts"))?,"package_lock_sha256":file_digest(&root.join("package-lock.json"))?,"artifacts":{"config.yaml":file_digest(&config_path)?},"seed":goal.seed,"catalog_version":goal.catalog_version,"scorer_version":goal.scorer_version,"started_ms":now_ms(),"price_table":{"revision":format!("{}-2026-10-12-conservative-peak",upstream.provider),"input_microusd_per_million":goal.input_price_microusd_per_million,"output_microusd_per_million":goal.output_price_microusd_per_million,"cache_hit_microusd_per_million":goal.cache_hit_price_microusd_per_million},"deadline_seconds":deadline,"deferred":["Raft/QUIC and multi-host HA","500-agent acceptance","SVID and signed audit witness","Firecracker tools/full Tier P","local provider and air gap","policy actors/module unloading/retractions","history optimization and three-family rotation"]});
+    // The checker's legacy provider check reads this key; present it only when
+    // it is accurate, so an old manifest stays byte-identical and a Venice one
+    // is never mislabelled.
+    if upstream.provider != "deepseek" {
+        manifest["upstream_provider"] = json!(upstream.provider);
+    }
     ensure!(
         !run_dir.join("events.jsonl").exists(),
         "run already exists; inspect its retained evidence instead of replaying"
@@ -341,17 +618,26 @@ async fn run(
     )?;
     state.goal_status = "running".into();
     let store = Arc::new(Mutex::new(state));
+    // A Goal that did not grant run_code must not even initialize the executor,
+    // so the capability cannot be acquired by a frozen older case.
+    let code = if goal.grants.iter().any(|grant| grant == "run_code") {
+        Some(Arc::new(CodeExecutor::new(&run_dir)?))
+    } else {
+        None
+    };
     let goal = Arc::new(goal);
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(90))
+        .timeout(Duration::from_secs(600))
         .connect_timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let broker = Broker {
         goal: goal.clone(),
         store: store.clone(),
-        provider: Arc::new(DeepSeek { client, key }),
-        slots: Arc::new(Semaphore::new(4)),
+        provider: Arc::new(provider_for(&upstream, client.clone(), key)),
+        slots: Arc::new(Semaphore::new(goal.agent_count)),
+        client,
+        code,
     };
     let socket = std::env::temp_dir().join(format!("swarm-{}.sock", uuid::Uuid::new_v4()));
     let listener = UnixListener::bind(&socket)?;
@@ -360,7 +646,10 @@ async fn run(
     let settings = run_dir.join("pi-settings.json");
     write_json(
         &settings,
-        &json!({"retry":{"enabled":false},"compaction":{"enabled":false},"quietStartup":true}),
+        // Compaction is the context-overflow defence, so it is on even though a
+        // worker may legitimately read for a long time. Reserve the model's
+        // output room, not the default 16K, so the next request still fits.
+        &json!({"retry":{"enabled":false},"compaction":{"enabled":true,"reserveTokens":65_536},"quietStartup":true}),
     )?;
     let (tx, mut rx) = mpsc::channel(256);
     let mut workers = Vec::new();
@@ -369,7 +658,20 @@ async fn run(
     for n in 0..goal.agent_count {
         let id = format!("agent-{n:02}");
         let token = store.lock().await.admit(&id)?;
-        let mut child = match sandbox(&node, &root, &socket, &settings, &token, &id).spawn() {
+        // The worker's Pi model id is the provider's wire model, because the
+        // broker transcript echoes whichever id Pi asks for.
+        let mut child = match sandbox(
+            &node,
+            &root,
+            &socket,
+            &settings,
+            &goal.grants.join(","),
+            &token,
+            &id,
+            &upstream.model,
+        )
+        .spawn()
+        {
             Ok(child) => child,
             Err(error) => {
                 startup_error = Some(anyhow::Error::new(error));
@@ -387,9 +689,14 @@ async fn run(
                 let mut file =
                     tokio::fs::File::create(dir.join(format!("{who}.rpc.jsonl"))).await?;
                 let mut reader = BufReader::new(stdout);
-                while let Some(line) = bounded_line(&mut reader, 262_144).await? {
+                while let Some(line) = bounded_line(&mut reader, 16_777_216).await? {
                     file.write_all(&line).await?;
-                    let value: Value = serde_json::from_slice(&line).context("invalid Pi JSONL")?;
+                    // A line that is not JSON is tolerated rather than fatal: a
+                    // crash-truncated or interleaved write must not cost the whole
+                    // worker its transcript, which is also the evidence.
+                    let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+                        continue;
+                    };
                     if value["type"] == "agent_settled" || value["type"] == "response" {
                         send.send((who.clone(), Ok(value))).await.ok();
                     }
@@ -443,6 +750,13 @@ async fn run(
     };
     {
         let mut state = store.lock().await;
+        if let Err(error) = &result {
+            // Deadline or cancel: keep what the agents did. Partial findings for
+            // unfiled Tasks, then the exact-union artifact of whatever was filed.
+            let reason = error.to_string();
+            let _ = state.file_partial_findings(&goal, &reason);
+            let _ = state.synthesize_artifact(&reason);
+        }
         state.goal_status = if result.is_ok() {
             "completed"
         } else {
@@ -540,22 +854,25 @@ async fn execute(command: Action) -> Result<()> {
             run_dir,
             pi_root,
             node,
+            provider,
             credential_file,
             deadline_seconds,
             idle_probe,
         } => {
-            run(
+            run(RunOptions {
                 config,
                 run_dir,
-                pi_root,
+                root: pi_root,
                 node,
+                provider,
                 credential_file,
-                deadline_seconds,
-                idle_probe,
-            )
+                deadline: deadline_seconds,
+                idle: idle_probe,
+            })
             .await
         }
         Action::Doctor { pi_root, node } => doctor(&pi_root, &node).await,
+        Action::FetchProbe { pi_root, node, url } => fetch_probe(&pi_root, &node, &url).await,
     }
 }
 async fn doctor(root: &Path, node: &Path) -> Result<()> {
@@ -578,12 +895,15 @@ async fn doctor(root: &Path, node: &Path) -> Result<()> {
             "--ro-bind",
             "/usr",
             "/usr",
-            "--symlink",
-            "usr/lib",
+            "--ro-bind-try",
             "/lib",
-            "--symlink",
-            "usr/lib64",
+            "/lib",
+            "--ro-bind-try",
             "/lib64",
+            "/lib64",
+            "--ro-bind-try",
+            "/etc",
+            "/etc",
             "--proc",
             "/proc",
             "--dev",
@@ -598,4 +918,226 @@ async fn doctor(root: &Path, node: &Path) -> Result<()> {
         json!({"verdict":"PASS","node":String::from_utf8_lossy(&version.stdout).trim(),"isolation":"bubblewrap-unshare-all"})
     );
     Ok(())
+}
+
+/// Probe the sandboxed worker path end to end without spending a token.
+///
+/// This exists because on a host without the pinned Linux layout a failure in
+/// the worker sandbox is indistinguishable from a failure in a worker's
+/// reasoning, and the second kind costs money to rediscover. The broker here is a
+/// throwaway one-serving fetch endpoint, so the probe answers exactly one
+/// question: can a clearenv worker inside bubblewrap reach the network and call
+/// an HTTP broker over its Unix socket.
+async fn fetch_probe(root: &Path, node: &Path, url: &str) -> Result<()> {
+    use axum::{Json, Router, extract::State, routing::post};
+    let root = root.canonicalize()?;
+    let node = node.canonicalize()?;
+    ensure!(
+        root.join("extensions/broker.ts").is_file(),
+        "broker extension missing"
+    );
+    let work = std::env::temp_dir().join(format!("swarm-probe-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&work)?;
+    let socket = work.join("broker.sock");
+    let settings = work.join("settings.json");
+    write_json(
+        &settings,
+        &json!({"retry":{"enabled":false},"compaction":{"enabled":false},"quietStartup":true}),
+    )?;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let target = url.to_owned();
+    let listener = UnixListener::bind(&socket)?;
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
+    let server = tokio::spawn(async move {
+        let app = Router::new()
+            .route(
+                "/model",
+                post(
+                    |Json(body): Json<Value>| async move {
+                        if body["messages"]
+                            .as_array()
+                            .is_some_and(|m| m.iter().any(|m| {
+                                m["content"]
+                                    .as_str()
+                                    .is_some_and(|c| c.contains("<fetch_result>"))
+                            }))
+                        {
+                            Json(json!({"id":"probe-2","created":1,"model":"probe-m1",
+                                "choices":[{"index":0,"message":{"role":"assistant","content":"probe done"},"finish_reason":"stop"}],
+                                "usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}))
+                        } else {
+                            Json(json!({"id":"probe-1","created":1,"model":"probe-m1",
+                                "choices":[{"index":0,"message":{"role":"assistant","content":null,
+                                    "tool_calls":[{"id":"call-fetch","type":"function",
+                                        "function":{"name":"fetch_url","arguments":serde_json::to_string(&json!({"url":target})).unwrap()}}]},
+                                    "finish_reason":"tool_calls"}],
+                                "usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}))
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/session",
+                post(|| async {
+                    // The probe serves the same envelope a real broker would, so the
+                    // extension registers the model and the tool from the session
+                    // rather than from its own hard-coded list.
+                    Json(json!({
+                        "workload": {"trust_domain":"probe.local","tenant":"probe","goal":"probe",
+                                     "node":"probe-1","agent":"agent-00","incarnation":"1"},
+                        "model": {"id":"probe-m1","name":"Probe","reasoning":false,"input":["text"],
+                                  "contextWindow":131072,"maxTokens":8192,
+                                  "cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},
+                                  "compat":{"supportsStore":false,"supportsDeveloperRole":false,
+                                            "maxTokensField":"max_tokens","supportsStrictMode":false}},
+                        "tools": [{"name":"fetch_url",
+                                   "description":"Fetch one live URL.",
+                                   "parameters":{"type":"object","required":["url"],
+                                                 "properties":{"url":{"type":"string"}},
+                                                 "additionalProperties":false}}]
+                    }))
+                }),
+            )
+            .route(
+                "/tool/fetch_url",
+                post(
+                    |State(client): State<reqwest::Client>, Json(args): Json<Value>| async move {
+                        let url = args["url"].as_str().unwrap_or_default().to_owned();
+                        match solos_swarm::broker::fetch(&client, &json!({"url":url})).await {
+                            Ok(value) => Json(json!({"content":[{"type":"text","text":value.to_string()}]})),
+                            Err(error) => Json(json!({"content":[{"type":"text","text":format!("error: {error}")}]})),
+                        }
+                    },
+                ),
+            )
+            .with_state(client);
+        axum::serve(listener, app).await
+    });
+    let mut child = sandbox(
+        &node,
+        &root,
+        &socket,
+        &settings,
+        "claim_task,board_read,board_post,submit_finding,read_findings,submit_artifact,fetch_url",
+        "probe-token",
+        "agent-00",
+        "probe-m1",
+    )
+    .spawn()?;
+    let mut stdin = child.stdin.take().context("missing Pi stdin")?;
+    let stdout = child.stdout.take().context("missing Pi stdout")?;
+    let mut stderr = child.stderr.take().context("missing Pi stderr")?;
+    let stderr_task = tokio::spawn(async move {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text).await;
+        text
+    });
+    let mut reader = BufReader::new(stdout);
+    stdin
+        .write_all(
+            format!(
+                "{}\n",
+                json!({"id":"probe","type":"prompt","message":"Fetch the target URL with fetch_url."})
+            )
+            .as_bytes(),
+        )
+        .await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let mut observed = None;
+    while tokio::time::Instant::now() < deadline {
+        let line = match tokio::time::timeout(
+            Duration::from_secs(5),
+            bounded_line(&mut reader, 4 * 1024 * 1024),
+        )
+        .await
+        {
+            Ok(Ok(Some(line))) => line,
+            Ok(Ok(None)) => break,
+            _ => continue,
+        };
+        let record: Value = match serde_json::from_slice(&line) {
+            Ok(record) => record,
+            Err(_) => continue,
+        };
+        if record["type"] == "extension_error" {
+            anyhow::bail!("fetch probe extension error: {record}");
+        }
+        if std::env::var("PROBE_DEBUG").is_ok()
+            && matches!(
+                record["type"].as_str(),
+                Some("tool_execution_start" | "tool_execution_end" | "agent_end")
+            )
+        {
+            eprintln!(
+                "PROBE: {}",
+                &record.to_string()[..record.to_string().len().min(400)]
+            );
+        }
+        if record["type"] == "agent_settled" || record["type"] == "agent_end" {
+            observed = Some(record);
+            break;
+        }
+    }
+    let _ = child.kill().await;
+    let stderr_text = stderr_task.await.unwrap_or_default();
+    let _ = fs::remove_dir_all(&work);
+    server.abort();
+    ensure!(
+        observed.is_some(),
+        "probe worker did not settle; stderr: {stderr_text}"
+    );
+    println!(
+        "{}",
+        json!({"verdict":"PASS","url":url,"worker":"bubblewrap-unshare-all"})
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task() -> broker::Task {
+        serde_json::from_value(json!({
+            "id": "lens-04",
+            "input": {"output_contract": {
+                "result_key": "papers",
+                "required_fields": ["id", "title", "file", "description", "severity"],
+                "severities": ["breakthrough", "useful", "background"],
+            }},
+            "claimed_by": "agent-07",
+            "status": "claimed",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_mandatory_nudge_names_the_goal_contract_call_without_inventing_rows() {
+        let task = task();
+        let text = nudge(NUDGE_MANDATORY_AT, "agent-07", Some(&task));
+        assert!(
+            text.contains(r#"submit_finding({"task_id":"lens-04","result":{"papers":[]}})"#),
+            "the exact call must be literal: {text}"
+        );
+        assert!(text.contains("id, title, file, description, severity"));
+        assert!(text.contains("breakthrough | useful | background"));
+        assert!(text.contains("Never invent a paper"));
+        assert!(text.contains("Do not call fetch_url again"));
+        // The skeleton never carries a made-up record.
+        assert!(!text.contains("family-"));
+    }
+
+    #[test]
+    fn early_nudges_still_allow_research_and_an_unclaimed_worker_gets_no_fake_task() {
+        let task = task();
+        assert!(nudge(1, "agent-07", Some(&task)).contains("Keep researching"));
+        assert!(!nudge(1, "agent-07", Some(&task)).contains("submit_finding({"));
+        let unclaimed = nudge(NUDGE_MANDATORY_AT, "agent-07", None);
+        assert!(unclaimed.contains("submit_finding exactly once"));
+        assert!(!unclaimed.contains("lens-04"));
+    }
 }

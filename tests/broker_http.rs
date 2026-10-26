@@ -1,6 +1,12 @@
 #[allow(dead_code)]
 #[path = "../src/broker.rs"]
 mod broker;
+#[allow(dead_code)]
+#[path = "../src/code.rs"]
+mod code;
+#[allow(dead_code)]
+#[path = "../src/progress.rs"]
+mod progress;
 
 use anyhow::Result;
 use axum::{Json, Router, extract::State, routing::post};
@@ -93,6 +99,8 @@ async fn unix_broker_denials_dispatch_nothing_and_allowed_call_settles_once() {
         store: state.clone(),
         provider: Arc::new(provider),
         slots: Arc::new(Semaphore::new(1)),
+        client: reqwest::Client::new(),
+        code: None,
     });
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();

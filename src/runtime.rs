@@ -3334,6 +3334,12 @@ pub async fn serve_with_tools(path: &Path, tools: Arc<dyn ToolExecutor>) -> Resu
         backends: adapters,
         stops: Arc::new(Mutex::new(BTreeMap::new())),
         tools,
+        client: reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .build()?,
     };
     let tool_factory = if config.tools.is_some() {
         let factory = crate::tool_identity::ScopedToolIdentityFactory::new(

@@ -80,7 +80,7 @@ class ScenarioTests(unittest.TestCase):
             event["hash"] = hashlib.sha256(previous.encode() + checker.canonical(event)).hexdigest()
             event["prev_hash"] = previous
             previous = event["hash"]
-            lines.append(json.dumps(event))
+            lines.append(json.dumps(event, ensure_ascii=False))
         (self.run / "events.jsonl").write_text("\n".join(lines) + "\n")
 
     def write(self, name, value):
@@ -111,6 +111,7 @@ class ScenarioTests(unittest.TestCase):
     def test_complete_structural_evidence_passes(self):
         # Synthetic unit evidence validates the scorer, not a live gate invocation.
         self.assertEqual(self.report()["verdict"], "PASS")
+        self.assertEqual(self.report()["coverage"], "single-host-1-30-agent-live-preview")
 
     def test_artifact_order_is_irrelevant(self):
         artifact = {"inconsistencies": list(reversed(self.expected["artifact"]["inconsistencies"]))}
@@ -195,6 +196,19 @@ class ScenarioTests(unittest.TestCase):
         lines[0] = json.dumps(event)
         path.write_text("\n".join(lines) + "\n")
         self.assertEqual(self.report()["evidence_verdict"], "FAIL")
+
+    def test_unicode_line_separators_inside_a_record_do_not_break_the_chain(self):
+        # A fetched page can legally carry U+0085/U+2028/U+2029 inside a JSON
+        # string. `str.splitlines()` treats them as record boundaries, which
+        # corrupted a real run's event chain with "Unterminated string".
+        self.events.insert(2, {
+            "kind": "tool_completed",
+            "data": {"agent_id": "agent-00", "tool": "board_post",
+                     "args": {"message": "read A\u0085B C D"},
+                     "result": {"seq": 1}},
+        })
+        self.write_events()
+        self.assertEqual(self.report()["evidence_verdict"], "PASS")
 
     def test_omitted_event_fails_even_after_rehash(self):
         self.events = [event for event in self.events if event["kind"] != "provider_settled"]

@@ -49,14 +49,44 @@ class RemoteTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "different candidate or frozen case"):
                 remote.start_host(request)
 
-    def test_credential_is_only_read_from_the_deepseek_entry(self):
+    def test_credential_is_only_read_from_the_named_provider_entry(self):
         with tempfile.TemporaryDirectory() as directory:
             auth = Path(directory) / "auth.json"
             auth.write_text(json.dumps({"deepseek": {"type": "api_key", "key": "test-secret"}}))
             self.assertEqual(remote.read_deepseek_key(auth), "test-secret")
+            self.assertEqual(remote.read_provider_key(auth, "deepseek"), "test-secret")
+            # A provider with no entry fails loudly instead of spending against
+            # a different vendor's credential.
+            with self.assertRaisesRegex(ValueError, "no venice api_key entry"):
+                remote.read_provider_key(auth, "venice")
             auth.write_text(json.dumps({"deepseek": {"type": "oauth", "key": "test-secret"}}))
-            with self.assertRaisesRegex(ValueError, "no DeepSeek api_key"):
+            with self.assertRaisesRegex(ValueError, "no deepseek api_key entry"):
                 remote.read_deepseek_key(auth)
+
+    def test_goal_limits_admit_thirty_agents_and_refuse_thirty_one(self):
+        goal = {"agent_count": 30, "tasks": [{} for _ in range(30)], "deadline_seconds": 14_400,
+                "budget_microusd": 100_000_000}
+        remote.validate_goal_limits(goal)
+        goal["agent_count"] = 31
+        goal["tasks"].append({})
+        with self.assertRaisesRegex(ValueError, "1-30 agents"):
+            remote.validate_goal_limits(goal)
+        goal["agent_count"] = 30
+        goal["tasks"].pop()
+        goal["budget_microusd"] = 100_000_001
+        with self.assertRaisesRegex(ValueError, "1-30 agents"):
+            remote.validate_goal_limits(goal)
+
+    def test_provider_follows_the_goal_upstream_over_the_legacy_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            goal = Path(directory) / "goal.json"
+            goal.write_text(json.dumps({"model": "deepseek-flash"}))
+            self.assertEqual(remote.provider_for(goal, None), "deepseek")
+            goal.write_text(json.dumps({"model": "m", "upstream": {"provider": "venice"}}))
+            self.assertEqual(remote.provider_for(goal, None), "venice")
+            # An explicit flag wins outright.
+            self.assertEqual(remote.provider_for(goal, "deepseek"), "deepseek")
+            self.assertEqual(remote.provider_for(None, None), "deepseek")
 
     def test_start_ignores_only_ssh_hangup_after_reading_complete_request(self):
         request = {"run_id": "preview-42"}

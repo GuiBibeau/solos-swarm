@@ -674,6 +674,11 @@ impl Harness {
                 [(f.subject.id().into(), worker_stop.clone())].into(),
             )),
             tools,
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
         };
         // Keep the Unix path below sockaddr_un's platform limit.
         let worker_directory =
