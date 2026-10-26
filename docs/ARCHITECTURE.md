@@ -77,7 +77,7 @@ A child task capability $C_{\text{child}}$ and budget $B_{\text{child}}$ must sa
 
 | Tier | Runtime | Workload |
 |---|---|---|
-| `W` | `wasmtime` (`43.0`) with fuel and memory caps | Deterministic parsers and compute tools |
+| `W` | `wasmtime` (`49.0.4`) with fuel and memory caps | Deterministic parsers and compute tools |
 | `P` | `bwrap` + read-only SquashFS + Landlock v3 + seccomp + cgroups v2 | Pi worker processes (`extensions/broker-tools.mjs`) |
 | `G` | `runsc` (gVisor) user-space kernel | Containerized CLI tools without KVM |
 | `V` | Firecracker / KVM microVM | Untrusted native binaries |

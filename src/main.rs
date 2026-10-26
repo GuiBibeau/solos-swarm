@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
     fs,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -20,6 +20,7 @@ use tokio::{
     process::{Child, ChildStdin, Command},
     sync::{Mutex, Semaphore, mpsc},
 };
+use zeroize::Zeroizing;
 
 #[derive(Parser)]
 #[command(version, about = "Governed Rust/Pi swarm runtime")]
@@ -297,12 +298,10 @@ async fn run(
     let key = if let Some(path) = credential_file {
         let result = fs::read_to_string(&path);
         let _ = fs::remove_file(&path);
-        result
-            .context("cannot read broker credential")?
-            .trim()
-            .to_owned()
+        let raw = Zeroizing::new(result.context("cannot read broker credential")?);
+        Zeroizing::new(raw.trim().to_owned())
     } else {
-        String::new()
+        Zeroizing::new(String::new())
     };
     let goal: Goal = serde_yaml::from_slice(&fs::read(&config)?).context("invalid Goal YAML")?;
     goal.validate()?;
@@ -353,9 +352,10 @@ async fn run(
         provider: Arc::new(DeepSeek { client, key }),
         slots: Arc::new(Semaphore::new(4)),
     };
-    let socket = std::env::temp_dir().join(format!("swarm-{}.sock", uuid::Uuid::new_v4()));
-    let listener = UnixListener::bind(&socket)?;
-    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
+    // Bind inside the 0700 run directory. A world-writable temp socket plus a
+    // later chmod leaves a window where another user can connect.
+    let broker_socket = prepare_broker_socket(&run_dir)?;
+    let listener = UnixListener::bind(&broker_socket.path).context("broker socket bind failed")?;
     let server = tokio::spawn(async move { axum::serve(listener, router(broker)).await });
     let settings = run_dir.join("pi-settings.json");
     write_json(
@@ -369,13 +369,14 @@ async fn run(
     for n in 0..goal.agent_count {
         let id = format!("agent-{n:02}");
         let token = store.lock().await.admit(&id)?;
-        let mut child = match sandbox(&node, &root, &socket, &settings, &token, &id).spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                startup_error = Some(anyhow::Error::new(error));
-                break;
-            }
-        };
+        let mut child =
+            match sandbox(&node, &root, &broker_socket.path, &settings, &token, &id).spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    startup_error = Some(anyhow::Error::new(error));
+                    break;
+                }
+            };
         let stdout = child.stdout.take().context("missing Pi stdout")?;
         let stderr = child.stderr.take().context("missing Pi stderr")?;
         let stdin = child.stdin.take().context("missing Pi stdin")?;
@@ -484,7 +485,7 @@ async fn run(
     }
     server.abort();
     let _ = server.await;
-    let _ = fs::remove_file(&socket);
+    broker_socket.cleanup();
     {
         let mut state = store.lock().await;
         for intent in &mut state.intents {
@@ -508,6 +509,51 @@ async fn run(
         json!({"runtime_verdict":if runtime_pass {"PASS"}else{"FAIL"},"run_dir":run_dir,"cleanup_verdict":if remaining==0 {"PASS"}else{"INCONCLUSIVE"}})
     );
     result
+}
+
+/// `sockaddr_un.sun_path` is 108 bytes and must also store a trailing NUL.
+const SUN_PATH_LIMIT: usize = 108;
+
+struct BrokerSocket {
+    path: PathBuf,
+    private_dir: Option<PathBuf>,
+}
+
+impl BrokerSocket {
+    fn cleanup(&self) {
+        let _ = fs::remove_file(&self.path);
+        if let Some(dir) = &self.private_dir {
+            let _ = fs::remove_dir(dir);
+        }
+    }
+}
+
+impl Drop for BrokerSocket {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+fn sun_path_fits(path: &Path) -> bool {
+    path.as_os_str().as_encoded_bytes().len() < SUN_PATH_LIMIT
+}
+
+fn prepare_broker_socket(run_dir: &Path) -> Result<BrokerSocket> {
+    let path = run_dir.join("broker.sock");
+    if sun_path_fits(&path) {
+        return Ok(BrokerSocket {
+            path,
+            private_dir: None,
+        });
+    }
+    let private_dir = std::env::temp_dir().join(format!("ss-{}", uuid::Uuid::new_v4().as_simple()));
+    let path = private_dir.join("socket");
+    ensure!(sun_path_fits(&path), "broker socket path exceeds SUN_LEN");
+    fs::DirBuilder::new().mode(0o700).create(&private_dir)?;
+    Ok(BrokerSocket {
+        path,
+        private_dir: Some(private_dir),
+    })
 }
 
 fn main() {
@@ -598,4 +644,69 @@ async fn doctor(root: &Path, node: &Path) -> Result<()> {
         json!({"verdict":"PASS","node":String::from_utf8_lossy(&version.stdout).trim(),"isolation":"bubblewrap-unshare-all"})
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{prepare_broker_socket, sun_path_fits};
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn broker_socket_binds_inside_private_run_dir() {
+        let run_dir = std::env::temp_dir().join(format!("ss-run-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&run_dir).unwrap();
+        fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let candidate = run_dir.join("broker.sock");
+        let socket = prepare_broker_socket(&run_dir).unwrap();
+        assert!(sun_path_fits(&socket.path));
+        if sun_path_fits(&candidate) {
+            assert!(socket.private_dir.is_none());
+            assert_eq!(socket.path, candidate);
+        } else {
+            let private_dir = socket.private_dir.clone().unwrap();
+            assert_eq!(socket.path, private_dir.join("socket"));
+            assert_eq!(
+                fs::metadata(&private_dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        let listener = UnixListener::bind(&socket.path).unwrap();
+        drop(listener);
+        let private_dir = socket.private_dir.clone();
+        socket.cleanup();
+        assert!(!socket.path.exists());
+        if let Some(dir) = private_dir {
+            assert!(!dir.exists());
+        }
+        fs::remove_dir_all(run_dir).unwrap();
+    }
+
+    #[test]
+    fn long_run_dir_creates_mode_700_dir_before_bind() {
+        let parent =
+            std::env::temp_dir().join(format!("ss-long-{}", uuid::Uuid::new_v4().as_simple()));
+        let run_dir = parent.join("r".repeat(80));
+        fs::create_dir_all(&run_dir).unwrap();
+        let candidate = run_dir.join("broker.sock");
+        assert!(
+            !sun_path_fits(&candidate),
+            "fixture path must exceed SUN_LEN"
+        );
+        let socket = prepare_broker_socket(&run_dir).unwrap();
+        let private_dir = socket.private_dir.clone().expect("fallback directory");
+        assert_eq!(socket.path, private_dir.join("socket"));
+        assert!(sun_path_fits(&socket.path));
+        assert_eq!(
+            fs::metadata(&private_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let listener = UnixListener::bind(&socket.path).unwrap();
+        drop(listener);
+        socket.cleanup();
+        assert!(!socket.path.exists());
+        assert!(!private_dir.exists());
+        fs::remove_dir_all(parent).unwrap();
+    }
 }

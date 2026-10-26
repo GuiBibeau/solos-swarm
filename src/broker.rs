@@ -19,6 +19,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex, Semaphore};
+use zeroize::Zeroizing;
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -480,7 +481,7 @@ pub trait Provider: Send + Sync {
 }
 pub struct DeepSeek {
     pub client: reqwest::Client,
-    pub key: String,
+    pub key: Zeroizing<String>,
 }
 impl Provider for DeepSeek {
     fn dispatch(&self, body: Value) -> Dispatch {
@@ -489,7 +490,7 @@ impl Provider for DeepSeek {
         Box::pin(async move {
             let mut response = client
                 .post("https://api.deepseek.com/chat/completions")
-                .bearer_auth(key)
+                .bearer_auth(key.as_str())
                 .json(&body)
                 .send()
                 .await

@@ -13,18 +13,18 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 serde_yaml = "=0.9.34"
 sha2 = "=0.10.9"
-tokio = { version = "=1.53.2", features = ["full"] }
+tokio = { version = "=1.53.3", features = ["full"] }
 uuid = { version = "=1.27.0", features = ["v4"] }
 openraft = { version = "=0.9.25", features = ["serde", "storage-v2"] }
 quinn = { version = "=0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
-rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 rustls-pemfile = "2"
 ed25519-dalek = { version = "=2.2.0", features = ["rand_core", "pkcs8"] }
 rcgen = { version = "=0.14.10", features = ["x509-parser", "pem"] }
 x509-parser = { version = "=0.18.1", features = ["verify"] }
 jsonwebtoken = { version = "=10.3.0", default-features = false, features = ["rust_crypto"] }
-rand = "=0.8.5"
+rand = "=0.8.6"
 time = { version = "=0.3.55", features = ["serde"] }
 getrandom = "=0.4.3"
 hyper = { version = "1", features = ["server", "http1"] }
@@ -38,11 +38,11 @@ aes = { version = "=0.8.4", features = ["zeroize"] }
 minijinja = { version = "=2.24.0", features = ["json", "fuel"] }
 minijinja-contrib = { version = "=2.24.0", features = ["pycompat"] }
 tokenizers = { version = "=0.22.2", default-features = false, features = ["fancy-regex"] }
-wasmtime = { version = "=49.0.0", default-features = false, features = ["anyhow", "cranelift", "runtime", "std", "wat"] }
-wasmtime-wasi = { version = "=49.0.0", default-features = false, features = ["p1"] }
+wasmtime = { version = "=49.0.4", default-features = false, features = ["anyhow", "cranelift", "runtime", "std", "wat"] }
+wasmtime-wasi = { version = "=49.0.4", default-features = false, features = ["p1"] }
 
 opentelemetry = { version = "=0.32.0", default-features = false, features = ["trace", "metrics"] }
-opentelemetry_sdk = { version = "=0.32.0", default-features = false, features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["trace", "metrics"] }
 opentelemetry-proto = { version = "=0.32.0", default-features = false, features = ["gen-tonic-messages", "trace", "metrics", "with-serde"] }
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.22", default-features = false, features = ["registry", "std"] }
