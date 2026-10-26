@@ -1,0 +1,36 @@
+//! Authoritative swarm state, policy and replicated storage shared by CLI and brokers.
+pub mod artifacts;
+pub mod audit;
+pub mod cluster;
+pub mod context;
+pub mod delegation;
+pub mod diagnostics;
+pub mod domain;
+pub mod evaluator;
+pub mod evaluator_runtime;
+pub mod flow;
+pub mod identity;
+pub mod kernel;
+pub mod ledger;
+pub mod modules;
+pub mod node;
+pub mod operator;
+pub mod placement;
+pub mod planner;
+pub mod provider;
+pub mod qa;
+pub mod quota;
+pub mod resource_guard;
+pub mod runtime;
+pub mod sandbox;
+pub mod scenarios;
+pub mod scheduler;
+#[cfg(all(test, target_os = "linux"))]
+mod sdk_integration_tests;
+pub mod security;
+pub mod telemetry;
+pub mod tool_identity;
+pub mod tools;
+pub mod transport;
+pub mod wasi_worker;
+pub mod witness;
