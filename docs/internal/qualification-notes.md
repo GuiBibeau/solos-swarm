@@ -8,7 +8,7 @@ This map preserves every normative TRD requirement ID and every acceptance targe
 
 Current qualification: **INCONCLUSIVE for the expanded MVP candidate**. The earlier [ten-agent preview](POC-RESULTS.md) used a different runtime digest. Its successful DeepSeek run demonstrates that preview only. Rebuilding or adding software invalidates any claim that the old report qualifies the new candidate.
 
-The authorized infrastructure is remote-ai only. Independent worker failure domains and a proposer-excluded evaluator pool, 500-agent scale, physical witness independence, GPU/local-provider production serving, complete air-gap bootstrap, production OIDC/operator MFA and all numerical performance targets remain pending. No smaller agent count, colocated process, compile, unit test or idle loop substitutes for those targets.
+Recorded host alias for these notes: `remote-ai`. Independent worker failure domains and a proposer-excluded evaluator pool, 500-agent scale, physical witness independence, GPU/local-provider production serving, complete air-gap bootstrap, production OIDC/operator MFA and all numerical performance targets remain pending. No smaller agent count, colocated process, compile, unit test or idle loop substitutes for those targets.
 
 ## Recorded functional checks
 
@@ -44,6 +44,6 @@ Additional full-suite/remote logs must be attached to the candidate manifest by 
 
 The current implementation provides declared interfaces and fail-closed boundaries. A missing installed native executor, unregistered module action, absent production scenario recipe, unavailable MFA session, unprepared GPU serving asset, unavailable witness or a missing physical-host scenario remains unsupported/unqualified until connected and run. The implementation map must be updated as those integration paths land.
 
-Q27/Q28 and every still-open choice in TRD §12 retain their original status. The current operator authorization permits remote-ai; it does not authorize new machines, targets, deployments, paid experiments beyond the task, or a relaxation of two-person/MFA/evaluator-pool requirements. No silent resolution is made by this map.
+Q27/Q28 and every still-open choice in TRD §12 retain their original status. This diary does not add machines, targets, deployments, or paid experiments, and it does not relax two-person, MFA, or evaluator-pool requirements.
 
 Current release gate additionally pins the protected verifier executable SHA (`verifier_sha256`), requires `useful_agent_ids` to equal all ten distinct live participating identities, and binds multi-host reports to distinct hardware identities from `independent_node_inventory`. Process or replica labels cannot qualify independent hosts. The runtime response store retains encrypted large bodies outside bounded quorum state; admitted effects reserve critical reconciliation bytes, and paid receipts survive malformed completion or missing archived bodies with an explicit stop. These changes require the current candidate's own executed evidence.
