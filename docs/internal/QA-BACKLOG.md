@@ -2,7 +2,7 @@ Historical delivery stories. Not an operator runbook. Requirements: [../TRD.md](
 
 # Verification and QA backlog
 
-Status: proposed. This file is the story text for the delivery map in `docs/TRD.md` §9. The requirements are in §§6.11 and 6.15–6.19 and in §7 (SEC-F-48, SEC-NF-29). Story IDs are suggested backlog IDs. Estimates wait for the repository audit (QA-00).
+Status: proposed. This file is the story text for the delivery map in `docs/TRD.md` §9. The requirements are in §§6.11 and 6.15-6.19 and in §7 (SEC-F-48, SEC-NF-29). Story IDs are suggested backlog IDs. Estimates wait for the repository audit (QA-00).
 
 All commands, paths, profile names and schemas in this file and in the TRD are **proposed interfaces**. None is implemented. Do not describe one as working until it has run. Reuse the repository's existing names and abstractions where they already solve the problem.
 

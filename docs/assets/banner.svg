@@ -1,0 +1,149 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0A0B0E"/>
+      <stop offset="55%" stop-color="#0E1016"/>
+      <stop offset="100%" stop-color="#0A0B0E"/>
+    </linearGradient>
+    <radialGradient id="glow-amber" cx="76%" cy="45%" r="45%">
+      <stop offset="0%" stop-color="#F59E0B" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#0A0B0E" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glow-cyan" cx="22%" cy="20%" r="40%">
+      <stop offset="0%" stop-color="#38BDF8" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#0A0B0E" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
+      <path d="M 24 0 L 0 0 0 24" fill="none" stroke="#181B24" stroke-width="0.75"/>
+    </pattern>
+    <marker id="arrow-amber" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+      <path d="M 0 1 L 7 4 L 0 7 z" fill="#F59E0B"/>
+    </marker>
+    <marker id="arrow-cyan" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+      <path d="M 0 1 L 7 4 L 0 7 z" fill="#38BDF8"/>
+    </marker>
+    <marker id="arrow-emerald" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+      <path d="M 0 1 L 7 4 L 0 7 z" fill="#10B981"/>
+    </marker>
+  </defs>
+
+  <!-- Background & Outer Frame -->
+  <rect x="0" y="0" width="1200" height="320" rx="12" fill="url(#bg-grad)"/>
+  <rect x="0" y="0" width="1200" height="320" rx="12" fill="url(#grid)" opacity="0.65"/>
+  <rect x="0" y="0" width="1200" height="320" rx="12" fill="url(#glow-amber)"/>
+  <rect x="0" y="0" width="1200" height="320" rx="12" fill="url(#glow-cyan)"/>
+  <rect x="1" y="1" width="1198" height="318" rx="11" fill="none" stroke="#222630" stroke-width="1"/>
+
+  <!-- Top Left Status Pill -->
+  <rect x="48" y="42" width="292" height="26" rx="13" fill="#111318" stroke="#222630" stroke-width="1"/>
+  <circle cx="64" cy="55" r="4" fill="#10B981"/>
+  <text x="76" y="59" fill="#94A3B8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="11" font-weight="600" letter-spacing="0.08em">CONTROL PLANE // RAFT + mTLS QUIC</text>
+
+  <!-- Wordmark & Version Badge -->
+  <text x="48" y="122" fill="#F8FAFC" font-family="-apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="48" font-weight="700" letter-spacing="-0.03em">solos-swarm</text>
+  <rect x="352" y="92" width="118" height="24" rx="6" fill="#141720" stroke="#2A2F3D" stroke-width="1"/>
+  <text x="411" y="108" text-anchor="middle" fill="#38BDF8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="11" font-weight="600">v0.1.0 · rust 2024</text>
+
+  <!-- Monospace Tagline -->
+  <text x="48" y="154" fill="#F59E0B" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="12" font-weight="600" letter-spacing="0.14em">GOVERNED AGENT SWARM CONTROL PLANE</text>
+
+  <!-- Crisp Technical Lede -->
+  <text x="48" y="186" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="14.5" font-weight="400">Deterministic scheduling, capability leases, and conservative spend accounting</text>
+  <text x="48" y="208" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="14.5" font-weight="400">for isolated Pi, WASI, and Firecracker workloads across Linux clusters.</text>
+
+  <!-- Bottom Telemetry Chips -->
+  <g transform="translate(48, 244)">
+    <rect x="0" y="0" width="166" height="30" rx="6" fill="#111318" stroke="#222630" stroke-width="1"/>
+    <text x="12" y="19" fill="#64748B" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10.5" font-weight="600">STATE</text>
+    <text x="56" y="19" fill="#E2E8F0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10.5" font-weight="600">OpenRaft + Quinn</text>
+
+    <rect x="178" y="0" width="194" height="30" rx="6" fill="#111318" stroke="#222630" stroke-width="1"/>
+    <text x="190" y="19" fill="#64748B" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10.5" font-weight="600">TIER-P</text>
+    <text x="238" y="19" fill="#E2E8F0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10.5" font-weight="600">bwrap / WASI / KVM</text>
+
+    <rect x="384" y="0" width="154" height="30" rx="6" fill="#111318" stroke="#222630" stroke-width="1"/>
+    <text x="396" y="19" fill="#64748B" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10.5" font-weight="600">AUDIT</text>
+    <text x="440" y="19" fill="#10B981" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10.5" font-weight="600">Ed25519 Merkle</text>
+  </g>
+
+  <!-- Vertical Divider -->
+  <line x1="572" y1="32" x2="572" y2="288" stroke="#1E222B" stroke-width="1" stroke-dasharray="3 3"/>
+
+  <!-- RIGHT SCHEMATIC: Control Plane -> Broker Conduit -> Isolated Runtimes -->
+  <!-- Panel 1: Raft Control Plane -->
+  <rect x="596" y="34" width="236" height="252" rx="8" fill="#111318" stroke="#222630" stroke-width="1"/>
+  <rect x="596" y="34" width="236" height="30" rx="8" fill="#151821"/>
+  <line x1="596" y1="64" x2="832" y2="64" stroke="#222630" stroke-width="1"/>
+  <text x="610" y="53" fill="#E2E8F0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10.5" font-weight="700" letter-spacing="0.06em">RAFT KERNEL</text>
+  <text x="820" y="53" text-anchor="end" fill="#10B981" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10" font-weight="600">mTLS QUIC</text>
+
+  <!-- Raft Node Quorum Row -->
+  <rect x="608" y="74" width="66" height="36" rx="4" fill="#0A0B0E" stroke="#38BDF8" stroke-width="1"/>
+  <text x="641" y="89" text-anchor="middle" fill="#F8FAFC" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9.5" font-weight="600">node-01</text>
+  <text x="641" y="102" text-anchor="middle" fill="#38BDF8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="8.5">LEADER</text>
+
+  <rect x="681" y="74" width="66" height="36" rx="4" fill="#0A0B0E" stroke="#222630" stroke-width="1"/>
+  <text x="714" y="89" text-anchor="middle" fill="#94A3B8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9.5" font-weight="600">node-02</text>
+  <text x="714" y="102" text-anchor="middle" fill="#64748B" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="8.5">VOTER</text>
+
+  <rect x="754" y="74" width="66" height="36" rx="4" fill="#0A0B0E" stroke="#222630" stroke-width="1"/>
+  <text x="787" y="89" text-anchor="middle" fill="#94A3B8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9.5" font-weight="600">node-03</text>
+  <text x="787" y="102" text-anchor="middle" fill="#64748B" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="8.5">VOTER</text>
+
+  <!-- Kernel Primitives Stack -->
+  <rect x="608" y="120" width="212" height="44" rx="5" fill="#0A0B0E" stroke="#222630" stroke-width="1"/>
+  <text x="618" y="138" fill="#F8FAFC" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10.5" font-weight="600">Goal -&gt; Need -&gt; Task</text>
+  <text x="618" y="154" fill="#64748B" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9.5">Ordered Board + fencing token</text>
+
+  <rect x="608" y="172" width="212" height="44" rx="5" fill="#0A0B0E" stroke="#222630" stroke-width="1"/>
+  <text x="618" y="190" fill="#F59E0B" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10.5" font-weight="600">Capability &amp; Spend Ledger</text>
+  <text x="618" y="206" fill="#64748B" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9.5">Pre-admission hold -&gt; receipt</text>
+
+  <rect x="608" y="224" width="212" height="48" rx="5" fill="#0A0B0E" stroke="#222630" stroke-width="1"/>
+  <text x="618" y="242" fill="#38BDF8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10.5" font-weight="600">Signed Lineage &amp; Audit</text>
+  <text x="618" y="258" fill="#64748B" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9.5">Finding + Attempt + Merkle root</text>
+
+  <!-- Conduit Arrows between Control Plane and Sandboxes -->
+  <line x1="832" y1="92" x2="906" y2="92" stroke="#38BDF8" stroke-width="1.25" marker-end="url(#arrow-cyan)"/>
+  <text x="869" y="84" text-anchor="middle" fill="#38BDF8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="8.5" font-weight="600">PERMIT</text>
+
+  <line x1="832" y1="150" x2="906" y2="150" stroke="#F59E0B" stroke-width="1.25" marker-end="url(#arrow-amber)"/>
+  <text x="869" y="142" text-anchor="middle" fill="#F59E0B" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="8.5" font-weight="600">BROKER</text>
+
+  <line x1="906" y1="208" x2="832" y2="208" stroke="#10B981" stroke-width="1.25" marker-end="url(#arrow-emerald)"/>
+  <text x="869" y="200" text-anchor="middle" fill="#10B981" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="8.5" font-weight="600">FINDING</text>
+
+  <line x1="906" y1="258" x2="832" y2="258" stroke="#10B981" stroke-width="1.25" marker-end="url(#arrow-emerald)"/>
+  <text x="869" y="250" text-anchor="middle" fill="#10B981" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="8.5" font-weight="600">WITNESS</text>
+
+  <!-- Panel 2: Isolated Execution & Independent Verification -->
+  <rect x="912" y="34" width="248" height="252" rx="8" fill="#111318" stroke="#222630" stroke-width="1"/>
+  <rect x="912" y="34" width="248" height="30" rx="8" fill="#151821"/>
+  <line x1="912" y1="64" x2="1160" y2="64" stroke="#222630" stroke-width="1"/>
+  <text x="926" y="53" fill="#E2E8F0" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10.5" font-weight="700" letter-spacing="0.06em">WORKERS &amp; VERIFIERS</text>
+  <text x="1148" y="53" text-anchor="end" fill="#F59E0B" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10" font-weight="600">NO KEYS</text>
+
+  <!-- Sandbox 1: Pi Agents -->
+  <rect x="924" y="74" width="224" height="46" rx="5" fill="#0A0B0E" stroke="#222630" stroke-width="1"/>
+  <text x="934" y="92" fill="#F8FAFC" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10.5" font-weight="600">Pi Coding Agents</text>
+  <text x="1138" y="92" text-anchor="end" fill="#38BDF8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9">bwrap + seccomp</text>
+  <text x="934" y="109" fill="#64748B" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9.5">Landlock RO · Unix socket RPC</text>
+
+  <!-- Sandbox 2: WASI Worker -->
+  <rect x="924" y="128" width="224" height="44" rx="5" fill="#0A0B0E" stroke="#222630" stroke-width="1"/>
+  <text x="934" y="146" fill="#F8FAFC" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10.5" font-weight="600">WASI Tool Sandbox</text>
+  <text x="1138" y="146" text-anchor="end" fill="#F59E0B" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9">wasmtime 49</text>
+  <text x="934" y="162" fill="#64748B" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9.5">Deterministic fuel &amp; mem cap</text>
+
+  <!-- Sandbox 3: Firecracker Native Tools -->
+  <rect x="924" y="180" width="224" height="44" rx="5" fill="#0A0B0E" stroke="#222630" stroke-width="1"/>
+  <text x="934" y="198" fill="#F8FAFC" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10.5" font-weight="600">Native Tool VM</text>
+  <text x="1138" y="198" text-anchor="end" fill="#F59E0B" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9">Firecracker</text>
+  <text x="934" y="214" fill="#64748B" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9.5">Scoped SVID · vsock guest agent</text>
+
+  <!-- Sandbox 4: Independent Evaluator & Witness -->
+  <rect x="924" y="232" width="224" height="42" rx="5" fill="#0A0B0E" stroke="#10B981" stroke-width="1"/>
+  <text x="934" y="249" fill="#10B981" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="10.5" font-weight="600">Evaluator &amp; Witness</text>
+  <text x="1138" y="249" text-anchor="end" fill="#10B981" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9">SEPARATE UID</text>
+  <text x="934" y="265" fill="#94A3B8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="9.5">Protected oracle · SignedTreeHead</text>
+</svg>
