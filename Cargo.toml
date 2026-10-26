@@ -3,6 +3,13 @@ name = "solos-swarm"
 version = "0.1.0"
 edition = "2024"
 publish = false
+description = "Rust control plane, scheduler, and capability broker for governed multi-node AI agent swarms."
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/GuiBibeau/solos-swarm"
+homepage = "https://guibibeau.com/blog/solos-swarm"
+keywords = ["ai-agents", "multi-agent", "raft", "sandbox", "wasmtime"]
+categories = ["command-line-utilities", "concurrency", "cryptography", "network-programming", "wasm"]
 
 [dependencies]
 anyhow = "=1.0.104"
