@@ -1,73 +1,81 @@
 # solos-swarm
 
-Rust control plane and broker for a swarm of Pi agents. The MVP implements the [TRD](docs/TRD.md) domain and security contracts: Goal, Need, Task, ordered Board, Capability, Finding and Attempt; Raft over mTLS QUIC; atomic placement and delegation; bounded provider spending; protected evaluation; and read-only evidence verification.
+<p align="center">
+  <img src="docs/assets/banner.svg" alt="solos-swarm: Governed control plane for multi-node agent swarms" width="100%" />
+</p>
 
-Workers use signed workload identities and receive no provider key. Hosted DeepSeek and a pinned local Qwen/llama.cpp server use the same admission, receipt and quota path. Generated WASI runs in a bounded separate process. Native tools use Firecracker with a scoped broker identity; gVisor is an explicit fallback only on hosts without KVM. Findings, artifacts, input markings and retractions remain part of the recorded lineage. The Board has append, bounded read and cursor APIs; operator state readback and `mvp inspect --kind board` expose its recorded entries.
+[![ci](https://img.shields.io/github/actions/workflow/status/GuiBibeau/solos-swarm/ci.yml?branch=main&label=ci&color=27272A&labelColor=121215)](https://github.com/GuiBibeau/solos-swarm/actions/workflows/ci.yml)
+[![rust](https://img.shields.io/badge/rust-1.96.0%20%C2%B7%202024-27272A?labelColor=121215)](Cargo.toml)
+[![node](https://img.shields.io/badge/node-24.18.0-27272A?labelColor=121215)](package.json)
+[![pi](https://img.shields.io/badge/pi--coding--agent-1.1.0-27272A?labelColor=121215)](package.json)
+[![license](https://img.shields.io/badge/license-Apache--2.0-27272A?labelColor=121215)](LICENSE)
 
-Use [the MVP operator runbook](docs/MVP-RUNBOOK.md) for cold-checkout provisioning and startup, [MVP implementation and qualification](docs/MVP-TRACEABILITY.md) for all requirement mappings and remaining acceptance evidence, and [matched evaluation campaigns](docs/CAMPAIGNS.md) for the normal authenticated campaign driver. Runtime startup consumes an operator-prepared configuration, approved policy, private identity files and verified dependencies. It does not grant itself operator approval.
+A Rust control plane, scheduler, and capability broker for governed agent swarms across Linux clusters.
 
-```sh
-cargo build --locked --release
-solos-swarm mvp serve --config /absolute/path/runtime.json
-solos-swarm mvp witness-serve --config /absolute/path/witness.json
-solos-swarm mvp qa --config /absolute/path/qa.json --profile integration --output /absolute/path/evidence
-solos-swarm mvp campaign --config /absolute/path/campaign.json --output /absolute/path/campaign
-```
+## Architecture
 
-The authorized test host is currently `remote-ai`. The earlier ten-agent DeepSeek preview passed using its frozen binary; it does not qualify a rebuilt MVP binary. Independent worker hosts/evaluator failure domains and the unchanged 500-agent, air-gap, production identity and performance acceptance gates remain separately recorded as pending. Missing evidence returns `INCONCLUSIVE`, and failed scenarios stay failed.
+<p align="center">
+  <img src="docs/assets/architecture.svg" alt="solos-swarm architecture" width="100%" />
+</p>
 
-## Run the first preview
+## Primitives
 
-Local requirements: Python 3.11+, Git, OpenSSH, an existing host-key-verified `remote-ai` SSH alias, and a `deepseek` API-key entry in `~/.pi/agent/auth.json`. The host needs Rust/Cargo, Python 3, bubblewrap with unprivileged user namespaces, a working user systemd manager with lingering enabled, and the existing pinned Node install at `~/.local/opt/node-v24.18.0-linux-x64`. These commands change only solos-swarm-owned directories and units.
+| Primitive | Role |
+|---|---|
+| `Goal` | Top-level intent, microUSD budget cap, deadline, and signed operator approval. |
+| `Need` | Verifiable sub-requirement with an acceptance predicate and rubric binding. |
+| `Task` | Fenced work unit carrying a monotonic token, lease, and trace context. |
+| `Board` | Revision-ordered coordination log with bounded reads, cursors, and retractions. |
+| `Capability Lease` | Signed `DispatchPermit` bound to workload SVID, `Goal`, fence, and epoch. |
+| `Finding & Attempt` | Broker-signed worker outputs and scored candidates with provenance lineage. |
+| `Spend Ledger` | Pre-dispatch peak microUSD hold and once-only provider receipt settlement. |
+| `Witness & Evaluator` | Isolated oracle scorer and append-only Merkle `SignedTreeHead` witness. |
+| `Raft over mTLS QUIC` | OpenRaft state machine over Quinn TLS 1.3 with SPIFFE peer validation. |
 
-```sh
-python3 scripts/remote.py deploy
-```
+## Runtimes
 
-Copy the returned `candidate_id` into the start command. Deployment copies source, runs `cargo build --release --locked` and `npm ci --ignore-scripts`, and freezes the binary, pinned Pi 1.1.0 dependencies, Node 24.18.0, source revision, and file digests in `candidate.json`. Repeating deployment of the same source returns the same artifact. Run startup verifies its manifest and performs no build or dependency download.
+| Runtime | Isolation |
+|---|---|
+| `Pi Agent Sandbox` | Pinned Pi 1.1.0 inside `bwrap`, Landlock, `seccomp`, and Unix RPC socket. |
+| `WASI Worker` | Separate `wasmtime` process with deterministic fuel and memory caps. |
+| `Firecracker MicroVM` | KVM microVMs with scoped broker SVID over vsock (`gVisor` fallback). |
+| `Model Broker` | Keyless worker gate for DeepSeek API and local Qwen / `llama.cpp`. |
 
-```sh
-python3 scripts/remote.py start --candidate CANDIDATE_ID --run-id poc-20261012-01 --seed 20261012
-python3 scripts/remote.py status --run-id poc-20261012-01
-python3 scripts/remote.py collect --run-id poc-20261012-01 --output work/evidence/poc-20261012-01
-```
-
-The case and seed are frozen before inference. The Goal caps all ten agents at a total of $1, eight calls each, 2,048 output tokens per call, and ten minutes. Provider calls and spending pass through the broker. The API key travels over SSH stdin, is written to a private one-use file outside the run and candidate, and is removed when the broker reads it or when the service stops. It is absent from the worker environment, public config, and evidence. The default auth path can be changed with `--auth-file PATH`.
-
-Start returns immediately. A detached `systemd --user` service survives an SSH disconnect. `RuntimeMaxSec`, the runtime deadline, `KillMode=control-group`, and bubblewrap's parent-death handling bound the run when the controller is unavailable. Repeating `start` with the same run ID and candidate/seed returns the existing run; changing its identity is refused. Failed runs are retained and never silently rerolled.
-
-After receiving a complete start request, the host controller ignores SSH hangup until the manager handoff finishes. A forced `SIGKILL` or host crash during that handoff can still leave a private credential file under `~/.local/state/solos-swarm/credentials/`; recovery requires the trusted operator to confirm the matching service is stopped and remove that run's file. This setup-crash recovery is outside the first passing grade.
-
-Collect after the service stops. Read `summary.md` and `report.json` in the retrieved evidence. A passing report requires successful runtime execution, the ten-agent Goal, exact candidate/case digests, and confirmed worker cleanup. `controller-status.json` also records systemd state and `cleanup_confirmed`. Missing or altered evidence, nine idle agents, a failed artifact, or unknown cleanup cannot qualify. Only the exact artifacts that passed are qualified, for this single-host preview.
-
-## Stop and inspect
-
-```sh
-python3 scripts/remote.py cancel --run-id poc-20261012-01
-python3 scripts/remote.py status --run-id poc-20261012-01
-```
-
-Cancellation stops only `solos-swarm-poc-20261012-01.service`; repeating cancellation after it has stopped returns its recorded status. Host cleanup removes the one-use credential, runs the independent checker, and preserves evidence. Run artifacts remain at `~/.local/state/solos-swarm/runs/RUN_ID`; protected scorer expectations remain separately under `~/.local/state/solos-swarm/evaluators/RUN_ID`; immutable candidates live under `~/.local/share/solos-swarm/CANDIDATE_ID`. Retention is manual for this preview.
-
-Lifecycle probes use the same candidate and isolated Pi workers but make no paid model requests. They are explicitly marked non-live and cannot pass the live checker. Use distinct IDs while keeping the same seed; the first command demonstrates host-side deadline expiry, and the second pair demonstrates cancellation.
+## Quickstart
 
 ```sh
-python3 scripts/remote.py start --candidate CANDIDATE_ID --run-id deadline-probe-01 --seed 20261012 --idle-probe --deadline-seconds 10
-python3 scripts/remote.py start --candidate CANDIDATE_ID --run-id cancel-probe-01 --seed 20261012 --idle-probe --deadline-seconds 120
-python3 scripts/remote.py cancel --run-id cancel-probe-01
-```
-
-## Local checks
-
-```sh
+# Build and verify contracts
 python3 scripts/bootstrap_tokenizers.py --output work/tokenizers
-cargo test --locked
-cargo clippy --locked --all-targets -- -D warnings
+cargo build --locked --release
+cargo test --locked -- --test-threads=1
 python3 -m unittest discover -s tests -p 'test_*.py'
-npm ci --ignore-scripts --no-audit --no-fund
-npm run test:broker
+npm ci --ignore-scripts --no-audit --no-fund && npm run test:broker
 ```
 
-The Python checks exercise scoring failures, altered or missing evidence, candidate integrity, and idempotent remote identity without live inference. The Pi extension checks run a real RPC subprocess against a fixture Unix-socket broker.
+```sh
+# Launch witness, evaluator, runtime, and QA
+solos-swarm mvp witness-serve --config /path/to/witness.json
+solos-swarm mvp evaluator-serve --bundle /path/to/bundle.json --certificate /path/to/eval.der   --private-key /path/to/eval.key --ca /path/to/ca.pem --state /path/to/state.json   --ipc-socket /path/to/evaluator.sock --broker-uid 1001
+solos-swarm mvp serve --config /path/to/runtime.json
+solos-swarm mvp qa --config /path/to/qa.json --profile integration --output /path/to/evidence
+```
 
-The legacy preview commands above retain their original behavior and evidence. The expanded runtime uses `mvp serve`, inherited file-descriptor or one-use peer-checked socket credentials, separate evaluator/witness services, and `scripts/bundle.py` for verified offline artifacts. Its implementation and qualification status are recorded separately in [MVP-TRACEABILITY.md](docs/MVP-TRACEABILITY.md); the historical preview cannot establish those new contracts.
+```sh
+# Inspect state and verify evidence offline
+solos-swarm mvp inspect --snapshot /path/to/snapshot.json --kind board --id GOAL_ID
+solos-swarm mvp verify --snapshot /path/to/snapshot.json --head /path/to/head.json   --trusted-key /path/to/public-key.json --output /path/to/verification.json
+```
+
+## Documentation
+
+| Document | Scope |
+|---|---|
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Domain model, Raft over mTLS QUIC, Tier-P sandboxes, and spend ledger. |
+| [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | Identity provisioning, offline startup, cluster recovery, and operations. |
+| [`docs/CAMPAIGNS.md`](docs/CAMPAIGNS.md) | Matched 1-vs-10 worker evaluation design and schemas. |
+| [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | Live 10-agent DeepSeek results, microbenchmarks, and acceptance SLOs. |
+| [`skills/verify-solos-swarm/SKILL.md`](skills/verify-solos-swarm/SKILL.md) | Release qualification workflow for immutable candidates. |
+
+## License
+
+Apache-2.0. Copyright 2026 Gui Bibeau.
