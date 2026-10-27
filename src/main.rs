@@ -747,7 +747,7 @@ async fn run(options: RunOptions) -> Result<()> {
     } else {
         tokio::select! {
             result=work(&mut workers,&store,&mut rx,&goal,idle) => result,
-            _=tokio::time::sleep(Duration::from_secs(deadline)) => Err(anyhow::anyhow!("host-side Goal deadline expired")),
+            _=unpaused_deadline(deadline, run_dir.clone()) => Err(anyhow::anyhow!("host-side Goal deadline expired")),
             _=term.recv() => Err(anyhow::anyhow!("operator cancelled run")),
             _=tokio::signal::ctrl_c() => Err(anyhow::anyhow!("operator interrupted run")),
         }
@@ -1146,10 +1146,39 @@ async fn fetch_probe(root: &Path, node: &Path, url: &str) -> Result<()> {
     Ok(())
 }
 
+/// The Goal deadline counts only time in which model calls are allowed: a pause (operator file or peak window) does not
+/// consume it. `RuntimeMaxSec` on the service remains the wall-clock backstop.
+async fn unpaused_deadline(deadline: u64, run_dir: PathBuf) {
+    let tick = Duration::from_secs(5);
+    let mut left = Duration::from_secs(deadline);
+    while !left.is_zero() {
+        let step = left.min(tick);
+        tokio::time::sleep(step).await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        if broker::pause_retry_after(&run_dir, now).is_none() {
+            left -= step;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener; // std, not the tokio listener the daemon binds
+
+    #[tokio::test]
+    async fn a_pause_stops_the_deadline_clock_and_resuming_restarts_it() {
+        let dir = std::env::temp_dir().join(format!("swarm-dl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("PAUSE"), "").unwrap();
+        let paused = tokio::time::timeout(Duration::from_secs(3), unpaused_deadline(1, dir.clone())).await;
+        assert!(paused.is_err(), "deadline must not expire while paused");
+        std::fs::remove_file(dir.join("PAUSE")).unwrap();
+        let resumed = tokio::time::timeout(Duration::from_secs(4), unpaused_deadline(1, dir.clone())).await;
+        assert!(resumed.is_ok(), "deadline runs once the pause is lifted");
+    }
 
     fn task() -> broker::Task {
         serde_json::from_value(json!({

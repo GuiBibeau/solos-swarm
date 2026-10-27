@@ -51,7 +51,19 @@ export default function swarmBroker(pi: ExtensionAPI) {
         fetch: async (input, init) => {
           const incoming = new Request(input, init);
           const payload = await incoming.json();
-          const response = await broker("/model", { ...payload, stream: false }, incoming.signal);
+          let response = await broker("/model", { ...payload, stream: false }, incoming.signal);
+          // A paused broker (operator pause or peak window) refuses BEFORE reserving anything: wait and ask again, as
+          // many times as it takes. This is not an error, spends no call and no budget.
+          while (response.status === 503) {
+            const note = await response.clone().json().catch(() => ({}));
+            if (!note.paused) break;
+            const wait = Math.min(Math.max(Number(note.retry_after_s) || 30, 0.1), 300) * 1000;
+            await new Promise((done, fail) => {
+              const timer = setTimeout(done, wait);
+              incoming.signal.addEventListener("abort", () => { clearTimeout(timer); fail(new Error("aborted while paused")); }, { once: true });
+            });
+            response = await broker("/model", { ...payload, stream: false }, incoming.signal);
+          }
           if (!response.ok) return response;
           const completion = await response.json();
           const choice = completion.choices?.[0];

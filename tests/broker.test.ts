@@ -15,6 +15,7 @@ test("real pinned Pi talks only to Unix broker and completes a tool loop", { tim
   const dir = await mkdtemp(`${tmpdir()}/swarm-pi-`);
   const socket = `${dir}/broker.sock`;
   let modelCalls = 0;
+  let pausedReplies = 2;
   const toolCalls: string[] = [];
   // Longer than the Board limit on purpose: the boundary must shorten it, not
   // reject the call, or a model can loop on the validation error until its
@@ -27,6 +28,12 @@ test("real pinned Pi talks only to Unix broker and completes a tool loop", { tim
       for await (const chunk of req) chunks.push(chunk);
       const body = JSON.parse(Buffer.concat(chunks).toString());
       res.setHeader("Content-Type", "application/json");
+      if (req.url === "/model" && pausedReplies > 0) {
+        pausedReplies--; // a paused broker must be waited out, not treated as an error or a spent call
+        res.statusCode = 503;
+        res.end(JSON.stringify({ paused: true, retry_after_s: 0.2 }));
+        return;
+      }
       if (req.url === "/model") {
         assert.equal(body.stream, false);
         assert.equal(body.model, "deepseek-flash");
