@@ -179,11 +179,16 @@
     selectedWorkerIndex: 0,
     cmdkOpen: false,
     cmdkQuery: "",
-    cmdkActiveIdx: 0
+    cmdkActiveIdx: 0,
+    feedSnapshot: null,
+    feedEnabled: true,
+    feedFailed: false,
+    feedLoading: false
   };
 
   function parseInitialUrlParams() {
     var params = new URLSearchParams(window.location.search);
+    if (params.get("demo") === "1" || params.has("preset")) state.feedEnabled = false;
     var preset = params.get("preset");
     if (preset === "10" || preset === "live" || preset === "live-20260412-132831") {
       state.presetKey = "live-20260412-132831";
@@ -197,20 +202,27 @@
     if (params.get("cmdk") === "1") {
       state.cmdkOpen = true;
     }
+    var formation = params.get("formation");
+    if (formation === "orbit" || formation === "lattice" || formation === "helix") {
+      spatialFormation = formation;
+    }
   }
 
   function formatNumber(n) {
-    return Number(n || 0).toLocaleString("en-US");
+    return n == null ? "—" : Number(n).toLocaleString("en-US");
   }
 
   function formatUsdFromMicro(micro, forceDecimals) {
+    if (micro == null) return "—";
     var usd = Number(micro || 0) / 1000000;
     var digits = typeof forceDecimals === "number" ? forceDecimals : 3;
     return "$" + usd.toFixed(digits);
   }
 
   function formatTokens(totalTokens) {
+    if (totalTokens == null) return "—";
     var n = Number(totalTokens || 0);
+    if (n >= 1000000) return (n / 1000000).toFixed(1) + "M";
     if (n >= 1000) {
       return (n / 1000).toFixed(1) + "k";
     }
@@ -218,6 +230,7 @@
   }
 
   function formatSecondsFromMs(ms) {
+    if (ms == null) return "—";
     return (Number(ms || 0) / 1000).toFixed(1) + "s";
   }
 
@@ -230,6 +243,8 @@
   }
 
   function normalizeSnapshotPacket(raw) {
+    var telemetry = window.SwarmTelemetry && window.SwarmTelemetry.normalize(raw);
+    if (telemetry) return telemetry;
     var root = raw && raw.snapshot ? raw.snapshot : raw || {};
     var domain = root.domain || {};
     var ledger = root.ledger || {};
@@ -507,6 +522,7 @@
     if (state.customSnapshot) {
       return state.customSnapshot;
     }
+    if (state.feedEnabled && state.feedSnapshot) return state.feedSnapshot;
     return state.snapshots[state.presetKey] || state.snapshots["swarm-100"];
   }
 
@@ -567,63 +583,72 @@
   function buildCmdkItems(vm) {
     var items = [
       {
+        id: "runtime",
+        label: "Runtime",
+        right: "",
+        action: followRuntime
+      },
+      {
         id: "preset-100",
-        label: "Switch preset → 100-Agent Swarm (reconcile-fleet-100)",
-        right: "100 workers · $0.174",
+        label: "100 agents · Demo",
+        right: "",
         action: function () {
           switchPreset("swarm-100");
         }
       },
       {
         id: "preset-10",
-        label: "Switch preset → 10-Agent Benchmark (live-20260412-132831)",
-        right: "10 workers · $0.017",
+        label: "10 agents · Demo",
+        right: "",
         action: function () {
           switchPreset("live-20260412-132831");
         }
       },
       {
         id: "view-waterfall",
-        label: "View → Execution Waterfall + Synchronized Matrix",
-        right: "Tab 1",
+        label: "Trace",
+        right: "1",
         action: function () {
           state.viewMode = "waterfall";
         }
       },
       {
         id: "view-matrix",
-        label: "View → Full Sandbox Matrix (" + vm.workerCount + " units)",
-        right: "Tab 2",
+        label: "Agents",
+        right: "2",
         action: function () {
           state.viewMode = "matrix";
         }
       },
       {
         id: "view-ledger",
-        label: "View → Spend Ledger & RFC 6962 Witness Proofs",
-        right: "Tab 3",
+        label: "Ledger",
+        right: "3",
         action: function () {
           state.viewMode = "ledger";
         }
       },
       {
         id: "toggle-theme",
-        label: "Toggle Dark / Light Monochrome Theme",
-        right: "Key T",
+        label: "Theme",
+        right: "T",
         action: function () {
           toggleTheme();
         }
       }
     ];
+    if (vm.isRealData && !vm.timelineRows.some(function (row) { return row.durationMs != null; })) {
+      items = items.filter(function (item) { return item.id !== "view-waterfall"; });
+    }
 
     vm.workers.forEach(function (w) {
       items.push({
         id: "worker-" + w.index,
-        label: "Inspect " + w.workerId + " (" + w.taskId + ")",
-        right: "fence " + w.fence + " · " + formatSecondsFromMs(w.durationMs),
+        label: w.workerId + (w.taskId ? " · " + w.taskId : ""),
+        right: formatSecondsFromMs(w.durationMs),
         action: function () {
           state.selectedWorkerIndex = w.index;
-          state.selectedRowIndex = vm.workers.length > 10 ? Math.floor(w.index / 10) : w.index;
+          state.selectedRowIndex = vm.workers.length > 10 ? Math.floor(w.index / Math.ceil(vm.workers.length / 10)) : w.index;
         }
       });
     });
@@ -663,9 +688,7 @@
             "<span>" +
             escapeHtml(w.workerId.replace("agent-", "#")) +
             "</span>" +
-            "<span>" +
-            formatSecondsFromMs(w.durationMs) +
-            "</span>" +
+            (w.durationMs == null ? "" : "<span>" + formatSecondsFromMs(w.durationMs) + "</span>") +
             "</button>"
           );
         })
@@ -674,11 +697,13 @@
     }
 
     if (state.viewMode === "ledger") {
-      var sampleWorkers = vm.workers.slice(0, 8);
-      var perCallMicro = Math.round(vm.settledMicro / vm.modelCalls);
+      var sampleWorkers = vm.workers;
+      var showFences = vm.workers.some(function (worker) { return worker.fence != null; });
+      var showKeys = !vm.isRealData || vm.keysInWorkers != null;
+      var perCallMicro = vm.modelCalls > 0 && vm.settledMicro != null ? Math.round(vm.settledMicro / vm.modelCalls) : null;
       var rowsHtml = sampleWorkers
         .map(function (w) {
-          var wMicro = w.calls * perCallMicro;
+          var wMicro = vm.isRealData ? w.settledMicro : w.calls * perCallMicro;
           return (
             "<tr>" +
             "<td>" +
@@ -687,16 +712,14 @@
             "<td>" +
             escapeHtml(w.taskId) +
             "</td>" +
-            "<td>rev " +
-            escapeHtml(w.fence) +
+            (showFences ? "<td>" + (w.fence == null ? "—" : escapeHtml(w.fence)) + "</td>" : "") +
+            "<td>" +
+            formatNumber(w.calls) +
             "</td>" +
             "<td>" +
-            escapeHtml(w.calls) +
-            " settled</td>" +
-            "<td>" +
-            formatNumber(wMicro) +
-            " µUSD</td>" +
-            "<td>0 keys</td>" +
+            formatUsdFromMicro(wMicro, 3) +
+            "</td>" +
+            (showKeys ? "<td>" + (vm.isRealData ? formatNumber(vm.keysInWorkers) : "0") + "</td>" : "") +
             "</tr>"
           );
         })
@@ -704,8 +727,9 @@
 
       return (
         '<div class="ledger-stage">' +
+        (vm.heldMicro > 0 ? '<div class="ledger-held">' + formatUsdFromMicro(vm.heldMicro, 3) + ' held</div>' : '') +
         '<table class="ledger-table">' +
-        "<thead><tr><th>Worker SVID</th><th>Shard</th><th>Fence Token</th><th>Broker Intents</th><th>Settled Spend</th><th>Worker Env</th></tr></thead>" +
+        "<thead><tr><th>Agent</th><th>Task</th>" + (showFences ? "<th>Fence</th>" : "") + "<th>Calls</th><th>Spend</th>" + (showKeys ? "<th>Keys</th>" : "") + "</tr></thead>" +
         "<tbody>" +
         rowsHtml +
         "</tbody>" +
@@ -718,15 +742,18 @@
     var wfRowsHtml = vm.timelineRows
       .map(function (row) {
         var isRowSelected = row.rowIndex === state.selectedRowIndex;
-        var shardWidthPct = ((row.durationMs / vm.totalMs) * 100).toFixed(2);
-        var synthLeftPct = ((vm.parallelMs / vm.totalMs) * 100).toFixed(2);
-        var synthWidthPct = ((row.synthesisMs / vm.totalMs) * 100).toFixed(2);
+        var shardWidthPct = (vm.totalMs > 0 && row.durationMs != null ? Math.min(100, row.durationMs / vm.totalMs * 100) : 0).toFixed(2);
+        var synthLeftPct = (vm.totalMs > 0 ? vm.parallelMs / vm.totalMs * 100 : 0).toFixed(2);
+        var synthWidthPct = (vm.totalMs > 0 ? row.synthesisMs / vm.totalMs * 100 : 0).toFixed(2);
         var rightDur = row.hasSynthesis
           ? formatSecondsFromMs(vm.totalMs)
           : formatSecondsFromMs(row.durationMs);
+        var rowLabel = row.workerIndices.length > 1
+          ? String(row.workerIndices[0]).padStart(2, "0") + "–" + String(row.workerIndices[row.workerIndices.length - 1]).padStart(2, "0")
+          : row.label;
 
         return (
-          '<button type="button" class="wf-row" role="option" style="--row-i:' +
+          '<button type="button" class="wf-row" role="option" title="' + escapeHtml(row.label) + '" aria-label="' + escapeHtml(row.label) + '" style="--row-i:' +
           row.rowIndex +
           '" aria-selected="' +
           (isRowSelected ? "true" : "false") +
@@ -734,7 +761,7 @@
           row.rowIndex +
           '">' +
           '<span class="wf-agent">' +
-          escapeHtml(row.label) +
+          escapeHtml(rowLabel) +
           "</span>" +
           '<span class="wf-track">' +
           '<span class="wf-bar-shard" style="width:' +
@@ -796,7 +823,7 @@
       "<span>0.0s</span>" +
       '<span class="axis-split-label">' +
       formatSecondsFromMs(vm.parallelMs) +
-      " shard barrier</span>" +
+      "</span>" +
       "<span>" +
       formatSecondsFromMs(vm.totalMs) +
       "</span>" +
@@ -806,10 +833,7 @@
       "</div>" +
       '<div class="matrix-strip">' +
       '<div class="matrix-strip-head">' +
-      '<span class="matrix-strip-title">SANDBOX FLEET MATRIX (' +
-      formatNumber(vm.workerCount) +
-      " ISOLATED UNITS · 0 API KEYS)</span>" +
-      "<span>Click or ↑↓←→ to inspect unit</span>" +
+      '<span class="matrix-strip-title">Agents</span>' +
       "</div>" +
       '<div class="' +
       (is100 ? "matrix-grid-100" : "matrix-grid-10") +
@@ -820,11 +844,58 @@
     );
   }
 
+  var motionPaused = false;
+  var spatialFormation = "orbit";
+  var motionPreference = window.matchMedia("(prefers-reduced-motion: reduce)");
+  var lastRender = null;
+
+  function selectSpatialWorker(index) {
+    var vm = normalizeSnapshotPacket(getActivePacket());
+    if (!Number.isInteger(index) || index < 0 || index >= vm.workers.length) return;
+    state.selectedWorkerIndex = index;
+    state.selectedRowIndex = vm.workers.length > 10 ? Math.floor(index / Math.ceil(vm.workers.length / 10)) : index;
+    render();
+  }
+
+  function syncExpandedScene() {
+    var stage = document.getElementById("spatial-stage");
+    var expanded = stage.classList.contains("is-expanded");
+    document.body.classList.toggle("scene-expanded", expanded);
+    document.querySelectorAll(".cmd-header, .metric-strip, .workspace-split").forEach(function (element) {
+      element.inert = expanded;
+    });
+    if (expanded) {
+      stage.setAttribute("role", "dialog");
+      stage.setAttribute("aria-modal", "true");
+    } else {
+      stage.removeAttribute("role");
+      stage.removeAttribute("aria-modal");
+    }
+    var button = document.getElementById("btn-expand");
+    button.setAttribute("aria-label", expanded ? "Collapse swarm" : "Expand swarm");
+    button.setAttribute("title", expanded ? "Collapse swarm" : "Expand swarm");
+  }
+
   function render() {
     var app = document.getElementById("app");
     if (!app) return;
+    if (counterAnimFrame) cancelAnimationFrame(counterAnimFrame);
+    var spatialStage = document.getElementById("spatial-stage");
+    var focused = document.activeElement;
+    var focusSelector = focused && focused.id ? "#" + focused.id : null;
+    ["data-worker-index", "data-row-index", "data-view", "data-preset", "data-formation"].forEach(function (attr) {
+      if (focused && focused.hasAttribute(attr)) {
+        focusSelector = "[" + attr + '="' + focused.getAttribute(attr) + '"]';
+      }
+    });
+    if (spatialStage) spatialStage.remove();
 
     var vm = normalizeSnapshotPacket(getActivePacket());
+    if (state.feedLoading || state.feedFailed && vm.isRealData && !vm.workers.length) {
+      vm.workerCount = vm.completedShards = vm.modelCalls = null;
+    }
+    var hasTiming = !vm.isRealData || vm.timelineRows.some(function (row) { return row.durationMs != null; });
+    if (!hasTiming && !state.feedLoading && state.viewMode === "waterfall") state.viewMode = "matrix";
     if (state.selectedWorkerIndex >= vm.workers.length) {
       state.selectedWorkerIndex = 0;
     }
@@ -832,16 +903,23 @@
       state.selectedRowIndex = 0;
     }
 
-    var selectedWorker = vm.workers[state.selectedWorkerIndex] || vm.workers[0];
+    var selectedWorker = vm.workers[state.selectedWorkerIndex] || vm.workers[0] || {
+      workerId: "—", taskId: "—", fence: null, durationMs: null, calls: null, tokens: null,
+      settledMicro: null, findingSummary: "No worker selected"
+    };
     var activeRow = vm.timelineRows[state.selectedRowIndex] || vm.timelineRows[0];
-    var splitRatio = (vm.parallelMs / vm.totalMs).toFixed(4);
-    var settledPct = Math.min(100, Math.max(2, (vm.settledMicro / vm.ceilingMicro) * 100)).toFixed(2);
-    var segIndex = !state.customSnapshot && state.presetKey === "live-20260412-132831" ? 1 : 0;
-    var themeLabel = currentTheme() === "light" ? "Light" : "Dark";
+    var splitRatio = (vm.totalMs > 0 ? vm.parallelMs / vm.totalMs : 0).toFixed(4);
+    var settledPct = vm.ceilingMicro > 0 && vm.settledMicro != null ? Math.min(100, Math.max(vm.isRealData ? 0 : 2, (vm.settledMicro / vm.ceilingMicro) * 100)).toFixed(2) : null;
+    var segIndex = vm.isRealData ? -1 : !state.customSnapshot && state.presetKey === "live-20260412-132831" ? 1 : 0;
+    var stageKey = (vm.isRealData ? vm.goalId + ":" + vm.workers.length : state.presetKey) + ":" + (state.customFilename || "") + ":" + state.viewMode;
+    var workspaceClass = "workspace-split" +
+      (!lastRender || lastRender.stageKey !== stageKey ? " is-view-enter" : "") +
+      (lastRender && lastRender.worker !== selectedWorker.workerId ? " is-selection-change" : "");
+    var previousViewIndex = ["waterfall", "matrix", "ledger"].indexOf(lastRender ? lastRender.view : state.viewMode);
 
-    var perCallTok = Math.round(vm.totalTokens / vm.modelCalls);
-    var workerTok = selectedWorker.calls * perCallTok;
-    var workerMicro = Math.round((vm.settledMicro / vm.modelCalls) * selectedWorker.calls);
+    var perCallTok = vm.modelCalls > 0 && vm.totalTokens != null ? Math.round(vm.totalTokens / vm.modelCalls) : null;
+    var workerTok = vm.isRealData ? selectedWorker.tokens : selectedWorker.calls * perCallTok;
+    var workerMicro = vm.isRealData ? selectedWorker.settledMicro : Math.round((vm.settledMicro / vm.modelCalls) * selectedWorker.calls);
 
     var daemonsHtml = vm.daemons
       .map(function (d) {
@@ -890,7 +968,7 @@
         '<div class="cmdk-dialog">' +
         '<div class="cmdk-input-wrap">' +
         '<span class="cmdk-prompt">&gt;_</span>' +
-        '<input id="cmdk-input" class="cmdk-input" type="text" placeholder="Jump to agent-00..99, switch preset, or inspect ledger…" value="' +
+        '<input id="cmdk-input" class="cmdk-input" type="text" placeholder="Find agent or action…" value="' +
         escapeHtml(state.cmdkQuery) +
         '" autocomplete="off" />' +
         "<kbd>ESC</kbd>" +
@@ -899,8 +977,7 @@
         listHtml +
         "</div>" +
         '<div class="cmdk-footer">' +
-        "<span>↑↓ to navigate · ↵ to select</span>" +
-        "<span>solos-swarm inspect protocol v1</span>" +
+        "<span>↑↓ ↵</span>" +
         "</div>" +
         "</div>" +
         "</div>";
@@ -916,15 +993,9 @@
       '<span class="goal-slug">' +
       escapeHtml(vm.goalId) +
       "</span>" +
-      '<span class="status-chip"><span class="status-chip-dot"></span>' +
-      escapeHtml(vm.statusLabel) +
-      "</span>" +
-      '<span class="goal-intent">' +
-      escapeHtml(vm.goalTitle) +
-      "</span>" +
       "</div>" +
       '<div class="cmd-right">' +
-      '<div class="seg-control" role="group" aria-label="Swarm Cohort Preset" style="--seg-index:' +
+      '<div class="seg-control"' + (vm.isRealData ? " hidden" : "") + ' data-runtime="' + Boolean(vm.isRealData) + '" role="group" aria-label="Swarm Cohort Preset" style="--seg-index:' +
       segIndex +
       '">' +
       '<span class="seg-thumb"></span>' +
@@ -938,107 +1009,94 @@
       '<button type="button" class="tool-btn" id="btn-cmdk" aria-label="Open command palette">' +
       "<span>Jump</span><kbd>⌘K</kbd>" +
       "</button>" +
-      '<button type="button" class="tool-btn" id="btn-load-snapshot">' +
+      '<button type="button" class="tool-btn" id="btn-load-snapshot" title="Import snapshot">' +
       "<span>" +
-      (state.customFilename ? escapeHtml(state.customFilename) : "Import JSON") +
+      "Import" +
       "</span>" +
       "</button>" +
-      '<button type="button" class="tool-btn" id="btn-theme-toggle" aria-label="Toggle theme">' +
-      "<span>" +
-      themeLabel +
-      "</span><kbd>T</kbd>" +
+      '<button type="button" class="tool-btn theme-toggle" id="btn-theme-toggle" aria-label="Toggle theme" title="Theme · T">' +
+      '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" aria-hidden="true"><circle cx="8" cy="8" r="3"/><path d="M8 0v2m0 12v2M0 8h2m12 0h2M2.3 2.3l1.4 1.4m8.6 8.6 1.4 1.4M2.3 13.7l1.4-1.4m8.6-8.6 1.4-1.4"/></svg>' +
       "</button>" +
       "</div>" +
       "</header>" +
+      '<div class="observatory">' +
       /* Tier 2: Unified 4-Cell Hairline Metric Strip */
       '<section class="metric-strip" aria-label="Swarm Key Performance Indicators">' +
       '<article class="metric-cell">' +
       '<div class="metric-head">' +
-      '<span class="metric-label">Workers</span>' +
-      '<span class="metric-tag">0 API keys</span>' +
+      '<span class="metric-label">Agents</span>' +
       "</div>" +
       '<div class="metric-val" id="metric-workers">' +
       formatNumber(vm.workerCount) +
       "</div>" +
-      '<div class="metric-proof">bwrap + Landlock · mTLS capability gate</div>' +
+      '<div class="metric-proof" id="metric-capacity"' + (vm.configuredWorkers == null || vm.configuredWorkers === vm.workerCount ? ' hidden' : '') + '>/ ' + formatNumber(vm.configuredWorkers) + ' configured</div>' +
       "</article>" +
       '<article class="metric-cell">' +
       '<div class="metric-head">' +
-      '<span class="metric-label">Spend Ledger</span>' +
-      '<span class="metric-tag">' +
-      formatNumber(vm.settledMicro) +
-      " µUSD</span>" +
+      '<span class="metric-label">Spend</span>' +
       "</div>" +
       '<div class="metric-val" id="metric-spend">' +
       formatUsdFromMicro(vm.settledMicro, 3) +
       "</div>" +
-      '<div class="metric-proof">' +
-      settledPct +
-      "% of $1.00 cap · " +
-      vm.unknownHolds +
-      " unknown holds</div>" +
-      '<div class="metric-progress-track" role="progressbar" aria-valuenow="' +
-      vm.settledMicro +
-      '" aria-valuemin="0" aria-valuemax="' +
-      vm.ceilingMicro +
-      '">' +
+      '<div class="metric-proof" id="metric-cap">/ ' + formatUsdFromMicro(vm.ceilingMicro, 2) +
+      (vm.unknownHolds > 0 ? " · " + formatNumber(vm.unknownHolds) + " unknown holds" : "") + '</div>' +
+      '<div class="metric-progress-track" role="progressbar" aria-label="Spend ledger" ' +
+      (settledPct == null ? 'aria-valuetext="Unknown"' : 'aria-valuenow="' + vm.settledMicro + '" aria-valuemin="0" aria-valuemax="' + vm.ceilingMicro + '"') + '>' +
       '<span class="metric-progress-fill" style="width:' +
-      settledPct +
+      (settledPct || "0") +
       '%"></span>' +
       "</div>" +
       "</article>" +
       '<article class="metric-cell">' +
       '<div class="metric-head">' +
-      '<span class="metric-label">Throughput</span>' +
-      '<span class="metric-tag">' +
-      formatNumber(vm.completedShards) +
-      "/" +
-      formatNumber(vm.workerCount) +
-      " shards</span>" +
+      '<span class="metric-label">Calls</span>' +
       "</div>" +
       '<div class="metric-val" id="metric-calls">' +
       formatNumber(vm.modelCalls) +
       "</div>" +
-      '<div class="metric-proof">model calls · ' +
-      formatTokens(vm.totalTokens) +
-      " tokens settled</div>" +
       "</article>" +
       '<article class="metric-cell">' +
       '<div class="metric-head">' +
-      '<span class="metric-label">Wall Clock</span>' +
-      '<span class="metric-tag">rev ' +
-      formatNumber(vm.revision) +
-      "</span>" +
+      '<span class="metric-label">Elapsed</span>' +
       "</div>" +
       '<div class="metric-val">' +
       formatSecondsFromMs(vm.totalMs) +
       "</div>" +
-      '<div class="metric-proof">' +
-      formatSecondsFromMs(vm.parallelMs) +
-      " parallel + " +
-      formatSecondsFromMs(vm.synthMs) +
-      " synthesis</div>" +
       "</article>" +
       "</section>" +
+      '<section id="spatial-stage" class="spatial-stage" aria-label="Sandbox fleet visualization">' +
+      '<div class="spatial-heading"><span>Swarm <span class="source-badge" id="source-badge">Demo</span></span><span class="spatial-config"></span><button type="button" class="source-connect" id="btn-feed" aria-label="Follow runtime">Connect</button></div>' +
+      '<div class="spatial-controls">' +
+      '<div class="formation-controls" role="group" aria-label="Swarm formation">' +
+      '<button type="button" class="formation-btn" data-formation="orbit" aria-pressed="true"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="3"/><ellipse cx="8" cy="8" rx="7" ry="3" transform="rotate(-35 8 8)"/></svg>Orbit</button>' +
+      '<button type="button" class="formation-btn" data-formation="lattice" aria-pressed="false"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m8 1 6 3.5v7L8 15l-6-3.5v-7Zm0 7v7M2 4.5 8 8l6-3.5"/></svg>Lattice</button>' +
+      '<button type="button" class="formation-btn" data-formation="helix" aria-pressed="false"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 1c0 5 8 2 8 7s-8 2-8 7M12 1c0 5-8 2-8 7s8 2 8 7M5 3h6M5 13h6M4 8h8"/></svg>Helix</button>' +
+      "</div>" +
+      '<button type="button" class="motion-toggle" id="btn-motion" aria-label="Pause motion" title="Pause motion"></button>' +
+      '<button type="button" class="scene-expand" id="btn-expand" aria-label="Expand swarm" title="Expand swarm"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 2H2v4m8-4h4v4M2 10v4h4m8-4v4h-4"/></svg></button>' +
+      "</div>" +
+      '<div class="spatial-axis" aria-hidden="true"><svg viewBox="0 0 52 52"><path d="M26 26V6m0 20 18 11M26 26 8 37"/><circle cx="26" cy="26" r="2"/><text x="23" y="5">Y</text><text x="45" y="43">X</text><text x="2" y="43">Z</text></svg></div>' +
+      '<span class="spatial-corner spatial-corner-tl" aria-hidden="true"></span>' +
+      '<span class="spatial-corner spatial-corner-br" aria-hidden="true"></span>' +
+      "</section>" +
+      "</div>" +
       /* Tier 3: 72% / 28% Primary Workspace + Progressive-Disclosure Inspector */
-      '<section class="workspace-split" aria-label="Execution Trace and Live Unit Inspector">' +
+      '<section class="' + workspaceClass + '" data-mode="' + state.viewMode + '" style="--previous-view-index:' + previousViewIndex + '" aria-label="Execution Trace and Live Unit Inspector">' +
       '<div class="canvas-pane">' +
       '<div class="pane-bar">' +
       '<div class="pane-tabs" role="tablist" aria-label="Telemetry View Mode">' +
-      '<button type="button" class="pane-tab" role="tab" data-view="waterfall" aria-selected="' +
+      '<button type="button" class="pane-tab" role="tab" data-view="waterfall"' + (hasTiming ? '' : ' disabled') + ' aria-selected="' +
       (state.viewMode === "waterfall" ? "true" : "false") +
-      '">1. Waterfall + Fleet</button>' +
+      '" title="' + (hasTiming ? 'Trace · 1' : 'Timing unavailable') + '">Trace</button>' +
       '<button type="button" class="pane-tab" role="tab" data-view="matrix" aria-selected="' +
       (state.viewMode === "matrix" ? "true" : "false") +
-      '">2. Sandbox Matrix (' +
-      vm.workerCount +
-      ")</button>" +
+      '" title="Agents · 2">Agents</button>' +
       '<button type="button" class="pane-tab" role="tab" data-view="ledger" aria-selected="' +
       (state.viewMode === "ledger" ? "true" : "false") +
-      '">3. Spend &amp; Witness</button>' +
+      '" title="Ledger · 3">Ledger</button>' +
       "</div>" +
-      '<div class="pane-legend">' +
-      '<span class="legend-item"><span class="swatch shard"></span>Parallel shards</span>' +
+      '<div class="pane-legend"' + (vm.isRealData || state.viewMode !== 'waterfall' ? ' hidden' : '') + '>' +
+      '<span class="legend-item"><span class="swatch shard"></span>Shards</span>' +
       '<span class="legend-item"><span class="swatch synth"></span>Synthesis</span>' +
       "</div>" +
       "</div>" +
@@ -1048,46 +1106,113 @@
       '<aside class="inspector-pane" aria-label="Selected Worker Telemetry">' +
       '<div class="inspector-animated">' +
       '<div class="inspector-head">' +
-      '<span class="inspector-title">Unit Inspector</span>' +
+      '<span class="inspector-title">Agent</span>' +
       '<span class="inspector-worker-pill">' +
       escapeHtml(selectedWorker.workerId) +
       "</span>" +
       "</div>" +
       '<div class="kv-table">' +
-      '<div class="kv-row"><span class="kv-key">Task shard</span><span class="kv-val">' +
+      '<div class="kv-row"><span class="kv-key">Task</span><span class="kv-val">' +
       escapeHtml(selectedWorker.taskId) +
       "</span></div>" +
-      '<div class="kv-row"><span class="kv-key">Fencing token</span><span class="kv-val">rev ' +
-      escapeHtml(selectedWorker.fence) +
-      " · monotonic</span></div>" +
-      '<div class="kv-row"><span class="kv-key">Execution phase</span><span class="kv-val">' +
+      '<div class="kv-row"' + (selectedWorker.fence == null ? ' hidden' : '') + '><span class="kv-key">Fence</span><span class="kv-val">' +
+      formatNumber(selectedWorker.fence) + '</span></div>' +
+      '<div class="kv-row"' + (selectedWorker.durationMs == null ? ' hidden' : '') + '><span class="kv-key">Time</span><span class="kv-val">' +
       formatSecondsFromMs(selectedWorker.durationMs) +
-      (selectedWorker.index === 0 ? " + " + formatSecondsFromMs(vm.synthMs) + " synth" : " parallel") +
       "</span></div>" +
-      '<div class="kv-row"><span class="kv-key">Broker usage</span><span class="kv-val">' +
-      selectedWorker.calls +
+      '<div class="kv-row"><span class="kv-key">Usage</span><span class="kv-val">' +
+      formatNumber(selectedWorker.calls) +
       " calls · " +
-      formatNumber(workerTok) +
+      formatTokens(workerTok) +
       " tok · " +
-      formatNumber(workerMicro) +
-      " µUSD</span></div>" +
-      '<div class="kv-row"><span class="kv-key">Worker env keys</span><span class="kv-val">0 (OPENAI/DEEPSEEK = ∅)</span></div>' +
+      formatUsdFromMicro(workerMicro, 3) + '</span></div>' +
+      '<div class="kv-row"' + (vm.isRealData && vm.keysInWorkers == null ? ' hidden' : '') + '><span class="kv-key">Keys</span><span class="kv-val">' + (vm.isRealData ? formatNumber(vm.keysInWorkers) : "0") + '</span></div>' +
       "</div>" +
-      '<div class="finding-section">' +
-      '<span class="finding-label">Signed Finding Digest</span>' +
+      '<div class="finding-section"' + (!vm.isRealData || selectedWorker.findingSummary === 'No finding recorded' || selectedWorker.findingSummary === 'No worker selected' ? ' hidden' : '') + '>' +
+      '<span class="finding-label">Finding</span>' +
       '<div class="finding-box">' +
-      escapeHtml(selectedWorker.findingSummary) +
+      escapeHtml(selectedWorker.findingSummary === 'Finding recorded' ? 'Filed' : selectedWorker.findingSummary) +
       "</div>" +
       "</div>" +
       "</div>" +
-      '<div class="enclave-block">' +
-      '<div class="enclave-header"><span>Unix UID Isolation</span><span>RFC 6962</span></div>' +
+      '<details class="enclave-block"' + (vm.isRealData && !vm.daemons.length ? " hidden" : "") + '>' +
+      '<summary class="enclave-header">Isolation</summary>' +
       daemonsHtml +
-      "</div>" +
+      "</details>" +
       "</aside>" +
       "</section>" +
       "</main>" +
       cmdkModalHtml;
+
+    var nextStage = document.getElementById("spatial-stage");
+    if (spatialStage) nextStage.replaceWith(spatialStage);
+    else {
+      spatialStage = nextStage;
+      if (window.SwarmSpatial) window.SwarmSpatial.mount(spatialStage);
+    }
+    var source = vm.source || {};
+    var sourceAge = source.updated_at == null ? null : Math.max(0, Date.now() - source.updated_at);
+    var sourceStatus = state.feedLoading ? "Connecting" : vm.isRealData
+      ? (state.feedFailed || source.connected === false && state.feedEnabled ? (vm.workers.length ? "Stale" : "Unavailable")
+        : source.service_active === true && sourceAge != null && sourceAge < 30000 ? "Live"
+        : vm.statusLabel === "RUNNING" && sourceAge != null && sourceAge >= 30000 ? "Stale" : "Snapshot")
+      : "Demo";
+    var sourceBadge = spatialStage.querySelector("#source-badge");
+    sourceBadge.textContent = sourceStatus;
+    sourceBadge.setAttribute("data-status", sourceStatus.toLowerCase());
+    sourceBadge.title = (source.label || (sourceStatus === "Demo" ? "Bundled example snapshot" : "Swarm source")) +
+      (source.updated_at == null ? "" : " · " + new Date(source.updated_at).toLocaleString());
+    spatialStage.querySelector(".spatial-config").textContent = vm.model || vm.provider || "";
+    spatialStage.querySelector("#btn-feed").hidden = state.feedEnabled && Boolean(state.feedSnapshot) && !state.feedFailed;
+    spatialStage.setAttribute("data-formation-state", spatialFormation);
+    spatialStage.querySelectorAll("[data-formation]").forEach(function (button) {
+      button.setAttribute("aria-pressed", String(button.getAttribute("data-formation") === spatialFormation));
+    });
+    var motionButton = spatialStage.querySelector("#btn-motion");
+    motionButton.setAttribute("aria-label", motionPaused ? "Resume motion" : "Pause motion");
+    motionButton.setAttribute("title", motionPaused ? "Resume motion" : "Pause motion");
+    motionButton.setAttribute("aria-pressed", String(motionPaused));
+    motionButton.disabled = motionPreference.matches;
+    if (motionPreference.matches) {
+      motionButton.setAttribute("aria-label", "Motion reduced by system preference");
+      motionButton.setAttribute("title", "Motion reduced by system preference");
+    }
+    motionButton.innerHTML = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">' +
+      (motionPaused ? '<path d="M4 2.5 11 7l-7 4.5z" fill="currentColor"/>' : '<path d="M4.5 3v8m5-8v8" stroke="currentColor" stroke-width="1.5"/>') + '</svg>';
+    if (window.SwarmSpatial) window.SwarmSpatial.update({
+      workers: vm.workers,
+      selectedWorkerIndex: state.selectedWorkerIndex,
+      selectedRowIndex: state.selectedRowIndex,
+      cohortIndices: activeRow ? activeRow.workerIndices : [],
+      formation: spatialFormation,
+      onSelect: selectSpatialWorker,
+      activityEnabled: sourceStatus === "Live" || sourceStatus === "Demo",
+      paused: motionPaused
+    });
+    syncExpandedScene();
+
+    var reducedMotion = motionPreference.matches;
+    if (!reducedMotion && !lastRender) {
+      app.animate([{ opacity: 0, transform: "perspective(1200px) translateY(20px) rotateX(2deg)" }, { opacity: 1, transform: "none" }],
+        { duration: 850, easing: "cubic-bezier(.16,1,.3,1)" });
+    }
+    if (!reducedMotion && (!lastRender || lastRender.stageKey !== stageKey)) {
+      app.querySelectorAll(".wf-bar-shard, .wf-bar-synth, .full-matrix-tile").forEach(function (el, index) {
+        el.animate([{ opacity: 0, transform: "translateY(8px) scaleX(.88)" }, { opacity: 1, transform: "none" }],
+          { duration: 600, delay: Math.min(index * 18, 350), easing: "cubic-bezier(.16,1,.3,1)", fill: "backwards" });
+      });
+      app.querySelector(".canvas-pane").animate([{ opacity: 0.5, transform: "translateY(8px)" }, { opacity: 1, transform: "none" }],
+        { duration: 450, easing: "cubic-bezier(.16,1,.3,1)" });
+    }
+    if (!reducedMotion && lastRender && lastRender.worker !== selectedWorker.workerId) {
+      app.querySelector(".inspector-animated").animate([{ opacity: 0.3, transform: "translateX(10px)" }, { opacity: 1, transform: "none" }],
+        { duration: 320, easing: "cubic-bezier(.16,1,.3,1)" });
+    }
+    lastRender = { stageKey: stageKey, worker: selectedWorker.workerId, view: state.viewMode };
+    if (focusSelector && !state.cmdkOpen) {
+      var focusTarget = app.querySelector(focusSelector);
+      if (focusTarget) focusTarget.focus({ preventScroll: true });
+    }
 
     if (state.cmdkOpen) {
       var inputEl = document.getElementById("cmdk-input");
@@ -1100,8 +1225,12 @@
   }
 
   function switchPreset(nextKey) {
-    if (state.presetKey === nextKey && !state.customSnapshot) return;
+    if (state.presetKey === nextKey && !state.customSnapshot && !state.feedSnapshot) return;
     var prevVm = normalizeSnapshotPacket(getActivePacket());
+    state.feedEnabled = false;
+    state.feedSnapshot = null;
+    state.feedFailed = false;
+    state.feedLoading = false;
     state.presetKey = nextKey;
     state.customSnapshot = null;
     state.customFilename = null;
@@ -1121,7 +1250,7 @@
         })
         .then(function (data) {
           state.snapshots[key] = data;
-          if (!state.customSnapshot && state.presetKey === key) {
+          if (!state.customSnapshot && !state.feedSnapshot && state.presetKey === key) {
             render();
           }
         })
@@ -1131,6 +1260,70 @@
     });
   }
 
+  var feedTimer = null;
+  var feedInFlight = false;
+  var feedFingerprint = "";
+  function followRuntime() {
+    state.feedEnabled = true;
+    state.customSnapshot = null;
+    state.customFilename = null;
+    state.feedLoading = true;
+    if (!state.feedSnapshot) state.feedSnapshot = { schema: "solos-swarm.telemetry/v1", source: { label: "Connecting", connected: false }, config: {}, state: {} };
+    feedFingerprint = "";
+    render();
+    loadRuntimeFeed(false);
+  }
+
+  async function loadRuntimeFeed(initial) {
+    clearTimeout(feedTimer);
+    if (!state.feedEnabled || feedInFlight) return;
+    feedInFlight = true;
+    var changed = false;
+    try {
+      var response = await fetch("/api/swarm", { cache: "no-store", signal: AbortSignal.timeout(12000) });
+      if (!state.feedEnabled) return;
+      if (response.status === 404 && initial) {
+        state.feedEnabled = false;
+        state.feedSnapshot = null;
+      } else {
+        if (!response.ok) throw new Error("Runtime source unavailable");
+        var packet = await response.json();
+        if (packet.schema !== "solos-swarm.telemetry/v1") throw new Error("Invalid telemetry source");
+        var packetAge = packet.source && packet.source.updated_at != null ? Date.now() - packet.source.updated_at : null;
+        var fingerprint = JSON.stringify(packet) + ":fresh=" + (packetAge != null && packetAge < 30000);
+        changed = state.feedFailed || fingerprint !== feedFingerprint;
+        if (state.feedSnapshot && state.feedSnapshot.source && packet.source && state.feedSnapshot.source.label !== packet.source.label) {
+          state.selectedRowIndex = state.selectedWorkerIndex = 0;
+        }
+        feedFingerprint = fingerprint;
+        state.feedSnapshot = packet;
+        state.feedFailed = false;
+      }
+    } catch (_) {
+      if (!state.feedEnabled) return;
+      changed = !state.feedFailed;
+      state.feedFailed = true;
+      if (!state.feedSnapshot) {
+        state.feedSnapshot = { schema: "solos-swarm.telemetry/v1", source: { label: "Runtime unavailable", connected: false }, config: {}, state: {} };
+      }
+    } finally {
+      feedInFlight = false;
+      state.feedLoading = false;
+      if (initial || changed) render();
+      if (initial) loadExternalSnapshots();
+      if (state.feedEnabled) {
+        feedTimer = setTimeout(function poll() {
+          if (!state.feedEnabled) return;
+          if (document.hidden) {
+            feedTimer = setTimeout(poll, 5000);
+            return;
+          }
+          loadRuntimeFeed(false);
+        }, 5000);
+      }
+    }
+  }
+
   function handleFileImport(file) {
     if (!file) return;
     var reader = new FileReader();
@@ -1138,6 +1331,10 @@
       try {
         var parsed = JSON.parse(String(ev.target.result || "{}"));
         state.customSnapshot = parsed;
+        state.feedEnabled = false;
+        state.feedSnapshot = null;
+        state.feedFailed = false;
+        state.feedLoading = false;
         state.customFilename = file.name;
         state.selectedRowIndex = 0;
         state.selectedWorkerIndex = 0;
@@ -1150,7 +1347,34 @@
   }
 
   function bindEvents() {
+    motionPreference.addEventListener("change", function () {
+      if (motionPreference.matches) {
+        document.getAnimations().forEach(function (animation) { animation.cancel(); });
+      }
+      render();
+    });
     document.addEventListener("click", function (ev) {
+      if (ev.target.closest("#btn-feed")) {
+        followRuntime();
+        return;
+      }
+      if (ev.target.closest("#btn-expand")) {
+        var stage = document.getElementById("spatial-stage");
+        stage.classList.toggle("is-expanded");
+        syncExpandedScene();
+        return;
+      }
+      var formationButton = ev.target.closest("button[data-formation]");
+      if (formationButton) {
+        spatialFormation = formationButton.getAttribute("data-formation");
+        render();
+        return;
+      }
+      if (ev.target.closest("#btn-motion")) {
+        motionPaused = !motionPaused;
+        render();
+        return;
+      }
       var presetBtn = ev.target.closest("[data-preset]");
       if (presetBtn) {
         switchPreset(presetBtn.getAttribute("data-preset"));
@@ -1223,7 +1447,7 @@
         var wIdx = Number(workerBtn.getAttribute("data-worker-index")) || 0;
         var vm3 = normalizeSnapshotPacket(getActivePacket());
         state.selectedWorkerIndex = wIdx;
-        state.selectedRowIndex = vm3.workers.length > 10 ? Math.floor(wIdx / 10) : wIdx;
+        state.selectedRowIndex = vm3.workers.length > 10 ? Math.floor(wIdx / Math.ceil(vm3.workers.length / 10)) : wIdx;
         render();
       }
     });
@@ -1245,6 +1469,21 @@
     }
 
     document.addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape" && document.body.classList.contains("scene-expanded") && !state.cmdkOpen) {
+        document.getElementById("btn-expand").click();
+        document.getElementById("btn-expand").focus();
+        return;
+      }
+      if (ev.key === "Tab" && document.body.classList.contains("scene-expanded") && !state.cmdkOpen) {
+        var controls = Array.from(document.querySelectorAll("#spatial-stage button:not(:disabled)")).filter(function (button) {
+          return button.getClientRects().length > 0;
+        });
+        var current = controls.indexOf(document.activeElement);
+        if (current < 0 || (ev.shiftKey && current === 0) || (!ev.shiftKey && current === controls.length - 1)) {
+          ev.preventDefault();
+          controls[ev.shiftKey ? controls.length - 1 : 0].focus();
+        }
+      }
       if ((ev.metaKey || ev.ctrlKey) && (ev.key === "k" || ev.key === "K")) {
         ev.preventDefault();
         state.cmdkOpen = !state.cmdkOpen;
@@ -1319,21 +1558,38 @@
         var total = vm.workers.length;
         if (!total) return;
         ev.preventDefault();
+        var workerControl = ev.target.closest("[data-worker-index]");
+        var rowControl = ev.target.closest("[data-row-index]");
         var step = 1;
         if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
-          step = total > 10 ? 10 : 1;
+          step = total > 10 ? Math.ceil(total / 10) : 1;
+          if (workerControl) {
+            step = getComputedStyle(workerControl.parentElement).gridTemplateColumns.split(" ").length;
+          }
         }
         var dir = ev.key === "ArrowRight" || ev.key === "ArrowDown" ? 1 : -1;
         var next = (state.selectedWorkerIndex + dir * step + total) % total;
         state.selectedWorkerIndex = next;
-        state.selectedRowIndex = total > 10 ? Math.floor(next / 10) : next;
+        state.selectedRowIndex = total > 10 ? Math.floor(next / Math.ceil(total / 10)) : next;
         render();
+        var nextFocus = workerControl
+          ? document.querySelector('[data-worker-index="' + next + '"]')
+          : rowControl && document.querySelector('[data-row-index="' + state.selectedRowIndex + '"]');
+        if (nextFocus) nextFocus.focus({ preventScroll: true });
       }
     });
   }
 
   parseInitialUrlParams();
   bindEvents();
-  render();
-  loadExternalSnapshots();
+  if (state.feedEnabled) {
+    state.feedLoading = true;
+    state.feedSnapshot = { schema: "solos-swarm.telemetry/v1", source: { label: "Connecting", connected: false }, config: {}, state: {} };
+    render();
+    loadRuntimeFeed(true);
+  }
+  else {
+    render();
+    loadExternalSnapshots();
+  }
 })();

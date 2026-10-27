@@ -1053,28 +1053,6 @@ kbd {
 /* ==========================================================================
    Micro-Animations (Gated by prefers-reduced-motion: no-preference)
    ========================================================================== */
-@keyframes bar-enter {
-  from {
-    opacity: 0.25;
-    transform: scaleX(0.92);
-  }
-  to {
-    opacity: 1;
-    transform: scaleX(1);
-  }
-}
-
-@keyframes inspector-fade {
-  from {
-    opacity: 0.55;
-    transform: translateY(2px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
 @media (prefers-reduced-motion: no-preference) {
   .seg-thumb {
     transition: transform 200ms var(--ease-spring);
@@ -1093,18 +1071,178 @@ kbd {
       opacity 140ms ease;
   }
 
-  .wf-bar-shard,
-  .wf-bar-synth {
-    animation: bar-enter 220ms var(--ease-out-expo) both;
-    animation-delay: calc(var(--row-i, 0) * 14ms);
-  }
-
-  .inspector-animated {
-    animation: inspector-fade 160ms var(--ease-out-expo) both;
-  }
-
   .metric-progress-fill {
     transition: width 240ms var(--ease-out-expo);
+  }
+}
+
+/* A spatial instrument above the unchanged telemetry workspace. */
+.instrument-shell {
+  box-shadow: 0 32px 100px -32px #0009, 0 0 0 4px color-mix(in srgb, var(--surface-1) 35%, transparent), inset 0 1px 0 var(--highlight-top);
+}
+
+.metric-cell {
+  background: linear-gradient(155deg, color-mix(in srgb, var(--surface-elevated) 25%, transparent), transparent 65%);
+}
+
+.spatial-stage {
+  position: relative;
+  height: 302px;
+  overflow: hidden;
+  contain: layout paint;
+  border-bottom: 1px solid var(--border-hairline);
+  background: radial-gradient(ellipse at 50% 60%, var(--surface-elevated), var(--surface-1) 66%);
+}
+
+.spatial-stage canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.spatial-heading,
+.spatial-selection {
+  position: absolute;
+  z-index: 1;
+  left: 1.25rem;
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  pointer-events: none;
+}
+
+.spatial-heading {
+  top: 1.125rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.375rem;
+  color: var(--text-secondary);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.spatial-count {
+  font-size: 0.5625rem;
+  letter-spacing: 0.01em;
+  color: var(--text-muted);
+  text-transform: none;
+}
+
+.spatial-selection {
+  bottom: 1.125rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--text-secondary);
+}
+
+.spatial-selection-line {
+  width: 1.375rem;
+  height: 1px;
+  background: var(--text-secondary);
+}
+
+.motion-toggle {
+  position: absolute;
+  z-index: 2;
+  right: 0.875rem;
+  top: 0.75rem;
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--border-hairline);
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--surface-1) 70%, transparent);
+  color: var(--text-secondary);
+}
+
+.motion-toggle:hover {
+  color: var(--text-primary);
+  border-color: var(--border-strong);
+}
+
+.motion-toggle:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.spatial-corner {
+  position: absolute;
+  z-index: 1;
+  width: 9px;
+  height: 9px;
+  pointer-events: none;
+}
+
+.spatial-corner-tl {
+  left: 1.25rem;
+  top: 5.5rem;
+  border-left: 1px solid var(--border-strong);
+  border-top: 1px solid var(--border-strong);
+}
+
+.spatial-corner-br {
+  right: 1.25rem;
+  bottom: 1.25rem;
+  border-right: 1px solid var(--border-strong);
+  border-bottom: 1px solid var(--border-strong);
+}
+
+.matrix-grid-100,
+.matrix-grid-10,
+.full-matrix-stage {
+  perspective: 1000px;
+}
+
+.matrix-cell,
+.full-matrix-tile {
+  position: relative;
+  box-shadow: 0 2px 0 var(--bg-canvas), inset 0 1px 0 var(--highlight-top);
+  transform: translateZ(0);
+}
+
+.matrix-cell:is(:hover, :focus-visible),
+.full-matrix-tile:is(:hover, :focus-visible) {
+  z-index: 2;
+  transform: translateY(-4px) rotateX(7deg);
+  box-shadow: 0 6px 0 var(--bg-canvas), 0 10px 18px #0002, inset 0 1px 0 var(--highlight-top);
+}
+
+.full-matrix-tile[aria-selected="true"] {
+  box-shadow: 0 3px 0 var(--border-strong), 0 6px 18px #0003, inset 0 1px 0 var(--highlight-top);
+}
+
+.wf-bar-shard {
+  background: linear-gradient(180deg, var(--bar-shard-active), var(--bar-shard));
+  box-shadow: inset 0 1px 0 var(--highlight-top), 0 2px 0 #0003;
+}
+
+.wf-bar-synth {
+  box-shadow: inset 0 1px 0 #fff8, 0 0 18px color-mix(in srgb, var(--bar-synthesis) 9%, transparent);
+}
+
+.ledger-stage {
+  overflow-x: auto;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .matrix-cell,
+  .full-matrix-tile,
+  .tool-btn,
+  .motion-toggle {
+    transition: transform 240ms var(--ease-out-expo), background-color 150ms ease, border-color 150ms ease, color 150ms ease;
+  }
+  .tool-btn:hover {
+    transform: translateY(-1px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .matrix-cell:is(:hover, :focus-visible),
+  .full-matrix-tile:is(:hover, :focus-visible) {
+    transform: none;
   }
 }
 
@@ -1154,5 +1292,29 @@ kbd {
   .waterfall-body {
     --label-w: 4.125rem;
     --dur-w: 3rem;
+  }
+  .spatial-stage {
+    height: 270px;
+  }
+  .full-matrix-stage {
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+  }
+  .matrix-grid-10 {
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+  }
+  .pane-bar,
+  .pane-tabs {
+    gap: 0.25rem;
+  }
+  .pane-tabs {
+    flex-wrap: wrap;
+  }
+  .matrix-strip-head {
+    flex-wrap: wrap;
+  }
+  .wf-bar-synth {
+    overflow: hidden;
+    font-size: 0.5625rem;
+    padding: 0 0.125rem;
   }
 }

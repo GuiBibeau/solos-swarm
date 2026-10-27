@@ -34,5 +34,7 @@ jobs:
         run: cargo test --locked -- --test-threads=1
       - name: Python tests
         run: python3 -m unittest discover -s tests -p 'test_*.py'
+      - name: Dashboard tests
+        run: node --test tests/dashboard-*.test.mjs
       - name: Node broker & MVP tests
         run: npm ci --ignore-scripts --no-audit --no-fund && npm run test:broker
