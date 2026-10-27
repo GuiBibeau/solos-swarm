@@ -77,6 +77,7 @@ def make_case(seed):
         "max_output_tokens": 2_048,
         "input_price_microusd_per_million": 300_000,
         "output_price_microusd_per_million": 1_200_000,
+        "cache_hit_price_microusd_per_million": 6_000,
         "grants": ["claim_task", "board_read", "board_post", "submit_finding", "read_findings", "submit_artifact"],
         "tasks": tasks,
     }

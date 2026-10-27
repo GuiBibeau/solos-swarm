@@ -625,31 +625,58 @@ fn financial_receipt(value: &Value) -> Result<(String, Usage)> {
         .filter(|v| !v.is_empty())
         .context("provider receipt ID missing")?
         .to_owned();
-    let input = value["usage"]["prompt_tokens"]
+    Ok((id, completion_usage(&value["usage"])?))
+}
+
+/// Parse reported cache usage once for both hosted inference brokers.
+pub fn completion_usage(usage: &Value) -> Result<Usage> {
+    let input = usage["prompt_tokens"]
         .as_u64()
         .context("input usage missing")?;
-    let output = value["usage"]["completion_tokens"]
+    let output = usage["completion_tokens"]
         .as_u64()
         .context("output usage missing")?;
-    let cached = value["usage"]["prompt_cache_hit_tokens"]
-        .as_u64()
-        .or_else(|| value["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64())
+    let counter = |value: Option<&Value>| -> Result<Option<u64>> {
+        value
+            .map(|v| v.as_u64().context("invalid cache usage"))
+            .transpose()
+    };
+    let hit = counter(usage.get("prompt_cache_hit_tokens"))?;
+    let details = usage.get("prompt_tokens_details");
+    ensure!(
+        details.is_none_or(|v| v.is_null() || v.is_object()),
+        "invalid prompt token details"
+    );
+    let nested_hit = counter(details.and_then(|v| v.get("cached_tokens")))?;
+    let miss = counter(usage.get("prompt_cache_miss_tokens"))?;
+    if let (Some(hit), Some(nested)) = (hit, nested_hit) {
+        ensure!(hit == nested, "conflicting cache usage");
+    }
+    if let Some(miss) = miss {
+        ensure!(miss <= input, "cache miss usage exceeds total input");
+    }
+    let cached = hit
+        .or(nested_hit)
+        .or_else(|| miss.map(|v| input - v))
         .unwrap_or(0);
     // A reported output overrun is still a real receipt: settlement must retain its charge and engage the ledger stop.
     ensure!(cached <= input, "cached usage exceeds total input");
+    if let Some(miss) = miss {
+        ensure!(
+            miss == input - cached,
+            "cache usage does not match total input"
+        );
+    }
     let mut categories = BTreeMap::new();
     categories.insert("input_tokens".into(), input - cached);
     categories.insert("cached_input_tokens".into(), cached);
     categories.insert("output_tokens".into(), output);
-    Ok((
-        id,
-        Usage {
-            input_tokens: input,
-            output_tokens: output,
-            cached_input_tokens: cached,
-            categories,
-        },
-    ))
+    Ok(Usage {
+        input_tokens: input,
+        output_tokens: output,
+        cached_input_tokens: cached,
+        categories,
+    })
 }
 fn validate_completion(value: &Value) -> Result<()> {
     let choices = value["choices"]
@@ -790,6 +817,53 @@ fn parse_sse_receipt(bytes: &[u8], require_complete: bool) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cached_usage_is_disjoint_and_provider_formats_agree() {
+        for fields in [
+            json!({"prompt_cache_hit_tokens":90}),
+            json!({"prompt_tokens_details":{"cached_tokens":90}}),
+            json!({"prompt_cache_miss_tokens":10}),
+            json!({"prompt_cache_hit_tokens":90,"prompt_cache_miss_tokens":10,"prompt_tokens_details":{"cached_tokens":90}}),
+        ] {
+            let mut usage = json!({"prompt_tokens":100,"completion_tokens":50});
+            usage
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let parsed = completion_usage(&usage).unwrap();
+            assert_eq!(parsed.input_tokens, 100);
+            assert_eq!(parsed.cached_input_tokens, 90);
+            assert_eq!(parsed.categories["input_tokens"], 10);
+            assert_eq!(parsed.categories["cached_input_tokens"], 90);
+        }
+        assert_eq!(
+            completion_usage(&json!({"prompt_tokens":100,"completion_tokens":0}))
+                .unwrap()
+                .cached_input_tokens,
+            0
+        );
+    }
+    #[test]
+    fn malformed_or_conflicting_cache_usage_cannot_reduce_a_charge() {
+        for fields in [
+            json!({"prompt_cache_hit_tokens":101}),
+            json!({"prompt_cache_hit_tokens":null}),
+            json!({"prompt_cache_hit_tokens":"90"}),
+            json!({"prompt_cache_hit_tokens":-1}),
+            json!({"prompt_cache_hit_tokens":1.5}),
+            json!({"prompt_cache_miss_tokens":101}),
+            json!({"prompt_cache_hit_tokens":90,"prompt_cache_miss_tokens":11}),
+            json!({"prompt_cache_hit_tokens":90,"prompt_tokens_details":{"cached_tokens":80}}),
+            json!({"prompt_tokens_details":[]}),
+        ] {
+            let mut usage = json!({"prompt_tokens":100,"completion_tokens":50});
+            usage
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            assert!(completion_usage(&usage).is_err(), "{usage}");
+        }
+    }
     #[test]
     fn unusable_completion_cannot_discard_a_paid_usage_receipt() {
         let mut value = json!({"id":"paid-invalid","usage":{"prompt_tokens":4,"completion_tokens":100},"choices":[]});

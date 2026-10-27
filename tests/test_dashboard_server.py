@@ -76,10 +76,20 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(len(packet["state"]["agents"]), 1)
         self.assertEqual(packet["config"]["capabilities"], ["claim_task", "board_read"])
         self.assertEqual(packet["state"]["spent_microusd"], 0)
+        self.assertEqual(packet["state"]["intents"][0]["usage"], {"input_tokens": 0, "output_tokens": 0})
         self.assertEqual(packet["state"]["agents"]["agent-00"]["model_calls"], 0)
         self.assertIsNone(packet["state"]["tasks"][0]["fencing_token"])
         self.assertEqual(packet["state"]["findings"][0], {"agent_id": "agent-00", "task_id": "a00", "has_result": True})
         self.assertIs(packet["source"]["service_active"], False)
+
+    def test_cache_breakdown_survives_the_public_projection(self):
+        state, config = fixture()
+        state["intents"][0]["usage"].update(input_tokens=100, cached_input_tokens=90, uncached_input_tokens=10)
+        packet = server_module.project_runtime(state, config, "cached-run", 456)
+        self.assertEqual(packet["state"]["intents"][0]["usage"], {
+            "input_tokens": 100, "output_tokens": 0, "cached_input_tokens": 90, "uncached_input_tokens": 10,
+        })
+        self.assertNotIn("PRIVATE", json.dumps(packet))
 
     def test_missing_values_remain_unknown_and_kernel_format_is_explicitly_rejected(self):
         packet = server_module.project_runtime({"agents": {}, "tasks": []}, {}, "empty", 0)

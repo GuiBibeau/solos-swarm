@@ -105,6 +105,10 @@ $$\text{hold\_microusd} = \left\lceil \frac{\text{input\_tokens} \times P_{\text
 
 Dropped connections after socket write enter `Unknown`. Holds stay locked and never auto-retry.
 
+The hosted preview broker reserves every input token at the cache-miss rate. New Goals from `scripts/prepare_case.py` settle reported cache hits at `cache_hit_price_microusd_per_million: 6000`, alongside `input_price_microusd_per_million: 300000` and `output_price_microusd_per_million: 1200000`. These are conservative [DeepSeek Flash peak rates](https://api-docs.deepseek.com/quick_start/pricing/) verified on 2026-10-27; off-peak discounts are not applied.
+
+Settlement charges uncached input and cached input separately, rounds their combined charge up to microUSD, then adds the rounded output charge. Receipts retain total, cached, and uncached input counts. Inconsistent cache counters leave the hold unresolved. Missing cache counters receive no discount; Goals that omit the cache-hit rate retain their original all-miss pricing. Frozen runs are never repriced. `scripts/check_run.py` independently recomputes these charges from the retained provider responses and Goal rates. The MVP ledger uses its signed price table's `input_tokens`, `cached_input_tokens`, and `output_tokens` categories with the same validated provider counters.
+
 
 ## 6. Lineage, taint, and context assembly
 

@@ -45,7 +45,7 @@ async fn receive(State(calls): State<Arc<AtomicUsize>>, Json(body): Json<Value>)
     assert_eq!(body["max_tokens"], 2048);
     assert_eq!(body["stream"], false);
     Json(
-        json!({"id":"fixture-receipt-1","choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150}}),
+        json!({"id":"fixture-receipt-1","choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"prompt_cache_hit_tokens":90,"prompt_cache_miss_tokens":10,"completion_tokens":50,"total_tokens":150}}),
     )
 }
 
@@ -61,6 +61,7 @@ async fn unix_broker_denials_dispatch_nothing_and_allowed_call_settles_once() {
         "agent_count":1,"deadline_seconds":10,"budget_microusd":1000000,"max_calls_per_agent":8,
         "max_input_bytes":65536,"max_output_tokens":2048,"input_price_microusd_per_million":300000,
         "output_price_microusd_per_million":1200000,
+        "cache_hit_price_microusd_per_million":6000,
         "grants":["claim_task","board_read","board_post","submit_finding","read_findings","submit_artifact"],
         "tasks":[{"id":"task-0","input":{}}],"seed":1,"catalog_version":"test","scorer_version":"1"
     })).unwrap();
@@ -180,13 +181,17 @@ async fn unix_broker_denials_dispatch_nothing_and_allowed_call_settles_once() {
     assert!(response.status().is_success());
     let receipt: Value = response.json().await.unwrap();
     assert_eq!(receipt["id"], "fixture-receipt-1");
-    assert_eq!(receipt["swarm_cost_microusd"], 90);
+    assert_eq!(receipt["swarm_cost_microusd"], 64);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     {
         let state = state.lock().await;
         assert_eq!(state.intents.len(), 1);
         assert_eq!(state.intents[0].state, "completed");
-        assert_eq!(state.spent_microusd, 90);
+        assert_eq!(state.spent_microusd, 64);
+        assert_eq!(
+            state.intents[0].usage.as_ref().unwrap()["cached_input_tokens"],
+            90
+        );
         assert_eq!(state.held_microusd, 0);
     }
     server.abort();
