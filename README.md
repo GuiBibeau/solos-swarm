@@ -76,6 +76,8 @@ python3 scripts/dashboard_server.py --state /path/to/run/state.json --config /pa
 
 The dashboard follows the selected run's agents, model, budget, and receipts. It polls every five seconds; `--latest` follows the newest state file. The server binds to `127.0.0.1` and never starts agents or makes model calls.
 
+For non-JSON YAML configs, install `scripts/requirements-dashboard.txt` in the reader's Python environment (the Lima guest for `--lima`). For a local virtual environment: `python3 -m venv work/dashboard-python && work/dashboard-python/bin/pip install -r scripts/requirements-dashboard.txt`; then use `work/dashboard-python/bin/python` for the server and Python checks.
+
 `Live` requires both a fresh state file and a confirmed active service. Retained or unavailable sources show `Snapshot`, `Stale`, or `Unavailable`; missing measurements stay `—`. Orbit, lattice, and helix change the layout of the same recorded workers. Use `?demo=1` for the bundled example presets, or Import JSON for a saved snapshot.
 
 Dashboard checks: `node --test tests/dashboard-spatial.test.mjs tests/dashboard-telemetry.test.mjs` and `python3 -m unittest discover -s tests -p 'test_dashboard_server.py'`.

@@ -8,6 +8,7 @@ import mimetypes
 from pathlib import Path
 import re
 import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,9 +18,14 @@ DASHBOARD = Path(__file__).resolve().parent.parent / "dashboard"
 NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}\Z")
 RUN_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,47}\Z")
 MAX_BYTES = 32 * 1024 * 1024
+YAML_DEPENDENCY_ERROR = "YAML configuration requires PyYAML; install the dashboard Python requirements in the source environment."
 
 
 class TelemetryUnavailable(Exception):
+    pass
+
+
+class YamlDependencyMissing(ValueError):
     pass
 
 
@@ -105,17 +111,42 @@ def project_runtime(state, config, label, updated_at, service_active=None):
     }
 
 
-def read_json(path, optional=False):
+def read_file(path, optional=False):
     try:
         with Path(path).open("rb") as handle:
             data = handle.read(MAX_BYTES + 1)
     except FileNotFoundError:
         if optional:
-            return {}
+            return None
         raise
     if len(data) > MAX_BYTES:
         raise ValueError("Run file exceeds limit")
-    return json.loads(data)
+    return data
+
+
+def read_json(path, optional=False):
+    data = read_file(path, optional)
+    return json.loads(data) if data is not None else {}
+
+
+def read_config(path, optional=False):
+    data = read_file(path, optional)
+    if data is None:
+        return {}
+    try:
+        config = json.loads(data)
+    except json.JSONDecodeError:
+        try:
+            import yaml
+        except ImportError as error:
+            raise YamlDependencyMissing(YAML_DEPENDENCY_ERROR) from error
+        try:
+            config = yaml.safe_load(data)
+        except yaml.YAMLError as error:
+            raise ValueError("Invalid YAML configuration") from error
+    if not isinstance(config, dict):
+        raise ValueError("Configuration must be an object")
+    return config
 
 
 def guest_reader():
@@ -123,7 +154,9 @@ def guest_reader():
     return "\n".join([
         "import json, pathlib, re, subprocess, sys",
         "MAX_BYTES = " + str(MAX_BYTES),
-        inspect.getsource(project_runtime), inspect.getsource(read_json),
+        "YAML_DEPENDENCY_ERROR = " + repr(YAML_DEPENDENCY_ERROR),
+        inspect.getsource(YamlDependencyMissing), inspect.getsource(project_runtime),
+        inspect.getsource(read_file), inspect.getsource(read_json), inspect.getsource(read_config),
         "runs = pathlib.Path.home() / '.local/state/solos-swarm/runs'",
         "selection = sys.argv[1]",
         "if selection == '--latest':",
@@ -133,7 +166,7 @@ def guest_reader():
         "run_id = root.name",
         "Path = pathlib.Path",
         "state = read_json(root / 'state.json')",
-        "config = read_json(root / 'config.yaml', optional=True)",
+        "config = read_config(root / 'config.yaml', optional=True)",
         "active = None",
         "if state.get('goal_status') == 'running':",
         "    try:",
@@ -161,6 +194,7 @@ class RuntimeSource:
     def read(self):
         with self.lock:
             if time.monotonic() - self.checked >= 3:
+                previous_error = self.error
                 try:
                     if self.lima:
                         result = subprocess.run(["limactl", "shell", self.lima, "--", "python3", "-c", guest_reader(), "--latest" if self.latest else self.run], capture_output=True, text=True, timeout=8, check=True)
@@ -169,13 +203,21 @@ class RuntimeSource:
                             raise ValueError("Unsupported snapshot format")
                     else:
                         state = read_json(self.state)
-                        config = read_json(self.config, optional=self.config_optional)
+                        config = read_config(self.config, optional=self.config_optional)
                         label = self.state.parent.name if self.state.name == "state.json" else self.state.name
                         self.cached = project_runtime(state, config, label, int(self.state.stat().st_mtime * 1000))
                     self.error = None
+                except YamlDependencyMissing:
+                    self.cached = None
+                    self.error = YAML_DEPENDENCY_ERROR
+                except subprocess.CalledProcessError as error:
+                    self.cached = None
+                    self.error = YAML_DEPENDENCY_ERROR if YAML_DEPENDENCY_ERROR in (error.stderr or "") else "Swarm telemetry is unavailable."
                 except (OSError, ValueError, subprocess.SubprocessError):
                     self.cached = None
                     self.error = "Swarm telemetry is unavailable."
+                if self.error == YAML_DEPENDENCY_ERROR and self.error != previous_error:
+                    print(self.error, file=sys.stderr)
                 self.checked = time.monotonic()
             if self.error:
                 raise TelemetryUnavailable(self.error)

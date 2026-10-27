@@ -1,10 +1,12 @@
 """Read-only telemetry projection and HTTP boundary checks; no live swarm is started."""
 
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -15,7 +17,39 @@ from urllib.request import Request, urlopen
 MODULE = Path(__file__).resolve().parents[1] / "scripts/dashboard_server.py"
 spec = importlib.util.spec_from_file_location("dashboard_server", MODULE)
 server_module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = server_module
 spec.loader.exec_module(server_module)
+
+YAML_GOAL = """schema_version: 1
+intent: |-
+  Inspect one fleet.
+  Preserve the goal's scope.
+agent_count: 20
+budget_microusd: 100000000
+model: deepseek-flash
+provider: deepseek
+deadline_seconds: 21600
+max_calls_per_agent: 500
+max_input_bytes: 1000000
+max_output_tokens: 65536
+input_price_microusd_per_million: 300000
+output_price_microusd_per_million: 1200000
+scope: public-web-research
+seed: 20261027
+catalog_version: test-v1
+scorer_version: test-v1
+grants:
+  - claim_task
+  - board_read
+worker_prompt: |
+  PRIVATE worker instructions.
+  Never publish these instructions.
+synthesis_prompt: PRIVATE synthesis instructions
+tasks:
+  - id: a00
+    input: {secret: PRIVATE}
+    budget_microusd: 3000000
+"""
 
 
 def fixture():
@@ -86,12 +120,32 @@ class ProjectionTests(unittest.TestCase):
             state, config = fixture()
             state["goal_status"] = "stopped"
             (root / "state.json").write_text(json.dumps(state))
-            (root / "config.yaml").write_text(json.dumps(config))
+            (root / "config.yaml").write_text(YAML_GOAL)
             # Rebind home only inside this isolated subprocess fixture.
             env = dict(os.environ, HOME=directory)
-            result = subprocess.run(["python3", "-c", server_module.guest_reader(), "vm-run"], capture_output=True, text=True, check=True, env=env)
+            result = subprocess.run([sys.executable, "-c", server_module.guest_reader(), "vm-run"], capture_output=True, text=True, check=True, env=env)
             self.assertNotIn("PRIVATE", result.stdout)
             self.assertEqual(json.loads(result.stdout)["config"]["max_agents"], 20)
+            self.assertEqual(json.loads(result.stdout)["config"]["capabilities"], ["claim_task", "board_read"])
+            self.assertEqual(json.loads(result.stdout)["config"]["intent"], "Inspect one fleet.\nPreserve the goal's scope.")
+
+    def test_json_fast_path_needs_no_yaml_dependency_and_missing_yaml_is_clear(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(json.dumps(fixture()[1]))
+            with patch.dict("sys.modules", {"yaml": None}):
+                self.assertEqual(server_module.read_config(path)["agent_count"], 20)
+                path.write_text(YAML_GOAL)
+                with self.assertRaisesRegex(server_module.YamlDependencyMissing, "requires PyYAML"):
+                    server_module.read_config(path)
+                state = Path(directory) / "state.json"
+                state.write_text(json.dumps(fixture()[0]))
+                source = server_module.RuntimeSource(state=state)
+                with patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                    with self.assertRaises(server_module.TelemetryUnavailable):
+                        source.read()
+                    self.assertIn("requires PyYAML", stderr.getvalue())
+                    self.assertNotIn(directory, stderr.getvalue())
 
     def test_latest_follows_newest_state_and_ignores_incomplete_runs(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -106,7 +160,7 @@ class ProjectionTests(unittest.TestCase):
                 os.utime(root / "state.json", (modified, modified))
             (runs / "incomplete").mkdir()
             env = dict(os.environ, HOME=directory)
-            command = ["python3", "-c", server_module.guest_reader(), "--latest"]
+            command = [sys.executable, "-c", server_module.guest_reader(), "--latest"]
             first = subprocess.run(command, capture_output=True, text=True, check=True, env=env)
             self.assertEqual(json.loads(first.stdout)["source"]["label"], "newer")
             os.utime(runs / "older/state.json", (300, 300))
@@ -184,6 +238,40 @@ class HttpTests(unittest.TestCase):
         source = server_module.RuntimeSource(state=self.state, config=self.root / "missing-config.json")
         with self.assertRaises(server_module.TelemetryUnavailable):
             source.read()
+
+    def test_yaml_goal_is_projected_without_private_prompts_or_task_inputs(self):
+        (self.root / "config.yaml").write_text(YAML_GOAL)
+        with urlopen(self.base + "/api/swarm") as response:
+            body = response.read()
+            packet = json.loads(body)
+        self.assertEqual(packet["config"]["max_agents"], 20)
+        self.assertEqual(packet["config"]["budget_microusd"], 100000000)
+        self.assertEqual(packet["config"]["model"], "deepseek-flash")
+        self.assertEqual(packet["config"]["capabilities"], ["claim_task", "board_read"])
+        self.assertEqual(packet["config"]["intent"], "Inspect one fleet.\nPreserve the goal's scope.")
+        self.assertNotIn(b"PRIVATE", body)
+
+    def test_invalid_yaml_and_unsafe_tags_fail_closed_without_demo_fallback(self):
+        for config in ["grants: [unterminated", "- not-a-config-object", "!!python/object/apply:os.system ['echo PRIVATE']"]:
+            with self.subTest(config=config):
+                (self.root / "config.yaml").write_text(config)
+                self.source.checked = float("-inf")
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(self.base + "/api/swarm")
+                self.assertEqual(error.exception.code, 503)
+                body = error.exception.read()
+                self.assertEqual(json.loads(body), {"error": "Swarm telemetry is unavailable."})
+                self.assertNotIn(b"PRIVATE", body)
+                self.assertNotIn(b"swarm-100", body)
+                error.exception.close()
+
+    def test_state_file_remains_strict_json_even_with_valid_yaml_config(self):
+        (self.root / "config.yaml").write_text(YAML_GOAL)
+        self.state.write_text("schema_version: 1\nagent_count: 20\n")
+        with self.assertRaises(HTTPError) as error:
+            urlopen(self.base + "/api/swarm")
+        self.assertEqual(error.exception.code, 503)
+        error.exception.close()
 
 
 if __name__ == "__main__":
