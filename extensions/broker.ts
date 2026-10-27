@@ -38,7 +38,9 @@ export default function swarmBroker(pi: ExtensionAPI) {
     baseUrl: "http://swarm.invalid/v1", api: "swarm-broker", apiKey: "$SWARM_TOKEN",
     models: [{
       id: "deepseek-flash", name: "Brokered DeepSeek Flash", reasoning: false,
-      input: ["text"], contextWindow: 1_048_576, maxTokens: 393_216,
+      // The broker refuses requests over the Goal's max_input_bytes (1 MiB by default, roughly
+      // 250k tokens). Advertising a smaller window makes pi compact before that refusal.
+      input: ["text"], contextWindow: Number(process.env.SWARM_CONTEXT_TOKENS ?? 200_000), maxTokens: 65_536,
       cost: { input: 0.3, output: 1.2, cacheRead: 0.03, cacheWrite: 0 },
       compat: { supportsStore: false, supportsDeveloperRole: false, maxTokensField: "max_tokens", supportsStrictMode: false },
     }],
