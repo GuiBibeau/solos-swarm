@@ -65,9 +65,22 @@ solos-swarm mvp qa --config /path/to/qa.json --profile integration --output /pat
 solos-swarm mvp inspect --snapshot /path/to/snapshot.json --kind board --id GOAL_ID
 solos-swarm mvp verify --snapshot /path/to/snapshot.json --head /path/to/head.json   --trusted-key /path/to/public-key.json --output /path/to/verification.json
 
-# Open the monochrome swarm monitoring dashboard
-python3 -m http.server 8080 --directory dashboard
+# Follow the latest local Lima swarm (read-only)
+python3 scripts/dashboard_server.py --lima swarm --latest
+
+# Or inspect a retained run from local files
+python3 scripts/dashboard_server.py --state /path/to/run/state.json --config /path/to/run/config.yaml
 ```
+
+![Swarm dashboard — demo](dashboard/assets/dashboard.png)
+
+The dashboard follows the selected run's agents, model, budget, and receipts. It polls every five seconds; `--latest` follows the newest state file. The server binds to `127.0.0.1` and never starts agents or makes model calls.
+
+For non-JSON YAML configs, install `scripts/requirements-dashboard.txt` in the reader's Python environment (the Lima guest for `--lima`). For a local virtual environment: `python3 -m venv work/dashboard-python && work/dashboard-python/bin/pip install -r scripts/requirements-dashboard.txt`; then use `work/dashboard-python/bin/python` for the server and Python checks.
+
+`Live` requires both a fresh state file and a confirmed active service. Retained or unavailable sources show `Snapshot`, `Stale`, or `Unavailable`; missing measurements stay `—`. Orbit, lattice, and helix change the layout of the same recorded workers. Use `?demo=1` for the bundled example presets, or Import JSON for a saved snapshot.
+
+Dashboard checks: `node --test tests/dashboard-spatial.test.mjs tests/dashboard-telemetry.test.mjs` and `python3 -m unittest discover -s tests -p 'test_dashboard_server.py'`.
 
 ## Documentation
 
@@ -77,7 +90,7 @@ python3 -m http.server 8080 --directory dashboard
 | [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | Identity provisioning, offline startup, cluster recovery, and operations. |
 | [`docs/CAMPAIGNS.md`](docs/CAMPAIGNS.md) | Matched 1-vs-10 worker evaluation design and schemas. |
 | [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | Live 10-agent DeepSeek results, microbenchmarks, and acceptance SLOs. |
-| [`dashboard/index.html`](dashboard/index.html) | Minimal monochrome UI dashboard for monitoring 10- and 100-agent swarm snapshots. |
+| [`dashboard/index.html`](dashboard/index.html) | Spatial dashboard for runtime telemetry and saved snapshots. |
 | [`skills/verify-solos-swarm/SKILL.md`](skills/verify-solos-swarm/SKILL.md) | Release qualification workflow for immutable candidates. |
 
 ## License
