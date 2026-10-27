@@ -1,0 +1,1158 @@
+/* ==========================================================================
+   solos-swarm · Shu Ding / Resend Monochrome Architectural Telemetry
+   Continuous 1px hairline grid · Tabular numerals · Micro-animations
+   ========================================================================== */
+
+/* 1. Modern CSS Reset */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+* {
+  margin: 0;
+}
+
+html {
+  hanging-punctuation: first last;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  min-height: 100dvh;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+img,
+picture,
+video,
+canvas,
+svg {
+  display: block;
+  max-width: 100%;
+}
+
+input,
+button,
+textarea,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+p,
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  overflow-wrap: break-word;
+}
+
+#app {
+  isolation: isolate;
+}
+
+/* 2. Monochrome Design Tokens */
+html {
+  --bg-canvas: #09090b;
+  --bg-glow: #141419;
+  --dot-grid: #1f1f26;
+  --surface-1: #0e0e12;
+  --surface-2: #141419;
+  --surface-elevated: #1b1b22;
+  --border-hairline: #23232b;
+  --border-strong: #3f3f48;
+  --highlight-top: rgba(255, 255, 255, 0.14);
+  --text-primary: #f4f4f6;
+  --text-secondary: #a1a1aa;
+  --text-muted: #71717a;
+
+  --bar-shard: #25252e;
+  --bar-shard-border: #3a3a46;
+  --bar-shard-active: #353542;
+  --bar-synthesis: #f4f4f6;
+  --bar-synthesis-text: #09090b;
+
+  --cell-bg: #131318;
+  --cell-cohort: #1f1f28;
+  --cell-border: #272730;
+
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-spring: cubic-bezier(0.22, 1, 0.36, 1);
+
+  --font-sans: "Geist", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  color-scheme: dark;
+  font-family: var(--font-sans);
+  font-size: 16px;
+  background-color: var(--bg-canvas);
+  color: var(--text-primary);
+}
+
+html[data-theme="light"] {
+  --bg-canvas: #f7f7f9;
+  --bg-glow: #ffffff;
+  --dot-grid: #e1e1e8;
+  --surface-1: #ffffff;
+  --surface-2: #f4f4f7;
+  --surface-elevated: #eaeaf0;
+  --border-hairline: #e4e4ec;
+  --border-strong: #bcbcc8;
+  --highlight-top: rgba(255, 255, 255, 0.95);
+  --text-primary: #111115;
+  --text-secondary: #52525b;
+  --text-muted: #71717a;
+
+  --bar-shard: #e4e4ec;
+  --bar-shard-border: #c6c6d2;
+  --bar-shard-active: #d4d4e0;
+  --bar-synthesis: #141418;
+  --bar-synthesis-text: #f9f9fb;
+
+  --cell-bg: #f5f5f8;
+  --cell-cohort: #e8e8f0;
+  --cell-border: #dcdce6;
+
+  color-scheme: light;
+}
+
+body {
+  background-color: var(--bg-canvas);
+  background-image:
+    radial-gradient(980px 440px at 50% 0%, var(--bg-glow), transparent 72%),
+    radial-gradient(circle, var(--dot-grid) 1px, transparent 1px);
+  background-size: 100% 100%, 28px 28px;
+  background-position: 0 0, 14px 14px;
+  padding: 1.25rem 1.5rem;
+}
+
+/* Tabular Numeral Discipline */
+.mono,
+.metric-val,
+.metric-proof,
+.wf-agent,
+.wf-dur,
+.axis-ticks,
+.matrix-cell,
+.kv-val,
+.finding-box,
+.enclave-row,
+.cmdk-item-right,
+kbd {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Accessibility & Focus */
+.skip-link {
+  position: absolute;
+  top: -4rem;
+  left: 1.5rem;
+  z-index: 200;
+  padding: 0.5rem 0.75rem;
+  background: var(--surface-1);
+  border: 1px solid var(--border-strong);
+  border-radius: 0.375rem;
+  font-size: 0.75rem;
+  text-decoration: none;
+}
+
+.skip-link:focus {
+  top: 1rem;
+}
+
+:focus {
+  outline: none;
+}
+
+:focus-visible {
+  outline: 1.5px solid var(--text-primary);
+  outline-offset: 2px;
+}
+
+button {
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
+/* ==========================================================================
+   3. Continuous 1px Architectural Hairline Shell (Shu Ding / Geist Frame)
+   ========================================================================== */
+.instrument-shell {
+  position: relative;
+  max-width: 84rem; /* 1344px */
+  margin: 0 auto;
+  background: var(--surface-1);
+  border: 1px solid var(--border-hairline);
+  border-radius: 0.75rem;
+  box-shadow:
+    0 24px 64px -24px rgba(0, 0, 0, 0.55),
+    inset 0 1px 0 var(--highlight-top);
+  overflow: hidden;
+}
+
+/* Top Specular Shimmer Line */
+.instrument-shell::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 8%;
+  right: 8%;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--highlight-top), transparent);
+  pointer-events: none;
+  z-index: 5;
+}
+
+/* ==========================================================================
+   Tier 1: Slim Command Header Bar (48px)
+   ========================================================================== */
+.cmd-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  min-height: 3.125rem;
+  padding: 0.375rem 1.125rem;
+  border-bottom: 1px solid var(--border-hairline);
+  background: color-mix(in srgb, var(--surface-2) 55%, var(--surface-1));
+  flex-wrap: wrap;
+}
+
+.cmd-left {
+  display: flex;
+  align-items: center;
+  gap: 0.5625rem;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.brand-mark {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4375rem;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--text-primary);
+}
+
+.beacon-dot {
+  width: 0.4375rem;
+  height: 0.4375rem;
+  border-radius: 999px;
+  background: var(--text-primary);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--text-primary) 16%, transparent);
+}
+
+.crumb-sep {
+  color: var(--border-strong);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  user-select: none;
+}
+
+.goal-slug {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.goal-intent {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 22rem;
+}
+
+.status-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3125rem;
+  padding: 0.125rem 0.5rem;
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  background: var(--surface-elevated);
+  border: 1px solid var(--border-strong);
+  color: var(--text-primary);
+}
+
+.status-chip-dot {
+  width: 0.3125rem;
+  height: 0.3125rem;
+  border-radius: 999px;
+  background: var(--text-primary);
+}
+
+.cmd-right {
+  display: flex;
+  align-items: center;
+  gap: 0.4375rem;
+  flex-wrap: wrap;
+}
+
+/* Sliding Segmented Control */
+.seg-control {
+  position: relative;
+  display: inline-grid;
+  grid-template-columns: 1fr 1fr;
+  padding: 0.125rem;
+  background: var(--surface-1);
+  border: 1px solid var(--border-hairline);
+  border-radius: 0.4375rem;
+}
+
+.seg-thumb {
+  position: absolute;
+  top: 0.125rem;
+  bottom: 0.125rem;
+  left: 0.125rem;
+  width: calc(50% - 0.125rem);
+  background: var(--surface-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: 0.3125rem;
+  box-shadow: inset 0 1px 0 var(--highlight-top);
+  transform: translateX(calc(var(--seg-index, 0) * 100%));
+  pointer-events: none;
+}
+
+.seg-btn {
+  position: relative;
+  z-index: 1;
+  min-height: 32px;
+  padding: 0 0.6875rem;
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  font-weight: 500;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.seg-btn[aria-pressed="true"] {
+  color: var(--text-primary);
+}
+
+.tool-btn {
+  min-height: 34px;
+  padding: 0 0.5625rem;
+  border-radius: 0.4375rem;
+  background: var(--surface-1);
+  border: 1px solid var(--border-hairline);
+  font-size: 0.6875rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  white-space: nowrap;
+}
+
+.tool-btn:hover,
+.seg-btn:hover {
+  color: var(--text-primary);
+  border-color: var(--border-strong);
+}
+
+kbd {
+  display: inline-block;
+  padding: 0.0625rem 0.3125rem;
+  font-size: 0.625rem;
+  line-height: 1.25;
+  color: var(--text-muted);
+  background: var(--surface-2);
+  border: 1px solid var(--border-hairline);
+  border-radius: 0.25rem;
+}
+
+/* ==========================================================================
+   Tier 2: Unified 4-Cell Hairline Metric Strip (Resend / Vercel Analytics)
+   ========================================================================== */
+.metric-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  border-bottom: 1px solid var(--border-hairline);
+}
+
+.metric-cell {
+  position: relative;
+  padding: 0.9375rem 1.25rem 1rem;
+  border-right: 1px solid var(--border-hairline);
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 0.3125rem;
+}
+
+.metric-cell:last-child {
+  border-right: 0;
+}
+
+.metric-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.metric-label {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.metric-tag {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  color: var(--text-secondary);
+}
+
+.metric-val {
+  font-size: 1.875rem;
+  font-weight: 600;
+  letter-spacing: -0.04em;
+  line-height: 1.08;
+  color: var(--text-primary);
+  margin: 0.125rem 0;
+}
+
+.metric-proof {
+  font-size: 0.6875rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Flush 2px Bottom Progress Hairline inside Spend Cell */
+.metric-progress-track {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.metric-progress-fill {
+  display: block;
+  height: 100%;
+  background: var(--text-primary);
+}
+
+/* ==========================================================================
+   Tier 3: 72% / 28% Primary Workspace + Progressive-Disclosure Inspector
+   ========================================================================== */
+.workspace-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 22.5rem;
+  align-items: stretch;
+}
+
+.canvas-pane {
+  border-right: 1px solid var(--border-hairline);
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+}
+
+/* Subheader Bar with View Tabs & Legend */
+.pane-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.5625rem 1.25rem;
+  border-bottom: 1px solid var(--border-hairline);
+  flex-wrap: wrap;
+}
+
+.pane-tabs {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.pane-tab {
+  min-height: 30px;
+  padding: 0 0.625rem;
+  border-radius: 0.375rem;
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  font-weight: 500;
+  color: var(--text-muted);
+  border: 1px solid transparent;
+}
+
+.pane-tab[aria-selected="true"] {
+  color: var(--text-primary);
+  background: var(--surface-2);
+  border-color: var(--border-hairline);
+}
+
+.pane-legend {
+  display: flex;
+  align-items: center;
+  gap: 0.875rem;
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  color: var(--text-secondary);
+}
+
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+}
+
+.swatch {
+  width: 0.5625rem;
+  height: 0.5625rem;
+  border-radius: 0.125rem;
+}
+
+.swatch.shard {
+  background: var(--bar-shard);
+  border: 1px solid var(--bar-shard-border);
+}
+
+.swatch.synth {
+  background: var(--bar-synthesis);
+}
+
+/* Waterfall Stage */
+.waterfall-body {
+  padding: 0.75rem 1.25rem 0.625rem;
+  position: relative;
+  --label-w: 4.75rem;
+  --dur-w: 3.5rem;
+}
+
+.wf-list {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 0.125rem;
+}
+
+/* Hover spotlight dimming */
+.wf-list:hover .wf-row:not(:hover):not([aria-selected="true"]) {
+  opacity: 0.48;
+}
+
+.wf-guide-start,
+.wf-guide-split,
+.wf-guide-end {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.wf-guide-start {
+  left: var(--label-w);
+  border-left: 1px solid var(--border-hairline);
+}
+
+.wf-guide-split {
+  left: calc(var(--label-w) + (100% - var(--label-w) - var(--dur-w)) * var(--split-ratio, 0.4697));
+  border-left: 1px dashed var(--border-strong);
+}
+
+.wf-guide-end {
+  right: var(--dur-w);
+  border-left: 1px solid var(--border-hairline);
+}
+
+.wf-row {
+  position: relative;
+  z-index: 2;
+  display: grid;
+  grid-template-columns: var(--label-w) minmax(0, 1fr) var(--dur-w);
+  align-items: center;
+  min-height: 31px;
+  padding: 0 0.25rem;
+  border-radius: 0.3125rem;
+  text-align: left;
+}
+
+.wf-row:hover {
+  background: color-mix(in srgb, var(--surface-2) 70%, transparent);
+}
+
+.wf-row[aria-selected="true"] {
+  background: var(--surface-2);
+}
+
+.wf-agent {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+
+.wf-row[aria-selected="true"] .wf-agent {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.wf-track {
+  position: relative;
+  height: 1.125rem; /* 18px crisp bar */
+  width: 100%;
+}
+
+.wf-bar-shard {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  background: var(--bar-shard);
+  border: 1px solid var(--bar-shard-border);
+  border-radius: 0.1875rem;
+  transform-origin: left center;
+}
+
+.wf-row[aria-selected="true"] .wf-bar-shard {
+  background: var(--bar-shard-active);
+  border-color: var(--text-secondary);
+}
+
+.wf-bar-synth {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: var(--bar-synthesis);
+  color: var(--bar-synthesis-text);
+  border-radius: 0.1875rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  white-space: nowrap;
+  padding: 0 0.5rem;
+  transform-origin: left center;
+}
+
+.wf-dur {
+  font-size: 0.6875rem;
+  color: var(--text-muted);
+  text-align: right;
+  padding-left: 0.5rem;
+}
+
+.wf-row[aria-selected="true"] .wf-dur {
+  color: var(--text-primary);
+}
+
+.wf-axis {
+  display: grid;
+  grid-template-columns: var(--label-w) minmax(0, 1fr) var(--dur-w);
+  margin-top: 0.3125rem;
+  padding: 0 0.25rem;
+}
+
+.axis-ticks {
+  position: relative;
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.6875rem;
+  color: var(--text-muted);
+  height: 1rem;
+}
+
+.axis-split-label {
+  position: absolute;
+  left: calc(var(--split-ratio, 0.4697) * 100%);
+  transform: translateX(-50%);
+  color: var(--text-secondary);
+}
+
+/* Synchronized 100-Unit Micro-Matrix Strip at Bottom of Left Pane */
+.matrix-strip {
+  padding: 0.625rem 1.25rem 0.75rem;
+  border-top: 1px solid var(--border-hairline);
+  background: color-mix(in srgb, var(--surface-2) 35%, var(--surface-1));
+  display: flex;
+  flex-direction: column;
+  gap: 0.4375rem;
+}
+
+.matrix-strip-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  color: var(--text-muted);
+}
+
+.matrix-strip-title {
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.matrix-grid-100 {
+  display: grid;
+  grid-template-columns: repeat(25, minmax(0, 1fr));
+  gap: 0.1875rem;
+}
+
+.matrix-grid-10 {
+  display: grid;
+  grid-template-columns: repeat(10, minmax(0, 1fr));
+  gap: 0.3125rem;
+}
+
+.matrix-cell {
+  height: 1.5rem;
+  border-radius: 0.1875rem;
+  background: var(--cell-bg);
+  border: 1px solid var(--cell-border);
+  font-size: 0.625rem;
+  color: var(--text-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.matrix-cell[data-in-cohort="true"] {
+  background: var(--cell-cohort);
+  color: var(--text-secondary);
+  border-color: var(--border-strong);
+}
+
+.matrix-cell:hover {
+  color: var(--text-primary);
+  border-color: var(--text-secondary);
+}
+
+.matrix-cell[aria-selected="true"] {
+  background: var(--text-primary);
+  color: var(--bg-canvas);
+  border-color: var(--text-primary);
+  font-weight: 600;
+}
+
+/* Full 10x10 Matrix View Mode (when tab = matrix) */
+.full-matrix-stage {
+  padding: 1rem 1.25rem;
+  display: grid;
+  grid-template-columns: repeat(10, minmax(0, 1fr));
+  gap: 0.375rem;
+}
+
+.full-matrix-tile {
+  min-height: 2.375rem;
+  padding: 0.25rem 0.4375rem;
+  border-radius: 0.3125rem;
+  background: var(--cell-bg);
+  border: 1px solid var(--cell-border);
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.full-matrix-tile[aria-selected="true"] {
+  background: var(--surface-elevated);
+  border-color: var(--text-primary);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+/* Ledger & Witness View Mode (when tab = ledger) */
+.ledger-stage {
+  padding: 1rem 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.ledger-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+}
+
+.ledger-table th,
+.ledger-table td {
+  padding: 0.5rem 0.625rem;
+  border-bottom: 1px solid var(--border-hairline);
+  text-align: left;
+}
+
+.ledger-table th {
+  font-size: 0.6875rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-weight: 500;
+}
+
+/* ==========================================================================
+   Right Column (28%): Progressive-Disclosure Live Inspector & UID Enclaves
+   ========================================================================== */
+.inspector-pane {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  background: color-mix(in srgb, var(--surface-2) 28%, var(--surface-1));
+}
+
+.inspector-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5625rem 1.125rem;
+  border-bottom: 1px solid var(--border-hairline);
+  min-height: 2.6875rem;
+}
+
+.inspector-title {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.inspector-worker-pill {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  padding: 0.125rem 0.5rem;
+  border-radius: 0.25rem;
+  background: var(--surface-elevated);
+  border: 1px solid var(--border-strong);
+}
+
+.kv-table {
+  display: flex;
+  flex-direction: column;
+}
+
+.kv-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.5rem 1.125rem;
+  border-bottom: 1px solid var(--border-hairline);
+  font-size: 0.75rem;
+}
+
+.kv-key {
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.kv-val {
+  color: var(--text-primary);
+  font-size: 0.75rem;
+  text-align: right;
+}
+
+.finding-section {
+  padding: 0.6875rem 1.125rem;
+  border-bottom: 1px solid var(--border-hairline);
+  display: flex;
+  flex-direction: column;
+  gap: 0.375rem;
+}
+
+.finding-label {
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.finding-box {
+  padding: 0.5rem 0.625rem;
+  border-radius: 0.375rem;
+  background: var(--surface-1);
+  border: 1px solid var(--border-hairline);
+  font-size: 0.6875rem;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
+
+/* Three-Daemon Unix UID Enclave Readout (Flush Bottom of Inspector) */
+.enclave-block {
+  padding: 0.6875rem 1.125rem 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.375rem;
+}
+
+.enclave-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 0.125rem;
+}
+
+.enclave-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  font-size: 0.6875rem;
+  padding: 0.25rem 0.5rem;
+  border-radius: 0.3125rem;
+  background: var(--surface-1);
+  border: 1px solid var(--border-hairline);
+}
+
+.enclave-svc {
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.enclave-uid {
+  color: var(--text-muted);
+}
+
+.enclave-ok {
+  color: var(--text-secondary);
+}
+
+/* ==========================================================================
+   ⌘K Command Palette Modal (Shu Ding / Linear / Resend Pattern)
+   ========================================================================== */
+.cmdk-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 150;
+  background: rgba(9, 9, 11, 0.72);
+  backdrop-filter: blur(6px);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 11vh;
+}
+
+.cmdk-dialog {
+  width: min(34rem, 92vw);
+  background: var(--surface-1);
+  border: 1px solid var(--border-strong);
+  border-radius: 0.75rem;
+  box-shadow:
+    0 28px 70px -16px rgba(0, 0, 0, 0.75),
+    inset 0 1px 0 var(--highlight-top);
+  overflow: hidden;
+}
+
+.cmdk-input-wrap {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border-hairline);
+}
+
+.cmdk-prompt {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  color: var(--text-muted);
+}
+
+.cmdk-input {
+  flex: 1;
+  background: transparent;
+  border: 0;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  color: var(--text-primary);
+}
+
+.cmdk-input:focus {
+  outline: none;
+}
+
+.cmdk-list {
+  max-height: 18rem;
+  overflow-y: auto;
+  padding: 0.375rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.125rem;
+}
+
+.cmdk-item {
+  width: 100%;
+  min-height: 36px;
+  padding: 0 0.6875rem;
+  border-radius: 0.375rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  text-align: left;
+}
+
+.cmdk-item:hover,
+.cmdk-item[data-active="true"] {
+  background: var(--surface-elevated);
+  color: var(--text-primary);
+}
+
+.cmdk-item-right {
+  font-size: 0.6875rem;
+  color: var(--text-muted);
+}
+
+.cmdk-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.4375rem 0.875rem;
+  border-top: 1px solid var(--border-hairline);
+  background: var(--surface-2);
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  color: var(--text-muted);
+}
+
+/* ==========================================================================
+   Micro-Animations (Gated by prefers-reduced-motion: no-preference)
+   ========================================================================== */
+@keyframes bar-enter {
+  from {
+    opacity: 0.25;
+    transform: scaleX(0.92);
+  }
+  to {
+    opacity: 1;
+    transform: scaleX(1);
+  }
+}
+
+@keyframes inspector-fade {
+  from {
+    opacity: 0.55;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .seg-thumb {
+    transition: transform 200ms var(--ease-spring);
+  }
+
+  .wf-row,
+  .matrix-cell,
+  .tool-btn,
+  .seg-btn,
+  .pane-tab,
+  .cmdk-item {
+    transition:
+      background-color 130ms ease,
+      border-color 130ms ease,
+      color 130ms ease,
+      opacity 140ms ease;
+  }
+
+  .wf-bar-shard,
+  .wf-bar-synth {
+    animation: bar-enter 220ms var(--ease-out-expo) both;
+    animation-delay: calc(var(--row-i, 0) * 14ms);
+  }
+
+  .inspector-animated {
+    animation: inspector-fade 160ms var(--ease-out-expo) both;
+  }
+
+  .metric-progress-fill {
+    transition: width 240ms var(--ease-out-expo);
+  }
+}
+
+/* ==========================================================================
+   Responsive Breakpoints
+   ========================================================================== */
+@media (max-width: 1080px) {
+  .metric-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .metric-cell:nth-child(2) {
+    border-right: 0;
+  }
+  .metric-cell:nth-child(1),
+  .metric-cell:nth-child(2) {
+    border-bottom: 1px solid var(--border-hairline);
+  }
+  .workspace-split {
+    grid-template-columns: 1fr;
+  }
+  .canvas-pane {
+    border-right: 0;
+    border-bottom: 1px solid var(--border-hairline);
+  }
+}
+
+@media (max-width: 640px) {
+  body {
+    padding: 0.5rem;
+  }
+  .metric-strip {
+    grid-template-columns: 1fr;
+  }
+  .metric-cell {
+    border-right: 0;
+    border-bottom: 1px solid var(--border-hairline);
+  }
+  .metric-cell:last-child {
+    border-bottom: 0;
+  }
+  .goal-intent {
+    display: none;
+  }
+  .matrix-grid-100 {
+    grid-template-columns: repeat(10, minmax(0, 1fr));
+  }
+  .waterfall-body {
+    --label-w: 4.125rem;
+    --dur-w: 3rem;
+  }
+}
