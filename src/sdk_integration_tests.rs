@@ -226,7 +226,7 @@ async fn actual_microvm_sdk_uses_normal_broker_and_preserves_private_lineage() {
         serde_json::from_slice(&std::fs::read(native_directory.join("cleanup.json")).unwrap())
             .unwrap();
     assert_eq!(cleanup["verdict"], "PASS");
-    let proof = json!({"verdict":"PASS","scope":"actual Tier V SDK, normal authenticated Broker and owned fixed GET fixture on remote-ai; independent-host qualification separate",
+    let proof = json!({"verdict":"PASS","scope":"actual Tier V SDK, normal authenticated Broker and owned fixed GET fixture on worker-node-01; independent-host qualification separate",
         "guest":output,"target_calls":1,"provider_calls":0,"host_signer_only":true,"private_lineage_transferred":true,
         "private_provider_egress_denied":true,"test_binary_sha256":test_binary_sha256,
         "source_revision":std::env::var("SOLOS_SOURCE_REVISION").unwrap_or_else(|_|"uncommitted-source-probe".into()),

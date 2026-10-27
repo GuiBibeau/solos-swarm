@@ -41,7 +41,7 @@ export default function swarmBroker(pi: ExtensionAPI) {
       // The broker refuses requests over the Goal's max_input_bytes (1 MiB by default, roughly
       // 250k tokens). Advertising a smaller window makes pi compact before that refusal.
       input: ["text"], contextWindow: Number(process.env.SWARM_CONTEXT_TOKENS ?? 200_000), maxTokens: 65_536,
-      cost: { input: 0.3, output: 1.2, cacheRead: 0.03, cacheWrite: 0 },
+      cost: { input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0 },
       compat: { supportsStore: false, supportsDeveloperRole: false, maxTokensField: "max_tokens", supportsStrictMode: false },
     }],
     streamSimple(model, context, options) {

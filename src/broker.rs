@@ -21,6 +21,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex, Semaphore};
+use zeroize::Zeroizing;
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -135,7 +136,7 @@ pub struct Goal {
     /// hits (`usage.prompt_cache_hit_tokens`). Absent keeps the historical
     /// all-miss settlement. Holds are always priced all-miss, so a settlement
     /// can never exceed its reservation.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_hit_price_microusd_per_million: Option<u64>,
     pub grants: Vec<String>,
     pub tasks: Vec<Task>,
@@ -234,8 +235,8 @@ impl Goal {
         );
         if let Some(hit) = self.cache_hit_price_microusd_per_million {
             ensure!(
-                (30_000..=self.input_price_microusd_per_million).contains(&hit),
-                "cache-hit price must be between the provider cache-read rate and the input price"
+                (6_000..=self.input_price_microusd_per_million).contains(&hit),
+                "cache-hit rate outside admitted peak prices"
             );
         }
         // The six historical grants always exist; `fetch_url` and `run_code`
@@ -284,17 +285,18 @@ impl Goal {
             .clone()
             .unwrap_or_else(|| Upstream::deepseek(&self.model))
     }
-    /// Settlement cost: cache-hit prompt tokens at the optional hit rate.
-    fn settled_cost(&self, input: u64, hit: u64, output: u64) -> u64 {
-        let hit = hit.min(input);
-        let rate = self.cache_hit_price_microusd_per_million;
-        let hit_cost =
-            (hit * rate.unwrap_or(self.input_price_microusd_per_million)).div_ceil(1_000_000);
-        hit_cost + self.cost(input - hit, output)
-    }
     fn cost(&self, input: u64, output: u64) -> u64 {
         // Charge all input at peak cache-miss rates; this deliberately overstates the invoice.
         (input * self.input_price_microusd_per_million).div_ceil(1_000_000)
+            + (output * self.output_price_microusd_per_million).div_ceil(1_000_000)
+    }
+    fn settled_cost(&self, input: u64, cached: u64, output: u64) -> u64 {
+        let hit_rate = self
+            .cache_hit_price_microusd_per_million
+            .unwrap_or(self.input_price_microusd_per_million);
+        // Round the combined input charge once so splitting a prompt never increases its cost.
+        ((input - cached) * self.input_price_microusd_per_million + cached * hit_rate)
+            .div_ceil(1_000_000)
             + (output * self.output_price_microusd_per_million).div_ceil(1_000_000)
     }
 }
@@ -637,12 +639,10 @@ impl Store {
             self.intents[index].state == "dispatched",
             "intent already settled or not dispatched"
         );
-        let input = response["usage"]["prompt_tokens"]
-            .as_u64()
-            .context("missing input usage")?;
-        let output = response["usage"]["completion_tokens"]
-            .as_u64()
-            .context("missing output usage")?;
+        let usage = solos_swarm::provider::completion_usage(&response["usage"])?;
+        let input = usage.input_tokens;
+        let output = usage.output_tokens;
+        let cached = usage.cached_input_tokens;
         ensure!(
             input <= 1_000_000 && output <= goal.max_output_tokens,
             "provider usage exceeds contract"
@@ -652,17 +652,16 @@ impl Store {
             .filter(|v| !v.is_empty())
             .context("missing provider receipt")?
             .to_owned();
-        let hit = response["usage"]["prompt_cache_hit_tokens"]
-            .as_u64()
-            .unwrap_or(0);
-        let cost = goal.settled_cost(input, hit, output);
+        let cost = goal.settled_cost(input, cached, output);
         let intent = &mut self.intents[index];
         let exceeds_hold = cost > intent.hold_microusd;
         let id = intent.agent_id.clone();
         self.held_microusd -= intent.hold_microusd;
         self.spent_microusd += cost;
         intent.cost_microusd = cost;
-        intent.usage = Some(json!({"input_tokens":input,"output_tokens":output}));
+        intent.usage = Some(
+            json!({"input_tokens":input,"cached_input_tokens":cached,"uncached_input_tokens":input-cached,"output_tokens":output}),
+        );
         intent.request_id = Some(request_id);
         intent.state = "completed".into();
         self.agents.get_mut(&id).unwrap().successful_model_calls += 1;
@@ -994,7 +993,7 @@ pub struct OpenAiCompatible {
     pub endpoint: &'static str,
     pub dialect: Dialect,
     pub client: reqwest::Client,
-    pub key: String,
+    pub key: Zeroizing<String>,
 }
 impl Provider for OpenAiCompatible {
     fn dispatch(&self, body: Value) -> Dispatch {
@@ -1022,7 +1021,7 @@ impl Provider for OpenAiCompatible {
             }
             let mut response = client
                 .post(endpoint)
-                .bearer_auth(key)
+                .bearer_auth(key.as_str())
                 .json(&body)
                 .send()
                 .await
@@ -1935,6 +1934,67 @@ mod tests {
         // An accounting failure stays terminal.
         store.goal_status = "accounting_failed".into();
         assert!(store.reserve(&goal, "agent-00", 200).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn cache_discount_settles_reported_usage_without_discounting_reservations() {
+        let (mut goal, mut store, dir) = setup();
+        let all_miss_hold = goal.cost(200 + 4096, goal.max_output_tokens);
+        goal.cache_hit_price_microusd_per_million = Some(6_000);
+        goal.validate().unwrap();
+        let index = store.reserve(&goal, "agent-00", 200).unwrap();
+        assert_eq!(store.held_microusd, all_miss_hold);
+        store.intents[index].state = "dispatched".into();
+        let response = json!({"id":"cached-receipt","usage":{"prompt_tokens":100,"prompt_cache_hit_tokens":90,"prompt_cache_miss_tokens":10,"completion_tokens":50}});
+        assert_eq!(store.settle(&goal, index, &response).unwrap(), 64);
+        assert_eq!(store.spent_microusd, 64);
+        assert_eq!(store.held_microusd, 0);
+        assert_eq!(
+            store.intents[index].usage,
+            Some(
+                json!({"input_tokens":100,"cached_input_tokens":90,"uncached_input_tokens":10,"output_tokens":50})
+            )
+        );
+        assert!(store.settle(&goal, index, &response).is_err());
+        assert_eq!(store.spent_microusd, 64);
+        assert_eq!(goal.settled_cost(100, 0, 50), 90);
+        assert_eq!(goal.settled_cost(0, 0, 0), 0);
+        assert_eq!(goal.settled_cost(1_000_000, 1_000_000, 0), 6_000);
+        for input in 0..100 {
+            for cached in 0..=input {
+                assert!(goal.settled_cost(input, cached, 0) <= goal.cost(input, 0));
+            }
+        }
+        goal.cache_hit_price_microusd_per_million = None;
+        assert_eq!(goal.settled_cost(100, 90, 50), 90);
+        goal.cache_hit_price_microusd_per_million = Some(goal.input_price_microusd_per_million);
+        assert_eq!(goal.settled_cost(2, 1, 0), goal.cost(2, 0));
+        goal.cache_hit_price_microusd_per_million = Some(3_000);
+        assert!(goal.validate().is_err());
+        goal.cache_hit_price_microusd_per_million = Some(goal.input_price_microusd_per_million + 1);
+        assert!(goal.validate().is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn invalid_cache_counts_retain_the_full_hold() {
+        let (mut goal, mut store, dir) = setup();
+        goal.cache_hit_price_microusd_per_million = Some(6_000);
+        let index = store.reserve(&goal, "agent-00", 200).unwrap();
+        store.intents[index].state = "dispatched".into();
+        let held = store.held_microusd;
+        for usage in [
+            json!({"prompt_tokens":100,"completion_tokens":50,"prompt_cache_hit_tokens":101}),
+            json!({"prompt_tokens":100,"completion_tokens":50,"prompt_cache_hit_tokens":90,"prompt_cache_miss_tokens":90}),
+        ] {
+            assert!(
+                store
+                    .settle(&goal, index, &json!({"id":"invalid-cache","usage":usage}))
+                    .is_err()
+            );
+            assert_eq!(store.held_microusd, held);
+            assert_eq!(store.spent_microusd, 0);
+            assert_eq!(store.intents[index].state, "dispatched");
+        }
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]

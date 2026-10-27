@@ -61,6 +61,51 @@ def verify_events(events):
     return previous
 
 
+def cache_hits(usage, total):
+    if not isinstance(usage, dict) or type(total) is not int or total < 0:
+        raise ValueError("Invalid input usage")
+
+    def counter(container, name):
+        if name not in container:
+            return None
+        value = container[name]
+        if type(value) is not int or value < 0:
+            raise ValueError("Invalid cache usage")
+        return value
+
+    hit = counter(usage, "prompt_cache_hit_tokens")
+    details = usage.get("prompt_tokens_details")
+    if details is not None and not isinstance(details, dict):
+        raise ValueError("Invalid prompt token details")
+    nested = counter(details or {}, "cached_tokens")
+    miss = counter(usage, "prompt_cache_miss_tokens")
+    if hit is not None and nested is not None and hit != nested:
+        raise ValueError("Conflicting cache usage")
+    if miss is not None and miss > total:
+        raise ValueError("Cache miss usage exceeds input")
+    cached = hit if hit is not None else nested if nested is not None else total - miss if miss is not None else 0
+    if cached > total or (miss is not None and miss != total - cached):
+        raise ValueError("Cache usage does not match input")
+    return cached
+
+
+def receipt_cost(config, input_tokens, cached, output_tokens):
+    values = [input_tokens, cached, output_tokens]
+    if not all(type(value) is int and value >= 0 for value in values) or cached > input_tokens:
+        raise ValueError("Invalid token usage")
+    miss_rate = config.get("input_price_microusd_per_million")
+    output_rate = config.get("output_price_microusd_per_million")
+    hit_rate = config.get("cache_hit_price_microusd_per_million")
+    if hit_rate is None:
+        hit_rate = miss_rate
+    if not (type(miss_rate) is int and 300_000 <= miss_rate <= 10_000_000
+            and type(output_rate) is int and 1_200_000 <= output_rate <= 10_000_000
+            and type(hit_rate) is int and 6_000 <= hit_rate <= miss_rate):
+        raise ValueError("Invalid admitted prices")
+    return (((input_tokens - cached) * miss_rate + cached * hit_rate + 999_999) // 1_000_000
+            + (output_tokens * output_rate + 999_999) // 1_000_000)
+
+
 def event_evidence(events, state, config):
     by_kind = {}
     for event in events:
@@ -92,8 +137,26 @@ def event_evidence(events, state, config):
         if [items[0]["seq"] for items in sequence] != sorted(items[0]["seq"] for items in sequence):
             issues.append(f"Provider lifecycle out of order for {intent['id']}")
         request, response = sequence[1][0]["data"].get("body", {}), sequence[4][0]["data"].get("body", {})
-        if request.get("model") != config["model"] or response.get("id") != intent["request_id"] or response.get("usage", {}).get("prompt_tokens") != intent["usage"].get("input_tokens") or response.get("usage", {}).get("completion_tokens") != intent["usage"].get("output_tokens"):
-            issues.append(f"Provider receipt or usage disagrees for {intent['id']}")
+        try:
+            usage = intent["usage"]
+            total, output = usage["input_tokens"], usage["output_tokens"]
+            if not isinstance(request, dict) or not isinstance(response, dict):
+                raise ValueError("Malformed provider evidence")
+            raw_usage = response.get("usage", {})
+            cached = cache_hits(raw_usage, total)
+            if (request.get("model") != config["model"] or response.get("id") != intent["request_id"]
+                    or type(raw_usage.get("prompt_tokens")) is not int or raw_usage["prompt_tokens"] != total
+                    or type(raw_usage.get("completion_tokens")) is not int or raw_usage["completion_tokens"] != output):
+                raise ValueError("Provider receipt or usage disagrees")
+            for name, expected in [("cached_input_tokens", cached), ("uncached_input_tokens", total - cached)]:
+                if name in usage and (type(usage[name]) is not int or usage[name] != expected):
+                    raise ValueError("Recorded cache usage disagrees with receipt")
+            if config.get("cache_hit_price_microusd_per_million") is not None and cached and "cached_input_tokens" not in usage:
+                raise ValueError("Discounted receipt omits cache usage")
+            if intent["cost_microusd"] != receipt_cost(config, total, cached, output):
+                raise ValueError("Recorded charge disagrees with receipt and prices")
+        except (KeyError, TypeError, ValueError) as error:
+            issues.append(f"Invalid settlement for {intent['id']}: {error}")
     for finding in state["findings"]:
         tools = matching("tool_completed", agent_id=finding.get("agent_id"))
         if not any(event["data"].get("tool") == "claim_task" and event["data"].get("result", {}).get("id") == finding.get("task_id") for event in tools):

@@ -112,6 +112,7 @@ test("real pinned Pi talks only to Unix broker and completes a tool loop", { tim
     assert.equal(messages.at(-1).message.content[0].text, "Finished Ω\u2028 safely.");
     assert.equal(messages.at(-1).message.usage.cost.total, 0.00003);
     assert.equal(messages.at(-1).message.usage.cacheRead, 5);
+    assert.ok(Math.abs(messages.at(-1).message.usage.cost.cacheRead - 0.00000003) < 1e-14);
   } finally {
     child.kill("SIGKILL");
     await new Promise<void>((done) => server.close(() => done()));

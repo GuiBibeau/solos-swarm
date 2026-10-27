@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 300" width="100%" height="100%">
+  <defs>
+    <radialGradient id="vignette" cx="78%" cy="50%" r="55%">
+      <stop offset="0%" stop-color="#141418" stop-opacity="1"/>
+      <stop offset="100%" stop-color="#09090B" stop-opacity="1"/>
+    </radialGradient>
+    <linearGradient id="ring-fade" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#3F3F46" stop-opacity="0.65"/>
+      <stop offset="100%" stop-color="#222228" stop-opacity="0.2"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Matte Carbon Canvas -->
+  <rect x="0" y="0" width="1200" height="300" rx="12" fill="url(#vignette)"/>
+  <rect x="0.5" y="0.5" width="1199" height="299" rx="11.5" fill="none" stroke="#222228" stroke-width="1"/>
+
+  <!-- Subtle Geometric Mark (Right-side Concentric Rings & 3-Node Quorum Lattice) -->
+  <g transform="translate(930, 150)">
+    <circle cx="0" cy="0" r="190" fill="none" stroke="#16161A" stroke-width="1"/>
+    <circle cx="0" cy="0" r="140" fill="none" stroke="#1C1C22" stroke-width="1"/>
+    <circle cx="0" cy="0" r="96" fill="none" stroke="url(#ring-fade)" stroke-width="1"/>
+    <circle cx="0" cy="0" r="52" fill="none" stroke="#27272A" stroke-width="1" stroke-dasharray="2 4"/>
+
+    <!-- Subtle Hairline Crosshairs -->
+    <line x1="-220" y1="0" x2="220" y2="0" stroke="#16161A" stroke-width="1"/>
+    <line x1="0" y1="-150" x2="0" y2="150" stroke="#16161A" stroke-width="1"/>
+
+    <!-- 3-Node Lattice Triangle -->
+    <polygon points="0,-64 55,32 -55,32" fill="none" stroke="#3F3F46" stroke-width="1"/>
+    <line x1="0" y1="-64" x2="0" y2="0" stroke="#27272A" stroke-width="1"/>
+    <line x1="55" y1="32" x2="0" y2="0" stroke="#27272A" stroke-width="1"/>
+    <line x1="-55" y1="32" x2="0" y2="0" stroke="#27272A" stroke-width="1"/>
+
+    <!-- Lattice Vertices -->
+    <circle cx="0" cy="0" r="3" fill="#52525B"/>
+    <circle cx="0" cy="-64" r="4.5" fill="#09090B" stroke="#8E8E98" stroke-width="1.5"/>
+    <circle cx="55" cy="32" r="4.5" fill="#09090B" stroke="#8E8E98" stroke-width="1.5"/>
+    <circle cx="-55" cy="32" r="4.5" fill="#09090B" stroke="#8E8E98" stroke-width="1.5"/>
+  </g>
+
+  <!-- Editorial Lockup (Left) -->
+  <text x="72" y="148" fill="#F4F4F6" font-family="-apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="52" font-weight="600" letter-spacing="-0.035em">solos-swarm</text>
+  <text x="74" y="186" fill="#8E8E98" font-family="-apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="17" font-weight="400" letter-spacing="-0.01em">Governed control plane for multi-node agent swarms.</text>
+</svg>

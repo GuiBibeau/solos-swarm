@@ -1,29 +1,99 @@
-# Running matched MVP evaluation campaigns
+# Campaigns
 
-`solos-swarm mvp campaign --config campaign.json --output campaign-run` executes a frozen campaign through the normal authenticated operator and broker paths. It does not issue operator identities, create approvals, read an evaluator key or bypass a Capability. Supply real operator session files using the same client configuration as `mvp qa`.
+Matched 2x2 experimental design for comparing worker parallelism and planner context policies.
 
-A campaign contains at least two independent catalog cases. Each case has four cells: one and ten workers, each with scored history and single-draft refinement. All four cells have the same total budget, public inputs, model, dataset/template version, shared worker policy and independently pinned scorer key/version. Each cell has its own Goal and Goal-scoped evaluator URI. Service agents are excluded from the worker count but still require admitted grants, leases and bounded resources.
 
-The `CampaignConfig` JSON contains:
+## 1. 2x2 matrix
 
-- `client`: the normal `QaConfig` with controller identity, operator session, named independent receiver probes and a separate encrypted evidence key file.
-- `plan`: `CampaignPlan`, including every immutable `TrialPlan`, fixed stopping/failure rules, finite deadlines and regression thresholds. Each `TrialPlan` supplies `scorer_id` and `scorer_public_key`; the URI is Goal scoped while the key/version identifies the comparable scorer pool.
-- `trials`: a map from trial ID to `FrozenTrial`. Every entry supplies `goal_id`, the catalog's public case, normal operator `setup` commands, owned supervisor unit names, public evaluator certificate/CA paths and an independent receiver name plus JSON pointers for its unsafe and successful effect counters.
-- `controlplane_public_key`: the expected audit signer. A signed snapshot from another signer is rejected.
-- `evidence_directory`: a fresh directory for encrypted, signed observations. Its key remains outside that directory.
+Each trial seed runs four cells under identical budgets, token limits, and model parameters:
 
-Prepare each trial by freezing exactly one `RegisterGoal` command with its genuine approvals and one `ApplySwarm` command. Bind the full Goal contract with `security::bind_goal_contract` before requesting approval. Pin the independent evaluator's actual public key. Include a required Need whose predicate is `{"kind":"catalog-final"}`. Submit only public catalog input to workers; retain oracle fixtures and evaluator private keys in the independent service's owner-only files.
+| Cell | `workers` | `history_mode` | Context policy |
+|---|---:|---|---|
+| `C1` | `1` | `scored_history` | Top-K scored attempts + retractions |
+| `C2` | `1` | `single_draft_refinement` | Best single draft + retractions |
+| `C3` | `10` | `scored_history` | Shared board + top-K scored attempts |
+| `C4` | `10` | `single_draft_refinement` | Shared board + best single draft |
 
-Use `qa::campaign_task_inputs(public_case, agent_count)` to obtain the matched worker inputs. The ten-worker cell receives one original shard per worker; the single worker receives their combined public records/components/documents. `qa::campaign_agent_config_digest(swarm)` computes the shared worker policy fingerprint. Exact full Goal and Swarm definitions are also checked against authoritative readback, so count and planning treatment cannot be relabeled afterward.
 
-History cells use `history.mode="scored_history"`. Refinement cells use `history.mode="single_draft_refinement"` and `new_candidates=1`. Refinement reads the latest eligible draft; scored history selects compatible scored candidates. Both retain the complete archive and retraction barrier. Each model completion opens a recorded planning round using its exact admitted context; agents cannot supply a round ID or exceed its candidate limit.
+## 2. Invariants
 
-Provision a Goal-scoped evaluator service and its admitted nonbillable `evaluate/<goal>` Capability/allocation lease for every frozen trial. The independent service owns its private Unix IPC socket and validates the control-plane UID and signed requests. Its protected bundle pins the normal broker's mTLS socket/origin; its own SVID signs and delivers results. The control plane never reads its private key or oracle. An unprivileged daemon cannot use `setuid` to manufacture this separation: the service must already be launched under its independently provisioned UID.
+1. **Frozen trial catalog**: Seeds, caps, and model parameters lock before trial `0`.
+2. **Matched cell envelopes**: Every cell gets identical `budget_microusd`, `max_calls`, `max_input_tokens`, `max_output_tokens`, and `deadline_ms`.
+3. **Holdout isolation**: Iterative proposals score on `search`; `evaluator-serve` scores `final_holdout` once at cell completion.
+4. **Goal-scoped IPC**: Evaluator socket binds per `goal_id` under UID `995` (`0710` dir, `0660` socket).
+5. **Pre-dispatch token gate**: Contexts exceeding `max_input_tokens` under `VerifiedTokenizer` fail closed before spend.
 
-The driver waits for a separately signed final evaluation, verifies the approved evaluator key, current contract, lineage, signed audit checkpoint, exact frozen definitions and all receipts, and requires every declared worker to have a successful settled inference and a Finding in the final candidate's lineage. Its independent receiver must observe a positive permitted effect; a missing counter cannot stand in for zero unsafe effects.
 
-Every trial, including setup failures, wrong answers, timeouts and unknown outcomes, remains in the report and encrypted observations. The driver always attempts bounded Goal-owned cleanup, verifies the existing owned supervisor units and never kills ambient machine processes. Equal budget caps do not establish equal expenditure: unmatched measured costs keep the acceptance verdict inconclusive. Comparison statistics remain available with all failures retained as zero.
+## 3. Command
 
-The production campaign is currently unrun. Real OIDC/MFA, independently provisioned evaluator services, physically independent hosts/witnesses, GPU serving and the unchanged TRD scale/performance targets remain separate qualifications. The earlier ten-agent preview does not qualify this expanded binary.
+```bash
+./target/release/solos-swarm mvp campaign \
+  --config /path/to/campaign.json \
+  --output /path/to/campaign-report.json
+```
 
-Each `FrozenTrial` also pins `runtime_node` and the parsed `runtime_configuration_sha256` (32-byte array). Before setup and in final evidence the driver verifies the actual runtime instance measurement inside the current signed/checkpoint-bound packet against the frozen executable/configuration hashes. A declared hash in a trial file alone cannot qualify the running binary. This software measurement is not hardware attestation.
+
+## 4. `CampaignConfig`
+
+```json
+{
+  "id": "campaign-reconcile-01",
+  "seed": 20260412,
+  "family": "synthetic_reconciliation",
+  "trials": 5,
+  "model": "deepseek-chat",
+  "temperature_millis": 0,
+  "budget_microusd": 1000000,
+  "max_calls": 20,
+  "max_input_tokens": 8192,
+  "max_output_tokens": 2048,
+  "deadline_ms": 600000,
+  "evaluator_endpoint": "https://127.0.0.1:9445",
+  "evaluator_socket_root": "/var/lib/solos-swarm/evaluator/ipc",
+  "evaluator_identity": {
+    "certificate_path": "/var/lib/solos-swarm/cp/cp.der",
+    "private_key_path": "/var/lib/solos-swarm/cp/cp.key.der",
+    "ca_certificate_path": "/var/lib/solos-swarm/shared/ca.der",
+    "expected_spiffe_id": "spiffe://solos.local/ns/prod/sa/evaluator-01"
+  },
+  "provider": {
+    "id": "deepseek",
+    "kind": "openai_compatible",
+    "endpoint": "https://api.deepseek.com/v1/chat/completions",
+    "model": "deepseek-chat",
+    "credential": { "kind": "file", "path": "/run/credentials/deepseek.key" },
+    "input_price_microusd_per_million": 300000,
+    "output_price_microusd_per_million": 1200000,
+    "max_output_tokens": 2048,
+    "tokenizer": {
+      "format": "huggingface_json",
+      "path": "work/tokenizers/deepseek-v4.1-flash/tokenizer.json",
+      "sha256": "c2fd98e9fc2bd49fd7fcce7fb8fd2ca6fb9fa065ff4dc124e2d8d594bf9610b7"
+    }
+  }
+}
+```
+
+
+## 5. Scenario families (`CatalogFamily`)
+
+| Family | Task |
+|---|---|
+| `synthetic_reconciliation` | 10-shard record mismatch synthesis |
+| `wasm_transform` | WASI binary synthesis under fuel caps |
+| `policy_repair` | ABAC and capability constraint repair |
+| `log_triage` | Multi-shard incident lineage correlation |
+
+
+## 6. Output fields (`CampaignReport`)
+
+| Field | Meaning |
+|---|---|
+| `trials[].cells[].workers` | `1` or `10` |
+| `trials[].cells[].history_mode` | `scored_history` or `single_draft_refinement` |
+| `trials[].cells[].search_attempts` | Candidate evaluations on `search` split |
+| `trials[].cells[].best_search_score_millis` | Peak `search` score (`0..1000`) |
+| `trials[].cells[].final_holdout_score_millis` | Signed `final_holdout` score (`0..1000`) |
+| `trials[].cells[].settled_microusd` | Total settled cell spend |
+| `trials[].cells[].elapsed_ms` | Cell wall-clock runtime |
+| `summary` | Win/tie/loss counts and median scores |

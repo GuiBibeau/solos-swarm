@@ -113,6 +113,52 @@ class ScenarioTests(unittest.TestCase):
         self.assertEqual(self.report()["verdict"], "PASS")
         self.assertEqual(self.report()["coverage"], "single-host-1-30-agent-live-preview")
 
+    def test_cached_receipts_are_repriced_and_recorded_cache_counts_are_verified(self):
+        intent = self.state["intents"][0]
+        intent["usage"].update(cached_input_tokens=90, uncached_input_tokens=10)
+        intent["cost_microusd"] = 40
+        self.state["spent_microusd"] = 634
+        for event in self.events:
+            data = event["data"]
+            if data.get("intent_id") != intent["id"]:
+                continue
+            if event["kind"] == "provider_settled":
+                data.update(cost_microusd=40, usage=intent["usage"])
+            elif event["kind"] == "provider_response":
+                data["body"]["usage"].update(prompt_cache_hit_tokens=90, prompt_cache_miss_tokens=10)
+        self.write("state.json", self.state)
+        self.write_events()
+        self.assertEqual(self.report()["verdict"], "PASS")
+        intent["usage"]["cached_input_tokens"] = 91
+        self.write("state.json", self.state)
+        self.write_events()
+        self.assertEqual(self.report()["evidence_verdict"], "FAIL")
+        intent["usage"]["cached_input_tokens"] = 90
+        # A forged discount must fail even when state totals and event hashes agree.
+        intent["cost_microusd"] = 39
+        self.state["spent_microusd"] = 633
+        for event in self.events:
+            if event["kind"] == "provider_settled" and event["data"].get("intent_id") == intent["id"]:
+                event["data"]["cost_microusd"] = 39
+        self.write("state.json", self.state)
+        self.write_events()
+        self.assertEqual(self.report()["evidence_verdict"], "FAIL")
+
+    def test_invalid_cache_usage_is_rejected_by_independent_checker(self):
+        for usage in [
+            {"prompt_cache_hit_tokens":101},
+            {"prompt_cache_hit_tokens":True},
+            {"prompt_cache_hit_tokens":90,"prompt_cache_miss_tokens":11},
+            {"prompt_cache_hit_tokens":90,"prompt_tokens_details":{"cached_tokens":80}},
+        ]:
+            with self.subTest(usage=usage), self.assertRaises(ValueError):
+                checker.cache_hits(usage, 100)
+        self.assertEqual(checker.cache_hits({"prompt_cache_miss_tokens":10}, 100), 90)
+        self.assertEqual(checker.cache_hits({"prompt_tokens_details":{"cached_tokens":90}}, 100), 90)
+        legacy = {key: value for key, value in self.goal.items() if key != "cache_hit_price_microusd_per_million"}
+        self.assertEqual(checker.receipt_cost(legacy, 100, 90, 30), 66)
+        self.assertEqual(checker.receipt_cost(self.goal, 100, 90, 30), 40)
+
     def test_artifact_order_is_irrelevant(self):
         artifact = {"inconsistencies": list(reversed(self.expected["artifact"]["inconsistencies"]))}
         self.state["artifact"] = artifact

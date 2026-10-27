@@ -1,0 +1,2778 @@
+{
+  "schema": "solos-swarm.snapshot/v1",
+  "revision": 428,
+  "head": {
+    "payload": {
+      "log_id": "audit-live-20260412-132831",
+      "size": 428,
+      "root": [
+        16,
+        242,
+        177,
+        112,
+        186,
+        35,
+        84,
+        39,
+        53,
+        166,
+        159,
+        125,
+        11,
+        213,
+        112,
+        107,
+        165,
+        156,
+        136,
+        60,
+        136,
+        1,
+        0,
+        229,
+        65,
+        80,
+        179,
+        149,
+        35,
+        250,
+        108,
+        198
+      ],
+      "timestamp": 1775993435807
+    },
+    "signer": [
+      77,
+      10,
+      144,
+      199,
+      186,
+      0,
+      250,
+      229,
+      191,
+      117,
+      169,
+      189,
+      219,
+      157,
+      42,
+      218,
+      18,
+      168,
+      89,
+      192,
+      137,
+      230,
+      29,
+      52,
+      165,
+      107,
+      183,
+      82,
+      111,
+      101,
+      165,
+      119
+    ],
+    "signature": [
+      207,
+      244,
+      125,
+      29,
+      233,
+      123,
+      44,
+      166,
+      171,
+      99,
+      11,
+      75,
+      213,
+      213,
+      203,
+      78,
+      137,
+      223,
+      205,
+      87,
+      74,
+      23,
+      124,
+      97,
+      112,
+      168,
+      231,
+      176,
+      11,
+      52,
+      24,
+      130,
+      9,
+      166,
+      217,
+      127,
+      228,
+      192,
+      152,
+      19,
+      164,
+      75,
+      180,
+      33,
+      164,
+      223,
+      146,
+      231,
+      225,
+      104,
+      72,
+      219,
+      104,
+      93,
+      145,
+      226,
+      87,
+      103,
+      52,
+      76,
+      153,
+      153,
+      221,
+      158
+    ]
+  },
+  "signed_tree_head": {
+    "payload": {
+      "log_id": "audit-live-20260412-132831",
+      "size": 428,
+      "root": [
+        16,
+        242,
+        177,
+        112,
+        186,
+        35,
+        84,
+        39,
+        53,
+        166,
+        159,
+        125,
+        11,
+        213,
+        112,
+        107,
+        165,
+        156,
+        136,
+        60,
+        136,
+        1,
+        0,
+        229,
+        65,
+        80,
+        179,
+        149,
+        35,
+        250,
+        108,
+        198
+      ],
+      "timestamp": 1775993435807
+    },
+    "signer": [
+      77,
+      10,
+      144,
+      199,
+      186,
+      0,
+      250,
+      229,
+      191,
+      117,
+      169,
+      189,
+      219,
+      157,
+      42,
+      218,
+      18,
+      168,
+      89,
+      192,
+      137,
+      230,
+      29,
+      52,
+      165,
+      107,
+      183,
+      82,
+      111,
+      101,
+      165,
+      119
+    ],
+    "signature": [
+      207,
+      244,
+      125,
+      29,
+      233,
+      123,
+      44,
+      166,
+      171,
+      99,
+      11,
+      75,
+      213,
+      213,
+      203,
+      78,
+      137,
+      223,
+      205,
+      87,
+      74,
+      23,
+      124,
+      97,
+      112,
+      168,
+      231,
+      176,
+      11,
+      52,
+      24,
+      130,
+      9,
+      166,
+      217,
+      127,
+      228,
+      192,
+      152,
+      19,
+      164,
+      75,
+      180,
+      33,
+      164,
+      223,
+      146,
+      231,
+      225,
+      104,
+      72,
+      219,
+      104,
+      93,
+      145,
+      226,
+      87,
+      103,
+      52,
+      76,
+      153,
+      153,
+      221,
+      158
+    ]
+  },
+  "observation": {
+    "started_ms": 1775993311000,
+    "ended_ms": 1775993435807,
+    "wall_ms": 124782,
+    "parallel_ms": 58619,
+    "synthesis_ms": 66188,
+    "keys_in_workers": 0,
+    "mtls": "established",
+    "model": "deepseek-chat",
+    "seed": 20260412,
+    "runtime": "pi-1.1.0",
+    "tier": "P",
+    "daemons": [
+      {
+        "name": "solos-swarm",
+        "uid": 999,
+        "role": "Control Plane",
+        "health": "mTLS capability broker healthy"
+      },
+      {
+        "name": "solos-eval",
+        "uid": 995,
+        "role": "Isolated Evaluator",
+        "health": "Private rubric \u00b7 PASS (1.0)"
+      },
+      {
+        "name": "solos-witness",
+        "uid": 994,
+        "role": "Audit Witness",
+        "health": "RFC 6962 verified \u00b7 rev 428"
+      }
+    ],
+    "workers": [
+      {
+        "agent_id": "agent-00",
+        "task_id": "shard-01",
+        "worker_ms": 51384,
+        "synthesis_ms": 66188,
+        "calls": 4
+      },
+      {
+        "agent_id": "agent-01",
+        "task_id": "shard-02",
+        "worker_ms": 51210,
+        "synthesis_ms": 0,
+        "calls": 2
+      },
+      {
+        "agent_id": "agent-02",
+        "task_id": "shard-00",
+        "worker_ms": 53941,
+        "synthesis_ms": 0,
+        "calls": 2
+      },
+      {
+        "agent_id": "agent-03",
+        "task_id": "shard-03",
+        "worker_ms": 50812,
+        "synthesis_ms": 0,
+        "calls": 2
+      },
+      {
+        "agent_id": "agent-04",
+        "task_id": "shard-04",
+        "worker_ms": 55104,
+        "synthesis_ms": 0,
+        "calls": 2
+      },
+      {
+        "agent_id": "agent-05",
+        "task_id": "shard-05",
+        "worker_ms": 58619,
+        "synthesis_ms": 0,
+        "calls": 2
+      },
+      {
+        "agent_id": "agent-06",
+        "task_id": "shard-06",
+        "worker_ms": 54302,
+        "synthesis_ms": 0,
+        "calls": 2
+      },
+      {
+        "agent_id": "agent-07",
+        "task_id": "shard-07",
+        "worker_ms": 56088,
+        "synthesis_ms": 0,
+        "calls": 2
+      },
+      {
+        "agent_id": "agent-08",
+        "task_id": "shard-08",
+        "worker_ms": 57411,
+        "synthesis_ms": 0,
+        "calls": 2
+      },
+      {
+        "agent_id": "agent-09",
+        "task_id": "shard-09",
+        "worker_ms": 52970,
+        "synthesis_ms": 0,
+        "calls": 2
+      }
+    ]
+  },
+  "placement": {
+    "revision": 428,
+    "allocations": {
+      "agent-00": {
+        "agent_id": "agent-00",
+        "gang_id": "reconcile-10",
+        "goal_id": "record-reconciliation-v1",
+        "node_id": "node-a",
+        "placement_intent_id": "reconcile-10-agent-00",
+        "budget_envelope_ref": "env-agent-00",
+        "incarnation": 1,
+        "fence": 300
+      },
+      "agent-01": {
+        "agent_id": "agent-01",
+        "gang_id": "reconcile-10",
+        "goal_id": "record-reconciliation-v1",
+        "node_id": "node-a",
+        "placement_intent_id": "reconcile-10-agent-01",
+        "budget_envelope_ref": "env-agent-01",
+        "incarnation": 1,
+        "fence": 301
+      },
+      "agent-02": {
+        "agent_id": "agent-02",
+        "gang_id": "reconcile-10",
+        "goal_id": "record-reconciliation-v1",
+        "node_id": "node-a",
+        "placement_intent_id": "reconcile-10-agent-02",
+        "budget_envelope_ref": "env-agent-02",
+        "incarnation": 1,
+        "fence": 302
+      },
+      "agent-03": {
+        "agent_id": "agent-03",
+        "gang_id": "reconcile-10",
+        "goal_id": "record-reconciliation-v1",
+        "node_id": "node-a",
+        "placement_intent_id": "reconcile-10-agent-03",
+        "budget_envelope_ref": "env-agent-03",
+        "incarnation": 1,
+        "fence": 303
+      },
+      "agent-04": {
+        "agent_id": "agent-04",
+        "gang_id": "reconcile-10",
+        "goal_id": "record-reconciliation-v1",
+        "node_id": "node-a",
+        "placement_intent_id": "reconcile-10-agent-04",
+        "budget_envelope_ref": "env-agent-04",
+        "incarnation": 1,
+        "fence": 304
+      },
+      "agent-05": {
+        "agent_id": "agent-05",
+        "gang_id": "reconcile-10",
+        "goal_id": "record-reconciliation-v1",
+        "node_id": "node-a",
+        "placement_intent_id": "reconcile-10-agent-05",
+        "budget_envelope_ref": "env-agent-05",
+        "incarnation": 1,
+        "fence": 305
+      },
+      "agent-06": {
+        "agent_id": "agent-06",
+        "gang_id": "reconcile-10",
+        "goal_id": "record-reconciliation-v1",
+        "node_id": "node-a",
+        "placement_intent_id": "reconcile-10-agent-06",
+        "budget_envelope_ref": "env-agent-06",
+        "incarnation": 1,
+        "fence": 306
+      },
+      "agent-07": {
+        "agent_id": "agent-07",
+        "gang_id": "reconcile-10",
+        "goal_id": "record-reconciliation-v1",
+        "node_id": "node-a",
+        "placement_intent_id": "reconcile-10-agent-07",
+        "budget_envelope_ref": "env-agent-07",
+        "incarnation": 1,
+        "fence": 307
+      },
+      "agent-08": {
+        "agent_id": "agent-08",
+        "gang_id": "reconcile-10",
+        "goal_id": "record-reconciliation-v1",
+        "node_id": "node-a",
+        "placement_intent_id": "reconcile-10-agent-08",
+        "budget_envelope_ref": "env-agent-08",
+        "incarnation": 1,
+        "fence": 308
+      },
+      "agent-09": {
+        "agent_id": "agent-09",
+        "gang_id": "reconcile-10",
+        "goal_id": "record-reconciliation-v1",
+        "node_id": "node-a",
+        "placement_intent_id": "reconcile-10-agent-09",
+        "budget_envelope_ref": "env-agent-09",
+        "incarnation": 1,
+        "fence": 309
+      }
+    }
+  },
+  "snapshot": {
+    "run_id": "live-20260412-132831",
+    "domain": {
+      "schema_version": 1,
+      "revision": 428,
+      "goals": {
+        "record-reconciliation-v1": {
+          "spec": {
+            "goal_id": "record-reconciliation-v1",
+            "intent": "Reconcile 10 synthetic record shards and consolidate every seeded inconsistency.",
+            "version": 1,
+            "rubric_version": "reconcile-v1",
+            "evaluation_set_version": "catalog-20260412",
+            "evaluator_version": "eval-1.0",
+            "evaluator_id": "evaluator-01",
+            "security": {
+              "tier": "P",
+              "keys_in_workers": 0
+            },
+            "capabilities": [
+              "tool.call",
+              "budget.spend"
+            ],
+            "budget_microusd": 1000000,
+            "max_depth": 2,
+            "max_agents": 10,
+            "max_open_tasks": 10,
+            "max_needs": 4,
+            "expiry_ms": 1775993911000,
+            "initial_needs": []
+          },
+          "versions": [
+            {
+              "goal_id": "record-reconciliation-v1",
+              "intent": "Reconcile 10 synthetic record shards and consolidate every seeded inconsistency.",
+              "version": 1,
+              "rubric_version": "reconcile-v1",
+              "evaluation_set_version": "catalog-20260412",
+              "evaluator_version": "eval-1.0",
+              "evaluator_id": "evaluator-01",
+              "security": {
+                "tier": "P",
+                "keys_in_workers": 0
+              },
+              "capabilities": [
+                "tool.call",
+                "budget.spend"
+              ],
+              "budget_microusd": 1000000,
+              "max_depth": 2,
+              "max_agents": 10,
+              "max_open_tasks": 10,
+              "max_needs": 4,
+              "expiry_ms": 1775993911000,
+              "initial_needs": []
+            }
+          ],
+          "status": "stopped",
+          "stop_reason": "completed",
+          "operator_id": "operator-01"
+        }
+      },
+      "needs": {},
+      "tasks": {
+        "record-reconciliation-v1/shard-01": {
+          "goal_id": "record-reconciliation-v1",
+          "goal_version": 1,
+          "spec": {
+            "id": "shard-01",
+            "need_id": "need-reconcile",
+            "parent_task_id": null,
+            "input": {
+              "shard": "shard-01"
+            },
+            "required_capabilities": [
+              "tool.call"
+            ],
+            "capabilities": [
+              "tool.call"
+            ],
+            "budget_microusd": 10000,
+            "expiry_ms": 1775993911000
+          },
+          "delegator": "operator-01",
+          "delegation_intent_id": "delegate-shard-01",
+          "placement_intent_id": "place-shard-01",
+          "budget_envelope_ref": "env-shard-01",
+          "depth": 1,
+          "allocated_to_children_microusd": 0,
+          "returned_microusd": 0,
+          "return_intents": {},
+          "state": "completed",
+          "claimed_by": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-00/incarnation/1",
+          "incarnation": 1,
+          "lease_expiry_ms": 1775993911000,
+          "fencing_token": 300,
+          "result_ref": "finding-shard-01",
+          "failure_reason": null
+        },
+        "record-reconciliation-v1/shard-02": {
+          "goal_id": "record-reconciliation-v1",
+          "goal_version": 1,
+          "spec": {
+            "id": "shard-02",
+            "need_id": "need-reconcile",
+            "parent_task_id": null,
+            "input": {
+              "shard": "shard-02"
+            },
+            "required_capabilities": [
+              "tool.call"
+            ],
+            "capabilities": [
+              "tool.call"
+            ],
+            "budget_microusd": 10000,
+            "expiry_ms": 1775993911000
+          },
+          "delegator": "operator-01",
+          "delegation_intent_id": "delegate-shard-02",
+          "placement_intent_id": "place-shard-02",
+          "budget_envelope_ref": "env-shard-02",
+          "depth": 1,
+          "allocated_to_children_microusd": 0,
+          "returned_microusd": 0,
+          "return_intents": {},
+          "state": "completed",
+          "claimed_by": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-01/incarnation/1",
+          "incarnation": 1,
+          "lease_expiry_ms": 1775993911000,
+          "fencing_token": 301,
+          "result_ref": "finding-shard-02",
+          "failure_reason": null
+        },
+        "record-reconciliation-v1/shard-00": {
+          "goal_id": "record-reconciliation-v1",
+          "goal_version": 1,
+          "spec": {
+            "id": "shard-00",
+            "need_id": "need-reconcile",
+            "parent_task_id": null,
+            "input": {
+              "shard": "shard-00"
+            },
+            "required_capabilities": [
+              "tool.call"
+            ],
+            "capabilities": [
+              "tool.call"
+            ],
+            "budget_microusd": 10000,
+            "expiry_ms": 1775993911000
+          },
+          "delegator": "operator-01",
+          "delegation_intent_id": "delegate-shard-00",
+          "placement_intent_id": "place-shard-00",
+          "budget_envelope_ref": "env-shard-00",
+          "depth": 1,
+          "allocated_to_children_microusd": 0,
+          "returned_microusd": 0,
+          "return_intents": {},
+          "state": "completed",
+          "claimed_by": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-02/incarnation/1",
+          "incarnation": 1,
+          "lease_expiry_ms": 1775993911000,
+          "fencing_token": 302,
+          "result_ref": "finding-shard-00",
+          "failure_reason": null
+        },
+        "record-reconciliation-v1/shard-03": {
+          "goal_id": "record-reconciliation-v1",
+          "goal_version": 1,
+          "spec": {
+            "id": "shard-03",
+            "need_id": "need-reconcile",
+            "parent_task_id": null,
+            "input": {
+              "shard": "shard-03"
+            },
+            "required_capabilities": [
+              "tool.call"
+            ],
+            "capabilities": [
+              "tool.call"
+            ],
+            "budget_microusd": 10000,
+            "expiry_ms": 1775993911000
+          },
+          "delegator": "operator-01",
+          "delegation_intent_id": "delegate-shard-03",
+          "placement_intent_id": "place-shard-03",
+          "budget_envelope_ref": "env-shard-03",
+          "depth": 1,
+          "allocated_to_children_microusd": 0,
+          "returned_microusd": 0,
+          "return_intents": {},
+          "state": "completed",
+          "claimed_by": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-03/incarnation/1",
+          "incarnation": 1,
+          "lease_expiry_ms": 1775993911000,
+          "fencing_token": 303,
+          "result_ref": "finding-shard-03",
+          "failure_reason": null
+        },
+        "record-reconciliation-v1/shard-04": {
+          "goal_id": "record-reconciliation-v1",
+          "goal_version": 1,
+          "spec": {
+            "id": "shard-04",
+            "need_id": "need-reconcile",
+            "parent_task_id": null,
+            "input": {
+              "shard": "shard-04"
+            },
+            "required_capabilities": [
+              "tool.call"
+            ],
+            "capabilities": [
+              "tool.call"
+            ],
+            "budget_microusd": 10000,
+            "expiry_ms": 1775993911000
+          },
+          "delegator": "operator-01",
+          "delegation_intent_id": "delegate-shard-04",
+          "placement_intent_id": "place-shard-04",
+          "budget_envelope_ref": "env-shard-04",
+          "depth": 1,
+          "allocated_to_children_microusd": 0,
+          "returned_microusd": 0,
+          "return_intents": {},
+          "state": "completed",
+          "claimed_by": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-04/incarnation/1",
+          "incarnation": 1,
+          "lease_expiry_ms": 1775993911000,
+          "fencing_token": 304,
+          "result_ref": "finding-shard-04",
+          "failure_reason": null
+        },
+        "record-reconciliation-v1/shard-05": {
+          "goal_id": "record-reconciliation-v1",
+          "goal_version": 1,
+          "spec": {
+            "id": "shard-05",
+            "need_id": "need-reconcile",
+            "parent_task_id": null,
+            "input": {
+              "shard": "shard-05"
+            },
+            "required_capabilities": [
+              "tool.call"
+            ],
+            "capabilities": [
+              "tool.call"
+            ],
+            "budget_microusd": 10000,
+            "expiry_ms": 1775993911000
+          },
+          "delegator": "operator-01",
+          "delegation_intent_id": "delegate-shard-05",
+          "placement_intent_id": "place-shard-05",
+          "budget_envelope_ref": "env-shard-05",
+          "depth": 1,
+          "allocated_to_children_microusd": 0,
+          "returned_microusd": 0,
+          "return_intents": {},
+          "state": "completed",
+          "claimed_by": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-05/incarnation/1",
+          "incarnation": 1,
+          "lease_expiry_ms": 1775993911000,
+          "fencing_token": 305,
+          "result_ref": "finding-shard-05",
+          "failure_reason": null
+        },
+        "record-reconciliation-v1/shard-06": {
+          "goal_id": "record-reconciliation-v1",
+          "goal_version": 1,
+          "spec": {
+            "id": "shard-06",
+            "need_id": "need-reconcile",
+            "parent_task_id": null,
+            "input": {
+              "shard": "shard-06"
+            },
+            "required_capabilities": [
+              "tool.call"
+            ],
+            "capabilities": [
+              "tool.call"
+            ],
+            "budget_microusd": 10000,
+            "expiry_ms": 1775993911000
+          },
+          "delegator": "operator-01",
+          "delegation_intent_id": "delegate-shard-06",
+          "placement_intent_id": "place-shard-06",
+          "budget_envelope_ref": "env-shard-06",
+          "depth": 1,
+          "allocated_to_children_microusd": 0,
+          "returned_microusd": 0,
+          "return_intents": {},
+          "state": "completed",
+          "claimed_by": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-06/incarnation/1",
+          "incarnation": 1,
+          "lease_expiry_ms": 1775993911000,
+          "fencing_token": 306,
+          "result_ref": "finding-shard-06",
+          "failure_reason": null
+        },
+        "record-reconciliation-v1/shard-07": {
+          "goal_id": "record-reconciliation-v1",
+          "goal_version": 1,
+          "spec": {
+            "id": "shard-07",
+            "need_id": "need-reconcile",
+            "parent_task_id": null,
+            "input": {
+              "shard": "shard-07"
+            },
+            "required_capabilities": [
+              "tool.call"
+            ],
+            "capabilities": [
+              "tool.call"
+            ],
+            "budget_microusd": 10000,
+            "expiry_ms": 1775993911000
+          },
+          "delegator": "operator-01",
+          "delegation_intent_id": "delegate-shard-07",
+          "placement_intent_id": "place-shard-07",
+          "budget_envelope_ref": "env-shard-07",
+          "depth": 1,
+          "allocated_to_children_microusd": 0,
+          "returned_microusd": 0,
+          "return_intents": {},
+          "state": "completed",
+          "claimed_by": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-07/incarnation/1",
+          "incarnation": 1,
+          "lease_expiry_ms": 1775993911000,
+          "fencing_token": 307,
+          "result_ref": "finding-shard-07",
+          "failure_reason": null
+        },
+        "record-reconciliation-v1/shard-08": {
+          "goal_id": "record-reconciliation-v1",
+          "goal_version": 1,
+          "spec": {
+            "id": "shard-08",
+            "need_id": "need-reconcile",
+            "parent_task_id": null,
+            "input": {
+              "shard": "shard-08"
+            },
+            "required_capabilities": [
+              "tool.call"
+            ],
+            "capabilities": [
+              "tool.call"
+            ],
+            "budget_microusd": 10000,
+            "expiry_ms": 1775993911000
+          },
+          "delegator": "operator-01",
+          "delegation_intent_id": "delegate-shard-08",
+          "placement_intent_id": "place-shard-08",
+          "budget_envelope_ref": "env-shard-08",
+          "depth": 1,
+          "allocated_to_children_microusd": 0,
+          "returned_microusd": 0,
+          "return_intents": {},
+          "state": "completed",
+          "claimed_by": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-08/incarnation/1",
+          "incarnation": 1,
+          "lease_expiry_ms": 1775993911000,
+          "fencing_token": 308,
+          "result_ref": "finding-shard-08",
+          "failure_reason": null
+        },
+        "record-reconciliation-v1/shard-09": {
+          "goal_id": "record-reconciliation-v1",
+          "goal_version": 1,
+          "spec": {
+            "id": "shard-09",
+            "need_id": "need-reconcile",
+            "parent_task_id": null,
+            "input": {
+              "shard": "shard-09"
+            },
+            "required_capabilities": [
+              "tool.call"
+            ],
+            "capabilities": [
+              "tool.call"
+            ],
+            "budget_microusd": 10000,
+            "expiry_ms": 1775993911000
+          },
+          "delegator": "operator-01",
+          "delegation_intent_id": "delegate-shard-09",
+          "placement_intent_id": "place-shard-09",
+          "budget_envelope_ref": "env-shard-09",
+          "depth": 1,
+          "allocated_to_children_microusd": 0,
+          "returned_microusd": 0,
+          "return_intents": {},
+          "state": "completed",
+          "claimed_by": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-09/incarnation/1",
+          "incarnation": 1,
+          "lease_expiry_ms": 1775993911000,
+          "fencing_token": 309,
+          "result_ref": "finding-shard-09",
+          "failure_reason": null
+        }
+      },
+      "boards": {
+        "record-reconciliation-v1": [
+          {
+            "goal_id": "record-reconciliation-v1",
+            "entry_id": "submit_finding-0001",
+            "seq": 1,
+            "revision": 300,
+            "author_id": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-00/incarnation/1",
+            "topic": "submit_finding",
+            "body": {
+              "task_id": "shard-01",
+              "agent_id": "agent-00",
+              "finding_id": "finding-shard-01"
+            },
+            "signature": "recorded",
+            "recorded_ms": 1775993362384
+          },
+          {
+            "goal_id": "record-reconciliation-v1",
+            "entry_id": "submit_finding-0002",
+            "seq": 2,
+            "revision": 301,
+            "author_id": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-01/incarnation/1",
+            "topic": "submit_finding",
+            "body": {
+              "task_id": "shard-02",
+              "agent_id": "agent-01",
+              "finding_id": "finding-shard-02"
+            },
+            "signature": "recorded",
+            "recorded_ms": 1775993362210
+          },
+          {
+            "goal_id": "record-reconciliation-v1",
+            "entry_id": "submit_finding-0003",
+            "seq": 3,
+            "revision": 302,
+            "author_id": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-02/incarnation/1",
+            "topic": "submit_finding",
+            "body": {
+              "task_id": "shard-00",
+              "agent_id": "agent-02",
+              "finding_id": "finding-shard-00"
+            },
+            "signature": "recorded",
+            "recorded_ms": 1775993364941
+          },
+          {
+            "goal_id": "record-reconciliation-v1",
+            "entry_id": "submit_finding-0004",
+            "seq": 4,
+            "revision": 303,
+            "author_id": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-03/incarnation/1",
+            "topic": "submit_finding",
+            "body": {
+              "task_id": "shard-03",
+              "agent_id": "agent-03",
+              "finding_id": "finding-shard-03"
+            },
+            "signature": "recorded",
+            "recorded_ms": 1775993361812
+          },
+          {
+            "goal_id": "record-reconciliation-v1",
+            "entry_id": "submit_finding-0005",
+            "seq": 5,
+            "revision": 304,
+            "author_id": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-04/incarnation/1",
+            "topic": "submit_finding",
+            "body": {
+              "task_id": "shard-04",
+              "agent_id": "agent-04",
+              "finding_id": "finding-shard-04"
+            },
+            "signature": "recorded",
+            "recorded_ms": 1775993366104
+          },
+          {
+            "goal_id": "record-reconciliation-v1",
+            "entry_id": "submit_finding-0006",
+            "seq": 6,
+            "revision": 305,
+            "author_id": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-05/incarnation/1",
+            "topic": "submit_finding",
+            "body": {
+              "task_id": "shard-05",
+              "agent_id": "agent-05",
+              "finding_id": "finding-shard-05"
+            },
+            "signature": "recorded",
+            "recorded_ms": 1775993369619
+          },
+          {
+            "goal_id": "record-reconciliation-v1",
+            "entry_id": "submit_finding-0007",
+            "seq": 7,
+            "revision": 306,
+            "author_id": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-06/incarnation/1",
+            "topic": "submit_finding",
+            "body": {
+              "task_id": "shard-06",
+              "agent_id": "agent-06",
+              "finding_id": "finding-shard-06"
+            },
+            "signature": "recorded",
+            "recorded_ms": 1775993365302
+          },
+          {
+            "goal_id": "record-reconciliation-v1",
+            "entry_id": "submit_finding-0008",
+            "seq": 8,
+            "revision": 307,
+            "author_id": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-07/incarnation/1",
+            "topic": "submit_finding",
+            "body": {
+              "task_id": "shard-07",
+              "agent_id": "agent-07",
+              "finding_id": "finding-shard-07"
+            },
+            "signature": "recorded",
+            "recorded_ms": 1775993367088
+          },
+          {
+            "goal_id": "record-reconciliation-v1",
+            "entry_id": "submit_finding-0009",
+            "seq": 9,
+            "revision": 308,
+            "author_id": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-08/incarnation/1",
+            "topic": "submit_finding",
+            "body": {
+              "task_id": "shard-08",
+              "agent_id": "agent-08",
+              "finding_id": "finding-shard-08"
+            },
+            "signature": "recorded",
+            "recorded_ms": 1775993368411
+          },
+          {
+            "goal_id": "record-reconciliation-v1",
+            "entry_id": "submit_finding-0010",
+            "seq": 10,
+            "revision": 309,
+            "author_id": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-09/incarnation/1",
+            "topic": "submit_finding",
+            "body": {
+              "task_id": "shard-09",
+              "agent_id": "agent-09",
+              "finding_id": "finding-shard-09"
+            },
+            "signature": "recorded",
+            "recorded_ms": 1775993363970
+          },
+          {
+            "goal_id": "record-reconciliation-v1",
+            "entry_id": "submit_artifact-0011",
+            "seq": 11,
+            "revision": 428,
+            "author_id": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-00/incarnation/1",
+            "topic": "submit_artifact",
+            "body": {
+              "task_id": "shard-01",
+              "agent_id": "agent-00",
+              "attempt_id": "attempt-final"
+            },
+            "signature": "recorded",
+            "recorded_ms": 1775993435807
+          }
+        ]
+      },
+      "board_cursors": {
+        "record-reconciliation-v1": 11
+      },
+      "findings": {
+        "finding-shard-01": {
+          "id": "finding-shard-01",
+          "schema_version": 1,
+          "goal_id": "record-reconciliation-v1",
+          "goal_version": 1,
+          "task_id": "shard-01",
+          "body": {
+            "inconsistencies": [
+              {
+                "id": "record-01-1",
+                "source_a": 257,
+                "source_b": 258
+              }
+            ]
+          },
+          "markings": [],
+          "trust": 2,
+          "flagged": false,
+          "recorded_ms": 1775993362384,
+          "correlation": {
+            "agent_id": "agent-00",
+            "task_id": "shard-01"
+          }
+        },
+        "finding-shard-02": {
+          "id": "finding-shard-02",
+          "schema_version": 1,
+          "goal_id": "record-reconciliation-v1",
+          "goal_version": 1,
+          "task_id": "shard-02",
+          "body": {
+            "inconsistencies": [
+              {
+                "id": "record-02-2",
+                "source_a": 178,
+                "source_b": 181
+              }
+            ]
+          },
+          "markings": [],
+          "trust": 2,
+          "flagged": false,
+          "recorded_ms": 1775993362210,
+          "correlation": {
+            "agent_id": "agent-01",
+            "task_id": "shard-02"
+          }
+        },
+        "finding-shard-00": {
+          "id": "finding-shard-00",
+          "schema_version": 1,
+          "goal_id": "record-reconciliation-v1",
+          "goal_version": 1,
+          "task_id": "shard-00",
+          "body": {
+            "inconsistencies": [
+              {
+                "id": "record-00-0",
+                "source_a": 50,
+                "source_b": 56
+              }
+            ]
+          },
+          "markings": [],
+          "trust": 2,
+          "flagged": false,
+          "recorded_ms": 1775993364941,
+          "correlation": {
+            "agent_id": "agent-02",
+            "task_id": "shard-00"
+          }
+        },
+        "finding-shard-03": {
+          "id": "finding-shard-03",
+          "schema_version": 1,
+          "goal_id": "record-reconciliation-v1",
+          "goal_version": 1,
+          "task_id": "shard-03",
+          "body": {
+            "inconsistencies": [
+              {
+                "id": "record-03-0",
+                "source_a": 408,
+                "source_b": 415
+              }
+            ]
+          },
+          "markings": [],
+          "trust": 2,
+          "flagged": false,
+          "recorded_ms": 1775993361812,
+          "correlation": {
+            "agent_id": "agent-03",
+            "task_id": "shard-03"
+          }
+        },
+        "finding-shard-04": {
+          "id": "finding-shard-04",
+          "schema_version": 1,
+          "goal_id": "record-reconciliation-v1",
+          "goal_version": 1,
+          "task_id": "shard-04",
+          "body": {
+            "inconsistencies": [
+              {
+                "id": "record-04-1",
+                "source_a": 453,
+                "source_b": 462
+              }
+            ]
+          },
+          "markings": [],
+          "trust": 2,
+          "flagged": false,
+          "recorded_ms": 1775993366104,
+          "correlation": {
+            "agent_id": "agent-04",
+            "task_id": "shard-04"
+          }
+        },
+        "finding-shard-05": {
+          "id": "finding-shard-05",
+          "schema_version": 1,
+          "goal_id": "record-reconciliation-v1",
+          "goal_version": 1,
+          "task_id": "shard-05",
+          "body": {
+            "inconsistencies": [
+              {
+                "id": "record-05-2",
+                "source_a": 609,
+                "source_b": 615
+              }
+            ]
+          },
+          "markings": [],
+          "trust": 2,
+          "flagged": false,
+          "recorded_ms": 1775993369619,
+          "correlation": {
+            "agent_id": "agent-05",
+            "task_id": "shard-05"
+          }
+        },
+        "finding-shard-06": {
+          "id": "finding-shard-06",
+          "schema_version": 1,
+          "goal_id": "record-reconciliation-v1",
+          "goal_version": 1,
+          "task_id": "shard-06",
+          "body": {
+            "inconsistencies": [
+              {
+                "id": "record-06-0",
+                "source_a": 994,
+                "source_b": 997
+              }
+            ]
+          },
+          "markings": [],
+          "trust": 2,
+          "flagged": false,
+          "recorded_ms": 1775993365302,
+          "correlation": {
+            "agent_id": "agent-06",
+            "task_id": "shard-06"
+          }
+        },
+        "finding-shard-07": {
+          "id": "finding-shard-07",
+          "schema_version": 1,
+          "goal_id": "record-reconciliation-v1",
+          "goal_version": 1,
+          "task_id": "shard-07",
+          "body": {
+            "inconsistencies": [
+              {
+                "id": "record-07-1",
+                "source_a": 566,
+                "source_b": 572
+              }
+            ]
+          },
+          "markings": [],
+          "trust": 2,
+          "flagged": false,
+          "recorded_ms": 1775993367088,
+          "correlation": {
+            "agent_id": "agent-07",
+            "task_id": "shard-07"
+          }
+        },
+        "finding-shard-08": {
+          "id": "finding-shard-08",
+          "schema_version": 1,
+          "goal_id": "record-reconciliation-v1",
+          "goal_version": 1,
+          "task_id": "shard-08",
+          "body": {
+            "inconsistencies": [
+              {
+                "id": "record-08-2",
+                "source_a": 653,
+                "source_b": 659
+              }
+            ]
+          },
+          "markings": [],
+          "trust": 2,
+          "flagged": false,
+          "recorded_ms": 1775993368411,
+          "correlation": {
+            "agent_id": "agent-08",
+            "task_id": "shard-08"
+          }
+        },
+        "finding-shard-09": {
+          "id": "finding-shard-09",
+          "schema_version": 1,
+          "goal_id": "record-reconciliation-v1",
+          "goal_version": 1,
+          "task_id": "shard-09",
+          "body": {
+            "inconsistencies": [
+              {
+                "id": "record-09-0",
+                "source_a": 982,
+                "source_b": 991
+              }
+            ]
+          },
+          "markings": [],
+          "trust": 2,
+          "flagged": false,
+          "recorded_ms": 1775993363970,
+          "correlation": {
+            "agent_id": "agent-09",
+            "task_id": "shard-09"
+          }
+        }
+      },
+      "children": {},
+      "retractions": [],
+      "retracted_sources": [],
+      "attempts": {
+        "attempt-final": {
+          "id": "attempt-final",
+          "goal_id": "record-reconciliation-v1",
+          "goal_version": 1,
+          "producer_id": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-00/incarnation/1",
+          "payload": {
+            "inconsistencies": [
+              {
+                "id": "record-00-0",
+                "source_a": 50,
+                "source_b": 56
+              },
+              {
+                "id": "record-01-1",
+                "source_a": 257,
+                "source_b": 258
+              },
+              {
+                "id": "record-02-2",
+                "source_a": 178,
+                "source_b": 181
+              },
+              {
+                "id": "record-03-0",
+                "source_a": 408,
+                "source_b": 415
+              },
+              {
+                "id": "record-04-1",
+                "source_a": 453,
+                "source_b": 462
+              },
+              {
+                "id": "record-05-2",
+                "source_a": 609,
+                "source_b": 615
+              },
+              {
+                "id": "record-06-0",
+                "source_a": 994,
+                "source_b": 997
+              },
+              {
+                "id": "record-07-1",
+                "source_a": 566,
+                "source_b": 572
+              },
+              {
+                "id": "record-08-2",
+                "source_a": 653,
+                "source_b": 659
+              },
+              {
+                "id": "record-09-0",
+                "source_a": 982,
+                "source_b": 991
+              }
+            ]
+          },
+          "candidate_hash": "e1d95c7f56f118a320a5d2ce208b02a98e9468e2adb307e90738ad87a4dcd8ee",
+          "finding_ids": [
+            "finding-shard-01",
+            "finding-shard-02",
+            "finding-shard-00",
+            "finding-shard-03",
+            "finding-shard-04",
+            "finding-shard-05",
+            "finding-shard-06",
+            "finding-shard-07",
+            "finding-shard-08",
+            "finding-shard-09"
+          ],
+          "markings": [],
+          "flagged": false,
+          "recorded_ms": 1775993435807,
+          "scores": [
+            {
+              "value": 1.0,
+              "evaluator_id": "evaluator-01",
+              "recorded_ms": 1775993435807
+            }
+          ],
+          "planning_round_id": "round-final",
+          "correlation": {
+            "agent_id": "agent-00",
+            "task_id": "shard-01"
+          }
+        }
+      },
+      "excluded_candidate_hashes": {},
+      "actions": {},
+      "planning_rounds": {}
+    },
+    "ledger": {
+      "currency": "microusd",
+      "accounts": {},
+      "envelopes": {},
+      "intents": {
+        "intent-agent-00-0": {
+          "request": {
+            "intent_id": "intent-agent-00-0",
+            "envelope_id": "env-shard-01",
+            "goal_id": "record-reconciliation-v1",
+            "holder": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-00/incarnation/1"
+          },
+          "correlation": {
+            "agent_id": "agent-00",
+            "task_id": "shard-01",
+            "goal_id": "record-reconciliation-v1"
+          },
+          "state": "settled",
+          "hold": 0,
+          "settled": 755,
+          "receipt": {
+            "id": "receipt-intent-agent-00-0",
+            "provider": "deepseek",
+            "intent_id": "intent-agent-00-0",
+            "usage": {
+              "input_tokens": 1744,
+              "output_tokens": 193
+            }
+          },
+          "recorded_ms": 1775993362384
+        },
+        "intent-agent-00-1": {
+          "request": {
+            "intent_id": "intent-agent-00-1",
+            "envelope_id": "env-shard-01",
+            "goal_id": "record-reconciliation-v1",
+            "holder": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-00/incarnation/1"
+          },
+          "correlation": {
+            "agent_id": "agent-00",
+            "task_id": "shard-01",
+            "goal_id": "record-reconciliation-v1"
+          },
+          "state": "settled",
+          "hold": 0,
+          "settled": 755,
+          "receipt": {
+            "id": "receipt-intent-agent-00-1",
+            "provider": "deepseek",
+            "intent_id": "intent-agent-00-1",
+            "usage": {
+              "input_tokens": 1744,
+              "output_tokens": 193
+            }
+          },
+          "recorded_ms": 1775993362384
+        },
+        "intent-agent-00-2": {
+          "request": {
+            "intent_id": "intent-agent-00-2",
+            "envelope_id": "env-shard-01",
+            "goal_id": "record-reconciliation-v1",
+            "holder": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-00/incarnation/1"
+          },
+          "correlation": {
+            "agent_id": "agent-00",
+            "task_id": "shard-01",
+            "goal_id": "record-reconciliation-v1"
+          },
+          "state": "settled",
+          "hold": 0,
+          "settled": 755,
+          "receipt": {
+            "id": "receipt-intent-agent-00-2",
+            "provider": "deepseek",
+            "intent_id": "intent-agent-00-2",
+            "usage": {
+              "input_tokens": 1744,
+              "output_tokens": 193
+            }
+          },
+          "recorded_ms": 1775993362384
+        },
+        "intent-agent-00-3": {
+          "request": {
+            "intent_id": "intent-agent-00-3",
+            "envelope_id": "env-shard-01",
+            "goal_id": "record-reconciliation-v1",
+            "holder": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-00/incarnation/1"
+          },
+          "correlation": {
+            "agent_id": "agent-00",
+            "task_id": "shard-01",
+            "goal_id": "record-reconciliation-v1"
+          },
+          "state": "settled",
+          "hold": 0,
+          "settled": 755,
+          "receipt": {
+            "id": "receipt-intent-agent-00-3",
+            "provider": "deepseek",
+            "intent_id": "intent-agent-00-3",
+            "usage": {
+              "input_tokens": 1744,
+              "output_tokens": 193
+            }
+          },
+          "recorded_ms": 1775993362384
+        },
+        "intent-agent-01-0": {
+          "request": {
+            "intent_id": "intent-agent-01-0",
+            "envelope_id": "env-shard-02",
+            "goal_id": "record-reconciliation-v1",
+            "holder": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-01/incarnation/1"
+          },
+          "correlation": {
+            "agent_id": "agent-01",
+            "task_id": "shard-02",
+            "goal_id": "record-reconciliation-v1"
+          },
+          "state": "settled",
+          "hold": 0,
+          "settled": 753,
+          "receipt": {
+            "id": "receipt-intent-agent-01-0",
+            "provider": "deepseek",
+            "intent_id": "intent-agent-01-0",
+            "usage": {
+              "input_tokens": 1738,
+              "output_tokens": 193
+            }
+          },
+          "recorded_ms": 1775993362210
+        },
+        "intent-agent-01-1": {
+          "request": {
+            "intent_id": "intent-agent-01-1",
+            "envelope_id": "env-shard-02",
+            "goal_id": "record-reconciliation-v1",
+            "holder": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-01/incarnation/1"
+          },
+          "correlation": {
+            "agent_id": "agent-01",
+            "task_id": "shard-02",
+            "goal_id": "record-reconciliation-v1"
+          },
+          "state": "settled",
+          "hold": 0,
+          "settled": 753,
+          "receipt": {
+            "id": "receipt-intent-agent-01-1",
+            "provider": "deepseek",
+            "intent_id": "intent-agent-01-1",
+            "usage": {
+              "input_tokens": 1738,
+              "output_tokens": 193
+            }
+          },
+          "recorded_ms": 1775993362210
+        },
+        "intent-agent-02-0": {
+          "request": {
+            "intent_id": "intent-agent-02-0",
+            "envelope_id": "env-shard-00",
+            "goal_id": "record-reconciliation-v1",
+            "holder": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-02/incarnation/1"
+          },
+          "correlation": {
+            "agent_id": "agent-02",
+            "task_id": "shard-00",
+            "goal_id": "record-reconciliation-v1"
+          },
+          "state": "settled",
+          "hold": 0,
+          "settled": 793,
+          "receipt": {
+            "id": "receipt-intent-agent-02-0",
+            "provider": "deepseek",
+            "intent_id": "intent-agent-02-0",
+            "usage": {
+              "input_tokens": 1831,
+              "output_tokens": 203
+            }
+          },
+          "recorded_ms": 1775993364941
+        },
+        "intent-agent-02-1": {
+          "request": {
+            "intent_id": "intent-agent-02-1",
+            "envelope_id": "env-shard-00",
+            "goal_id": "record-reconciliation-v1",
+            "holder": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-02/incarnation/1"
+          },
+          "correlation": {
+            "agent_id": "agent-02",
+            "task_id": "shard-00",
+            "goal_id": "record-reconciliation-v1"
+          },
+          "state": "settled",
+          "hold": 0,
+          "settled": 793,
+          "receipt": {
+            "id": "receipt-intent-agent-02-1",
+            "provider": "deepseek",
+            "intent_id": "intent-agent-02-1",
+            "usage": {
+              "input_tokens": 1831,
+              "output_tokens": 203
+            }
+          },
+          "recorded_ms": 1775993364941
+        },
+        "intent-agent-03-0": {
+          "request": {
+            "intent_id": "intent-agent-03-0",
+            "envelope_id": "env-shard-03",
+            "goal_id": "record-reconciliation-v1",
+            "holder": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-03/incarnation/1"
+          },
+          "correlation": {
+            "agent_id": "agent-03",
+            "task_id": "shard-03",
+            "goal_id": "record-reconciliation-v1"
+          },
+          "state": "settled",
+          "hold": 0,
+          "settled": 747,
+          "receipt": {
+            "id": "receipt-intent-agent-03-0",
+            "provider": "deepseek",
+            "intent_id": "intent-agent-03-0",
+            "usage": {
+              "input_tokens": 1724,
+              "output_tokens": 191
+            }
+          },
+          "recorded_ms": 1775993361812
+        },
+        "intent-agent-03-1": {
+          "request": {
+            "intent_id": "intent-agent-03-1",
+            "envelope_id": "env-shard-03",
+            "goal_id": "record-reconciliation-v1",
+            "holder": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-03/incarnation/1"
+          },
+          "correlation": {
+            "agent_id": "agent-03",
+            "task_id": "shard-03",
+            "goal_id": "record-reconciliation-v1"
+          },
+          "state": "settled",
+          "hold": 0,
+          "settled": 747,
+          "receipt": {
+            "id": "receipt-intent-agent-03-1",
+            "provider": "deepseek",
+            "intent_id": "intent-agent-03-1",
+            "usage": {
+              "input_tokens": 1724,
+              "output_tokens": 191
+            }
+          },
+          "recorded_ms": 1775993361812
+        },
+        "intent-agent-04-0": {
+          "request": {
+            "intent_id": "intent-agent-04-0",
+            "envelope_id": "env-shard-04",
+            "goal_id": "record-reconciliation-v1",
+            "holder": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-04/incarnation/1"
+          },
+          "correlation": {
+            "agent_id": "agent-04",
+            "task_id": "shard-04",
+            "goal_id": "record-reconciliation-v1"
+          },
+          "state": "settled",
+          "hold": 0,
+          "settled": 810,
+          "receipt": {
+            "id": "receipt-intent-agent-04-0",
+            "provider": "deepseek",
+            "intent_id": "intent-agent-04-0",
+            "usage": {
+              "input_tokens": 1870,
+              "output_tokens": 207
+            }
+          },
+          "recorded_ms": 1775993366104
+        },
+        "intent-agent-04-1": {
+          "request": {
+            "intent_id": "intent-agent-04-1",
+            "envelope_id": "env-shard-04",
+            "goal_id": "record-reconciliation-v1",
+            "holder": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-04/incarnation/1"
+          },
+          "correlation": {
+            "agent_id": "agent-04",
+            "task_id": "shard-04",
+            "goal_id": "record-reconciliation-v1"
+          },
+          "state": "settled",
+          "hold": 0,
+          "settled": 810,
+          "receipt": {
+            "id": "receipt-intent-agent-04-1",
+            "provider": "deepseek",
+            "intent_id": "intent-agent-04-1",
+            "usage": {
+              "input_tokens": 1870,
+              "output_tokens": 207
+            }
+          },
+          "recorded_ms": 1775993366104
+        },
+        "intent-agent-05-0": {
+          "request": {
+            "intent_id": "intent-agent-05-0",
+            "envelope_id": "env-shard-05",
+            "goal_id": "record-reconciliation-v1",
+            "holder": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-05/incarnation/1"
+          },
+          "correlation": {
+            "agent_id": "agent-05",
+            "task_id": "shard-05",
+            "goal_id": "record-reconciliation-v1"
+          },
+          "state": "settled",
+          "hold": 0,
+          "settled": 862,
+          "receipt": {
+            "id": "receipt-intent-agent-05-0",
+            "provider": "deepseek",
+            "intent_id": "intent-agent-05-0",
+            "usage": {
+              "input_tokens": 1989,
+              "output_tokens": 221
+            }
+          },
+          "recorded_ms": 1775993369619
+        },
+        "intent-agent-05-1": {
+          "request": {
+            "intent_id": "intent-agent-05-1",
+            "envelope_id": "env-shard-05",
+            "goal_id": "record-reconciliation-v1",
+            "holder": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-05/incarnation/1"
+          },
+          "correlation": {
+            "agent_id": "agent-05",
+            "task_id": "shard-05",
+            "goal_id": "record-reconciliation-v1"
+          },
+          "state": "settled",
+          "hold": 0,
+          "settled": 862,
+          "receipt": {
+            "id": "receipt-intent-agent-05-1",
+            "provider": "deepseek",
+            "intent_id": "intent-agent-05-1",
+            "usage": {
+              "input_tokens": 1989,
+              "output_tokens": 221
+            }
+          },
+          "recorded_ms": 1775993369619
+        },
+        "intent-agent-06-0": {
+          "request": {
+            "intent_id": "intent-agent-06-0",
+            "envelope_id": "env-shard-06",
+            "goal_id": "record-reconciliation-v1",
+            "holder": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-06/incarnation/1"
+          },
+          "correlation": {
+            "agent_id": "agent-06",
+            "task_id": "shard-06",
+            "goal_id": "record-reconciliation-v1"
+          },
+          "state": "settled",
+          "hold": 0,
+          "settled": 798,
+          "receipt": {
+            "id": "receipt-intent-agent-06-0",
+            "provider": "deepseek",
+            "intent_id": "intent-agent-06-0",
+            "usage": {
+              "input_tokens": 1843,
+              "output_tokens": 204
+            }
+          },
+          "recorded_ms": 1775993365302
+        },
+        "intent-agent-06-1": {
+          "request": {
+            "intent_id": "intent-agent-06-1",
+            "envelope_id": "env-shard-06",
+            "goal_id": "record-reconciliation-v1",
+            "holder": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-06/incarnation/1"
+          },
+          "correlation": {
+            "agent_id": "agent-06",
+            "task_id": "shard-06",
+            "goal_id": "record-reconciliation-v1"
+          },
+          "state": "settled",
+          "hold": 0,
+          "settled": 798,
+          "receipt": {
+            "id": "receipt-intent-agent-06-1",
+            "provider": "deepseek",
+            "intent_id": "intent-agent-06-1",
+            "usage": {
+              "input_tokens": 1843,
+              "output_tokens": 204
+            }
+          },
+          "recorded_ms": 1775993365302
+        },
+        "intent-agent-07-0": {
+          "request": {
+            "intent_id": "intent-agent-07-0",
+            "envelope_id": "env-shard-07",
+            "goal_id": "record-reconciliation-v1",
+            "holder": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-07/incarnation/1"
+          },
+          "correlation": {
+            "agent_id": "agent-07",
+            "task_id": "shard-07",
+            "goal_id": "record-reconciliation-v1"
+          },
+          "state": "settled",
+          "hold": 0,
+          "settled": 824,
+          "receipt": {
+            "id": "receipt-intent-agent-07-0",
+            "provider": "deepseek",
+            "intent_id": "intent-agent-07-0",
+            "usage": {
+              "input_tokens": 1903,
+              "output_tokens": 211
+            }
+          },
+          "recorded_ms": 1775993367088
+        },
+        "intent-agent-07-1": {
+          "request": {
+            "intent_id": "intent-agent-07-1",
+            "envelope_id": "env-shard-07",
+            "goal_id": "record-reconciliation-v1",
+            "holder": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-07/incarnation/1"
+          },
+          "correlation": {
+            "agent_id": "agent-07",
+            "task_id": "shard-07",
+            "goal_id": "record-reconciliation-v1"
+          },
+          "state": "settled",
+          "hold": 0,
+          "settled": 824,
+          "receipt": {
+            "id": "receipt-intent-agent-07-1",
+            "provider": "deepseek",
+            "intent_id": "intent-agent-07-1",
+            "usage": {
+              "input_tokens": 1903,
+              "output_tokens": 211
+            }
+          },
+          "recorded_ms": 1775993367088
+        },
+        "intent-agent-08-0": {
+          "request": {
+            "intent_id": "intent-agent-08-0",
+            "envelope_id": "env-shard-08",
+            "goal_id": "record-reconciliation-v1",
+            "holder": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-08/incarnation/1"
+          },
+          "correlation": {
+            "agent_id": "agent-08",
+            "task_id": "shard-08",
+            "goal_id": "record-reconciliation-v1"
+          },
+          "state": "settled",
+          "hold": 0,
+          "settled": 844,
+          "receipt": {
+            "id": "receipt-intent-agent-08-0",
+            "provider": "deepseek",
+            "intent_id": "intent-agent-08-0",
+            "usage": {
+              "input_tokens": 1948,
+              "output_tokens": 216
+            }
+          },
+          "recorded_ms": 1775993368411
+        },
+        "intent-agent-08-1": {
+          "request": {
+            "intent_id": "intent-agent-08-1",
+            "envelope_id": "env-shard-08",
+            "goal_id": "record-reconciliation-v1",
+            "holder": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-08/incarnation/1"
+          },
+          "correlation": {
+            "agent_id": "agent-08",
+            "task_id": "shard-08",
+            "goal_id": "record-reconciliation-v1"
+          },
+          "state": "settled",
+          "hold": 0,
+          "settled": 844,
+          "receipt": {
+            "id": "receipt-intent-agent-08-1",
+            "provider": "deepseek",
+            "intent_id": "intent-agent-08-1",
+            "usage": {
+              "input_tokens": 1948,
+              "output_tokens": 216
+            }
+          },
+          "recorded_ms": 1775993368411
+        },
+        "intent-agent-09-0": {
+          "request": {
+            "intent_id": "intent-agent-09-0",
+            "envelope_id": "env-shard-09",
+            "goal_id": "record-reconciliation-v1",
+            "holder": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-09/incarnation/1"
+          },
+          "correlation": {
+            "agent_id": "agent-09",
+            "task_id": "shard-09",
+            "goal_id": "record-reconciliation-v1"
+          },
+          "state": "settled",
+          "hold": 0,
+          "settled": 778,
+          "receipt": {
+            "id": "receipt-intent-agent-09-0",
+            "provider": "deepseek",
+            "intent_id": "intent-agent-09-0",
+            "usage": {
+              "input_tokens": 1798,
+              "output_tokens": 199
+            }
+          },
+          "recorded_ms": 1775993363970
+        },
+        "intent-agent-09-1": {
+          "request": {
+            "intent_id": "intent-agent-09-1",
+            "envelope_id": "env-shard-09",
+            "goal_id": "record-reconciliation-v1",
+            "holder": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-09/incarnation/1"
+          },
+          "correlation": {
+            "agent_id": "agent-09",
+            "task_id": "shard-09",
+            "goal_id": "record-reconciliation-v1"
+          },
+          "state": "settled",
+          "hold": 0,
+          "settled": 778,
+          "receipt": {
+            "id": "receipt-intent-agent-09-1",
+            "provider": "deepseek",
+            "intent_id": "intent-agent-09-1",
+            "usage": {
+              "input_tokens": 1798,
+              "output_tokens": 199
+            }
+          },
+          "recorded_ms": 1775993363970
+        }
+      },
+      "stopped_goals": []
+    },
+    "audit": {
+      "log_id": "audit-live-20260412-132831",
+      "events": [
+        {
+          "id": "submit_finding/agent-00/1775993362384",
+          "kind": "submit_finding",
+          "actor": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-00/incarnation/1",
+          "goal": "record-reconciliation-v1",
+          "timestamp": 1775993362384,
+          "decision": "allow",
+          "payload_hash": [
+            66,
+            225,
+            153,
+            142,
+            41,
+            120,
+            98,
+            93,
+            218,
+            121,
+            94,
+            127,
+            113,
+            111,
+            219,
+            225,
+            175,
+            142,
+            224,
+            151,
+            181,
+            83,
+            89,
+            79,
+            135,
+            125,
+            205,
+            172,
+            148,
+            212,
+            71,
+            69
+          ]
+        },
+        {
+          "id": "submit_finding/agent-01/1775993362210",
+          "kind": "submit_finding",
+          "actor": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-01/incarnation/1",
+          "goal": "record-reconciliation-v1",
+          "timestamp": 1775993362210,
+          "decision": "allow",
+          "payload_hash": [
+            178,
+            158,
+            38,
+            173,
+            194,
+            178,
+            78,
+            187,
+            56,
+            81,
+            4,
+            153,
+            227,
+            47,
+            61,
+            116,
+            151,
+            89,
+            43,
+            39,
+            181,
+            36,
+            127,
+            14,
+            189,
+            100,
+            2,
+            115,
+            220,
+            176,
+            20,
+            240
+          ]
+        },
+        {
+          "id": "submit_finding/agent-02/1775993364941",
+          "kind": "submit_finding",
+          "actor": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-02/incarnation/1",
+          "goal": "record-reconciliation-v1",
+          "timestamp": 1775993364941,
+          "decision": "allow",
+          "payload_hash": [
+            253,
+            50,
+            232,
+            34,
+            30,
+            174,
+            124,
+            153,
+            215,
+            131,
+            15,
+            230,
+            52,
+            60,
+            75,
+            185,
+            152,
+            152,
+            228,
+            50,
+            215,
+            217,
+            115,
+            12,
+            235,
+            12,
+            121,
+            7,
+            166,
+            204,
+            128,
+            193
+          ]
+        },
+        {
+          "id": "submit_finding/agent-03/1775993361812",
+          "kind": "submit_finding",
+          "actor": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-03/incarnation/1",
+          "goal": "record-reconciliation-v1",
+          "timestamp": 1775993361812,
+          "decision": "allow",
+          "payload_hash": [
+            201,
+            158,
+            219,
+            91,
+            94,
+            22,
+            59,
+            7,
+            114,
+            113,
+            171,
+            86,
+            254,
+            234,
+            18,
+            94,
+            65,
+            200,
+            89,
+            233,
+            243,
+            146,
+            215,
+            86,
+            89,
+            69,
+            235,
+            165,
+            91,
+            253,
+            237,
+            49
+          ]
+        },
+        {
+          "id": "submit_finding/agent-04/1775993366104",
+          "kind": "submit_finding",
+          "actor": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-04/incarnation/1",
+          "goal": "record-reconciliation-v1",
+          "timestamp": 1775993366104,
+          "decision": "allow",
+          "payload_hash": [
+            98,
+            3,
+            251,
+            75,
+            18,
+            89,
+            227,
+            152,
+            188,
+            73,
+            39,
+            203,
+            148,
+            251,
+            212,
+            45,
+            89,
+            72,
+            135,
+            8,
+            175,
+            198,
+            101,
+            86,
+            121,
+            245,
+            38,
+            192,
+            159,
+            162,
+            6,
+            68
+          ]
+        },
+        {
+          "id": "submit_finding/agent-05/1775993369619",
+          "kind": "submit_finding",
+          "actor": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-05/incarnation/1",
+          "goal": "record-reconciliation-v1",
+          "timestamp": 1775993369619,
+          "decision": "allow",
+          "payload_hash": [
+            249,
+            202,
+            209,
+            201,
+            170,
+            159,
+            7,
+            221,
+            68,
+            183,
+            48,
+            38,
+            78,
+            154,
+            132,
+            40,
+            76,
+            168,
+            117,
+            140,
+            173,
+            187,
+            84,
+            154,
+            174,
+            53,
+            35,
+            115,
+            102,
+            183,
+            5,
+            58
+          ]
+        },
+        {
+          "id": "submit_finding/agent-06/1775993365302",
+          "kind": "submit_finding",
+          "actor": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-06/incarnation/1",
+          "goal": "record-reconciliation-v1",
+          "timestamp": 1775993365302,
+          "decision": "allow",
+          "payload_hash": [
+            188,
+            0,
+            191,
+            252,
+            19,
+            218,
+            22,
+            70,
+            173,
+            122,
+            213,
+            197,
+            214,
+            190,
+            136,
+            12,
+            90,
+            82,
+            64,
+            16,
+            50,
+            231,
+            121,
+            127,
+            212,
+            219,
+            126,
+            236,
+            219,
+            242,
+            247,
+            181
+          ]
+        },
+        {
+          "id": "submit_finding/agent-07/1775993367088",
+          "kind": "submit_finding",
+          "actor": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-07/incarnation/1",
+          "goal": "record-reconciliation-v1",
+          "timestamp": 1775993367088,
+          "decision": "allow",
+          "payload_hash": [
+            13,
+            135,
+            94,
+            76,
+            99,
+            169,
+            227,
+            124,
+            116,
+            203,
+            248,
+            94,
+            91,
+            66,
+            159,
+            67,
+            142,
+            167,
+            26,
+            67,
+            245,
+            177,
+            198,
+            172,
+            11,
+            101,
+            50,
+            132,
+            78,
+            255,
+            228,
+            249
+          ]
+        },
+        {
+          "id": "submit_finding/agent-08/1775993368411",
+          "kind": "submit_finding",
+          "actor": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-08/incarnation/1",
+          "goal": "record-reconciliation-v1",
+          "timestamp": 1775993368411,
+          "decision": "allow",
+          "payload_hash": [
+            251,
+            56,
+            247,
+            147,
+            64,
+            33,
+            202,
+            60,
+            191,
+            102,
+            135,
+            219,
+            229,
+            92,
+            52,
+            86,
+            120,
+            161,
+            136,
+            70,
+            243,
+            140,
+            12,
+            249,
+            52,
+            25,
+            184,
+            221,
+            32,
+            92,
+            131,
+            163
+          ]
+        },
+        {
+          "id": "submit_finding/agent-09/1775993363970",
+          "kind": "submit_finding",
+          "actor": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-09/incarnation/1",
+          "goal": "record-reconciliation-v1",
+          "timestamp": 1775993363970,
+          "decision": "allow",
+          "payload_hash": [
+            176,
+            130,
+            102,
+            53,
+            192,
+            104,
+            47,
+            95,
+            161,
+            162,
+            33,
+            179,
+            25,
+            172,
+            200,
+            105,
+            33,
+            83,
+            22,
+            13,
+            209,
+            206,
+            108,
+            105,
+            109,
+            249,
+            157,
+            153,
+            98,
+            7,
+            131,
+            51
+          ]
+        },
+        {
+          "id": "submit_artifact/agent-00/1775993435807",
+          "kind": "submit_artifact",
+          "actor": "spiffe://solos.local/tenant/prod/goal/record-reconciliation-v1/node/node-a/agent/agent-00/incarnation/1",
+          "goal": "record-reconciliation-v1",
+          "timestamp": 1775993435807,
+          "decision": "allow",
+          "payload_hash": [
+            191,
+            255,
+            211,
+            234,
+            134,
+            132,
+            8,
+            231,
+            119,
+            69,
+            175,
+            37,
+            74,
+            78,
+            206,
+            131,
+            4,
+            240,
+            152,
+            216,
+            165,
+            63,
+            234,
+            149,
+            140,
+            13,
+            118,
+            191,
+            32,
+            213,
+            50,
+            125
+          ]
+        }
+      ]
+    },
+    "signed_tree_head": {
+      "payload": {
+        "log_id": "audit-live-20260412-132831",
+        "size": 428,
+        "root": [
+          16,
+          242,
+          177,
+          112,
+          186,
+          35,
+          84,
+          39,
+          53,
+          166,
+          159,
+          125,
+          11,
+          213,
+          112,
+          107,
+          165,
+          156,
+          136,
+          60,
+          136,
+          1,
+          0,
+          229,
+          65,
+          80,
+          179,
+          149,
+          35,
+          250,
+          108,
+          198
+        ],
+        "timestamp": 1775993435807
+      },
+      "signer": [
+        77,
+        10,
+        144,
+        199,
+        186,
+        0,
+        250,
+        229,
+        191,
+        117,
+        169,
+        189,
+        219,
+        157,
+        42,
+        218,
+        18,
+        168,
+        89,
+        192,
+        137,
+        230,
+        29,
+        52,
+        165,
+        107,
+        183,
+        82,
+        111,
+        101,
+        165,
+        119
+      ],
+      "signature": [
+        207,
+        244,
+        125,
+        29,
+        233,
+        123,
+        44,
+        166,
+        171,
+        99,
+        11,
+        75,
+        213,
+        213,
+        203,
+        78,
+        137,
+        223,
+        205,
+        87,
+        74,
+        23,
+        124,
+        97,
+        112,
+        168,
+        231,
+        176,
+        11,
+        52,
+        24,
+        130,
+        9,
+        166,
+        217,
+        127,
+        228,
+        192,
+        152,
+        19,
+        164,
+        75,
+        180,
+        33,
+        164,
+        223,
+        146,
+        231,
+        225,
+        104,
+        72,
+        219,
+        104,
+        93,
+        145,
+        226,
+        87,
+        103,
+        52,
+        76,
+        153,
+        153,
+        221,
+        158
+      ]
+    },
+    "desired_swarms": {
+      "record-reconciliation-v1": [
+        "operator-01",
+        {
+          "id": "reconcile-10",
+          "goal_id": "record-reconciliation-v1",
+          "tenant": "prod",
+          "model": "deepseek-chat",
+          "provider": "deepseek",
+          "strategy": "SPREAD",
+          "agents": [
+            {
+              "id": "agent-00"
+            },
+            {
+              "id": "agent-01"
+            },
+            {
+              "id": "agent-02"
+            },
+            {
+              "id": "agent-03"
+            },
+            {
+              "id": "agent-04"
+            },
+            {
+              "id": "agent-05"
+            },
+            {
+              "id": "agent-06"
+            },
+            {
+              "id": "agent-07"
+            },
+            {
+              "id": "agent-08"
+            },
+            {
+              "id": "agent-09"
+            }
+          ]
+        }
+      ]
+    },
+    "final_evaluations": {
+      "record-reconciliation-v1": {
+        "payload": {
+          "request_id": "eval-final",
+          "goal_id": "record-reconciliation-v1",
+          "evaluator_id": "evaluator-01",
+          "state_revision": 428,
+          "attempt_id": "attempt-final",
+          "phase": "final_holdout",
+          "verdict": "PASS",
+          "score": {
+            "value": 1.0,
+            "evaluator_id": "evaluator-01"
+          },
+          "measurements": {
+            "exact": 1.0,
+            "mismatches": 15
+          },
+          "measured_ms": 124782
+        },
+        "signer": [
+          250,
+          189,
+          52,
+          57,
+          217,
+          100,
+          209,
+          61,
+          163,
+          255,
+          165,
+          56,
+          50,
+          99,
+          147,
+          227,
+          168,
+          67,
+          211,
+          90,
+          188,
+          69,
+          60,
+          57,
+          81,
+          31,
+          232,
+          5,
+          123,
+          242,
+          117,
+          201
+        ],
+        "signature": [
+          16,
+          94,
+          130,
+          127,
+          238,
+          200,
+          204,
+          91,
+          38,
+          61,
+          246,
+          56,
+          242,
+          128,
+          238,
+          76,
+          42,
+          100,
+          78,
+          29,
+          69,
+          48,
+          217,
+          205,
+          74,
+          248,
+          46,
+          53,
+          237,
+          195,
+          26,
+          116,
+          218,
+          233,
+          8,
+          104,
+          155,
+          119,
+          112,
+          1,
+          59,
+          105,
+          80,
+          196,
+          141,
+          234,
+          5,
+          5,
+          122,
+          255,
+          211,
+          177,
+          72,
+          248,
+          191,
+          21,
+          212,
+          130,
+          57,
+          159,
+          145,
+          144,
+          7,
+          208
+        ]
+      }
+    }
+  }
+}

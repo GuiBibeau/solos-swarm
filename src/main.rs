@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -23,6 +23,7 @@ use tokio::{
     process::{Child, ChildStdin, Command},
     sync::{Mutex, Semaphore, mpsc},
 };
+use zeroize::Zeroizing;
 
 #[derive(Parser)]
 #[command(version, about = "Governed Rust/Pi swarm runtime")]
@@ -515,7 +516,11 @@ fn model_revision(upstream: &Upstream) -> String {
 }
 /// Build the transport for a resolved upstream, so both shipped profiles share
 /// one receipt, bound and error path.
-fn provider_for(upstream: &Upstream, client: reqwest::Client, key: String) -> OpenAiCompatible {
+fn provider_for(
+    upstream: &Upstream,
+    client: reqwest::Client,
+    key: Zeroizing<String>,
+) -> OpenAiCompatible {
     OpenAiCompatible {
         endpoint: endpoint(&upstream.provider).expect("resolved upstream endpoint"),
         dialect: upstream.dialect,
@@ -551,12 +556,10 @@ async fn run(options: RunOptions) -> Result<()> {
     let key = if let Some(path) = credential_file {
         let result = fs::read_to_string(&path);
         let _ = fs::remove_file(&path);
-        result
-            .context("cannot read broker credential")?
-            .trim()
-            .to_owned()
+        let raw = Zeroizing::new(result.context("cannot read broker credential")?);
+        Zeroizing::new(raw.trim().to_owned())
     } else {
-        String::new()
+        Zeroizing::new(String::new())
     };
     let mut goal: Goal =
         serde_yaml::from_slice(&fs::read(&config)?).context("invalid Goal YAML")?;
@@ -599,7 +602,7 @@ async fn run(options: RunOptions) -> Result<()> {
     // A Goal frozen before `upstream` existed carries neither the extra key nor
     // the derived revision, so its digest and manifest are unchanged; a Goal
     // that names its upstream records both.
-    let mut manifest = json!({"schema_version":1,"live":!idle,"provider":upstream.provider,"model":goal.model,"model_revision":model_revision(&upstream),"pi_version":"1.1.0","topology":"single-host","isolation":"bubblewrap-unshare-all","runtime_sha256":file_digest(&executable)?,"extension_sha256":file_digest(&root.join("extensions/broker.ts"))?,"package_lock_sha256":file_digest(&root.join("package-lock.json"))?,"artifacts":{"config.yaml":file_digest(&config_path)?},"seed":goal.seed,"catalog_version":goal.catalog_version,"scorer_version":goal.scorer_version,"started_ms":now_ms(),"price_table":{"revision":format!("{}-2026-10-12-conservative-peak",upstream.provider),"input_microusd_per_million":goal.input_price_microusd_per_million,"output_microusd_per_million":goal.output_price_microusd_per_million,"cache_hit_microusd_per_million":goal.cache_hit_price_microusd_per_million},"deadline_seconds":deadline,"deferred":["Raft/QUIC and multi-host HA","500-agent acceptance","SVID and signed audit witness","Firecracker tools/full Tier P","local provider and air gap","policy actors/module unloading/retractions","history optimization and three-family rotation"]});
+    let mut manifest = json!({"schema_version":1,"live":!idle,"provider":upstream.provider,"model":goal.model,"model_revision":model_revision(&upstream),"pi_version":"1.1.0","topology":"single-host","isolation":"bubblewrap-unshare-all","runtime_sha256":file_digest(&executable)?,"extension_sha256":file_digest(&root.join("extensions/broker.ts"))?,"package_lock_sha256":file_digest(&root.join("package-lock.json"))?,"artifacts":{"config.yaml":file_digest(&config_path)?},"seed":goal.seed,"catalog_version":goal.catalog_version,"scorer_version":goal.scorer_version,"started_ms":now_ms(),"price_table":{"revision":format!("{}-2026-10-27-conservative-peak-cache-aware",upstream.provider),"input_microusd_per_million":goal.input_price_microusd_per_million,"cache_hit_microusd_per_million":goal.cache_hit_price_microusd_per_million.unwrap_or(goal.input_price_microusd_per_million),"output_microusd_per_million":goal.output_price_microusd_per_million},"deadline_seconds":deadline,"deferred":["Raft/QUIC and multi-host HA","500-agent acceptance","SVID and signed audit witness","Firecracker tools/full Tier P","local provider and air gap","policy actors/module unloading/retractions","history optimization and three-family rotation"]});
     // The checker's legacy provider check reads this key; present it only when
     // it is accurate, so an old manifest stays byte-identical and a Venice one
     // is never mislabelled.
@@ -639,9 +642,10 @@ async fn run(options: RunOptions) -> Result<()> {
         client,
         code,
     };
-    let socket = std::env::temp_dir().join(format!("swarm-{}.sock", uuid::Uuid::new_v4()));
-    let listener = UnixListener::bind(&socket)?;
-    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
+    // Bind inside the 0700 run directory. A world-writable temp socket plus a
+    // later chmod leaves a window where another user can connect.
+    let broker_socket = prepare_broker_socket(&run_dir)?;
+    let listener = UnixListener::bind(&broker_socket.path).context("broker socket bind failed")?;
     let server = tokio::spawn(async move { axum::serve(listener, router(broker)).await });
     let settings = run_dir.join("pi-settings.json");
     write_json(
@@ -663,7 +667,7 @@ async fn run(options: RunOptions) -> Result<()> {
         let mut child = match sandbox(
             &node,
             &root,
-            &socket,
+            &broker_socket.path,
             &settings,
             &goal.grants.join(","),
             &token,
@@ -798,7 +802,7 @@ async fn run(options: RunOptions) -> Result<()> {
     }
     server.abort();
     let _ = server.await;
-    let _ = fs::remove_file(&socket);
+    broker_socket.cleanup();
     {
         let mut state = store.lock().await;
         for intent in &mut state.intents {
@@ -822,6 +826,51 @@ async fn run(options: RunOptions) -> Result<()> {
         json!({"runtime_verdict":if runtime_pass {"PASS"}else{"FAIL"},"run_dir":run_dir,"cleanup_verdict":if remaining==0 {"PASS"}else{"INCONCLUSIVE"}})
     );
     result
+}
+
+/// `sockaddr_un.sun_path` is 108 bytes and must also store a trailing NUL.
+const SUN_PATH_LIMIT: usize = 108;
+
+struct BrokerSocket {
+    path: PathBuf,
+    private_dir: Option<PathBuf>,
+}
+
+impl BrokerSocket {
+    fn cleanup(&self) {
+        let _ = fs::remove_file(&self.path);
+        if let Some(dir) = &self.private_dir {
+            let _ = fs::remove_dir(dir);
+        }
+    }
+}
+
+impl Drop for BrokerSocket {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+fn sun_path_fits(path: &Path) -> bool {
+    path.as_os_str().as_encoded_bytes().len() < SUN_PATH_LIMIT
+}
+
+fn prepare_broker_socket(run_dir: &Path) -> Result<BrokerSocket> {
+    let path = run_dir.join("broker.sock");
+    if sun_path_fits(&path) {
+        return Ok(BrokerSocket {
+            path,
+            private_dir: None,
+        });
+    }
+    let private_dir = std::env::temp_dir().join(format!("ss-{}", uuid::Uuid::new_v4().as_simple()));
+    let path = private_dir.join("socket");
+    ensure!(sun_path_fits(&path), "broker socket path exceeds SUN_LEN");
+    fs::DirBuilder::new().mode(0o700).create(&private_dir)?;
+    Ok(BrokerSocket {
+        path,
+        private_dir: Some(private_dir),
+    })
 }
 
 fn main() {
@@ -1100,6 +1149,7 @@ async fn fetch_probe(root: &Path, node: &Path, url: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::net::UnixListener; // std, not the tokio listener the daemon binds
 
     fn task() -> broker::Task {
         serde_json::from_value(json!({
@@ -1139,5 +1189,63 @@ mod tests {
         let unclaimed = nudge(NUDGE_MANDATORY_AT, "agent-07", None);
         assert!(unclaimed.contains("submit_finding exactly once"));
         assert!(!unclaimed.contains("lens-04"));
+    }
+
+    // Broker socket placement (main #5).
+    #[test]
+    fn broker_socket_binds_inside_private_run_dir() {
+        let run_dir = std::env::temp_dir().join(format!("ss-run-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&run_dir).unwrap();
+        fs::set_permissions(&run_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let candidate = run_dir.join("broker.sock");
+        let socket = prepare_broker_socket(&run_dir).unwrap();
+        assert!(sun_path_fits(&socket.path));
+        if sun_path_fits(&candidate) {
+            assert!(socket.private_dir.is_none());
+            assert_eq!(socket.path, candidate);
+        } else {
+            let private_dir = socket.private_dir.clone().unwrap();
+            assert_eq!(socket.path, private_dir.join("socket"));
+            assert_eq!(
+                fs::metadata(&private_dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        let listener = UnixListener::bind(&socket.path).unwrap();
+        drop(listener);
+        let private_dir = socket.private_dir.clone();
+        socket.cleanup();
+        assert!(!socket.path.exists());
+        if let Some(dir) = private_dir {
+            assert!(!dir.exists());
+        }
+        fs::remove_dir_all(run_dir).unwrap();
+    }
+
+    #[test]
+    fn long_run_dir_creates_mode_700_dir_before_bind() {
+        let parent =
+            std::env::temp_dir().join(format!("ss-long-{}", uuid::Uuid::new_v4().as_simple()));
+        let run_dir = parent.join("r".repeat(80));
+        fs::create_dir_all(&run_dir).unwrap();
+        let candidate = run_dir.join("broker.sock");
+        assert!(
+            !sun_path_fits(&candidate),
+            "fixture path must exceed SUN_LEN"
+        );
+        let socket = prepare_broker_socket(&run_dir).unwrap();
+        let private_dir = socket.private_dir.clone().expect("fallback directory");
+        assert_eq!(socket.path, private_dir.join("socket"));
+        assert!(sun_path_fits(&socket.path));
+        assert_eq!(
+            fs::metadata(&private_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let listener = UnixListener::bind(&socket.path).unwrap();
+        drop(listener);
+        socket.cleanup();
+        assert!(!socket.path.exists());
+        assert!(!private_dir.exists());
+        fs::remove_dir_all(parent).unwrap();
     }
 }

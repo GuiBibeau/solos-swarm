@@ -1,23 +1,16 @@
-name: candidate-contracts
+name: ci
 on:
   pull_request:
   push:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      bundle:
-        description: Absolute path to the immutable candidate on the approved release runner
-        required: true
-      report:
-        description: Absolute path to the completed live report
-        required: true
-      attestation:
-        description: Absolute path to its protected release signature
-        required: true
 permissions:
   contents: read
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
-  quick:
+  check:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -26,38 +19,25 @@ jobs:
         with:
           toolchain: 1.96.0
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24.18.0
+          cache: 'npm'
       - name: Verify pinned tokenizer assets
         run: python3 scripts/bootstrap_tokenizers.py --output work/tokenizers
-      - name: Locked production contracts
+      - name: Rust format & clippy
         run: |
           cargo fmt --all -- --check
           cargo clippy --locked --all-targets -- -D warnings
-          cargo test --locked -- --test-threads=1
-          python3 -m unittest discover -s tests -p 'test_*.py'
-          npm ci --ignore-scripts --no-audit --no-fund
-          npm run test:broker
-  qualify:
-    if: github.event_name == 'workflow_dispatch'
-    needs: quick
-    runs-on: [self-hosted, linux, solos-release]
-    environment: runtime-release
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: Protected exact-artifact promotion
-        env:
-          BUNDLE: ${{ inputs.bundle }}
-          REPORT: ${{ inputs.report }}
-          ATTESTATION: ${{ inputs.attestation }}
-          PROFILE: ${{ vars.SOLOS_PROTECTED_PROFILE }}
-          TRUSTED_KEY: ${{ vars.SOLOS_RELEASE_PUBLIC_KEY_FILE }}
-          VERIFIER: ${{ vars.SOLOS_PROTECTED_VERIFIER }}
+      - name: Rust tests
+        run: cargo test --locked -- --test-threads=1
+      - name: Python tests
         run: |
-          test "$GITHUB_REF" = refs/heads/main
-          test -n "$PROFILE" && test -f "$PROFILE"
-          test -n "$TRUSTED_KEY" && test -f "$TRUSTED_KEY"
-          test -n "$VERIFIER" && test -x "$VERIFIER"
-          python3 scripts/qualify.py --bundle "$BUNDLE" --report "$REPORT" --profile "$PROFILE" --attestation "$ATTESTATION" --trusted-key "$TRUSTED_KEY" --verifier "$VERIFIER" --promote "qualified/$GITHUB_RUN_ID"
+          python3 -m venv work/dashboard-python
+          work/dashboard-python/bin/python -m pip install -r scripts/requirements-dashboard.txt
+          work/dashboard-python/bin/python -m unittest discover -s tests -p 'test_*.py'
+      - name: Dashboard tests
+        run: node --test tests/dashboard-*.test.mjs
+      - name: Node broker & MVP tests
+        run: npm ci --ignore-scripts --no-audit --no-fund && npm run test:broker

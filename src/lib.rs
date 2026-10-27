@@ -1,4 +1,6 @@
 //! Authoritative swarm state, policy and replicated storage shared by CLI and brokers.
+// broker.rs is also compiled into the bin and tests, where it names this crate as `solos_swarm`.
+extern crate self as solos_swarm;
 pub mod artifacts;
 pub mod audit;
 pub mod broker;
