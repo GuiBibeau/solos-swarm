@@ -37,7 +37,7 @@ export default function swarmBroker(pi: ExtensionAPI) {
     models: [{
       id: "deepseek-flash", name: "Brokered DeepSeek Flash", reasoning: false,
       input: ["text"], contextWindow: 128_000, maxTokens: 4096,
-      cost: { input: 0.3, output: 1.2, cacheRead: 0.03, cacheWrite: 0 },
+      cost: { input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0 },
       compat: { supportsStore: false, supportsDeveloperRole: false, maxTokensField: "max_tokens", supportsStrictMode: false },
     }],
     streamSimple(model, context, options) {

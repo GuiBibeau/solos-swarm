@@ -72,7 +72,7 @@ def project_runtime(state, config, label, updated_at, service_active=None):
             "state": text(intent.get("state"), 40),
             "hold_microusd": number(intent.get("hold_microusd")),
             "cost_microusd": number(intent.get("cost_microusd")),
-            "usage": {key: number(usage.get(key)) for key in ("input_tokens", "output_tokens")} if isinstance(usage, dict) else None,
+            "usage": {key: number(usage[key]) for key in ("input_tokens", "output_tokens", "cached_input_tokens", "uncached_input_tokens") if key in usage} if isinstance(usage, dict) else None,
             "provider": text(intent.get("provider"), 80),
         })
     findings = []
