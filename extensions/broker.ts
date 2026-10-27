@@ -47,7 +47,8 @@ export default function swarmBroker(pi: ExtensionAPI) {
     streamSimple(model, context, options) {
       let costMicrousd: number | undefined;
       const upstream = openAICompletionsApi().streamSimple({ ...model, api: "openai-completions" }, context, {
-        ...options, maxRetries: 0,
+        ...options, maxRetries: 0, timeoutMs: 86_400_000, // a paused broker may keep a call waiting for hours; the SDK default is 10 min
+        
         fetch: async (input, init) => {
           const incoming = new Request(input, init);
           const payload = await incoming.json();
