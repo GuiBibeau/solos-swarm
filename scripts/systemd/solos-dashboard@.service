@@ -2,13 +2,16 @@
 # Install on the box:  mkdir -p ~/.config/systemd/user && cp solos-dashboard@.service ~/.config/systemd/user/
 #                      systemctl --user daemon-reload
 # Start for a run:     systemctl --user start solos-dashboard@RUN_ID      (not enabled, never started automatically)
-# SWARM_REPO is the checkout on the box; edit the two paths below if it differs.
+# The box has no source checkout: scripts live inside each immutable candidate under ~/.local/share/solos-swarm/<id>/.
+# Put a line  DASHBOARD_CANDIDATE=<id>  in ~/.config/solos-swarm/dashboard.env (a candidate cannot name its own id) for any deployed candidate that contains scripts/dashboard_server.py (never the one a live
+# run depends on being replaced: this unit only reads it).
 [Unit]
 Description=solos-swarm dashboard for run %i (127.0.0.1 only)
 
 [Service]
-ExecStart=/usr/bin/python3 %h/solos-swarm/scripts/dashboard_server.py --state %h/.local/state/solos-swarm/runs/%i/state.json --config %h/.local/state/solos-swarm/runs/%i/config.yaml --port ${DASHBOARD_PORT}
+ExecStart=/usr/bin/python3 %h/.local/share/solos-swarm/${DASHBOARD_CANDIDATE}/scripts/dashboard_server.py --state %h/.local/state/solos-swarm/runs/%i/state.json --config %h/.local/state/solos-swarm/runs/%i/config.yaml --port ${DASHBOARD_PORT}
 Environment=DASHBOARD_PORT=4173
+EnvironmentFile=%h/.config/solos-swarm/dashboard.env
 Restart=on-failure
 MemoryMax=512M
 Nice=10

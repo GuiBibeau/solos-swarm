@@ -92,7 +92,7 @@ scripts/dashboard-tunnel.sh --start RUN_ID            # = ssh -N -L 4173:127.0.0
 scripts/dashboard-tunnel.sh --dry-run                 # print the commands only
 ```
 
-The unit reads the run's `state.json` and `config.yaml` read-only and starts no agents. Edit the repo path in the unit if the box checkout is not `~/solos-swarm`.
+The unit reads the run's `state.json` and `config.yaml` read-only and starts no agents. The box has no source checkout, so the unit runs `dashboard_server.py` from a deployed candidate (`~/.local/share/solos-swarm/<id>/scripts/`): put `DASHBOARD_CANDIDATE=<id>` in `~/.config/solos-swarm/dashboard.env` on the box before starting it.
 
 ### Replay-scored policy loop
 
