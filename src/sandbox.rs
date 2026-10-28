@@ -825,8 +825,8 @@ mod tests {
             assert!(status.success());
             return;
         }
-        // SAFETY: prctl with PR_SET_NO_NEW_PRIVS takes only integer arguments.
         assert_eq!(
+            // SAFETY: prctl with PR_SET_NO_NEW_PRIVS takes only integer arguments.
             unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
             0
         );
