@@ -608,6 +608,7 @@ unsafe extern "C" {
     fn dup(fd: i32) -> i32;
 }
 fn uid() -> u32 {
+    // SAFETY: geteuid(2) takes no arguments, cannot fail and touches no memory.
     unsafe { geteuid() }
 }
 fn public_json<T: serde::de::DeserializeOwned>(path: &Path, max: usize) -> Result<T> {
@@ -708,8 +709,10 @@ async fn credential(source: &CredentialSource) -> Result<Zeroizing<String>> {
                 *fd >= 3,
                 "credential descriptor cannot be a standard stream"
             );
+            // SAFETY: dup(2) only reads an integer descriptor; failure is returned as -1 and checked below.
             let copied = unsafe { dup(*fd) };
             ensure!(copied >= 0, "inherited credential descriptor absent");
+            // SAFETY: `copied` is a fresh descriptor (>= 0, checked above) owned by nothing else.
             let file = unsafe { std::fs::File::from_raw_fd(copied) };
             tokio::task::spawn_blocking(move || bounded_credential_fd(file)).await??
         }

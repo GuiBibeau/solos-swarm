@@ -60,5 +60,22 @@ landlock = "=0.4.7"
 seccompiler = "=0.5.0"
 libc = "=0.2.190"
 
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+# Google guidance: unsafe must be small and its correctness documented.
+undocumented_unsafe_blocks = "warn"
+missing_safety_doc = "warn"
+# Debug leftovers do not ship.
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+wildcard_imports = "warn"
+# Deferred (too many hits for a mechanical PR; tracked in docs/rust-style.md):
+# unwrap_used / expect_used (non-test: ~110), enum_glob_use (5), must_use_candidate (~150),
+# cast_possible_truncation / cast_sign_loss / cast_possible_wrap (~70), missing_errors_doc (~300).
+
 [profile.release]
 strip = true
