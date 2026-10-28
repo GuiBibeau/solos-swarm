@@ -118,7 +118,8 @@ def event_evidence(events, state, config):
     if not matching("goal_registered", config_sha256=config["config_sha256"]):
         issues.append("Goal registration missing or has wrong config digest")
     for identity in state["agents"]:
-        if len(matching("agent_started", agent_id=identity)) != 1 or len(matching("agent_stopped", agent_id=identity)) != 1:
+        # A drained run that was resumed stops once more per resume (the runtime does not yet resume; this keeps the rule honest).
+        if len(matching("agent_started", agent_id=identity)) != 1 or len(matching("agent_stopped", agent_id=identity)) != 1 + len(matching("agent_resumed", agent_id=identity)):
             issues.append(f"Missing or duplicate lifecycle events for {identity}")
     for intent in state["intents"]:
         if intent.get("state") != "completed":

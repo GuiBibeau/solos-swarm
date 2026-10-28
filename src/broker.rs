@@ -1113,12 +1113,18 @@ pub fn peak_retry_after(now_secs: u64) -> Option<u64> {
         .find(|(start, end)| (*start..*end).contains(&second_of_day))
         .map(|(_, end)| end - second_of_day)
 }
-/// A pause is a `PAUSE` file in the run directory (operator) or, with `SWARM_REFUSE_PEAK=1`, a peak window. Returns the
-/// polling interval the client should wait (at most 60 s). A paused request is refused BEFORE any reservation, so it
+/// The one pause test. `control.json` in the run directory is the source of truth: an operator or the broker
+/// itself (provider outage, drain) writes `{"mode":"pause"|"drain"}` there. Two inputs feed the same answer: a
+/// `PAUSE` file (the older operator switch) and, with `SWARM_REFUSE_PEAK=1`, a peak window. Returns the polling
+/// interval the client should wait (at most 60 s). A paused request is refused BEFORE any reservation, so it
 /// costs no call, no hold and no ledger entry.
 pub fn pause_retry_after(dir: &Path, now_secs: u64) -> Option<u64> {
-    if dir.join("PAUSE").exists() {
-        return Some(60);
+    let mode = fs::read_to_string(dir.join("control.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|control| control["mode"].as_str().map(str::to_owned));
+    if matches!(mode.as_deref(), Some("pause" | "drain")) || dir.join("PAUSE").exists() {
+        return Some(30);
     }
     if std::env::var("SWARM_REFUSE_PEAK").as_deref() == Ok("1") {
         return peak_retry_after(now_secs).map(|s| s.clamp(1, 60));

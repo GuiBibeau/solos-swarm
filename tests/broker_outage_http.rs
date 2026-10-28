@@ -72,7 +72,8 @@ async fn five_outage_errors_pause_the_run_and_the_sixth_call_is_never_reserved()
         .build()
         .unwrap();
     let body = json!({"model":"deepseek-flash","messages":[{"role":"user","content":"x"}]});
-    let mut last = String::new();
+    let mut last = json!(null);
+    let mut statuses = vec![];
     // The agent retries as hard as it can; the broker, not the agent, decides when to stop.
     for _ in 0..(OUTAGE_PAUSE_AFTER + 2) {
         let response = client
@@ -82,13 +83,19 @@ async fn five_outage_errors_pause_the_run_and_the_sixth_call_is_never_reserved()
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), 403);
-        last = response.json::<Value>().await.unwrap()["error"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+        statuses.push(response.status().as_u16());
+        last = response.json::<Value>().await.unwrap();
     }
-    assert!(last.contains("run pause"), "{last}");
+    // Failures are 403 until the pause, then the paused wire the Pi extension waits on: 503 {paused}.
+    assert_eq!(&statuses[..5], &[403; 5], "{statuses:?}");
+    assert_eq!(&statuses[5..], &[503, 503], "{statuses:?}");
+    assert_eq!(last["paused"], true, "{last}");
+    let control: Value =
+        serde_json::from_slice(&fs::read(dir.join("control.json")).unwrap()).unwrap();
+    assert_eq!(
+        control["mode"], "pause",
+        "control.json is the single source"
+    );
     assert_eq!(
         calls.load(Ordering::SeqCst),
         OUTAGE_PAUSE_AFTER as usize,

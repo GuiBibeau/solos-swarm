@@ -25,9 +25,11 @@ Status: partly implemented on branch `self-update-graceful-restart`. Sections ma
 - The `mvp`/kernel path (`src/kernel.rs`, `runtime.rs`, Raft) has its own durable state with
   `budget_pauses`, `rate_pauses`, `ResumeGoal` and quota pauses (`quota.rs`). It resumes a goal
   after a pause. It is a different product path from `run` and shares no code with it.
-- The pause mode named in the task brief (`SWARM_REFUSE_PEAK` or a `PAUSE` file) is **not in
-  `origin/main` 9c7dbf1**. It must live on another branch. The control file below uses the same
-  idea (a file in the run directory that closes the gate) and will need to be reconciled with it.
+- Pause mode (PR #12) refuses `/model` with 503 `{paused, retry_after_s}` before any reservation, in a
+  weekday peak window (`SWARM_REFUSE_PEAK=1`) or while `<run-dir>/PAUSE` exists. The Pi extension waits and
+  asks again. The Goal deadline stops counting while paused. This branch makes `control.json` the single
+  source: a broker pause (outage, drain) and an operator pause both write it, and the `PAUSE` file and the peak
+  window are inputs to the same `pause_retry_after` answer. The wire behaviour is unchanged.
 
 What exists for resume after a crash: nothing on the `run` path. `recover_run.py` builds a new
 Goal from a dead run's transcripts. That starts a fresh run and re-spends the context it recovers.
@@ -241,13 +243,24 @@ systemd, `doctor` on a real host, the drain against real Pi agents under bubblew
 sandbox path cannot be run on a Mac. A live drain-then-resume of an idle probe is the first thing
 to run on the box once approved.
 
-## 5. Rollout order
+## 5. Manual probe procedure (not run; the tournament run is live)
+
+Run only when no live run needs the host. All steps are read-only or zero-spend.
+
+1. `remote.py deploy`, then `remote.py doctor`. Expect no FAIL.
+2. `remote.py candidates promote --candidate <id> --channel canary`. This runs the gate, including the idle probe.
+3. `remote.py start --candidate current --run-id probe-1 --seed 1 --idle-probe --deadline-seconds 60`, then
+   `remote.py drain --run-id probe-1 --grace-seconds 10`. Expect `drained: true` and `held_microusd: 0`.
+4. `remote.py resume --run-id probe-1 --candidate current`. Expect a plan with `charge_microusd: 0`.
+5. `remote.py candidates rollback --channel canary`, then `status` to confirm `current` moved back.
+
+## 6. Rollout order
 
 1. This branch: pointer, gate, prune, doctor, pause/drain gate, `Store::resume`, `resume-plan`,
    `smoke`. It changes only the host controller and the broker. Candidates that were already
    deployed keep working. Their manifests lack `tree_sha256`, and `promote` computes the hash
    itself.
-2. `run --resume` plus the `check_run.py` segment rule (section 3c list), then a live drain and
+2. `run --resume` (deliberately not shipped in the first PR; no experimental half-built path) plus the `check_run.py` segment rule (section 3c list), then a live drain and
    resume of an idle probe.
 3. Stall watchdog, disk floor pause, off-host alert, fallback hook.
 4. Signed pointers; a host timer for canary promotion.

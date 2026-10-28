@@ -93,6 +93,12 @@ impl Store {
         }
     }
     pub fn begin_pause(&mut self, mode: &str, reason: &str) -> Result<()> {
+        self.begin_pause_from(mode, reason, true)
+    }
+    /// `publish` mirrors the pause into `control.json`, the one file every consumer
+    /// (model handler, deadline clock, doctor) reads. A pause that arrived through
+    /// that file is not written back.
+    fn begin_pause_from(&mut self, mode: &str, reason: &str, publish: bool) -> Result<()> {
         // A drain supersedes a pause; nothing supersedes a drain.
         if self
             .pause
@@ -112,6 +118,9 @@ impl Store {
             &json!({"kind":"run_paused","pause":pause}),
         )?;
         let event = json!({"mode":pause.mode,"reason":pause.reason});
+        if publish {
+            self.publish_control(mode, reason)?;
+        }
         // The gate closes even if the log write fails.
         self.pause = Some(pause);
         self.record("run_paused", event)
@@ -124,8 +133,22 @@ impl Store {
         self.pause = None;
         self.outage_streak = 0;
         let _ = fs::remove_file(self.dir.join("alert.json"));
+        self.publish_control("run", "pause lifted")?;
         self.record("run_unpaused", json!({}))?;
         Ok(true)
+    }
+    fn publish_control(&self, mode: &str, reason: &str) -> Result<()> {
+        let path = self.dir.join("control.json");
+        let current = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+        if current.is_some_and(|c| c["mode"] == mode) {
+            return Ok(());
+        }
+        write_json(
+            &path,
+            &json!({"mode":mode,"reason":reason,"source":"broker"}),
+        )
     }
     /// No call is reserved or in flight, and no budget is held.
     pub fn quiescent(&self) -> bool {
@@ -210,10 +233,10 @@ impl Store {
         let control: Value = serde_json::from_str(text).context("control.json is not JSON")?;
         let reason = control["reason"].as_str().unwrap_or("operator request");
         match control["mode"].as_str() {
-            Some("pause") => self.begin_pause("pause", reason).map(|()| None),
+            Some("pause") => self.begin_pause_from("pause", reason, false).map(|()| None),
             Some("run") => self.lift_pause().map(|_| None),
             Some("drain") => {
-                self.begin_pause("drain", reason)?;
+                self.begin_pause_from("drain", reason, false)?;
                 let grace = control["grace_seconds"]
                     .as_u64()
                     .unwrap_or(DRAIN_GRACE_SECONDS);
