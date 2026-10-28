@@ -615,6 +615,27 @@ HOST_ACTIONS = {"candidates-list": candidates_host, "candidates-current": curren
                 "resume": resume_host, "doctor": doctor_host}
 
 
+def collect_bundle(path, out, include_code=False):
+    """Stream the run's evidence as a tar. The per-run code/ dir is agents' run_code scratch
+    (27 GB observed per run), so it stays on the host; collect-manifest.json says what was left."""
+    skipped = {"path": "code", "files": 0, "bytes": 0}
+    with tarfile.open(fileobj=out, mode="w|") as bundle:
+        for item in sorted(path.rglob("*")):
+            if not item.is_file() or item.is_symlink():
+                continue
+            relative = item.relative_to(path)
+            if relative.parts[0] == "code" and not include_code:
+                skipped["files"] += 1
+                skipped["bytes"] += item.stat().st_size
+                continue
+            bundle.add(item, arcname=str(relative), recursive=False)
+        manifest = json.dumps({"skipped": [] if include_code else [skipped], "include_code": include_code}, indent=2).encode()
+        info = tarfile.TarInfo("collect-manifest.json")
+        info.size = len(manifest)
+        info.mtime = int(time.time())
+        bundle.addfile(info, io.BytesIO(manifest))
+
+
 def host_main(action):
     if action == "deploy":
         result = deploy_host()
@@ -625,10 +646,7 @@ def host_main(action):
         if not status["service_stopped"]:
             raise ValueError("Run service is not confirmed stopped; inspect status before collecting final evidence")
         write_json(path / "controller-status.json", status)
-        with tarfile.open(fileobj=sys.stdout.buffer, mode="w|") as bundle:
-            for item in sorted(path.rglob("*")):
-                if item.is_file() and not item.is_symlink():
-                    bundle.add(item, arcname=str(item.relative_to(path)), recursive=False)
+        collect_bundle(path, sys.stdout.buffer, bool(request.get("include_code")))
         return
     else:
         request = json.load(sys.stdin)
@@ -768,6 +786,7 @@ def main():
         command.add_argument("--run-id", required=True)
         if action == "collect":
             command.add_argument("--output", required=True, type=Path)
+            command.add_argument("--include-code", action="store_true", help="Also stream the per-run code/ scratch dir (can be tens of GB)")
     candidates = subparsers.add_parser("candidates", help="Channel pointers: which candidate new runs use").add_subparsers(dest="verb", required=True)
     for verb in ("list", "current", "promote", "rollback", "prune"):
         sub = candidates.add_parser(verb, parents=[common])
@@ -828,7 +847,7 @@ def main():
             print(json.dumps(call_host("resume", {"run_id": args.run_id, "candidate_id": candidate}, host), indent=2))
             return
         run_path(args.run_id)
-        request = {"run_id": args.run_id}
+        request = {"run_id": args.run_id, "include_code": getattr(args, "include_code", False)}
         if args.action == "start":
             candidate = args.candidate
             if candidate == "current":
