@@ -1189,7 +1189,7 @@ async fn unpaused_deadline(deadline: u64, run_dir: PathBuf) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        if broker::pause_retry_after(&run_dir, now).is_none() {
+        if broker::effective_control(&run_dir, now).is_none() {
             left -= step;
         }
     }

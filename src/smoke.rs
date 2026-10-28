@@ -80,7 +80,7 @@ pub async fn run(dir: &Path) -> Result<Value> {
     let (status, _) = post("model", body.clone()).await?;
     check(
         "pause_refuses_model",
-        status == 403 && store.lock().await.agents["agent-00"].model_calls == calls,
+        status == 503 && store.lock().await.agents["agent-00"].model_calls == calls,
     );
     store.lock().await.lift_pause()?;
     check("unpause_admits", post("model", body).await?.0 == 200);

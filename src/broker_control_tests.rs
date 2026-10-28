@@ -352,26 +352,26 @@ impl Goal {
 fn control_json_the_pause_file_and_the_peak_window_are_one_pause() {
     let (_goal, mut store, dir) = setup();
     let now = 1_700_000_000; // a Tuesday, outside every peak window
-    assert!(pause_retry_after(&dir, now).is_none());
+    assert!(effective_control(&dir, now).is_none());
     store.begin_pause("pause", "operator").unwrap();
     assert!(
-        pause_retry_after(&dir, now).is_some(),
+        effective_control(&dir, now).is_some(),
         "a broker pause is visible through control.json"
     );
     store.lift_pause().unwrap();
-    assert!(pause_retry_after(&dir, now).is_none());
+    assert!(effective_control(&dir, now).is_none());
     fs::write(dir.join("PAUSE"), "").unwrap();
     assert_eq!(
-        pause_retry_after(&dir, now),
-        Some(30),
+        effective_control(&dir, now),
+        Some(60),
         "the PAUSE file is an input to the same answer"
     );
     fs::remove_file(dir.join("PAUSE")).unwrap();
     // The operator writes control.json directly; the deadline clock and handler both see it.
     fs::write(dir.join("control.json"), r#"{"mode":"drain"}"#).unwrap();
-    assert!(pause_retry_after(&dir, now).is_some());
+    assert!(effective_control(&dir, now).is_some());
     fs::write(dir.join("control.json"), r#"{"mode":"run"}"#).unwrap();
-    assert!(pause_retry_after(&dir, now).is_none());
+    assert!(effective_control(&dir, now).is_none());
     // 2026-10-28 02:00 UTC is a Wednesday peak window: the env input pauses and is bounded to 60 s.
     assert_eq!(peak_retry_after(1_793_152_800).map(|s| s > 0), Some(true));
     fs::remove_dir_all(dir).unwrap();

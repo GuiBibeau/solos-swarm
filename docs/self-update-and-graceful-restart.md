@@ -29,7 +29,7 @@ Status: partly implemented on branch `self-update-graceful-restart`. Sections ma
   weekday peak window (`SWARM_REFUSE_PEAK=1`) or while `<run-dir>/PAUSE` exists. The Pi extension waits and
   asks again. The Goal deadline stops counting while paused. This branch makes `control.json` the single
   source: a broker pause (outage, drain) and an operator pause both write it, and the `PAUSE` file and the peak
-  window are inputs to the same `pause_retry_after` answer. The wire behaviour is unchanged.
+  window are inputs to the same `effective_control` answer. The wire behaviour is unchanged.
 
 What exists for resume after a crash: nothing on the `run` path. `recover_run.py` builds a new
 Goal from a dead run's transcripts. That starts a fresh run and re-spends the context it recovers.

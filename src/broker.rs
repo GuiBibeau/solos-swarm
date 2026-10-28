@@ -1118,13 +1118,16 @@ pub fn peak_retry_after(now_secs: u64) -> Option<u64> {
 /// `PAUSE` file (the older operator switch) and, with `SWARM_REFUSE_PEAK=1`, a peak window. Returns the polling
 /// interval the client should wait (at most 60 s). A paused request is refused BEFORE any reservation, so it
 /// costs no call, no hold and no ledger entry.
-pub fn pause_retry_after(dir: &Path, now_secs: u64) -> Option<u64> {
+pub fn effective_control(dir: &Path, now_secs: u64) -> Option<u64> {
     let mode = fs::read_to_string(dir.join("control.json"))
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .and_then(|control| control["mode"].as_str().map(str::to_owned));
-    if matches!(mode.as_deref(), Some("pause" | "drain")) || dir.join("PAUSE").exists() {
+    if matches!(mode.as_deref(), Some("pause" | "drain")) {
         return Some(30);
+    }
+    if dir.join("PAUSE").exists() {
+        return Some(60);
     }
     if std::env::var("SWARM_REFUSE_PEAK").as_deref() == Ok("1") {
         return peak_retry_after(now_secs).map(|s| s.clamp(1, 60));
@@ -1155,7 +1158,7 @@ async fn model(
             store.dir.clone(),
         )
     };
-    if let Some(wait) = pause_retry_after(&run_dir, unix_secs()) {
+    if let Some(wait) = effective_control(&run_dir, unix_secs()) {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(
