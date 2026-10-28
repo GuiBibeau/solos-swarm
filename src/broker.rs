@@ -320,7 +320,7 @@ fn open() -> String {
     "open".into()
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Agent {
     pub started_ms: u64,
     pub stopped_ms: Option<u64>,
@@ -337,13 +337,13 @@ pub struct Agent {
     pub run_code_calls: u32,
     pub notes: Vec<String>,
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Finding {
     pub agent_id: String,
     pub task_id: String,
     pub result: Value,
 }
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Intent {
     pub id: String,
     pub agent_id: String,
@@ -404,12 +404,20 @@ pub struct Store {
     pub spent_microusd: u64,
     pub held_microusd: u64,
     pub artifact: Option<Value>,
+    /// Set while the broker refuses new model work (operator drain or pause,
+    /// provider outage). Absent from state.json when the run is not paused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pause: Option<Pause>,
     #[serde(skip)]
     pub dir: PathBuf,
     #[serde(skip)]
     log: File,
-    #[serde(skip)]
+    /// Sequence of the last event; written to state.json so a resume can prove
+    /// state.json and events.jsonl describe the same instant.
+    #[serde(rename = "last_seq")]
     seq: u64,
+    #[serde(skip)]
+    outage_streak: u32,
     #[serde(skip)]
     previous_hash: String,
     #[serde(skip)]
@@ -429,6 +437,8 @@ impl Store {
             spent_microusd: 0,
             held_microusd: 0,
             artifact: None,
+            pause: None,
+            outage_streak: 0,
             dir: dir.into(),
             log: OpenOptions::new()
                 .create_new(true)
@@ -461,9 +471,17 @@ impl Store {
     pub fn admit(&mut self, id: &str) -> Result<String> {
         let token = uuid::Uuid::new_v4().to_string();
         self.tokens.insert(token.clone(), id.into());
-        self.agents.insert(
-            id.into(),
-            Agent {
+        // A resumed agent keeps its counters, so the call ceiling and envelope
+        // see its whole history rather than a fresh process.
+        let prior = self.agents.remove(id);
+        let resumed = prior.is_some();
+        let agent = match prior {
+            Some(mut agent) => {
+                agent.status = "running".into();
+                agent.stopped_ms = None;
+                agent
+            }
+            None => Agent {
                 started_ms: now_ms(),
                 stopped_ms: None,
                 successful_model_calls: 0,
@@ -474,8 +492,14 @@ impl Store {
                 run_code_calls: 0,
                 notes: vec![],
             },
-        );
-        self.record("agent_started", json!({"agent_id":id}))?;
+        };
+        self.agents.insert(id.into(), agent);
+        let kind = if resumed {
+            "agent_resumed"
+        } else {
+            "agent_started"
+        };
+        self.record(kind, json!({"agent_id":id}))?;
         Ok(token)
     }
     /// Admission for one more live read. The budget bounds accumulated context,
@@ -585,6 +609,8 @@ impl Store {
     }
     fn reserve(&mut self, goal: &Goal, id: &str, input_bytes: usize) -> Result<usize> {
         self.active(id)?;
+        // Before any counter moves: a paused run burns neither call ceiling nor budget.
+        self.gate_model()?;
         {
             let agent = self.agents.get(id).context("unknown allocation")?;
             if let Some(reason) = &agent.terminal {
@@ -1158,6 +1184,13 @@ async fn model(
         let index = match store.reserve(&broker.goal, &id, input_bytes) {
             Ok(index) => index,
             Err(error) => {
+                if store.pause.is_some() {
+                    // The run_paused event is the record; per-call denials
+                    // would only grow the log while agents poll.
+                    drop(store);
+                    tokio::time::sleep(PAUSED_RETRY_DELAY).await;
+                    return Err(denied(error));
+                }
                 store
                     .record(
                         "provider_denied",
@@ -1184,10 +1217,12 @@ async fn model(
         index
     };
     let outcome = broker.provider.dispatch(body).await;
+    let mut backoff = std::time::Duration::ZERO;
     let mut store = broker.store.lock().await;
     let outcome = match outcome {
         Ok(mut response) => match store.settle(&broker.goal, index, &response) {
             Ok(cost) => {
+                store.note_provider_ok();
                 response["swarm_cost_microusd"] = json!(cost);
                 let intent_id = store.intents[index].id.clone();
                 store
@@ -1200,7 +1235,10 @@ async fn model(
             }
             Err(error) => error,
         },
-        Err(error) => error,
+        Err(error) => {
+            backoff = store.note_provider_failure(&error.to_string());
+            error
+        }
     };
     if store.intents[index].state == "dispatched" {
         store.intents[index].state = "unknown".into();
@@ -1230,6 +1268,10 @@ async fn model(
             json!({"intent_id":intent_id,"reason":outcome.to_string(),"retryable":true}),
         )
         .map_err(denied)?;
+    // Bounded backoff outside the lock, still holding the dispatch slot, so an
+    // outage slows the whole cohort instead of letting each agent spin.
+    drop(store);
+    tokio::time::sleep(backoff).await;
     Err(denied(outcome))
 }
 async fn tool(
@@ -1245,6 +1287,9 @@ async fn tool(
         let store = broker.store.lock().await;
         let id = store.authenticate(&headers).map_err(denied)?;
         store.active(&id).map_err(denied)?;
+        if name == "claim_task" {
+            store.gate_claim(&id).map_err(denied)?;
+        }
         id
     };
     let mut args = args;
@@ -1381,6 +1426,8 @@ const FETCH_HEADER_BYTES: usize = 4_096;
 /// file; `submit_finding` is never denied by it.
 pub const FETCH_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
 /// The Board's message limit. Longer messages are shortened, never rejected.
+/// How long a paused run makes a polling agent wait before the next refusal.
+const PAUSED_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 pub const BOARD_MESSAGE_LIMIT: usize = 2_048;
 /// Headers a worker may not silently override, because the fetch contract the
 /// evidence depends on is stated in terms of them.
@@ -1489,6 +1536,15 @@ pub async fn fetch(client: &reqwest::Client, args: &Value) -> Result<Value> {
     }
     anyhow::bail!("fetch exceeded {FETCH_MAX_REDIRECTS} redirects")
 }
+#[path = "broker_control.rs"]
+mod control;
+#[allow(unused_imports)]
+pub use control::{
+    Drained, OUTAGE_PAUSE_AFTER, Pause, ResumeReport, control_watch, outage_backoff, resume_plan,
+};
+#[cfg(test)]
+#[path = "broker_control_tests.rs"]
+mod control_tests;
 #[cfg(test)]
 #[path = "broker_progress_tests.rs"]
 mod progress_tests;
