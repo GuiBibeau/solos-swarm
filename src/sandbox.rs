@@ -706,6 +706,7 @@ pub(crate) fn install_inner_guard(policy: &InnerPolicy, allow_exec: bool) -> Res
         ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset,
         RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope,
     };
+    // SAFETY: landlock_create_ruleset with a null attr and size 0 only queries the supported ABI version.
     let raw = unsafe {
         libc::syscall(
             libc::SYS_landlock_create_ruleset,
@@ -825,6 +826,7 @@ mod tests {
             return;
         }
         assert_eq!(
+            // SAFETY: prctl with PR_SET_NO_NEW_PRIVS takes only integer arguments.
             unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
             0
         );
@@ -832,20 +834,24 @@ mod tests {
         let mut cwd = [0_i8; 4096];
         let mut parameter = libc::sched_param { sched_priority: 0 };
         let mut attributes = [0_u64; 8];
+        // SAFETY: every pointer passed (cwd, parameter, attributes) refers to a live local buffer of the stated length.
         let queries_allowed = unsafe {
             !libc::getcwd(cwd.as_mut_ptr(), cwd.len()).is_null()
                 && libc::sched_getparam(0, &mut parameter) == 0
                 && libc::sched_getscheduler(0) >= 0
                 && libc::syscall(libc::SYS_sched_getattr, 0, attributes.as_mut_ptr(), 64, 0) == 0
         };
+        // SAFETY: sched_setscheduler reads the live `parameter` struct; errno is thread-local.
         let mutation_denied = unsafe {
             libc::sched_setscheduler(0, libc::SCHED_OTHER, &parameter) == -1
                 && *libc::__errno_location() == libc::EPERM
         };
+        // SAFETY: socket takes only integer arguments; errno is read from the calling thread.
         let network_denied = unsafe {
             libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) == -1
                 && *libc::__errno_location() == libc::EPERM
         };
+        // SAFETY: _exit takes no pointers and never returns; it is the sole exit path of this forked test child.
         unsafe {
             libc::_exit(if queries_allowed && mutation_denied && network_denied {
                 0

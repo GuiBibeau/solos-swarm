@@ -88,6 +88,7 @@ unsafe extern "C" {
     fn geteuid() -> u32;
 }
 fn uid() -> u32 {
+    // SAFETY: geteuid(2) takes no arguments, cannot fail and touches no memory.
     unsafe { geteuid() }
 }
 impl OwnedWitness {

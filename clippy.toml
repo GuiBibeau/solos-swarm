@@ -1,0 +1,5 @@
+# Used when the restriction lints listed in Cargo.toml (unwrap_used, expect_used)
+# are enabled; see docs/rust-style.md "Follow-ups".
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-print-in-tests = true
