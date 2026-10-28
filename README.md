@@ -12,6 +12,24 @@
 
 A Rust control plane, scheduler, and capability broker for governed agent swarms across Linux clusters.
 
+## What is in `main`
+
+- **`solos-swarm run`**: a single-host run of N sandboxed Pi agents against one Goal, with a model broker that enforces
+  a microUSD budget (conservative holds, cache-aware settlement), per-task envelopes, and a hash-chained event log.
+- **`scripts/remote.py`**: the controller for running on a Linux host over SSH: deploy immutable candidates, start,
+  status, collect and cancel runs, plus channels, drain and doctor.
+- **Pause mode**: model calls can be held in peak-price windows or by an operator; deadlines count unpaused time.
+  [docs/pause-mode.md](docs/pause-mode.md)
+- **Self-update**: `stable`/`canary` candidate channels with a promotion gate, rollback, prune, drain, doctor and
+  smoke. `run --resume` (re-spawning agents of a drained run) is not implemented.
+  [docs/self-update-operations.md](docs/self-update-operations.md)
+- **Dashboard** and a Mac SSH-tunnel script. [docs/dashboard.md](docs/dashboard.md)
+- **Replay-scored policy loop** for the tournament self-review. [replay/README.md](replay/README.md)
+- **Tournament runbook** from the first live run. [docs/running-a-tournament.md](docs/running-a-tournament.md)
+- The original `mvp` cluster path (Raft over QUIC, witness, evaluator), documented in `docs/ARCHITECTURE.md`.
+
+See [CHANGELOG.md](CHANGELOG.md) for what changed and when.
+
 ## Architecture
 
 <p align="center">
@@ -53,6 +71,16 @@ npm ci --ignore-scripts --no-audit --no-fund && npm run test:broker
 ```
 
 ```sh
+# Run on a Linux host from the controller (needs SSH access, bubblewrap and a provider key in the Pi auth file)
+python3 scripts/remote.py doctor                                    # host and controller health, no spend
+python3 scripts/remote.py deploy                                    # build an immutable candidate; prints its id
+python3 scripts/remote.py candidates promote --candidate ID         # gate (integrity, doctor, smoke, idle probe) then switch
+python3 scripts/remote.py start --candidate current --run-id RUN --seed 1 --goal-file goal.json --expected-file expected.json --refuse-peak
+python3 scripts/remote.py status --run-id RUN
+python3 scripts/remote.py collect --run-id RUN --output evidence/RUN    # leaves the code/ scratch dir on the host
+```
+
+```sh
 # Launch witness, evaluator, runtime, and QA
 solos-swarm mvp witness-serve --config /path/to/witness.json
 solos-swarm mvp evaluator-serve --bundle /path/to/bundle.json --certificate /path/to/eval.der   --private-key /path/to/eval.key --ca /path/to/ca.pem --state /path/to/state.json   --ipc-socket /path/to/evaluator.sock --broker-uid 1001
@@ -82,6 +110,8 @@ For non-JSON YAML configs, install `scripts/requirements-dashboard.txt` in the r
 
 ### Viewing the dashboard of a run on the remote box
 
+Full notes: [`docs/dashboard.md`](docs/dashboard.md).
+
 The server has no authentication, so it is never bound to a public interface: it listens on `127.0.0.1` on the box and you reach it through an SSH tunnel from your Mac. It has no token option; the Host-header check only admits `127.0.0.1:<its port>` and `localhost:<its port>`, which is why the tunnel uses the same port on both ends.
 
 ```sh
@@ -107,6 +137,14 @@ Dashboard checks: `node --test tests/dashboard-spatial.test.mjs tests/dashboard-
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Domain model, Raft over mTLS QUIC, Tier-P sandboxes, and spend ledger. |
 | [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | Identity provisioning, offline startup, cluster recovery, and operations. |
 | [`docs/CAMPAIGNS.md`](docs/CAMPAIGNS.md) | Matched 1-vs-10 worker evaluation design and schemas. |
+| [`docs/pause-mode.md`](docs/pause-mode.md) | `control.json`, `PAUSE`, `SWARM_REFUSE_PEAK`, the 503 reply, unpaused deadlines. |
+| [`docs/self-update-operations.md`](docs/self-update-operations.md) | Channels, promote/rollback/prune, drain, doctor, smoke, outage pause. |
+| [`docs/self-update-and-graceful-restart.md`](docs/self-update-and-graceful-restart.md) | Design and failure modes behind the above. |
+| [`docs/dashboard.md`](docs/dashboard.md) | Dashboard server and the Mac tunnel script. |
+| [`docs/running-a-tournament.md`](docs/running-a-tournament.md) | Runbook from the first live tournament. |
+| [`replay/README.md`](replay/README.md) | Replay-scored policy loop. |
+| [`docs/rust-style.md`](docs/rust-style.md) | Rust style, lints and the gates CI runs. |
+| [`CHANGELOG.md`](CHANGELOG.md) | PRs #6-#14 and what they added. |
 | [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | Live 10-agent DeepSeek results, microbenchmarks, and acceptance SLOs. |
 | [`dashboard/index.html`](dashboard/index.html) | Spatial dashboard for runtime telemetry and saved snapshots. |
 | [`skills/verify-solos-swarm/SKILL.md`](skills/verify-solos-swarm/SKILL.md) | Release qualification workflow for immutable candidates. |

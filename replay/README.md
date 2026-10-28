@@ -7,6 +7,26 @@ replays past runs, and the policy is prompt text. This package closes that gap i
 policies on recorded runs at zero model cost, and adopt one only if a guard says it beats the current policy on runs
 it was not tuned on. Plain Python, stdlib only, no Rust changes.
 
+## Status
+
+Read this first. The loop is built and tested; it has not yet produced a decision on real data.
+
+- **Relation to the tournament self-review.** Each close step (c1..c4) runs a self-review agent that emits a
+  `prompt_patch` of up to 500 characters of advice for the next wave. That advice is text and has no replay
+  semantics, so this package never scores it. The replay loop works on a different object: a JSON policy spec
+  (wave size, rounds, per-attempt call cap, trial budget, stop-after-N-null, who gets the next attempt). The two
+  run side by side; only an adopted policy spec could change the next tournament, and only through the
+  unapplied patches below.
+- **History is tiny.** The 15 runs collected under `work/` hold no counted trials, placebo bar or referee verdicts,
+  so 0 are scorable. A whole tournament (w1+w2+w3) counts as one run. The guard needs 12 scorable and 6 held-out
+  runs, so for now every verdict is `insufficient history`. The thresholds are not to be lowered.
+- **Patches not applied.** `drive-hook.patch` and `gen-hook.patch` (the `gen.py` patch) are not applied to
+  anything in `main` or to the live tournament. They were checked with `git apply --check` against a past tip of the
+  tournament branch. Applying `gen-hook.patch` changes the close protocol text, so only apply it between
+  tournaments.
+- **What it records.** Even with no decisions, `ingest`/`ingest-tournament` build the history that later
+  tournaments will be scored on.
+
 ## Pieces
 
 | File | What |

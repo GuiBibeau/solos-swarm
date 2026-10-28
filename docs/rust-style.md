@@ -1,5 +1,7 @@
 # Rust style
 
+See also: [README](../README.md), [CHANGELOG](../CHANGELOG.md) (adopted in #13) and the Rust commands CI runs (`cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`).
+
 Google publishes no single Rust style guide of its own. What exists, and what we follow:
 
 - Default `rustfmt` style. Chromium states it follows the Rust Style Guide, the Rust API
