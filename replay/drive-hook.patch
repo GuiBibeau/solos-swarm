@@ -1,0 +1,37 @@
+diff --git a/work/tournament-20261028/drive.py b/work/tournament-20261028/drive.py
+index d27c3e4..eeb9d4c 100644
+--- a/work/tournament-20261028/drive.py
++++ b/work/tournament-20261028/drive.py
+@@ -103,6 +103,15 @@ def log(ev):
+         f.write(json.dumps(dict(ev, at=datetime.now(timezone.utc).isoformat(timespec="seconds"))) + "\n")
+ 
+ 
++def replay_check(step):
++    """Optional (--replay-check): after a close step, score the self-review proposal by replay and log the verdict.
++    Never applies anything; see replay/README.md."""
++    sys.path.insert(0, str(REPO))
++    from replay import hook
++    v = hook.after_close(step, HERE, log)
++    print(f"replay verdict for {step}: {v['verdict']}")
++
++
+ def run_step(step, cand, runid, max_gb=800, legacy=False):
+     import gen
+     goal = json.loads((HERE / f"{step}-goal.json").read_text())
+@@ -149,6 +158,7 @@ def box_pause(on):
+ 
+ def main():
+     ap = argparse.ArgumentParser(); ap.add_argument("cmd"); ap.add_argument("--now"); ap.add_argument("--candidate")
++    ap.add_argument("--replay-check", action="store_true", help="after each close step, replay-score the policy proposal (off by default)")
+     ap.add_argument("--legacy", action="store_true", help="candidate 4ec772e2 without pause support: peak-avoiding deadlines")
+     a = ap.parse_args()
+     if a.cmd == "plan":
+@@ -172,6 +182,8 @@ def main():
+                 if gen.main(step) is None:
+                     state["done"].append(step); STATE.write_text(json.dumps(state)); continue
+         run_step(step, a.candidate, f"tourney-20261028-{step}", legacy=a.legacy)
++        if a.replay_check and step.startswith("c"):
++            replay_check(step)
+         state = load_state(); state["done"].append(step); state.pop("running", None); STATE.write_text(json.dumps(state))
+ 
+ 
