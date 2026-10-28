@@ -243,9 +243,9 @@ fn pause_file_pauses_and_removing_it_resumes() {
         &uuid::Uuid::new_v4().to_string()[..8]
     ));
     fs::create_dir(&dir).unwrap();
-    assert_eq!(broker::pause_retry_after(&dir, 0), None);
+    assert_eq!(broker::effective_control(&dir, 0), None);
     fs::write(dir.join("PAUSE"), "").unwrap();
-    assert_eq!(broker::pause_retry_after(&dir, 0), Some(60));
+    assert_eq!(broker::effective_control(&dir, 0), Some(60));
     fs::remove_file(dir.join("PAUSE")).unwrap();
-    assert_eq!(broker::pause_retry_after(&dir, 0), None);
+    assert_eq!(broker::effective_control(&dir, 0), None);
 }

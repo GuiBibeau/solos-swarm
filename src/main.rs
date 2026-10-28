@@ -1,4 +1,5 @@
 mod mvp;
+mod smoke;
 
 use solos_swarm::{broker, code::CodeExecutor};
 
@@ -68,6 +69,18 @@ enum Action {
         /// Lifecycle test only. Never qualifies as live inference.
         #[arg(long)]
         idle_probe: bool,
+    },
+    /// Read-only: verify a stopped run's state against its event chain and print
+    /// what a resume would settle and respawn. Changes nothing.
+    ResumePlan {
+        #[arg(long)]
+        run_dir: PathBuf,
+    },
+    /// Zero-spend smoke of this binary's broker, ledger, pause gate, drain and
+    /// resume against a scripted provider. Needs no key, network or sandbox.
+    Smoke {
+        #[arg(long)]
+        dir: PathBuf,
     },
     Doctor {
         #[arg(long)]
@@ -748,21 +761,28 @@ async fn run(options: RunOptions) -> Result<()> {
         tokio::select! {
             result=work(&mut workers,&store,&mut rx,&goal,idle) => result,
             _=unpaused_deadline(deadline, run_dir.clone()) => Err(anyhow::anyhow!("host-side Goal deadline expired")),
+            _=broker::control_watch(store.clone(),run_dir.clone()) => Err(anyhow::Error::new(broker::Drained)),
             _=term.recv() => Err(anyhow::anyhow!("operator cancelled run")),
             _=tokio::signal::ctrl_c() => Err(anyhow::anyhow!("operator interrupted run")),
         }
     };
+    let drained = matches!(&result, Err(error) if error.is::<broker::Drained>());
     {
         let mut state = store.lock().await;
         if let Err(error) = &result {
             // Deadline or cancel: keep what the agents did. Partial findings for
             // unfiled Tasks, then the exact-union artifact of whatever was filed.
-            let reason = error.to_string();
-            let _ = state.file_partial_findings(&goal, &reason);
-            let _ = state.synthesize_artifact(&reason);
+            // A drain files nothing: the unfinished tasks belong to the resumed run.
+            if !drained {
+                let reason = error.to_string();
+                let _ = state.file_partial_findings(&goal, &reason);
+                let _ = state.synthesize_artifact(&reason);
+            }
         }
         state.goal_status = if result.is_ok() {
             "completed"
+        } else if drained {
+            "drained"
         } else {
             "stopped"
         }
@@ -816,7 +836,11 @@ async fn run(options: RunOptions) -> Result<()> {
         &run_dir.join("cleanup.json"),
         &json!({"verdict":if remaining==0 {"PASS"}else{"INCONCLUSIVE"},"remaining_workers":remaining,"stopped_ms":now_ms()}),
     )?;
-    let runtime_pass = result.is_ok() && store.lock().await.held_microusd == 0;
+    let runtime_pass = (result.is_ok() || drained) && store.lock().await.held_microusd == 0;
+    if drained {
+        // Last write: it names the exact event and state a resume must find.
+        store.lock().await.write_resume_manifest()?;
+    }
     write_json(
         &run_dir.join("runtime-report.json"),
         &json!({"runtime_verdict":if runtime_pass {"PASS"}else{"FAIL"},"reason":result.as_ref().err().map(|e|e.to_string()),"stopped_ms":now_ms(),"idle_probe":idle}),
@@ -825,7 +849,7 @@ async fn run(options: RunOptions) -> Result<()> {
         "{}",
         json!({"runtime_verdict":if runtime_pass {"PASS"}else{"FAIL"},"run_dir":run_dir,"cleanup_verdict":if remaining==0 {"PASS"}else{"INCONCLUSIVE"}})
     );
-    result
+    if drained { Ok(()) } else { result }
 }
 
 /// `sockaddr_un.sun_path` is 108 bytes and must also store a trailing NUL.
@@ -919,6 +943,14 @@ async fn execute(command: Action) -> Result<()> {
                 idle: idle_probe,
             })
             .await
+        }
+        Action::Smoke { dir } => {
+            println!("{}", smoke::run(&dir).await?);
+            Ok(())
+        }
+        Action::ResumePlan { run_dir } => {
+            println!("{}", json!(broker::resume_plan(&run_dir)?));
+            Ok(())
         }
         Action::Doctor { pi_root, node } => doctor(&pi_root, &node).await,
         Action::FetchProbe { pi_root, node, url } => fetch_probe(&pi_root, &node, &url).await,
@@ -1157,7 +1189,7 @@ async fn unpaused_deadline(deadline: u64, run_dir: PathBuf) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        if broker::pause_retry_after(&run_dir, now).is_none() {
+        if broker::effective_control(&run_dir, now).is_none() {
             left -= step;
         }
     }
