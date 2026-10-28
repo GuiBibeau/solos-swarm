@@ -24,7 +24,7 @@ REPO = Path(__file__).resolve().parent.parent
 # Neutral SSH alias. Override with --host or SOLOS_SWARM_SSH_TARGET.
 EXAMPLE_SSH_HOST = "solos-node"
 SSH_HOST = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@:-]{0,127}\Z")
-NODE_SOURCE = Path.home() / ".local/opt/node-v24.18.0-linux-x64"
+NODE_SOURCE = Path(os.environ["SWARM_NODE_DIR"]) if os.environ.get("SWARM_NODE_DIR") else Path.home() / ".local/opt/node-v24.18.0-linux-x64"
 DATA = Path.home() / ".local/share/solos-swarm"
 STATE = Path.home() / ".local/state/solos-swarm"
 RUN_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,47}\Z")
@@ -151,6 +151,25 @@ def deploy_host():
             raise RuntimeError(f"Candidate preparation failed; build evidence retained at {staging}") from None
 
 
+def progress_brief(path):
+    """Counts and ledger from state.json; the host runs this file standalone, so it cannot import swarm_progress."""
+    try:
+        state = json.loads((path / "state.json").read_text())
+        cap = json.loads((path / "config.yaml").read_text()).get("budget_microusd")
+    except (OSError, ValueError):
+        return None
+    filed = {finding["agent_id"] for finding in state["findings"]}
+    deferred = {finding["agent_id"] for finding in state["findings"]
+                if all(row.get("severity") == "defer" for rows in finding["result"].values() if isinstance(rows, list) for row in rows)}
+    agents = state["agents"]
+    return {"goal_status": state["goal_status"], "agents": len(agents),
+            "running": sum(1 for name, a in agents.items() if a["status"] == "running" and name not in filed),
+            "filed": len(filed - deferred), "deferred_or_partial": len(deferred),
+            "spent_microusd": state["spent_microusd"], "held_microusd": state["held_microusd"], "cap_microusd": cap,
+            "artifact": state["artifact"] is not None,
+            "detail": "python3 scripts/swarm_progress.py --run-id " + path.name}
+
+
 def status_host(run_id):
     path = run_path(run_id)
     if not path.is_dir():
@@ -165,9 +184,23 @@ def status_host(run_id):
         artifact = path / f"{name}.json"
         if artifact.exists():
             output[name] = json.loads(artifact.read_text())
+    brief = progress_brief(path)
+    if brief:
+        output["progress"] = brief
     output["cleanup_confirmed"] = (stopped and output.get("cleanup", {}).get("verdict") == "PASS"
                                    and output.get("service-cleanup", {}).get("credential_removed") is True)
     return output
+
+
+def validate_goal_limits(goal):
+    """Refuse a frozen Goal outside the preview host's admitted envelope."""
+    if (
+        not 1 <= goal["agent_count"] <= 30
+        or goal["agent_count"] != len(goal["tasks"])
+        or not 1 <= goal["deadline_seconds"] <= 21_600
+        or goal["budget_microusd"] > 1_000_000_000_000
+    ):
+        raise ValueError("Runs require 1-30 agents, one task per agent, deadline <=21600s, and budget <=$1000000")
 
 
 def start_host(request):
@@ -176,6 +209,8 @@ def start_host(request):
     identity = {key: request[key] for key in ("candidate_id", "seed", "run_id")}
     identity["idle_probe"] = request.get("idle_probe", False)
     identity["deadline_seconds"] = request.get("deadline_seconds")
+    if request.get("case_sha256"):
+        identity["case_sha256"] = request["case_sha256"]
     with lock(f"run-{run_id}"):
         if path.exists():
             if json.loads((path / "request.json").read_text()) != identity:
@@ -191,12 +226,15 @@ def start_host(request):
         private.mkdir(parents=True, mode=0o700)
         credential = None
         try:
-            subprocess.run(["python3", str(candidate / "scripts/prepare_case.py"), "--seed", str(request["seed"]),
-                            "--goal", str(path / "config.yaml"), "--expected", str(private / "expected.json")],
-                           stdout=(path / "prepare.log").open("w"), stderr=subprocess.STDOUT, check=True)
+            if "goal" in request and "expected" in request:
+                (path / "config.yaml").write_text(request["goal"])
+                (private / "expected.json").write_text(request["expected"])
+            else:
+                subprocess.run(["python3", str(candidate / "scripts/prepare_case.py"), "--seed", str(request["seed"]),
+                                "--goal", str(path / "config.yaml"), "--expected", str(private / "expected.json")],
+                               stdout=(path / "prepare.log").open("w"), stderr=subprocess.STDOUT, check=True)
             goal = json.loads((path / "config.yaml").read_text())
-            if goal["agent_count"] != 10 or not 1 <= goal["deadline_seconds"] <= 1200 or goal["budget_microusd"] > 1_000_000:
-                raise ValueError("First preview requires ten agents, deadline <=1200s, and budget <=$1")
+            validate_goal_limits(goal)
             credentials = STATE / "credentials"
             credentials.mkdir(parents=True, exist_ok=True, mode=0o700)
             # shortcut: a host crash before service creation can retain this private file; use an in-memory handoff before production.
@@ -301,13 +339,14 @@ def host_main(action):
 
 
 def default_ssh_host():
-    return os.environ.get("SOLOS_SWARM_SSH_TARGET", EXAMPLE_SSH_HOST)
+    return os.environ.get("SOLOS_SWARM_SSH_TARGET") or os.environ.get("SWARM_SSH_HOST") or EXAMPLE_SSH_HOST
 
 
 def ssh_argv(host):
     if not isinstance(host, str) or not SSH_HOST.fullmatch(host):
         raise ValueError("SSH host must be an alias or user@host")
-    return ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ForwardAgent=no", "-o", "ConnectTimeout=15", host]
+    config = os.environ.get("SWARM_SSH_CONFIG")  # local Lima VM runner: ssh -F <vm ssh_config>
+    return ["ssh", *(["-F", config] if config else []), "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ForwardAgent=no", "-o", "ConnectTimeout=60", "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=20", host]
 
 
 def ssh_command(action, host):
@@ -331,7 +370,12 @@ def source_archive():
     with tarfile.open(fileobj=buffer, mode="w", format=tarfile.PAX_FORMAT) as bundle:
         for name in sorted(set(files) - {""}):
             path = REPO / name
-            if path.is_symlink() or not path.is_file() or Path(name).is_absolute() or ".." in Path(name).parts:
+            parts = Path(name).parts
+            # Build trees are local artifacts, not source. A stale target-linux/
+            # (5.4 GB) made the archive buffer balloon before the first deploy.
+            if parts and parts[0] in {"target", "target-linux", "runs", "work"}:
+                continue
+            if path.is_symlink() or not path.is_file() or Path(name).is_absolute() or ".." in parts:
                 raise ValueError(f"Unsafe source entry: {name}")
             if path.name in ("auth.json", ".env", "credentials.json") or "node_modules" in Path(name).parts:
                 raise ValueError(f"Private or generated source entry must be ignored: {name}")
@@ -349,12 +393,31 @@ def source_archive():
     return buffer.getvalue()
 
 
-def read_deepseek_key(auth_file):
-    entry = json.loads(auth_file.read_text()).get("deepseek", {})
+def read_provider_key(auth_file, provider):
+    """The operator's provider key from the private Pi auth config. The key
+    travels over SSH stdin only; it enters neither candidate nor public config."""
+    entry = json.loads(auth_file.read_text()).get(provider, {})
     value = entry.get("key", entry.get("apiKey"))
     if entry.get("type") != "api_key" or not isinstance(value, str) or not value.strip():
-        raise ValueError("Pi auth config has no DeepSeek api_key entry")
+        raise ValueError(f"Pi auth config has no {provider} api_key entry")
     return value
+
+
+def read_deepseek_key(auth_file):
+    return read_provider_key(auth_file, "deepseek")
+
+
+def provider_for(goal_file, supplied):
+    """The provider this run spends against: an explicit flag, else the Goal's
+    own upstream, else the legacy DeepSeek default. Kept here so the operator's
+    key is read from the matching auth entry."""
+    if supplied:
+        return supplied
+    if goal_file:
+        upstream = json.loads(goal_file.read_text()).get("upstream")
+        if isinstance(upstream, dict) and isinstance(upstream.get("provider"), str):
+            return upstream["provider"]
+    return "deepseek"
 
 
 def main():
@@ -363,11 +426,15 @@ def main():
     common.add_argument("--host", default=None, help="SSH alias or user@host. Default: solos-node. Override with SOLOS_SWARM_SSH_TARGET.")
     subparsers = parser.add_subparsers(dest="action", required=True)
     subparsers.add_parser("deploy", parents=[common], help="Build once on the selected host; freeze installed artifacts")
-    start = subparsers.add_parser("start", parents=[common], help="Freeze one case and start ten live agents as a bounded systemd service")
+    start = subparsers.add_parser("start", parents=[common], help="Freeze one case and start up to thirty live agents as a bounded systemd service")
     start.add_argument("--candidate", required=True)
     start.add_argument("--run-id", required=True)
     start.add_argument("--seed", required=True, type=int)
+    start.add_argument("--goal-file", type=Path, help="Frozen Goal JSON prepared locally; skips host-side prepare_case")
+    start.add_argument("--expected-file", type=Path, help="Private evaluator payload paired with --goal-file")
     start.add_argument("--auth-file", type=Path, default=Path.home() / ".pi/agent/auth.json")
+    start.add_argument("--provider", choices=("deepseek", "venice"),
+                       help="Provider that spends for this run; defaults to the Goal's own upstream")
     start.add_argument("--idle-probe", action="store_true", help="Exercise lifecycle with no paid model calls; never qualifies")
     start.add_argument("--deadline-seconds", type=int, help="Shortened deadline for an idle lifecycle probe only")
     for action in ("status", "cancel", "collect"):
@@ -397,9 +464,19 @@ def main():
             candidate_path(args.candidate)
             request.update(candidate_id=args.candidate, seed=args.seed)
             request.update(idle_probe=args.idle_probe, deadline_seconds=args.deadline_seconds)
+            if args.goal_file or args.expected_file:
+                if not args.goal_file or not args.expected_file:
+                    parser.exit(2, "remote: --goal-file and --expected-file are required together\n")
+                goal_bytes, expected_bytes = args.goal_file.read_bytes(), args.expected_file.read_bytes()
+                request["case_sha256"] = hashlib.sha256(goal_bytes + b"\x00" + expected_bytes).hexdigest()
+                request["goal"], request["expected"] = goal_bytes.decode(), expected_bytes.decode()
             result = call_host("start", request, host)
             if result.get("needs_credential"):
-                request["api_key"] = "non-live-lifecycle-probe" if args.idle_probe else read_deepseek_key(args.auth_file)
+                if args.idle_probe:
+                    request["api_key"] = "non-live-lifecycle-probe"
+                else:
+                    provider = provider_for(args.goal_file, args.provider)
+                    request["api_key"] = read_provider_key(args.auth_file, provider)
                 result = call_host("start", request, host)
             print(json.dumps(result, indent=2))
         elif args.action == "collect":

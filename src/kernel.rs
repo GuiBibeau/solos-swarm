@@ -2945,6 +2945,80 @@ impl Kernel {
         )
         .await
     }
+    /// Settle an admitted `fetch_url` with the live response the broker observed.
+    ///
+    /// A live response cannot be recomputed from replicated state, so unlike every
+    /// other tool the broker performs the call and hands the result in here. The
+    /// admitted payload is what gets recorded as the source, so a replayed intent
+    /// reconciles by wire hash and an unrecorded live read can never be invented.
+    pub(crate) async fn apply_fetch(
+        &self,
+        id: &str,
+        subject: &AuthenticatedSubject,
+        intent: &str,
+        goal_id: &str,
+        response: Value,
+        leases: Vec<LeaseCheck>,
+    ) -> Result<Reply> {
+        check_allocation(subject, &leases)?;
+        self.commit_local(
+            id,
+            subject,
+            &(intent, goal_id),
+            leases,
+            move |state: &mut KernelState| {
+                let now = crate::cluster::now_ms() / 1000;
+                let effect = state
+                    .effects
+                    .get(intent)
+                    .context("fetch lacks admitted intent")?
+                    .clone();
+                ensure!(
+                    !effect.permit.payload.billable
+                        && effect.state == "pending"
+                        && effect.request.action.kind == security::CapabilityKind::ToolCall
+                        && effect.request.action.operation == "tool_fetch"
+                        && effect.request.action.resource == format!("tool/{goal_id}")
+                        && effect.permit.payload.goal_id == goal_id,
+                    "fetch Capability/scope mismatch"
+                );
+                let url = effect.payload["url"]
+                    .as_str()
+                    .context("admitted fetch payload lost its url")?;
+                ensure!(
+                    effect.payload["request"]["url"].as_str() == Some(url),
+                    "fetch payload disagrees with its admitted request"
+                );
+                action_service(&state.modules, &effect.request.action.operation)?;
+                check_search_action(
+                    state,
+                    &effect.request,
+                    &effect.payload,
+                    effect.task_context.as_ref(),
+                    crate::cluster::now_ms(),
+                )?;
+                check_task(state, subject, effect.task_context.as_ref(), false)?;
+                let mut value = response.clone();
+                value["url"] = json!(url);
+                value["goal_id"] = json!(goal_id);
+                observe(
+                    state,
+                    subject,
+                    format!("fetch/{intent}"),
+                    "fetch_url",
+                    goal_id,
+                    &value,
+                    &self.signer,
+                    now,
+                )?;
+                let effect = state.effects.get_mut(intent).unwrap();
+                effect.state = "done".into();
+                effect.result = Some(value.clone());
+                Ok(value)
+            },
+        )
+        .await
+    }
     #[allow(clippy::too_many_arguments)] // Explicit broker input identity and scope are audited together.
     pub(crate) async fn observe(
         &self,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independently score retained ten-agent live evidence without replaying work."""
+"""Independently score retained live evidence (1-30 agents) without replaying work."""
 
 import argparse
 import hashlib
@@ -31,6 +31,17 @@ def normalized(result):
             raise ValueError("Record source values must be integers")
         seen.add(row["id"])
     return sorted(rows, key=lambda row: row["id"])
+
+
+def event_lines(text):
+    """Split a JSONL event log on ASCII newlines only.
+
+    `str.splitlines()` also breaks on U+0085, U+2028 and U+2029, which are
+    legal unescaped inside a JSON string. A fetched page can carry them, and
+    splitting there turns one valid record into two unparsable fragments. The
+    writer emits exactly one record per `\\n`, so that is the only separator.
+    """
+    return [line for line in text.split("\n") if line]
 
 
 def verify_events(events):
@@ -181,6 +192,54 @@ def validate_document(name, value):
     return value
 
 
+def security_finding(result, contract, assigned_files):
+    """Structurally validate one worker's security-review result against the
+    frozen contract. Returns a list of violation strings; an empty list means
+    the result is well formed and only cites files the worker actually received."""
+    issues = []
+    key = contract.get("result_key")
+    if not isinstance(result, dict) or set(result) != {key}:
+        return [f"result must contain only {key!r}"]
+    rows = result[key]
+    if not isinstance(rows, list):
+        return [f"{key} must be an array"]
+    required = contract.get("required_fields", [])
+    optional = set(contract.get("optional_fields", []))
+    severities = set(contract.get("severities", []))
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict) or not required or not set(required).issubset(row):
+            issues.append("Finding record is missing required fields")
+            continue
+        extra = set(row) - set(required) - optional
+        if extra:
+            issues.append(f"Finding record has unknown fields: {sorted(extra)}")
+        if row["severity"] not in severities:
+            issues.append(f"Invalid severity {row['severity']!r}")
+        for field in ("id", "title", "file", "description", "severity"):
+            if not isinstance(row.get(field), str) or not row[field]:
+                issues.append(f"Finding field {field!r} must be a nonempty string")
+        if "line" in row and type(row["line"]) is not int:
+            issues.append("Finding line must be an integer")
+        if row.get("id") in seen:
+            issues.append(f"Duplicate finding id {row.get('id')!r}")
+        seen.add(row.get("id"))
+        if row.get("file") not in assigned_files:
+            issues.append(f"Finding cites unassigned file {row.get('file')!r}")
+    return issues
+
+
+def security_union(findings, contract):
+    """Canonical union of all workers' vulnerability records, sorted by id."""
+    key = contract["result_key"]
+    rows = []
+    for finding in findings:
+        result = finding.get("result")
+        if isinstance(result, dict) and isinstance(result.get(key), list):
+            rows.extend(result[key])
+    return sorted(rows, key=lambda row: canonical(row))
+
+
 def check_run(run_dir, expected_path, runtime=None, extension=None, package_lock=None):
     run_dir = Path(run_dir).resolve()
     checks = []
@@ -209,15 +268,20 @@ def check_run(run_dir, expected_path, runtime=None, extension=None, package_lock
     config = read("config.yaml")  # prepare_case emits JSON, a valid YAML subset.
     try:
         expected = validate_document("expected.json", json.loads(Path(expected_path).read_text()))
-        if not isinstance(expected.get("tasks"), dict) or not isinstance(expected.get("artifact"), dict):
+        scorer_kind = expected.get("scorer_kind")
+        if scorer_kind == "security-review":
+            if not isinstance(expected.get("tasks"), dict) or not isinstance(expected.get("artifact_contract"), dict):
+                raise ValueError("Malformed private evaluator payload")
+        elif not isinstance(expected.get("tasks"), dict) or not isinstance(expected.get("artifact"), dict):
             raise ValueError("Malformed private evaluator payload")
         check("private-evaluator", "evidence", True, "Protected evaluator payload loaded")
     except (OSError, ValueError) as error:
         expected = None
+        scorer_kind = None
         check("private-evaluator", "evidence", False, str(error), missing=True)
 
     try:
-        events = [json.loads(line) for line in (run_dir / "events.jsonl").read_text().splitlines()]
+        events = [json.loads(line) for line in event_lines((run_dir / "events.jsonl").read_text())]
         event_head = verify_events(events)
         check("event-chain", "evidence", True, f"Verified {len(events)} entries; head={event_head}")
     except (OSError, ValueError, TypeError, AttributeError) as error:
@@ -252,10 +316,13 @@ def check_run(run_dir, expected_path, runtime=None, extension=None, package_lock
         check("frozen-goal", "evidence", digest(run_dir / "config.yaml") == expected.get("config_sha256"), "Goal must match the independently frozen case")
         tasks = config.get("tasks", [])
         check("frozen-fixture", "evidence", hashlib.sha256(canonical(tasks)).hexdigest() == expected.get("fixture_digest"), "Fixture must match the protected scorer")
-        check("ten-task-case", "goal", len(tasks) == 10 and len(expected.get("tasks", {})) == 10, "Exactly ten required tasks")
+        check("one-task-per-agent", "goal", type(config.get("agent_count")) is int and config.get("agent_count") == len(tasks) == len(expected.get("tasks", {})), "Exactly one required task per admitted agent")
         for name in ("seed", "catalog_version", "scorer_version"):
             check(f"version:{name}", "evidence", config.get(name) == expected.get(name) and (manifest or {}).get(name) == expected.get(name), "Case, manifest and scorer versions must agree")
-        check("allowlisted-model", "runtime", (manifest or {}).get("model") == config.get("model") == "deepseek-flash", "Expected explicitly allowlisted hosted model")
+        # The admitted model is whatever the frozen Goal declares; a Goal without
+        # an `upstream` keeps the historical DeepSeek pair.
+        upstream = config.get("upstream") or {"provider": "deepseek", "model": "deepseek-flash"}
+        check("allowlisted-model", "runtime", (manifest or {}).get("model") == config.get("model") == upstream.get("model") and (manifest or {}).get("provider") == upstream.get("provider"), "Expected explicitly allowlisted hosted model")
 
     if runtime_report is not None:
         check("runtime-outcome", "runtime", runtime_report.get("runtime_verdict") == "PASS", str(runtime_report.get("reason", "Missing runtime result")))
@@ -264,8 +331,8 @@ def check_run(run_dir, expected_path, runtime=None, extension=None, package_lock
 
     if state is not None:
         agents, intents, findings = state.get("agents", {}), state.get("intents", []), state.get("findings", [])
-        identities = {f"agent-{index:02d}" for index in range(10)}
-        check("ten-identities", "runtime", isinstance(agents, dict) and set(agents) == identities, "Ten distinct admitted identities required")
+        identities = {f"agent-{index:02d}" for index in range(len(expected.get("tasks", {})) if expected else 10)}
+        check("admitted-identities", "runtime", bool(identities) and isinstance(agents, dict) and set(agents) == identities, "One distinct admitted identity per admitted agent required")
         check("goal-completed", "runtime", state.get("goal_status") == "completed", "Goal must have completed")
         check("settled-ledger", "evidence", state.get("held_microusd") == 0 and all(intent.get("state") in {"completed", "denied"} for intent in intents), "Unknown or unsettled holds block qualification")
         completed_intents = [intent for intent in intents if intent.get("state") == "completed"]
@@ -284,7 +351,8 @@ def check_run(run_dir, expected_path, runtime=None, extension=None, package_lock
         intervals = []
         for identity in sorted(identities):
             agent = agents.get(identity, {}) if isinstance(agents, dict) else {}
-            completed = [intent for intent in intents if intent.get("agent_id") == identity and intent.get("state") == "completed" and intent.get("provider") == "deepseek"]
+            provider = ((config or {}).get("upstream") or {}).get("provider", "deepseek")
+            completed = [intent for intent in intents if intent.get("agent_id") == identity and intent.get("state") == "completed" and intent.get("provider") == provider]
             real = [intent for intent in completed if intent.get("request_id") and isinstance(intent.get("usage"), dict) and type(intent["usage"].get("input_tokens")) is int and intent["usage"]["input_tokens"] > 0 and type(intent["usage"].get("output_tokens")) is int and intent["usage"]["output_tokens"] > 0]
             successful = agent.get("successful_model_calls")
             check(f"inference:{identity}", "runtime", bool(real) and type(successful) is int and successful == len(completed), "Real completed inference with consistent count, receipt and usage required")
@@ -305,15 +373,21 @@ def check_run(run_dir, expected_path, runtime=None, extension=None, package_lock
                         continue
                     task_id = finding.get("task_id")
                     try:
-                        if task_id in expected["tasks"] and normalized(finding.get("result")) == normalized(expected["tasks"][task_id]):
+                        if scorer_kind == "security-review":
+                            contract = expected["artifact_contract"]
+                            assigned = (expected["tasks"].get(task_id) or {}).get("files", [])
+                            if task_id in expected["tasks"] and not security_finding(finding.get("result"), contract, assigned):
+                                useful.append(task_id)
+                        elif task_id in expected["tasks"] and normalized(finding.get("result")) == normalized(expected["tasks"][task_id]):
                             useful.append(task_id)
                     except (ValueError, TypeError, KeyError):
                         pass
-            check(f"contribution:{identity}", "goal", bool(useful), "An independently correct attributed shard result is required", missing=expected is None)
-        check("overlapping-lifetimes", "runtime", len(intervals) == 10 and max(start for start, _ in intervals) < min(stop for _, stop in intervals), "All ten agent lifetimes must overlap")
+            check(f"contribution:{identity}", "goal", bool(useful), "An independently verifiable attributed shard result is required", missing=expected is None)
+        check("overlapping-lifetimes", "runtime", bool(intervals) and len(intervals) == len(identities) and max(start for start, _ in intervals) < min(stop for _, stop in intervals), "Every admitted agent lifetime must overlap")
         task_ids = [finding.get("task_id") for finding in findings]
         scalar_task_ids = all(isinstance(task_id, str) for task_id in task_ids)
-        check("one-finding-per-task", "goal", scalar_task_ids and len(task_ids) == 10 and len(set(task_ids)) == 10 and set(task_ids) == set((expected or {}).get("tasks", {})), "All ten distinct tasks must contribute exactly once", missing=expected is None)
+        roster = set((expected or {}).get("tasks", {})) or set(task_ids)
+        check("one-finding-per-task", "goal", scalar_task_ids and set(task_ids) == roster and len(task_ids) == len(roster), "Every distinct task must contribute exactly once", missing=expected is None)
         claims = {task.get("id"): task.get("claimed_by") for task in state["tasks"] if isinstance(task.get("id"), str)}
         check("claim-attribution", "runtime", all(isinstance(finding.get("task_id"), str) and claims.get(finding["task_id"]) == finding.get("agent_id") for finding in findings), "Finding producers must be the authoritative Task claimants")
         if artifact is not None:
@@ -327,8 +401,15 @@ def check_run(run_dir, expected_path, runtime=None, extension=None, package_lock
 
     if artifact is not None and expected is not None:
         try:
-            matches = normalized(artifact) == normalized(expected["artifact"])
-            check("independent-artifact-score", "goal", matches, "Consolidated inconsistencies compared with private expected set")
+            if scorer_kind == "security-review":
+                key = expected["artifact_contract"]["result_key"]
+                merged = artifact[key] if isinstance(artifact, dict) and set(artifact) == {key} and isinstance(artifact[key], list) else None
+                matches = merged is not None and sorted(merged, key=canonical) == security_union(state["findings"], expected["artifact_contract"])
+                reason = "Artifact must contain every worker record exactly once, verbatim"
+            else:
+                matches = normalized(artifact) == normalized(expected["artifact"])
+                reason = "Consolidated inconsistencies compared with private expected set"
+            check("independent-artifact-score", "goal", matches, reason)
         except (ValueError, TypeError, KeyError) as error:
             check("independent-artifact-score", "goal", False, str(error))
 
@@ -347,7 +428,7 @@ def check_run(run_dir, expected_path, runtime=None, extension=None, package_lock
         "scorer_version": (expected or {}).get("scorer_version"),
         "seed": (expected or {}).get("seed"),
         "checks": checks,
-        "coverage": "single-host-ten-agent-live-preview",
+        "coverage": "single-host-1-30-agent-live-preview",
         "deferred": ["500-agent/three-node acceptance", "Raft/QUIC and HA", "local-provider/air-gap", "full Tier P security", "signed audit witness", "three-family rotation"],
     }
 
@@ -363,7 +444,7 @@ def main():
     report = check_run(args.run_dir, args.expected, args.runtime, args.extension, args.package_lock)
     args.run_dir.mkdir(parents=True, exist_ok=True)
     (args.run_dir / "report.json").write_text(json.dumps(report, indent=2) + "\n")
-    lines = [f"# Run {report['run_id']}: {report['verdict']}", "", "Scope: single-host ten-agent live preview.", ""]
+    lines = [f"# Run {report['run_id']}: {report['verdict']}", "", "Scope: single-host 1-30 agent live preview.", ""]
     lines.extend(f"- {name}: {report[name]}" for name in ("runtime_verdict", "goal_verdict", "evidence_verdict", "cleanup_verdict"))
     lines.extend(["", "Failed or missing checks:", ""])
     lines.extend(f"- {item['check']}: {item['verdict']} — {item['reason']}" for item in report["checks"] if item["verdict"] != "PASS")

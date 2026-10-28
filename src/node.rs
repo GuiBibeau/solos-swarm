@@ -84,6 +84,10 @@ pub struct BrokerNode {
     pub backends: BTreeMap<String, Backend>,
     pub stops: Arc<Mutex<BTreeMap<String, watch::Sender<bool>>>>,
     pub tools: Arc<dyn ToolExecutor>,
+    /// Egress client for the `fetch_url` tool. It is deliberately separate from
+    /// the provider client: a target's latency and redirects are the worker's
+    /// business, while the provider's are the runtime's.
+    pub client: reqwest::Client,
 }
 impl BrokerNode {
     async fn session(&self, peer: &Peer) -> Result<Session> {
@@ -1196,6 +1200,87 @@ impl BrokerNode {
                     .await?
                     .require();
             }
+            // Network egress is the one tool whose result is not derived from
+            // replicated state, so it runs between admission and apply: the
+            // permit is what the live call is charged against, and the response
+            // is recorded as the effect's result so a replay matches by wire hash.
+            "fetch_url" => {
+                ensure!(
+                    tool.operation == "tool_fetch",
+                    "fetch capability operation mismatch"
+                );
+                let target = args["url"]
+                    .as_str()
+                    .context("fetch url missing")?
+                    .to_owned();
+                let payload = json!({"goal_id":goal_id,"url":target,"request":args});
+                if let Some(cached) = self
+                    .kernel
+                    .cached_local_application(
+                        &peer.subject,
+                        &intent,
+                        &payload,
+                        (tool.kind, &tool.operation, &tool.resource),
+                        &Self::leases(session),
+                    )
+                    .await?
+                {
+                    return Ok(cached);
+                }
+                let request = self
+                    .request(
+                        session,
+                        &intent,
+                        tool.kind,
+                        &tool.operation,
+                        &tool.resource,
+                        payload.clone(),
+                        tool.class,
+                        None,
+                        None,
+                    )
+                    .await?;
+                let admission = self
+                    .kernel
+                    .admit(
+                        &format!("admit-{}", message.request_id),
+                        &peer.subject,
+                        Admission {
+                            request,
+                            payload,
+                            prices: None,
+                            approvals: vec![],
+                            leases: Self::leases(session),
+                            quota: None,
+                            task: Self::task_context(session),
+                        },
+                    )
+                    .await?
+                    .require()?;
+                if admission["status"] == "confirmation_required" {
+                    return Ok(admission);
+                }
+                // A live fetch that fails still has to settle its permit, so the
+                // denial is carried into the applied effect rather than raised
+                // before `apply`, where it would leave the intent unresolved.
+                let outcome = crate::broker::fetch(&self.client, &args).await;
+                let value = match outcome {
+                    Ok(response) => json!({"outcome":"ok","response":response}),
+                    Err(error) => json!({"outcome":"error","reason":error.to_string()}),
+                };
+                return self
+                    .kernel
+                    .apply_fetch(
+                        &format!("apply-{}", message.request_id),
+                        &peer.subject,
+                        &intent,
+                        &goal_id,
+                        value,
+                        Self::leases(session),
+                    )
+                    .await?
+                    .require();
+            }
             "request_stop" | "request_flag" => {
                 ensure!(
                     tool.kind == CapabilityKind::PolicyRequest,
@@ -1720,6 +1805,25 @@ pub fn make_tools(grant: &crate::security::Grant) -> Vec<ToolDefinition> {
             object(
                 json!({"scope":loose(),"trigger":text(),"reason_hash":{"type":"array","items":{"type":"integer","minimum":0,"maximum":255},"maxItems":32},"confidence_milli":{"type":"integer","minimum":0,"maximum":1000}}),
                 vec!["scope", "trigger", "reason_hash", "confidence_milli"],
+            ),
+        ),
+        (
+            "fetch_url",
+            "Fetch one live http(s) URL and return its status, headers and bounded body. \
+             This is a worker's only network egress, so it is what makes a live target \
+             auditable rather than merely paraphrased.",
+            CapabilityKind::ToolCall,
+            "tool_fetch",
+            format!("tool/{goal}"),
+            object(
+                json!({
+                    "url":{"type":"string","minLength":1,"maxLength":2048},
+                    "method":{"type":"string","enum":["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]},
+                    "headers":{"type":"object","properties":{},"additionalProperties":true},
+                    "body":{"type":"string","maxLength":65536},
+                    "max_bytes":{"type":"integer","minimum":1,"maximum":1048576}
+                }),
+                vec!["url"],
             ),
         ),
         (

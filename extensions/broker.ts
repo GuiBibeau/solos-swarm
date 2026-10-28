@@ -2,6 +2,8 @@ import { request } from "node:http";
 import { Type, lazyStream, openAICompletionsApi } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
+const BOARD_MESSAGE_LIMIT = 2_048;
+
 async function broker(path: string, payload: unknown, signal?: AbortSignal): Promise<Response> {
   const socketPath = process.env.SWARM_SOCKET;
   const token = process.env.SWARM_TOKEN;
@@ -25,7 +27,7 @@ async function broker(path: string, payload: unknown, signal?: AbortSignal): Pro
         headers: { "Content-Type": "application/json" },
       })));
     });
-    req.setTimeout(120_000, () => req.destroy(new Error("Broker request timed out")));
+    req.setTimeout(660_000, () => req.destroy(new Error("Broker request timed out")));
     req.on("error", reject);
     req.end(body);
   });
@@ -36,7 +38,9 @@ export default function swarmBroker(pi: ExtensionAPI) {
     baseUrl: "http://swarm.invalid/v1", api: "swarm-broker", apiKey: "$SWARM_TOKEN",
     models: [{
       id: "deepseek-flash", name: "Brokered DeepSeek Flash", reasoning: false,
-      input: ["text"], contextWindow: 128_000, maxTokens: 4096,
+      // The broker refuses requests over the Goal's max_input_bytes (1 MiB by default, roughly
+      // 250k tokens). Advertising a smaller window makes pi compact before that refusal.
+      input: ["text"], contextWindow: Number(process.env.SWARM_CONTEXT_TOKENS ?? 200_000), maxTokens: 65_536,
       cost: { input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0 },
       compat: { supportsStore: false, supportsDeveloperRole: false, maxTokensField: "max_tokens", supportsStrictMode: false },
     }],
@@ -80,19 +84,33 @@ export default function swarmBroker(pi: ExtensionAPI) {
   });
 
   const tools = [
-    { name: "claim_task", description: "Claim your assigned evidence-checking task. Returns its ID and source records.", parameters: Type.Object({}) },
+    { name: "claim_task", description: "Claim your assigned task. Returns its ID and input payload. Claim exactly once before any other tool.", parameters: Type.Object({}) },
     { name: "board_read", description: "Read shared progress messages for this Goal.", parameters: Type.Object({}) },
-    { name: "board_post", description: "Post a progress message to this Goal's shared Board.", parameters: Type.Object({ message: Type.String({ minLength: 1, maxLength: 2048 }) }) },
-    { name: "submit_finding", description: "Submit your claimed task's findings. Use result.inconsistencies with objects containing id, source_a and source_b.", parameters: Type.Object({ task_id: Type.String(), result: Type.Object({}, { additionalProperties: true }) }) },
+    // Deliberately no maxLength here: a schema rejection is a tool error the
+    // model can retry forever. The boundary shortens the message instead and
+    // tells the model to continue.
+    { name: "board_post", description: "Post a progress message to this Goal's shared Board. Messages longer than 2048 characters are shortened.", parameters: Type.Object({ message: Type.String({ minLength: 1 }) }) },
+    { name: "submit_finding", description: "Submit your claimed task's structured result exactly as the Goal's worker prompt defines it. Immutable once accepted.", parameters: Type.Object({ task_id: Type.String(), result: Type.Object({}, { additionalProperties: true }) }) },
     { name: "read_findings", description: "Coordinator only: read completed findings from every worker.", parameters: Type.Object({}) },
-    { name: "submit_artifact", description: "Coordinator only: submit the combined artifact with inconsistencies from all ten tasks.", parameters: Type.Object({ artifact: Type.Object({}, { additionalProperties: true }) }) },
-  ].filter((tool) => process.env.SWARM_ROLE === "coordinator" || !["read_findings", "submit_artifact"].includes(tool.name));
+    { name: "submit_artifact", description: "Coordinator only: submit the combined artifact exactly as the Goal's synthesis prompt defines it.", parameters: Type.Object({ artifact: Type.Object({}, { additionalProperties: true }) }) },
+    { name: "fetch_url", description: "Fetch one live http(s) URL through the broker; returns status, headers and bounded body. Your only network egress.", parameters: Type.Object({ url: Type.String({ minLength: 1, maxLength: 2048 }), method: Type.Optional(Type.String()), headers: Type.Optional(Type.Object({}, { additionalProperties: true })), body: Type.Optional(Type.String()), max_bytes: Type.Optional(Type.Number()) }) },
+    { name: "run_code", description: "Run one bash command in an isolated, CPU-only, offline Linux sandbox. The working directory and only writable path is /work. Read-only: /dataset (decoded Parquet), /regimes (source checkout), /venv (Python environment; use /venv/bin/python). No network, broker socket, host home, GPU, or credentials. Files are written into /work before the command. Returns bounded {exit_code,stdout,stderr,timed_out,duration_ms,truncated}. timeout_seconds is 1-300 (default 120).", parameters: Type.Object({ code: Type.String({ minLength: 1 }), files: Type.Optional(Type.Object({}, { additionalProperties: Type.String() })), timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 300 })), stdin: Type.Optional(Type.String()) }) },
+  ].filter((tool) => (process.env.SWARM_ROLE === "coordinator" || !["read_findings", "submit_artifact"].includes(tool.name))
+    && (!process.env.SWARM_GRANTS || process.env.SWARM_GRANTS.split(",").map((grant) => grant.trim()).filter(Boolean).includes(tool.name)));
   for (const tool of tools) pi.registerTool({
     ...tool, label: tool.name,
     async execute(_id, params, signal) {
-      const response = await broker(`/tool/${tool.name}`, params, signal);
+      let payload = params;
+      let notice: string | undefined;
+      const message = (params as { message?: unknown }).message;
+      if (tool.name === "board_post" && typeof message === "string" && message.length > BOARD_MESSAGE_LIMIT) {
+        payload = { ...(params as Record<string, unknown>), message: message.slice(0, BOARD_MESSAGE_LIMIT) };
+        notice = `Message shortened to the ${BOARD_MESSAGE_LIMIT}-character Board limit; continue.`;
+      }
+      const response = await broker(`/tool/${tool.name}`, payload, signal);
       if (!response.ok) throw new Error(`Broker denied ${tool.name}: HTTP ${response.status}`);
       const result = await response.json();
+      if (notice && result && typeof result === "object") result.notice = notice;
       return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
     },
   });

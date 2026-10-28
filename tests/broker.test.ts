@@ -9,13 +9,17 @@ import { normalizeContext } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ProviderConfig } from "@earendil-works/pi-coding-agent";
 import swarmBroker from "../extensions/broker.ts";
 
-const names = ["claim_task", "board_read", "board_post", "submit_finding", "read_findings", "submit_artifact"];
+const names = ["claim_task", "board_read", "board_post", "submit_finding", "read_findings", "submit_artifact", "fetch_url", "run_code"];
 
 test("real pinned Pi talks only to Unix broker and completes a tool loop", { timeout: 30_000 }, async (t) => {
   const dir = await mkdtemp(`${tmpdir()}/swarm-pi-`);
   const socket = `${dir}/broker.sock`;
   let modelCalls = 0;
   const toolCalls: string[] = [];
+  // Longer than the Board limit on purpose: the boundary must shorten it, not
+  // reject the call, or a model can loop on the validation error until its
+  // budget is gone (math-swarm-20261025-02, agent-07).
+  const boardMessage = `Checking A B ${"x".repeat(2100)}`;
   const server = createServer(async (req, res) => {
     try {
       assert.equal(req.headers.authorization, "Bearer session-test-token");
@@ -30,7 +34,7 @@ test("real pinned Pi talks only to Unix broker and completes a tool loop", { tim
         assert.ok(body.messages.some((message: { role: string }) => message.role === "system"));
         const calls = [
           { id: "call-claim", type: "function", function: { name: "claim_task", arguments: "{}" } },
-          { id: "call-board", type: "function", function: { name: "board_post", arguments: JSON.stringify({ message: "Checking A\u2028B" }) } },
+          { id: "call-board", type: "function", function: { name: "board_post", arguments: JSON.stringify({ message: boardMessage }) } },
           { id: "call-submit", type: "function", function: { name: "submit_finding", arguments: JSON.stringify({ task_id: "task-0", result: { inconsistencies: [] } }) } },
         ];
         modelCalls++;
@@ -38,6 +42,11 @@ test("real pinned Pi talks only to Unix broker and completes a tool loop", { tim
           assert.equal(body.messages.filter((message: { role: string }) => message.role === "tool").length, 3);
           const thinking = body.messages.find((message: { role: string }) => message.role === "assistant");
           assert.equal(thinking.tool_calls.length, 3);
+          const toolText = body.messages
+            .filter((message: { role: string }) => message.role === "tool")
+            .map((message: { content: unknown }) => typeof message.content === "string" ? message.content : JSON.stringify(message.content))
+            .join(" ");
+          assert.ok(toolText.includes("Message shortened"), "the model must be told the Board message was shortened");
         }
         res.end(JSON.stringify({
           id: `completion-${modelCalls}`, created: 1, model: "deepseek-flash", swarm_cost_microusd: 30,
@@ -49,7 +58,10 @@ test("real pinned Pi talks only to Unix broker and completes a tool loop", { tim
         assert.ok(names.includes(name));
         toolCalls.push(name);
         if (name === "claim_task") assert.deepEqual(body, {});
-        if (name === "board_post") assert.equal(body.message, "Checking A\u2028B");
+        if (name === "board_post") {
+          assert.equal(body.message.length, 2048, "the boundary must shorten to the Board limit");
+          assert.ok(body.message.startsWith("Checking A\u2028B "));
+        }
         if (name === "submit_finding") assert.deepEqual(body, { task_id: "task-0", result: { inconsistencies: [] } });
         res.end(JSON.stringify({ task_id: "task-0", accepted: true }));
       }
@@ -118,12 +130,29 @@ test("worker tools exclude coordinator grants, including forged tool calls", () 
       registerProvider() {}, registerTool(tool) { declared.push(tool.name); },
       on(event, handler) { if (event === "tool_call") guard = handler; },
     } as ExtensionAPI);
-    assert.deepEqual(declared.sort(), ["board_post", "board_read", "claim_task", "submit_finding"]);
+    assert.deepEqual(declared.sort(), ["board_post", "board_read", "claim_task", "fetch_url", "run_code", "submit_finding"]);
     assert.equal((guard?.({ toolName: "submit_artifact" }) as { block: boolean }).block, true);
     assert.equal((guard?.({ toolName: "read_findings" }) as { block: boolean }).block, true);
     assert.equal(guard?.({ toolName: "submit_finding" }), undefined);
   } finally {
     if (previousRole === undefined) delete process.env.SWARM_ROLE; else process.env.SWARM_ROLE = previousRole;
+  }
+});
+
+test("SWARM_GRANTS narrows the registered tools, so a Goal without run_code never advertises it", () => {
+  const previousRole = process.env.SWARM_ROLE;
+  const previousGrants = process.env.SWARM_GRANTS;
+  process.env.SWARM_ROLE = "worker";
+  process.env.SWARM_GRANTS = "claim_task,board_read,board_post,submit_finding,fetch_url";
+  const declared: string[] = [];
+  try {
+    swarmBroker({
+      registerProvider() {}, registerTool(tool) { declared.push(tool.name); }, on() {},
+    } as ExtensionAPI);
+    assert.deepEqual(declared.sort(), ["board_post", "board_read", "claim_task", "fetch_url", "submit_finding"]);
+  } finally {
+    if (previousRole === undefined) delete process.env.SWARM_ROLE; else process.env.SWARM_ROLE = previousRole;
+    if (previousGrants === undefined) delete process.env.SWARM_GRANTS; else process.env.SWARM_GRANTS = previousGrants;
   }
 });
 
