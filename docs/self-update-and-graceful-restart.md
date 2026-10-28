@@ -135,7 +135,8 @@ The runtime polls it every 200 ms (`control_watch`).
    spent/held, task counts, the runtime sha. Exit code is 0.
 
 `pause` and `unpause` use the same file (`mode: pause|run`). A pause leaves the run up with the
-gate shut and does not end it. The deadline keeps running.
+gate shut and does not end it. The deadline clock stops while paused, because `unpaused_deadline`
+reads the same `effective_control` answer (see [pause-mode.md](pause-mode.md)).
 
 **What can be resumed, and what cannot.**
 
