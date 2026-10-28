@@ -117,6 +117,31 @@ class RemoteTests(unittest.TestCase):
             signals.assert_called_once_with(remote.signal.SIGHUP, remote.signal.SIG_IGN)
             start.assert_called_once_with(request)
 
+    def test_collect_leaves_the_code_scratch_dir_on_the_host(self):
+        import tarfile
+        with tempfile.TemporaryDirectory() as root:
+            run = Path(root)
+            (run / "code/agent-1").mkdir(parents=True)
+            (run / "code/agent-1/scratch.bin").write_bytes(b"x" * 1000)
+            (run / "code/b.txt").write_bytes(b"yy")
+            (run / "results").mkdir()
+            (run / "results/summary.json").write_text("{}")
+            (run / "codex.json").write_text("{}")  # prefix lookalike must stay
+            for include, expect_code in ((False, False), (True, True)):
+                out = io.BytesIO()
+                remote.collect_bundle(run, out, include)
+                out.seek(0)
+                with tarfile.open(fileobj=out) as bundle:
+                    names = set(bundle.getnames())
+                    manifest = json.load(bundle.extractfile("collect-manifest.json"))
+                self.assertEqual("code/b.txt" in names, expect_code)
+                self.assertIn("results/summary.json", names)
+                self.assertIn("codex.json", names)
+                if expect_code:
+                    self.assertEqual(manifest["skipped"], [])
+                else:
+                    self.assertEqual(manifest["skipped"], [{"path": "code", "files": 2, "bytes": 1002}])
+
     def test_cancel_already_stopped_run_returns_status_without_stop(self):
         request = {"run_id": "preview-42"}
         status = {"run_id": "preview-42", "service_stopped": True, "cleanup_confirmed": True}
