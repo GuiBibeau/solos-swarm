@@ -608,6 +608,7 @@ unsafe extern "C" {
     fn dup(fd: i32) -> i32;
 }
 fn uid() -> u32 {
+    // SAFETY: geteuid(2) takes no arguments, cannot fail and touches no memory.
     unsafe { geteuid() }
 }
 fn public_json<T: serde::de::DeserializeOwned>(path: &Path, max: usize) -> Result<T> {
@@ -708,8 +709,10 @@ async fn credential(source: &CredentialSource) -> Result<Zeroizing<String>> {
                 *fd >= 3,
                 "credential descriptor cannot be a standard stream"
             );
+            // SAFETY: dup(2) only reads an integer descriptor; failure is returned as -1 and checked below.
             let copied = unsafe { dup(*fd) };
             ensure!(copied >= 0, "inherited credential descriptor absent");
+            // SAFETY: `copied` is a fresh descriptor (>= 0, checked above) owned by nothing else.
             let file = unsafe { std::fs::File::from_raw_fd(copied) };
             tokio::task::spawn_blocking(move || bounded_credential_fd(file)).await??
         }
@@ -763,6 +766,7 @@ fn verify_socket_owner(stream: &UnixStream, expected: u32) -> Result<()> {
         gid: 0,
     };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: getsockopt writes at most `len` bytes into the live `cred` struct and updates `len`.
     let result = unsafe {
         libc::getsockopt(
             std::os::unix::io::AsRawFd::as_raw_fd(stream),
@@ -3891,6 +3895,7 @@ fn bounded_credential_fd(mut file: std::fs::File) -> Result<Vec<u8>> {
             events: libc::POLLIN,
             revents: 0,
         };
+        // SAFETY: poll gets a pointer to one live pollfd and a count of 1.
         let ready = unsafe {
             libc::poll(
                 &mut poll,

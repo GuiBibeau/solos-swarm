@@ -1,0 +1,3 @@
+# Google/Chromium/Fuchsia/Android all use the default rustfmt style. Keep this
+# file empty of overrides on purpose; see docs/rust-style.md.
+edition = "2024"
