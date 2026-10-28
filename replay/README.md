@@ -17,7 +17,8 @@ it was not tuned on. Plain Python, stdlib only, no Rust changes.
 | `simulate.py` | Replay simulator and reward |
 | `guard.py` | Deployment guard: dev/held-out split, paired bootstrap CI, minimum history, unexplored-branch check |
 | `propose.py` | Grid search on dev runs only (the stand-in for Dream-RSI's policy-development agent) |
-| `hook.py`, `drive-hook.patch` | Optional `drive.py --replay-check` step |
+| `hook.py`, `drive-hook.patch`, `gen-hook.patch` | Optional `drive.py --replay-check` step and opt-in `gen.py` consumer |
+| `synthetic.py` | Synthetic histories for tests and the worked example |
 
 ## Use
 
@@ -25,7 +26,7 @@ it was not tuned on. Plain Python, stdlib only, no Rust changes.
 # 1. collect evidence (box side, once per run; not done by this package, no ssh here)
 python3 scripts/remote.py collect --run-id RUN --output work/tournament-20261028/evidence/w1
 # 2. ingest
-python3 -m replay ingest work/*/evidence-* work/tournament-20261028/evidence/* --out history.jsonl
+python3 -m replay ingest work/*/evidence-* work/arch-swarm-20261026/evidence-* --out history.jsonl
 # 3. score a policy spec, search on dev runs, ask the guard
 python3 -m replay score   --history history.jsonl --policy spec.json
 python3 -m replay propose --history history.jsonl > proposal.json   # {"policy", "tuned_on", "dev_mean"}
@@ -60,16 +61,52 @@ split is a hash of the run id, so it is stable as history grows. In pure-noise s
 by grid search on dev is adopted in about 7 percent of cases (4 of 60 at 24 runs), see `tests/test_replay.py`.
 Each adoption shrinks the held-out set's value: after adopting, treat those runs as spent and wait for new ones.
 
-## drive.py wiring (optional, off by default)
+## Worked example (synthetic history)
 
-`drive-hook.patch` adds `drive.py run --replay-check` to `work/tournament-20261028/drive.py` (that directory lives on
-the local tournament branch, not on this one, so the patch is not applied here; check it with `git apply --check`).
-After each close step (c1..c4) it ingests all collected evidence, looks for a proposal in
-`replay-proposal-<step>.json` or in the close step's findings, writes `evidence/<step>-replay-verdict.json`
-and appends the verdict to `launch-log.jsonl`. A `prompt_patch` alone is logged as `unscored`: prompt text has no
-replay semantics. A `policy` spec is applied only through `hook.approved_policy()`, which returns it solely when the
-stored verdict says `adopt`. Nothing in drive.py or gen.py consumes it yet; a later change can make gen.py read it.
-The close-step record contract does not yet allow a `policy` field, so today the proposal file is the way in.
+```sh
+python3 -m replay demo
+```
+
+builds 40 synthetic runs (12 families each, 3 "hot" families that give most survivors and confirmations, the rest
+nearly null), then asks the guard about an `adaptive` candidate (stop a family after one null, at most 4 attempts per
+family, 4 rounds) against the baseline. With 5 runs it answers `insufficient history`; with 40 it adopts: 28 dev runs
+and 12 held-out runs, mean reward gain about +0.76 dev and +0.91 held-out, held-out 95% CI [0.02, 1.89]. The same
+generator with `structured=False` (pure noise) is in the tests: a policy tuned on dev by grid search is refused 9 times
+out of 10, and adopted in about 7 percent of 60 trials. Real data will look nothing like this clean.
+
+## Real evidence when the tournament finishes
+
+Everything below reads the tournament directory and writes only `--out`:
+
+```sh
+# on the Mac, after drive.py has collected each step (evidence/<step>/ + evidence/<step>-perf.json)
+python3 -m replay ingest-tournament work/tournament-20261028 --out history.jsonl
+python3 -m replay score --history history.jsonl          # baseline reward on the scorable runs
+python3 -m replay check --history history.jsonl --proposal replay-proposal.json   # {"policy": {...}, "tuned_on": [...]}
+```
+
+`ingest-tournament` treats w1 + w2 + w3 as ONE run (families recur across waves; referee verdicts attach to the
+candidates they judged; collectors and closers are not attempts). Extra evidence dirs can be appended after the
+tournament dir on the same command line.
+
+**Plain expectation: the first real history is one run.** The guard needs 12 scorable runs and 6 held-out ones, so
+the verdict on the tournament alone will be `insufficient history`, and it stays that way until several tournaments or
+equivalent runs exist. That is the intended behaviour: the thresholds are not to be lowered to get an answer. Until then
+the loop is useful only for what it records (the history) and for scoring the baseline.
+
+## Wiring (optional, off by default, patches not applied)
+
+The tournament scripts live only on the local tournament branch, so the wiring ships as patches, each checked with
+`git apply --check` against tip 07a1dd5 and `test_goals.py` run on the patched copy:
+
+- `drive-hook.patch`: `drive.py run --replay-check`. After each close step (c1..c4) it ingests all collected evidence,
+  looks for a proposal in `replay-proposal-<step>.json` or in the close step's findings, writes
+  `evidence/<step>-replay-verdict.json` and appends the verdict to `launch-log.jsonl`. A `prompt_patch` alone is logged
+  as `unscored`: prompt text has no replay semantics.
+- `gen-hook.patch`: the close-step record contract gains an optional `policy` object (`OUT.optional_fields` and the
+  close protocol text), and `gen.py` reads the verdict file only when `TOURNAMENT_REPLAY=1`. It then applies the single
+  knob `trial_budget`, and only downward. Nothing is applied without an `adopt` verdict (`hook.approved_policy`).
+  Applying it changes the close protocol text, so apply it between tournaments, not under a live run.
 
 ## Comparison to Dream-RSI
 
