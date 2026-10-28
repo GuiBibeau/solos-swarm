@@ -1118,12 +1118,17 @@ async fn model(
     }
     let (id, run_dir) = {
         let store = broker.store.lock().await;
-        (store.authenticate(&headers).map_err(denied)?, store.dir.clone())
+        (
+            store.authenticate(&headers).map_err(denied)?,
+            store.dir.clone(),
+        )
     };
     if let Some(wait) = pause_retry_after(&run_dir, unix_secs()) {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"paused":true,"retry_after_s":wait,"reason":"model calls are paused (operator pause or peak window)"})),
+            Json(
+                json!({"paused":true,"retry_after_s":wait,"reason":"model calls are paused (operator pause or peak window)"}),
+            ),
         ));
     }
     if body["model"] != broker.goal.model

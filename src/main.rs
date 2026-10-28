@@ -1173,10 +1173,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("swarm-dl-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("PAUSE"), "").unwrap();
-        let paused = tokio::time::timeout(Duration::from_secs(3), unpaused_deadline(1, dir.clone())).await;
+        let paused =
+            tokio::time::timeout(Duration::from_secs(3), unpaused_deadline(1, dir.clone())).await;
         assert!(paused.is_err(), "deadline must not expire while paused");
         std::fs::remove_file(dir.join("PAUSE")).unwrap();
-        let resumed = tokio::time::timeout(Duration::from_secs(4), unpaused_deadline(1, dir.clone())).await;
+        let resumed =
+            tokio::time::timeout(Duration::from_secs(4), unpaused_deadline(1, dir.clone())).await;
         assert!(resumed.is_ok(), "deadline runs once the pause is lifted");
     }
 
