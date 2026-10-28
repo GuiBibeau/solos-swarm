@@ -766,6 +766,7 @@ fn verify_socket_owner(stream: &UnixStream, expected: u32) -> Result<()> {
         gid: 0,
     };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: getsockopt writes at most `len` bytes into the live `cred` struct and updates `len`.
     let result = unsafe {
         libc::getsockopt(
             std::os::unix::io::AsRawFd::as_raw_fd(stream),
@@ -3894,6 +3895,7 @@ fn bounded_credential_fd(mut file: std::fs::File) -> Result<Vec<u8>> {
             events: libc::POLLIN,
             revents: 0,
         };
+        // SAFETY: poll gets a pointer to one live pollfd and a count of 1.
         let ready = unsafe {
             libc::poll(
                 &mut poll,

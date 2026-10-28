@@ -36,6 +36,7 @@ fn process_uid() -> u32 {
     unsafe extern "C" {
         fn geteuid() -> u32;
     }
+    // SAFETY: geteuid takes no arguments and cannot fail.
     unsafe { geteuid() }
 }
 
