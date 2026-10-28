@@ -1074,6 +1074,37 @@ fn denied(error: anyhow::Error) -> (StatusCode, Json<Value>) {
     )
 }
 
+/// Seconds until the weekday peak window ends when `now_secs` (Unix, UTC) falls inside one: Mon-Fri 01:00-04:00 and
+/// 06:00-10:00. No model call may start inside it when `SWARM_REFUSE_PEAK=1`, so no tokens are bought at peak price.
+pub fn peak_retry_after(now_secs: u64) -> Option<u64> {
+    let weekday = (now_secs / 86_400 + 4) % 7; // 1970-01-01 was a Thursday; 0 = Sunday
+    if !(1..=5).contains(&weekday) {
+        return None;
+    }
+    let second_of_day = now_secs % 86_400;
+    [(3_600, 14_400), (21_600, 36_000)]
+        .into_iter()
+        .find(|(start, end)| (*start..*end).contains(&second_of_day))
+        .map(|(_, end)| end - second_of_day)
+}
+/// A pause is a `PAUSE` file in the run directory (operator) or, with `SWARM_REFUSE_PEAK=1`, a peak window. Returns the
+/// polling interval the client should wait (at most 60 s). A paused request is refused BEFORE any reservation, so it
+/// costs no call, no hold and no ledger entry.
+pub fn pause_retry_after(dir: &Path, now_secs: u64) -> Option<u64> {
+    if dir.join("PAUSE").exists() {
+        return Some(60);
+    }
+    if std::env::var("SWARM_REFUSE_PEAK").as_deref() == Ok("1") {
+        return peak_retry_after(now_secs).map(|s| s.clamp(1, 60));
+    }
+    None
+}
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 async fn model(
     State(broker): State<Broker>,
     headers: HeaderMap,
@@ -1085,10 +1116,21 @@ async fn model(
     if input_bytes > broker.goal.max_input_bytes {
         return Err(denied(anyhow::anyhow!("request exceeds Goal limit")));
     }
-    let id = {
+    let (id, run_dir) = {
         let store = broker.store.lock().await;
-        store.authenticate(&headers).map_err(denied)?
+        (
+            store.authenticate(&headers).map_err(denied)?,
+            store.dir.clone(),
+        )
     };
+    if let Some(wait) = pause_retry_after(&run_dir, unix_secs()) {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                json!({"paused":true,"retry_after_s":wait,"reason":"model calls are paused (operator pause or peak window)"}),
+            ),
+        ));
+    }
     if body["model"] != broker.goal.model
         || !body["messages"].is_array()
         || body["messages"].as_array().unwrap().is_empty()

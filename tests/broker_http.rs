@@ -208,3 +208,44 @@ async fn unix_broker_denials_dispatch_nothing_and_allowed_call_settles_once() {
     let _ = upstream.await;
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn peak_windows_are_weekday_utc_and_bounded() {
+    let at = |day: u64, h: u64, m: u64| (day * 86_400) + h * 3_600 + m * 60; // day 0 = Thu 1970-01-01
+    let wed = 20_754; // 2026-10-28, a Wednesday
+    assert_eq!((wed + 4) % 7, 3);
+    assert_eq!(broker::peak_retry_after(at(wed, 0, 59)), None);
+    assert_eq!(broker::peak_retry_after(at(wed, 1, 0)), Some(10_800));
+    assert_eq!(broker::peak_retry_after(at(wed, 3, 59)), Some(60));
+    assert_eq!(broker::peak_retry_after(at(wed, 4, 0)), None);
+    assert_eq!(broker::peak_retry_after(at(wed, 5, 59)), None);
+    assert_eq!(broker::peak_retry_after(at(wed, 6, 0)), Some(14_400));
+    assert_eq!(broker::peak_retry_after(at(wed, 9, 59)), Some(60));
+    assert_eq!(broker::peak_retry_after(at(wed, 10, 0)), None);
+    assert_eq!(broker::peak_retry_after(at(wed, 23, 0)), None);
+    assert_eq!(
+        broker::peak_retry_after(at(wed + 3, 7, 0)),
+        None,
+        "Saturday"
+    );
+    assert_eq!(broker::peak_retry_after(at(wed + 4, 2, 0)), None, "Sunday");
+    assert_eq!(
+        broker::peak_retry_after(at(wed + 5, 1, 0)),
+        Some(10_800),
+        "Monday"
+    );
+}
+
+#[test]
+fn pause_file_pauses_and_removing_it_resumes() {
+    let dir = std::env::temp_dir().join(format!(
+        "swarm-pause-{}",
+        &uuid::Uuid::new_v4().to_string()[..8]
+    ));
+    fs::create_dir(&dir).unwrap();
+    assert_eq!(broker::pause_retry_after(&dir, 0), None);
+    fs::write(dir.join("PAUSE"), "").unwrap();
+    assert_eq!(broker::pause_retry_after(&dir, 0), Some(60));
+    fs::remove_file(dir.join("PAUSE")).unwrap();
+    assert_eq!(broker::pause_retry_after(&dir, 0), None);
+}

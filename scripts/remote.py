@@ -27,6 +27,9 @@ SSH_HOST = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@:-]{0,127}\Z")
 NODE_SOURCE = Path(os.environ["SWARM_NODE_DIR"]) if os.environ.get("SWARM_NODE_DIR") else Path.home() / ".local/opt/node-v24.18.0-linux-x64"
 DATA = Path.home() / ".local/share/solos-swarm"
 STATE = Path.home() / ".local/state/solos-swarm"
+# With --refuse-peak the broker pauses model calls in weekday peak windows and the Goal deadline stops counting;
+# the service wall-clock backstop widens by this much (one day: at most 7 h of peak per weekday plus margin).
+PEAK_SLACK_SECONDS = 86_400
 RUN_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,47}\Z")
 CANDIDATE_ID = re.compile(r"[a-f0-9]{64}\Z")
 
@@ -209,6 +212,8 @@ def start_host(request):
     identity = {key: request[key] for key in ("candidate_id", "seed", "run_id")}
     identity["idle_probe"] = request.get("idle_probe", False)
     identity["deadline_seconds"] = request.get("deadline_seconds")
+    if request.get("refuse_peak"):
+        identity["refuse_peak"] = True
     if request.get("case_sha256"):
         identity["case_sha256"] = request["case_sha256"]
     with lock(f"run-{run_id}"):
@@ -258,12 +263,12 @@ def start_host(request):
                                  "--candidate", request["candidate_id"], "--credential-file", credential])
             service_command = ["systemd-run", "--user", "--quiet", "--unit", unit_name(run_id),
                                "--property=Type=exec", "--property=Restart=no", "--property=KillMode=control-group",
-                               f"--property=RuntimeMaxSec={deadline + 20}", "--property=TimeoutStopSec=15",
+                               f"--property=RuntimeMaxSec={deadline + 20 + (PEAK_SLACK_SECONDS if identity.get('refuse_peak') else 0)}", "--property=TimeoutStopSec=15",
                                "--property=SendSIGKILL=yes", "--property=UMask=0077", "--property=NoNewPrivileges=yes",
                                "--property=LimitCORE=0",
                                f"--property=WorkingDirectory={path}", f"--property=StandardOutput=append:{path / 'stdout.log'}",
                                f"--property=StandardError=append:{path / 'stderr.log'}", f"--property=ExecStopPost={finish}",
-                               "--setenv=PATH=/usr/bin:/bin", "--", *command]
+                               "--setenv=PATH=/usr/bin:/bin", *(["--setenv=SWARM_REFUSE_PEAK=1"] if identity.get("refuse_peak") else []), "--", *command]
             result = subprocess.run(service_command, capture_output=True, text=True)
             (path / "start.log").write_text(result.stdout + result.stderr)
             if result.returncode:
@@ -435,6 +440,7 @@ def main():
     start.add_argument("--auth-file", type=Path, default=Path.home() / ".pi/agent/auth.json")
     start.add_argument("--provider", choices=("deepseek", "venice"),
                        help="Provider that spends for this run; defaults to the Goal's own upstream")
+    start.add_argument("--refuse-peak", action="store_true", help="Broker pauses model calls Mon-Fri 01-04 and 06-10 UTC (needs a candidate built with this support)")
     start.add_argument("--idle-probe", action="store_true", help="Exercise lifecycle with no paid model calls; never qualifies")
     start.add_argument("--deadline-seconds", type=int, help="Shortened deadline for an idle lifecycle probe only")
     for action in ("status", "cancel", "collect"):
@@ -464,6 +470,8 @@ def main():
             candidate_path(args.candidate)
             request.update(candidate_id=args.candidate, seed=args.seed)
             request.update(idle_probe=args.idle_probe, deadline_seconds=args.deadline_seconds)
+            if args.refuse_peak:
+                request["refuse_peak"] = True
             if args.goal_file or args.expected_file:
                 if not args.goal_file or not args.expected_file:
                     parser.exit(2, "remote: --goal-file and --expected-file are required together\n")
