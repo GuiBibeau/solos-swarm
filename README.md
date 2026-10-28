@@ -80,6 +80,24 @@ For non-JSON YAML configs, install `scripts/requirements-dashboard.txt` in the r
 
 `Live` requires both a fresh state file and a confirmed active service. Retained or unavailable sources show `Snapshot`, `Stale`, or `Unavailable`; missing measurements stay `—`. Orbit, lattice, and helix change the layout of the same recorded workers. Use `?demo=1` for the bundled example presets, or Import JSON for a saved snapshot.
 
+### Viewing the dashboard of a run on the remote box
+
+The server has no authentication, so it is never bound to a public interface: it listens on `127.0.0.1` on the box and you reach it through an SSH tunnel from your Mac. It has no token option; the Host-header check only admits `127.0.0.1:<its port>` and `localhost:<its port>`, which is why the tunnel uses the same port on both ends.
+
+```sh
+# one-time, on the box: install the template unit (scripts/systemd/solos-dashboard@.service), never enabled
+mkdir -p ~/.config/systemd/user && cp scripts/systemd/solos-dashboard@.service ~/.config/systemd/user/ && systemctl --user daemon-reload
+# on the Mac: start the unit for one run, open the tunnel, open the browser
+scripts/dashboard-tunnel.sh --start RUN_ID            # = ssh -N -L 4173:127.0.0.1:4173 remote-ai, then http://127.0.0.1:4173/?source=runtime
+scripts/dashboard-tunnel.sh --dry-run                 # print the commands only
+```
+
+The unit reads the run's `state.json` and `config.yaml` read-only and starts no agents. Edit the repo path in the unit if the box checkout is not `~/solos-swarm`.
+
+### Replay-scored policy loop
+
+`replay/` records run history, scores candidate exploration policies on it without model calls, and gates adoption behind a held-out check; see [`replay/README.md`](replay/README.md). Tests: `python3 -m unittest discover -s tests -p 'test_replay.py'`.
+
 Dashboard checks: `node --test tests/dashboard-spatial.test.mjs tests/dashboard-telemetry.test.mjs` and `python3 -m unittest discover -s tests -p 'test_dashboard_server.py'`.
 
 ## Documentation
