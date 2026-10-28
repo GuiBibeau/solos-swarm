@@ -87,7 +87,7 @@ class RemoteTests(unittest.TestCase):
             remote.validate_goal_limits(goal)
         goal["agent_count"] = 30
         goal["tasks"].pop()
-        goal["budget_microusd"] = 100_000_001
+        goal["budget_microusd"] = 1_000_000_000_001   # one microdollar over the $1,000,000 ceiling
         with self.assertRaisesRegex(ValueError, "1-30 agents"):
             remote.validate_goal_limits(goal)
 
