@@ -1,0 +1,5 @@
+[Unit]
+Description=Tournament derived dataset build (only after the Binance pull is done and the guard is not paused)
+[Service]
+Type=oneshot
+ExecStart=%h/research/regimes/tournament-20261028/build_when_ready.sh

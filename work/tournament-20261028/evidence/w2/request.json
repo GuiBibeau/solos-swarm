@@ -1,0 +1,9 @@
+{
+  "candidate_id": "9589132866589167d69a3ea2626f63472b8b5abb523a4d32e3828e5311c48459",
+  "seed": 20261044,
+  "run_id": "tourney-20261028-w2",
+  "idle_probe": false,
+  "deadline_seconds": null,
+  "refuse_peak": true,
+  "case_sha256": "710d56ddcc570928c92624e953ab644628fd387f8e9927c8b203d9b705d331a3"
+}

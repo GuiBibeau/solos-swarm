@@ -1,0 +1,135 @@
+{
+ "schema_version": 1,
+ "scorer_kind": "security-review",
+ "scorer_id": "experiments-portfolio",
+ "scorer_version": "1",
+ "catalog_version": "tournament-w1-2026-10-28-v1",
+ "seed": 20261043,
+ "tasks": {
+  "w100": {
+   "files": [
+    "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md"
+   ]
+  },
+  "w101": {
+   "files": [
+    "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md"
+   ]
+  },
+  "w102": {
+   "files": [
+    "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md"
+   ]
+  },
+  "w103": {
+   "files": [
+    "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md"
+   ]
+  },
+  "w104": {
+   "files": [
+    "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md"
+   ]
+  },
+  "w105": {
+   "files": [
+    "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md"
+   ]
+  },
+  "w106": {
+   "files": [
+    "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md"
+   ]
+  },
+  "w107": {
+   "files": [
+    "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md"
+   ]
+  },
+  "w108": {
+   "files": [
+    "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md"
+   ]
+  },
+  "w109": {
+   "files": [
+    "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md"
+   ]
+  },
+  "w110": {
+   "files": [
+    "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md"
+   ]
+  },
+  "w111": {
+   "files": [
+    "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md"
+   ]
+  },
+  "w112": {
+   "files": [
+    "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md"
+   ]
+  },
+  "w113": {
+   "files": [
+    "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md"
+   ]
+  },
+  "w114": {
+   "files": [
+    "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md"
+   ]
+  },
+  "w115": {
+   "files": [
+    "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md"
+   ]
+  },
+  "w116": {
+   "files": [
+    "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md"
+   ]
+  },
+  "w117": {
+   "files": [
+    "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md"
+   ]
+  },
+  "w118": {
+   "files": [
+    "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md"
+   ]
+  },
+  "w119": {
+   "files": [
+    "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md"
+   ]
+  },
+  "w120": {
+   "files": [
+    "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md"
+   ]
+  },
+  "w121": {
+   "files": [
+    "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md"
+   ]
+  },
+  "w122": {
+   "files": [
+    "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md"
+   ]
+  },
+  "w123": {
+   "files": [
+    "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md"
+   ]
+  },
+  "w124": {
+   "files": [
+    "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md"
+   ]
+  }
+ }
+}

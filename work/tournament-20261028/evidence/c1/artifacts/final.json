@@ -1,0 +1,452 @@
+{
+  "papers": [
+    {
+      "decision": "Adopt the reserved-calls block, the 40%/60% notices, the early-partial-filing rule and the aligned checkpoint counter in the wave-2 protocol. These are process changes only and cannot alter the evaluation rules (trial counting, walk-forward, 14-19 bps costs, 200-shuffle placebo max, MDE floors, one confirmation look, no data from 2026-10-23, no lockbox weeks).",
+      "description": "EVIDENCE FROM THIS RUN. The performance block shows the wave spent 1992 run_code calls for 25 filed findings (calls_per_filed 83.9) and 2098 model calls, with tool_budget_blocked 21 and provider_denied {'Task budget envelope exhausted': 1, 'agent terminal: Task budget envelope exhausted': 17}. So 18 of 25 agents hit a budget-envelope denial, and 21 tool calls were refused for budget. The digest shows the consequence in the records themselves: w111 filed its placebo/decay/top-3-share metrics as 'not computed' because the guard fired at ~91% while it was still in the exploration loop; w119 reports analysis complete by call ~12 but 60 calls spent after that, with the first budget notice at 71% and the hard block at 91%; w101 reports ~10 calls re-sent after a harness fault before being blocked at 91%; w106 reports the 40-trial grid consumed the whole call budget so the mandated 200-shuffle placebo was never run; w103 reports ~20 calls wasted retrying a placebo that could not finish inside the 120 s per-call wall clock. The protocol's checkpoint schedule (Board posts at calls 14/29/41, submit by 47) is not aligned to the counter the guard actually uses. CHANGE. (1) Reserve a fixed block of run_code calls (e.g. 6) that are usable only for placebo + LINT + submit_finding, so a worker can never be locked out of filing. (2) Emit budget notices at 40% and 60% of the envelope, not only at 70%+. (3) Require an early partial filing: if the analysis is complete at call 12, file at call 13 rather than holding to call 47. (4) Align the checkpoint numbers to the same counter the guard uses. EXPECTED EFFECT. The 18 envelope denials and 21 budget blocks are the single largest source of degraded records in this wave; reserving the filing path converts 'not computed' metrics into computed ones and should cut calls_per_filed (83.9) materially, since w119 alone spent 60 calls after its analysis was done. HOW TO TEST. In wave 2, log for every agent the call index of its first complete analysis, the call index of submit_finding, and the count of metrics filed as 'not computed'. Success = zero agents blocked before submit, and a lower median (calls after analysis complete).",
+      "evidence": "performance.w1: run_code.total 1992, calls_per_filed 83.9, tool_budget_blocked 21, provider_denied {'Task budget envelope exhausted': 1, 'agent terminal: Task budget envelope exhausted': 17}, agents 25, filed 25. Digest: w111-swarm-improvement-budget-guard (guard fired at ~91%, placebo/decay/top-3-share filed as 'not computed'); w119 swarm-improvement-budget-guard (analysis complete by call 12, 60 calls spent after, first notice 71%, hard block 91%); w101-swarm-improvement (~10 calls re-sent after a harness fault, blocked at 91%); w106-swarm-improvement-budget-guard (grid consumed the budget, placebo never run); w103-swarm-placebo-wallclock (20 calls wasted on placebo retries).",
+      "file": "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md",
+      "id": "c101-swarm-01-budget-guard",
+      "kind": "swarm-improvement",
+      "prompt_patch": "File early: if your numbers are in hand, submit_finding at the next call, do not wait for call 47. Reserve your last ~6 run_code calls for placebo + lint + submit. If a call returns identical output twice, change the script, do not resend. If a run_code call fails on memory or timeout, change the algorithm. Write your trial ledger to /work after every evaluation and Board-post a partial record before any large-memory step.",
+      "severity": "useful",
+      "title": "Swarm improvement: the run_code budget guard strands the reporting block; reserve calls for placebo + filing and warn at 40%/60%"
+    },
+    {
+      "decision": "Adopt the shared read-only panel + funding matrix + age table + coverage mask as a wave-2 host deliverable, and state the funding coverage facts in the protocol. This changes only how data is delivered, not the grid, the closed-bar convention, the cost model or any evaluation rule.",
+      "description": "EVIDENCE FROM THIS RUN. The wave ran 25 agents and 1992 run_code calls for 82 digest records, i.e. ~80 calls per record, and the digest shows a large share of that went to identical data plumbing rather than to hypotheses. Independent records report the same build: w116-swarm-improvement-plumbing states roughly 8 of 59 calls went to reading 50 symbols of bars_5m, pivoting, resampling to 4h/8h/12h/24h and building a per-bar funding matrix from 134803 settlement rows, and that this is the direct reason it filed 5 of 40 trials; f04-swarm-improvement states every one of the 25 workers independently rebuilds the same panel from 8.9 GB of parquet and that a pre-built panel would save each worker 1-2 calls; w109-swarm-001 reports the first 4 calls spent on environment discovery and panel building; w105-swarm-improvement reports 3 run_code calls plus two hard failures (a 147 MiB allocation error and an 'OSError: File too large') on the same build; w124-swarm-improvement estimates ~20 of 59 calls re-sending the same 40-line pandas preamble. The funding gap was rediscovered at least four times with slightly different numbers: w115 (known_funding_cell_fraction 0.37, 11 symbols with zero funding months, 19 with 4 months), w110 (39/50 symbols, mean 18 symbols per day), w118 (n_no_funding 12, n_funding_2026_only 15, n_full_history 23), f04-method-harness (funding_cell_coverage 0.194, panel_coverage 0.578). CHANGE. The host builds and mounts a read-only cache once per wave: wide close/quote_volume/signed_usd/rv_tick frames at 4h/8h/12h/24h on the closed-bar convention, a per-bar funding matrix per grid with NaN where a symbol has no coverage, a symbol age table from manifest first_month, and a documented funding-coverage mask. The protocol states the coverage facts (39 of 50 symbols have funding; 11 have none) so no worker re-derives them. EXPECTED EFFECT. Recovers roughly 3-8 calls per worker out of ~59, which at 25 workers is on the order of 75-200 calls of the 1992 spent, and removes a whole class of OOM and file-size failures. HOW TO TEST. In wave 2, count run_code calls whose first line reads a bars_5m or funding parquet. Success = that count is zero for every worker, and trials_used per family rises from the wave-1 levels (several families filed 0/40, 5/40, 9/40, 18/40, 20/40, 24/40).",
+      "evidence": "performance.w1: agents 25, run_code.total 1992, calls_per_filed 83.9, cache_hit_rate 0.9725. Digest: w116-swarm-improvement-plumbing (~8 of 59 calls on plumbing, 134803 funding rows, filed 5 of 40 trials); f04-swarm-improvement (all 25 workers rebuild the same panel from 8.9 GB of parquet); w109-swarm-001 (first 4 calls on environment discovery and panel build); w105-swarm-improvement (3 calls plus a 147 MiB allocation error and an 'OSError: File too large'); w124-swarm-improvement (~20 of 59 calls on the repeated preamble); w115-f15-data-issue-funding-coverage (known_funding_cell_fraction 0.37, 11 symbols with zero funding months); w110-f10-data-issue-funding-coverage (39/50 symbols, mean 18 symbols per day); w118-data-issue-funding (n_no_funding 12, n_funding_2026_only 15, n_full_history 23); f04-method-harness (funding_cell_coverage 0.194, panel_coverage 0.578).",
+      "file": "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md",
+      "id": "c101-swarm-02-shared-panel",
+      "kind": "swarm-improvement",
+      "severity": "useful",
+      "title": "Swarm improvement: 25 workers each rebuilt the same 5m/4h panel and rediscovered the same funding-coverage gap; ship one pre-built panel and one funding mask"
+    },
+    {
+      "decision": "Adopt the streaming loader, the memory pre-flight, the stated RLIMIT_AS ceiling and the distinct OOM outcome tag in the wave-2 protocol. This is an environment and data-delivery change; it does not touch trial counting, walk-forward, costs, the placebo maximum, the MDE floors or the confirmation rules.",
+      "description": "EVIDENCE FROM THIS RUN. Three families produced no market evidence at all because the pooled 50-symbol 5m panel would not fit in one process. w120-f20-negative-001 reports 0 of 40 trials used, 40 of 59 run_code calls wasted on OOM, symbols_loaded_max 10, rss_mb_at_10_symbols 2153, and a failure on a 4.44 MiB allocation for shape 582528. w112-f12-oi-price-negative reports 0 of 40 trials used, symbols_loaded_before_failure 36, rows_loaded_before_failure 20000000, and a 2.49 MiB allocation failure inside pandas sort_values. w123-swarm-1 reports RLIMIT_AS = 4 GB and that a 21-feature design matrix could not be allocated, so its walk-forward ridge was never completed. w102-swarm-improve reports ~1.1 GB RAM with a 147 MiB concat failure and an 'OSError: File too large'. The failure mode is deceptive: it surfaces as a few-MiB MemoryError deep inside pandas, which reads like a code bug, so workers retry the same load (w120: 40 calls; w112: 20+ reproductions). Meanwhile the protocol's advice to 'batch work into a few larger scripts' pushes workers toward exactly the pattern that fails. CHANGE. (1) Ship a canonical streaming per-symbol loader (one symbol -> per-symbol trade records -> free) as the default pattern, with per-symbol parquet under /work and pooling only the small per-trade return series. (2) Add a memory pre-flight: load one symbol, measure RSS, extrapolate, and refuse the full-universe path if the projection exceeds the ceiling. (3) State the ceiling (RLIMIT_AS 4 GB) in the protocol's data section next to the run_code budget. (4) Tag OOM-terminated run_code calls as a distinct outcome so a wave can be re-run rather than filed as an empty negative. EXPECTED EFFECT. Recovers the 40-trial budgets of f12, f20 and f23 (120 trials of the 1407 total in this wave produced no market evidence) and stops the 40-call OOM retry loops. HOW TO TEST. In wave 2, count run_code calls terminating in MemoryError per agent. Success = zero, and f12/f20/f23-style families report trials_used > 0 with per-year net bps.",
+      "evidence": "performance.w1: run_code.total 1992, tool_budget_blocked 21. Digest: w120-f20-negative-001 (trials_used 0, run_code_calls_wasted_on_oom 40, symbols_loaded_max 10, rss_mb_at_10_symbols 2153, failed_allocation_mib 4.44); w112-f12-oi-price-negative (trials_used 0, symbols_loaded_before_failure 36, rows_loaded_before_failure 20000000, 2.49 MiB allocation failure); w123-swarm-1 (RLIMIT_AS 4 GB, walk-forward ridge not completed); w102-swarm-improve (147 MiB concat failure, 'OSError: File too large'); w120-data-issue-001 (rss_mb_1_symbol 500, rss_mb_5_symbols 1331, rss_mb_8_symbols 2030).",
+      "file": "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md",
+      "id": "c101-swarm-03-memory-ceiling",
+      "kind": "swarm-improvement",
+      "severity": "useful",
+      "title": "Swarm improvement: the sandbox memory ceiling silently voids whole families; mandate a streaming per-symbol loader and a memory pre-flight instead of 'batch into few large scripts'"
+    },
+    {
+      "decision": "Adopt the shared placebo helper with the precomputed day->bar map, the resumable shuffle accumulator, the run-placebo-early rule and the explicit ban on row-wise within-symbol permutation. The 200-shuffle maximum itself is unchanged; only its implementation and scheduling change.",
+      "description": "EVIDENCE FROM THIS RUN. The protocol requires a 200-shuffled-day placebo maximum for every candidate, but the digest shows it repeatedly could not be computed. w103-swarm-placebo-wallclock measures 3.4 s per shuffle on a 665568 x 50 signal matrix (2311 days), so 200 shuffles need about 11 minutes of CPU against a 120 s per-call limit; only ~20 of 200 shuffles fit per call, the process is killed before it can print or persist, and ~20 run_code calls were burned retrying. The result is that the placebo gate was never reached for the wave's most interesting non-candidate: w103-f03-neg-xsec-momentum reports placebo_max 'not computed' for a variant at +21.0 bps/trade, and w116, w110, w111, w114, w107, w122, w123 and w124 all report placebo 'not run' or 'not computed'. f04-method-harness shows the fix works: precomputing the day->bar-index map brings the 200-shuffle placebo to placebo_runtime_s 30. w124-f24-method adds a second, separate defect: row-wise within-symbol permutation is not a valid placebo because it destroys intra-day shape and biases the placebo distribution downward, which can make a dead signal look like it beats the placebo max. CHANGE. (1) Ship a vetted placebo helper with the precomputed day->bar map and a whole-day (not row-wise) permutation, as part of the shared harness. (2) Make the placebo resumable: persist the shuffle index and partial distribution to /work so a worker can accumulate 200 shuffles across calls instead of losing them. (3) Require the placebo to be run EARLY, on the first promising variant, not after the parameter sweep. (4) State in the protocol that row-wise within-symbol permutation is not an acceptable placebo. EXPECTED EFFECT. Turns 'placebo not computed' into a computed max for every candidate, which is the gate that decides promotion; f03's +21.0 bps variant currently cannot be judged at all. HOW TO TEST. In wave 2, count records whose placebo_max is 'not computed'. Success = zero for any record claiming a candidate, and placebo wall clock per candidate under one call.",
+      "evidence": "Digest: w103-swarm-placebo-wallclock (seconds_per_shuffle 3.4, placebo_shuffles_completed 20 of 200, wall_clock_per_call_s 120, calls_wasted_on_placebo_retries 20); w103-f03-neg-xsec-momentum (placebo_max 'not computed' for a +21.0 bps/trade variant); f04-method-harness (placebo_runtime_s 30 with a precomputed day->bar map, n_placebo 200); w124-f24-method (row-wise within-symbol permutation is not a valid placebo; placebo_shuffles_run 20 of 200); w116-f16-dispersion-rotation, w110-f10-funding-level-xs-negative, w111-f11-funding-change-negative, w114-depth-imbalance-negative, w107-f07-absorption-negative, w122-listing-age-negative, w123-f23-neg-1, w124-f24-negative-4h (all report placebo not run or not computed).",
+      "file": "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md",
+      "id": "c101-swarm-04-placebo-wallclock",
+      "kind": "swarm-improvement",
+      "severity": "useful",
+      "title": "Swarm improvement: the mandated 200-shuffle placebo does not fit the 120 s per-call wall clock; ship a precomputed day->bar map and a resumable placebo"
+    },
+    {
+      "decision": "Adopt call budgeting alongside trial budgeting, the non-zero-gross sanity assertion, the incremental on-disk trial ledger, and the two validated cheap kill tests as mandatory trial #1 for flow and cost families. Trial counting rules themselves are unchanged; this only changes how the budget is spent and audited.",
+      "description": "EVIDENCE FROM THIS RUN. The wave digest contains 1407 trials across 82 records, but the per-family ledgers show the 40-trial budget was rarely the limit. Trials used: f04 40/40, f05 40/40, f06 40/40, f09 40/40, f13 40/40, f18 40/40, f19 40/40, f01 40/40, f03 40/40, f08 40/40, f10 18/40, f11 24/40, f14 18/40, f16 5/40, f22 20/40, f23 5/40, f24 24/40, f02 16/40, f07 9/40, f12 0/40, f15 0/40, f20 0/40, f21 12/40 all void. So 3 families spent 0 trials and 4 more spent 5-9, while the wave as a whole spent 1992 run_code calls and 2098 model calls for 25 filed findings (calls_per_filed 83.9). The binding constraint is call efficiency, not the trial cap. Two further ledger defects are visible: w121-trial-ledger records 12 trials as VOID because a Series signal met a DataFrame engine and produced identically zero PnL, and w115-f15-trial-ledger records 0 trials evaluated with 59 of 59 calls used. CHANGE. (1) Wave 2 should budget calls, not just trials: state a per-family call allowance and require the first 5 trials to be cheap gross screens (quintile tables, IC, contemporaneous-vs-forward correlation) before any walk-forward run. (2) Require a sanity assertion that gross PnL is non-zero before any net number is trusted, so a void harness cannot be filed as a negative. (3) Require the trial ledger to be written to /work incrementally after every evaluation and re-read at each checkpoint, so a budget block cannot lose the audit trail. (4) Adopt the cheap kill tests the digest already validated: w105-method-flow-is-contemporaneous (contemporaneous corr 0.308 at 1h vs forward corr -0.0044, estimated 30 of 40 trials saved) and w101-method-cost-vs-gross (print gross / net14 / net19 per year before deciding to keep exploring). EXPECTED EFFECT. Moves families from 0-9 trials used toward the 40-trial cap and cuts the 83.9 calls per filed finding, since the wave-1 pattern was many calls spent on plumbing and retries and few on hypotheses. HOW TO TEST. In wave 2, report per family: trials_used, calls_used, calls per trial, and the count of void trials. Success = calls per trial falls and void trials are zero.",
+      "evidence": "performance.w1: run_code.total 1992, model_calls 2098, calls_per_filed 83.9, agents 25, filed 25, spent_per_filed_usd 0.21. Digest trials_used: f12 0/40, f15 0/40, f20 0/40, f16 5/40, f23 5/40, f07 9/40, f21 12/40 (all void), f02 16/40, f10 18/40, f14 18/40, f22 20/40, f11 24/40, f24 24/40, versus f01/f03/f04/f05/f06/f08/f09/f13/f18/f19 at 40/40; trials_total 1407. w121-trial-ledger (12 trials VOID, all_void true, net_bps 0); w115-f15-trial-ledger (trials_used 0, run_code_calls_used 59 of 59); w105-method-flow-is-contemporaneous (contemporaneous_corr_1h 0.308 vs forward_corr_1h -0.0044, trials_saved_estimate 30); w101-method-cost-vs-gross (example_gross_bps 0.42 vs example_net14_bps -12.6).",
+      "file": "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md",
+      "id": "c101-swarm-05-trial-budget-not-binding",
+      "kind": "swarm-improvement",
+      "severity": "useful",
+      "title": "Swarm improvement: the 40-trial budget is not the binding constraint - calls are; reallocate wave-2 effort from trial caps to call efficiency and require incremental ledgers"
+    },
+    {
+      "decision": "Adopt the spend-rate gate at 60%/80%/100% of the cap, the coordinator stall detector keyed on max_event_gap_s, and the shared on-disk digest instead of an inlined 82-record payload. These are budget and coordination controls; they do not change any evaluation rule or the confirmation protocol.",
+      "description": "EVIDENCE FROM THIS RUN. The performance block reports spent_usd 5.25 against a stated cap of 2.50, i.e. 2.1x over, with spent_per_filed_usd 0.21 across 25 filed findings. Per-agent spend ranged from 0.072 (agent-16) to 0.494 (agent-00, the coordinator), and the coordinator's own line shows calls 35, spent_usd 0.494, run_code_calls 2, filed true - so the coordinator consumed the largest single agent budget while running almost no code. Meanwhile stalled_agents_gt_10min_gap lists all 25 agents and max_event_gap_s is 23361 (about 6.5 hours), against wall_minutes 395.5 for the whole wave; time_to_first_finding_min is 0.1 but time_to_median_finding_min is 16.7, so the distribution is extremely skewed - a few agents filed almost immediately and the rest took far longer. cache_hit_rate is 0.9725 and prompt_tokens 97666371 against completion_tokens 1329530, so the spend is dominated by re-reading a very large context rather than by generation. CHANGE. (1) Add a spend-rate gate that warns the coordinator when cumulative spend crosses 60% and 80% of the cap, and blocks new agent launches at 100%, so the cap is enforced during the wave rather than discovered at the end. (2) Give the coordinator a stall detector keyed on max_event_gap_s and on the per-agent last-event time, so a 23361 s gap triggers a Board nudge instead of being reported after the fact. (3) Because cache_hit_rate is already 0.9725, target the prompt side: shorten the per-agent payload (the wave digest is 82 records and was re-read by every worker) and point workers at a shared on-disk digest rather than inlining it. EXPECTED EFFECT. Brings spend inside the 2.50 cap and shortens the long tail between time_to_first_finding_min 0.1 and time_to_median_finding_min 16.7. HOW TO TEST. In wave 2, report spent_usd against cap at 25/50/75/100% of wall time, the count of agents whose last event is older than 10 minutes at any checkpoint, and prompt_tokens per filed finding. Success = spend at or under cap and zero agents in the stalled list at filing time.",
+      "evidence": "performance.w1: spent_usd 5.25 against a 2.50 cap, spent_per_filed_usd 0.21, agent_spend_usd range 0.072 (agent-16) to 0.494 (agent-00), coordinator {calls 35, filed true, run_code_calls 2, spent_usd 0.494}, stalled_agents_gt_10min_gap lists all 25 agents, max_event_gap_s 23361, wall_minutes 395.5, time_to_first_finding_min 0.1, time_to_median_finding_min 16.7, cache_hit_rate 0.9725, prompt_tokens 97666371, completion_tokens 1329530, n_records 82.",
+      "file": "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md",
+      "id": "c101-swarm-06-coordinator-and-cost",
+      "kind": "swarm-improvement",
+      "severity": "useful",
+      "title": "Swarm improvement: the wave overspent its dollar cap by 2.1x while the coordinator used 2 run_code calls; add a spend-rate gate and a coordinator-visible stall detector"
+    },
+    {
+      "assignments": [
+        {
+          "family": "f08 volatility-regime-conditioned flow",
+          "kind": "deepen",
+          "lead_ids": [
+            "w108-f08-cand-flow24-lowvol-h4",
+            "w108-f08-ledger",
+            "w108-f08-method-placebo"
+          ],
+          "mission": "Replace the ad-hoc volrank<0.5 threshold with a pre-registered one chosen on 2020-2021 only, then re-run flow24 at h=4/8/12 with 19 bps plus funding. Report per-year net, placebo max/mean/p95, top3 day and name share, and the ex-majors and full-history-only subsets. Do not touch the confirmation slice.",
+          "slot": 1,
+          "title": "f08 candidate: pre-registered vol filter and cross-sectional form",
+          "trial_budget": 60
+        },
+        {
+          "family": "f08 volatility-regime-conditioned flow",
+          "kind": "deepen",
+          "lead_ids": [
+            "w108-f08-cand-flow24-lowvol-h4",
+            "w108-f08-method-placebo"
+          ],
+          "mission": "The day-permutation placebo keeps the cross-section, so it tests timing only. Build the cross-sectional version (rank flow24 across symbols each bar, long top / short bottom decile) and a joint cross-symbol day permutation. Report placebo mean and std next to the max, since the digest shows placebo mean 11.22 vs max 13.62.",
+          "slot": 2,
+          "title": "f08 candidate: cross-sectional flow24 in low vol, with a cross-sectional placebo",
+          "trial_budget": 50
+        },
+        {
+          "family": "f08 volatility-regime-conditioned flow",
+          "kind": "robustness",
+          "lead_ids": [
+            "w108-f08-cand-flow24-lowvol-h4",
+            "w124-f24-method"
+          ],
+          "mission": "Stress the candidate at 14 and 19 bps, with a 1-bar and 2-bar execution delay, with funding dropped and doubled, and on the 20 full-history symbols only. The digest already reports net_bps_delay_1_bar 14.32 and net_bps_full_history_only 12.6; extend to the cases that were not run and report which ones break the placebo max.",
+          "slot": 3,
+          "title": "f08 candidate: cost realism and execution delay",
+          "trial_budget": 40
+        },
+        {
+          "family": "f03 cross-sectional momentum",
+          "kind": "robustness",
+          "lead_ids": [
+            "w103-f03-neg-xsec-momentum",
+            "w103-f03-method-volscaling",
+            "w103-f03-trial-ledger"
+          ],
+          "mission": "The +21.0 bps/trade at k=5 h=24 never got a placebo (200 shuffles did not fit the 120 s call). Run the placebo on the precomputed rank matrix, and report the pre-2021 cohort (+4.97) and panel-start cohort (-13.36) side by side. Kill if the placebo max exceeds the realised net or the early cohort stays at or below zero.",
+          "slot": 4,
+          "title": "f03 vol-scaled 7d momentum: compute the missing placebo and split by listing cohort",
+          "trial_budget": 40
+        },
+        {
+          "family": "f24 wildcard cross-sectional",
+          "kind": "deepen",
+          "lead_ids": [
+            "w124-f24-negative-4h",
+            "w124-f24-ledger",
+            "w124-f24-method"
+          ],
+          "mission": "Best gross 13.0 bps at 4h, within 2x of the 14 bps floor, but never given a full walk-forward plus 200-shuffle placebo. Run it, exclude the 2023-12-09..12-31 window flagged as a single-event outlier, and report gross and net per year. Kill if gross does not exceed the placebo max.",
+          "slot": 5,
+          "title": "f24 XS 1h momentum in the top liquidity quintile: full walk-forward and placebo",
+          "trial_budget": 40
+        },
+        {
+          "family": "f09 volatility breakout",
+          "kind": "robustness",
+          "lead_ids": [
+            "w109-f09-neg-001",
+            "w109-f09-ledger-001",
+            "w109-f09-method-001"
+          ],
+          "mission": "The only positive f09 cell is +6.66 bps with t=1.08, top3_day_share 1.542 and top3_name_share 0.853, and it turns negative in 2024-2026. Re-test with the day-block placebo and a listing-age split. Kill unless net exceeds the placebo max and the top-3-day share falls below 0.30.",
+          "slot": 6,
+          "title": "f09 Donchian N=42 h=6: concentration and placebo re-test",
+          "trial_budget": 30
+        },
+        {
+          "family": "f04 cross-sectional reversal",
+          "kind": "robustness",
+          "lead_ids": [
+            "f04-xsrev-negative",
+            "f04-trial-ledger",
+            "f04-method-harness"
+          ],
+          "mission": "The 8h gross +6.63 bps was the best f04 cell but net was -7.37 at 14 bps and the liquid subset gave only 1.89. Rebuild the signal on 1m bars with a proper 1-bar execution delay and check whether the gross survives. Kill if gross stays below 14 bps.",
+          "slot": 7,
+          "title": "f04 8h cross-sectional reversal: 1m-bar rebuild with a 1-bar execution delay",
+          "trial_budget": 30
+        },
+        {
+          "family": "f04 cross-sectional reversal",
+          "kind": "explore-new",
+          "lead_ids": [
+            "f04-xsrev-negative",
+            "f04-trial-ledger"
+          ],
+          "mission": "The digest states the 14 bps taker round trip is the binding constraint and that a 2-4 bps maker round trip would leave +3.7 to +6.6 bps gross. Model a maker fill assumption explicitly, state the fill-rate assumption as a pre-registered parameter, and report net under 2, 4 and 14 bps. This is a cost-model experiment, not a new signal.",
+          "slot": 8,
+          "title": "Maker-cost variant of the 4h reversal",
+          "trial_budget": 30
+        },
+        {
+          "family": "f11 funding (reopened as microstructure)",
+          "kind": "explore-new",
+          "lead_ids": [
+            "w111-f11-funding-change-negative",
+            "w110-f10-funding-level-xs-negative",
+            "w110-f10-data-issue-funding-coverage"
+          ],
+          "mission": "f11 and f10 both killed post-settlement holds, and both recommended the last 30-60 min before settlement as the untested window. Test the pre-settlement window at 1h-4h holds on the 39 symbols with funding, with the same walk-forward and placebo. Report the funding-coverage mask explicitly.",
+          "slot": 9,
+          "title": "Funding-settlement-window microstructure",
+          "trial_budget": 40
+        },
+        {
+          "family": "f20 liquidation cascades",
+          "kind": "explore-new",
+          "lead_ids": [
+            "w120-f20-negative-001",
+            "w120-f20-trial-ledger-001",
+            "w120-data-issue-001"
+          ],
+          "mission": "f20 used 0 of 40 trials: the 50-symbol panel did not fit the sandbox. Use a streaming per-symbol loader, evaluate per symbol, pool only per-trade returns. Test one-sided taker-flow bursts, max_trade_usd spikes, xlarge one-sided flow and OI drops, then reversal vs continuation at 4/8/12/24h.",
+          "slot": 10,
+          "title": "Liquidation-cascade proxies (f20, never evaluated)",
+          "trial_budget": 40
+        },
+        {
+          "family": "f12 open interest vs price",
+          "kind": "explore-new",
+          "lead_ids": [
+            "w112-f12-oi-price-negative",
+            "w112-trial-ledger",
+            "w112-data-issue-panel-memory"
+          ],
+          "mission": "f12 used 0 of 40 trials. Execute the pre-registered grid already written in the ledger: oi_buildup_fade, oi_flush_follow, oi_only and price_only controls, taker and top-trader L/S extremes, at 4/8/12/24h, per-symbol parquet, expanding walk-forward 2022..2026-04.",
+          "slot": 11,
+          "title": "OI-vs-price build-up and flush (f12, never evaluated)",
+          "trial_budget": 40
+        },
+        {
+          "family": "f15 lead-lag",
+          "kind": "explore-new",
+          "lead_ids": [
+            "w115-f15-negative-leadlag",
+            "w115-f15-trial-ledger",
+            "w115-f15-data-issue-funding-coverage"
+          ],
+          "mission": "f15 used 0 of 40 trials because of a broadcast bug in a rolling-sum helper. Re-run the planned 32-combination grid (BTC/ETH windows 1/2/4/8h, holds 4/8/12/24h, beta-adjusted, cross-sectionally demeaned) with the corrected helper, on the known-funding mask, with placebo and MDE floors.",
+          "slot": 12,
+          "title": "BTC/ETH lead-lag to alts (f15, never evaluated)",
+          "trial_budget": 40
+        },
+        {
+          "family": "f21 relative value",
+          "kind": "explore-new",
+          "lead_ids": [
+            "w121-f21-inconclusive",
+            "w121-trial-ledger"
+          ],
+          "mission": "All 12 f21 trials returned identically zero PnL from a Series-vs-DataFrame bug, so the family is untested. Re-run the 12 residual-reversion trials as a DataFrame panel, assert gross PnL is non-zero before trusting any net number, then add the beta-hedged pairs variant. 28 trials remain of the original budget.",
+          "slot": 13,
+          "title": "Relative value / pairs (f21, void)",
+          "trial_budget": 40
+        },
+        {
+          "family": "f08 volatility-regime-conditioned flow",
+          "kind": "deepen",
+          "lead_ids": [
+            "w108-f08-cand-flow24-lowvol-h4",
+            "w114-depth-imbalance-negative",
+            "w123-f23-neg-1"
+          ],
+          "mission": "The candidate's own decision asks for depth_5m and oi_5m conditioning. Add depth imbalance and OI change as filters on flow24 in low vol, using the coverage figures already measured (dimbal 0.677, doi 0.816). Report whether conditioning raises net above the placebo max or only shrinks n.",
+          "slot": 14,
+          "title": "f08 candidate: depth and OI conditioning",
+          "trial_budget": 40
+        },
+        {
+          "family": "f08 volatility-regime-conditioned flow",
+          "kind": "robustness",
+          "lead_ids": [
+            "w108-f08-cand-flow24-lowvol-h4",
+            "w115-f15-data-issue-funding-coverage"
+          ],
+          "mission": "Replace the 19 bps assumption with measured spreads on the top-10 symbols by dollar volume and re-cost the candidate. Report net under measured spread plus funding, and state the fraction of trades whose measured cost exceeds the assumed 19 bps. This is the cheapest test of whether the candidate is a cost artefact.",
+          "slot": 15,
+          "title": "f08 candidate: real spreads on the top-10 symbols",
+          "trial_budget": 30
+        },
+        {
+          "family": "f03 cross-sectional momentum",
+          "kind": "combine",
+          "lead_ids": [
+            "w103-f03-method-volscaling",
+            "w103-f03-trial-ledger"
+          ],
+          "mission": "Vol-normalising the score before ranking was worth roughly +12 bps/trade at h=24 (plain k=5 9.22 vs volscaled 21.0). Apply the same preprocessing to the f24 XS 1h momentum and to the f04 8h reversal, and report whether the gain replicates outside momentum. Kill if the gain does not appear in at least one other family.",
+          "slot": 16,
+          "title": "f03 vol-scaling as a preprocessing default across families",
+          "trial_budget": 30
+        },
+        {
+          "family": "f18 volume and trade-count shocks",
+          "kind": "robustness",
+          "lead_ids": [
+            "w118-f18-negative",
+            "w118-trial-ledger"
+          ],
+          "mission": "The only f18 cell with a large gross was z_nagg TS |z|>3 at h=24 (gross 55.13, net 32.68) but per-year was -59.4/35.8/95.7/-23.6/-33.1 and the placebo max was -7.91. Run the 200-shuffle placebo and the 19 bps case before any further trials. Kill on sign instability.",
+          "slot": 17,
+          "title": "f18 event-conditional z_nagg h24: placebo and 19 bps first",
+          "trial_budget": 20
+        },
+        {
+          "family": "f05 taker flow",
+          "kind": "combine",
+          "lead_ids": [
+            "w105-f05-negative",
+            "w105-method-flow-is-contemporaneous",
+            "w105-trial-ledger"
+          ],
+          "mission": "f05 is dead standalone (gross 3.09 vs placebo max 4.32) but its own decision asks for flow as a conditioner: require flow to disagree with past return before taking a reversal trade. Test that interaction at 4h and 8h with the contemporaneous-vs-forward kill test as trial 1.",
+          "slot": 18,
+          "title": "f05 flow as a conditioner rather than a standalone signal",
+          "trial_budget": 30
+        },
+        {
+          "family": "f16 dispersion and rotation",
+          "kind": "explore-new",
+          "lead_ids": [
+            "w116-f16-dispersion-rotation",
+            "w116-trial-ledger-f16"
+          ],
+          "mission": "Only the dispersion axis was tested (5 of 40 trials). Test age rotation (rank by months since listing) and correlation-cluster rotation (cluster on trailing 30d 4h correlation, test laggard-to-leader reversion) at 8h and 24h. Spend the first 5 trials on cheap gross quintile tables before any walk-forward.",
+          "slot": 19,
+          "title": "f16 rotation sub-hypotheses: age buckets and correlation clusters",
+          "trial_budget": 30
+        },
+        {
+          "family": "f23 multi-feature model",
+          "kind": "deepen",
+          "lead_ids": [
+            "w123-f23-neg-1",
+            "w123-f23-ledger",
+            "w123-swarm-1"
+          ],
+          "mission": "f23 used 5 of 40 trials and never reached a costed simulation; best single-feature rank-IC was 0.0409 at 24h. Run the ridge walk-forward on 1h bars or a 12-symbol subset so the family gets a real per-year net-bps plus placebo verdict instead of an IC screen. Kill if net stays below +5 bps at 19 bps.",
+          "slot": 20,
+          "title": "f23 memory-feasible walk-forward ridge",
+          "trial_budget": 30
+        },
+        {
+          "family": "f22 listing age",
+          "kind": "combine",
+          "lead_ids": [
+            "f22-listing-age-negative",
+            "f22-trial-ledger"
+          ],
+          "mission": "f22 is dead standalone and its universe is survivorship-biased. Test listing age only as a conditioning variable on the f08 candidate and on the f03 vol-scaled momentum, reporting the young and old cohorts separately. Kill if the effect is confined to the young cohort.",
+          "slot": 21,
+          "title": "f22 listing-age as a conditioner on a validated signal",
+          "trial_budget": 20
+        },
+        {
+          "family": "f13 top-trader ratios",
+          "kind": "deepen",
+          "lead_ids": [
+            "w113-f13-neg-01",
+            "w113-f13-ledger-01"
+          ],
+          "mission": "f13 was screened on IC only; the ratio-change form at 4h-8h never got a cross-sectional quantile backtest or a placebo. Run it, plus the ratio interacted with signed taker flow. Kill if |IC| stays under 0.02 or net is not positive in 3 of 5 test years.",
+          "slot": 22,
+          "title": "f13 ratio change at 4h-8h with a proper cross-sectional backtest",
+          "trial_budget": 20
+        },
+        {
+          "family": "f14 book depth",
+          "kind": "deepen",
+          "lead_ids": [
+            "f14-depth-imbalance-negative",
+            "f14-trial-ledger",
+            "f14-harness-note"
+          ],
+          "mission": "f14 used 18 of 40 trials and its h24 cross-section was silently empty because per-symbol stride subsampling broke timestamp alignment. Fix the shared entry grid, then test depth change over 1h/4h and the 5m-1h horizon where the cost bar is lower. Kill if |IC| stays under 0.02 at h4-h24.",
+          "slot": 23,
+          "title": "f14 depth imbalance: delta form and short horizons",
+          "trial_budget": 20
+        },
+        {
+          "family": "f17 time-of-day seasonality",
+          "kind": "robustness",
+          "lead_ids": [
+            "f17-001",
+            "f17-002",
+            "f17-003"
+          ],
+          "mission": "The best gross slot was long 21-22 UTC at h=4 with +8.45 gross but sign-unstable by year, and net was -6.05. Re-test only that slot with the 200-shuffle placebo on the gross series first, per the f01 method rule. Kill if gross does not exceed the placebo max.",
+          "slot": 24,
+          "title": "f17 seasonality: gross-first gate on the best slot",
+          "trial_budget": 20
+        }
+      ],
+      "claim": "Wave 2 should spend most of its budget on the single surviving lead and on the three near-cost leads, and must reserve at least six slots for mechanisms that wave 1 never actually evaluated (f12, f15, f20, f21, settlement-window microstructure, maker-cost reversal). No candidate is confirmed by this record.",
+      "decision": "SURVIVORS: exactly one filed candidate in 82 records, f08 flow24 in low vol at h=4, net 14.15 bps/trade at 19 bps plus funding, per-year 9.21/12.42/16.75/15.95/8.76, placebo max 13.62, z=3.04, top3_day_share 0.036; three near-cost leads (f03 vol-scaled momentum 21.0 with early-cohort 4.97 and no placebo, f24 XS 1h momentum gross 13.0, f09 Donchian N=42 h6 6.66 with t=1.08) are re-tests, not candidates. DEAD FAMILIES: f01, f02, f04, f05, f06, f07, f09, f10, f11, f13, f14, f16, f17, f18, f19, f22, f23, f24 are negative with trials spent; f12, f15 and f20 are UNTESTED (0 trials each) and f21 is VOID (12 trials, all_void true), so they are not refuted and get new-mechanism slots. CONCENTRATION OF EVIDENCE: 1407 trials across 25 workers produced 1 filed candidate and 0 confirmed candidates; the single positive result is one cell of a 40-trial family, so the wave's evidence is concentrated in one mechanism and one horizon, and the 14-19 bps cost floor killed every family whose gross edge was under about 9 bps. PLAN: 24 slots, 18 deepening/robustness/combine and 6 explore-new, total trial budget 900, ranked by value of information with the candidate's pre-registered threshold and cost realism first. I do not pick a confirmed candidate; the referees do, on the confirmation slice from 2026-05-01.",
+      "description": "Coordinator plan for wave 2, built only from the wave-1 digest (n_records=82, trials_total=1407, 25 workers). The digest contains exactly one filed candidate: f08 flow24 conditioned on volrank<0.5 at h=4, net 14.15 bps/trade at 19 bps round trip plus funding, per-year 9.21/12.42/16.75/15.95/8.76 over 2022..2026-04, n=175194, placebo max 13.62, placebo mean 11.22, placebo p95 12.75, z=3.04, top3_day_share 0.036, top3_name_share 0.145, block bootstrap CI90 [11.91,16.42]. I do not confirm it; that is the referees' single look on the confirmation slice from 2026-05-01. Everything else in the digest is negative, void, or untested. Three near-cost leads are worth one cheap re-test each because their gross or net point estimates sit within roughly 2x of the 14 bps floor: f03 vol-scaled 7d momentum k=5 h=24 at +21.0 bps/trade but only +4.97 on the 20 symbols listed by 2021-01-01 and with placebo_max not computed; f24 cross-sectional 1h momentum restricted to the top-20% liquidity quintile with best gross 13.0 bps; f09 Donchian N=42 h=6 at +6.66 bps with t=1.08 and top3_day_share 1.542. Six slots are reserved for mechanisms the digest never reached: funding-settlement-window microstructure, liquidation-cascade proxies (f20 was never evaluated), OI-vs-price (f12 never evaluated), lead-lag (f15 never evaluated), relative value / pairs (f21 void), and a maker-cost variant of the 4h reversal. Assignments are ranked by value of information, not by expected return.",
+      "evidence": "Digest facts used: f08 candidate net_bps_per_trade 14.15 at cost 19 with funding, per_year 9.21/12.42/16.75/15.95/8.76, n_trades 175194, placebo_max 13.62, placebo_mean 11.22, placebo_p95 12.75, placebo_z 3.04, top3_day_share 0.036, top3_name_share 0.145, block_bootstrap_ci90 [11.91,16.42], net_bps_ex_majors 15.09, net_bps_full_history_only 12.6, net_bps_delay_1_bar 14.32, net_bps_h8 16.77, net_bps_h12 20.54, trials_used 40. f03: volscaled_k5_h24 net 21.0, cohort_split listed_by_2021_01_01_n20 4.97, present_at_panel_start_n3 -13.36, placebo_max not computed, trials_used 40. f24: best_gross_bps_per_trade 13, best_gross_variant XS 1h momentum top-20% liquidity quintile q=0.1, trials_used 24. f09: net_bps_per_trade_best 6.66, t_stat_best 1.08, top3_day_share 1.542, placebo_max -0.04, trials_used 40. f04: best_gross_bps 6.63, net_bps_per_trade -7.37, trials_used 40. Untested/void: f12 trials_used 0, f15 trials_used 0, f20 trials_used 0, f21 trials_used 12 all_void true. Dead with full budgets: f01 40, f05 40, f06 40, f09 40, f10 18, f11 24, f13 40, f18 40, f19 40, f22 20, f23 5, f24 24, f16 5, f14 18, f02 16, f07 9, f17 40, f03 40, f04 40, f08 40.",
+      "file": "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md",
+      "id": "c100-wave2-plan",
+      "kill_criterion": "Any wave-2 slot is killed if its walk-forward net bps/trade at 14 bps round trip plus funding is not positive in at least 3 of the 5 test years, or if it fails to exceed the maximum of 200 shuffled-day placebos on the same slice, or if its point estimate is below the MDE floor (0.12 train h1/h4, 0.35 held-out and h24), or if the top-3-day share of PnL exceeds 0.30. The f08 candidate is killed on the confirmation slice if net at 19 bps plus funding is at or below zero, or below the placebo max computed on that slice, or if fewer than 60% of traded symbols are positive.",
+      "kind": "wave-plan",
+      "limitations": "This plan is built only from the wave-1 digest and quotes only digest numbers; no new computation was run. Several digest records report placebo_max, top3_day_share or per-year tables as 'not computed' (f03, f10, f11, f14, f16, f22, f23), so the near-cost leads are weaker than their point estimates suggest. Funding coverage is reported inconsistently across records (39 of 50 symbols with funding in some, 23 full-history and 12 with none in another), so any funding-costed claim in wave 2 must state its mask. Three families (f12, f15, f20) produced zero evaluated trials and one (f21) produced only void trials, so the digest's negative count overstates how much of the mechanism space was actually tested.",
+      "metrics": {
+        "confirm_from": "2026-05-01",
+        "cost_rt_bps_high": 19,
+        "cost_rt_bps_low": 14,
+        "last_data_day": "2026-10-22",
+        "lead_f03_early_cohort_bps": 4.97,
+        "lead_f03_net_bps": 21,
+        "lead_f04_best_gross_bps": 6.63,
+        "lead_f08_net_bps": 14.15,
+        "lead_f08_placebo_max": 13.62,
+        "lead_f09_best_net_bps": 6.66,
+        "lead_f24_best_gross_bps": 13,
+        "lockbox_windows_dropped": 3,
+        "mde_heldout_h24": 0.35,
+        "mde_train_h1_h4": 0.12,
+        "n_symbols": 50,
+        "placebo_shuffles": 200,
+        "wave1_confirmed_candidates": 0,
+        "wave1_filed_candidates": 1,
+        "wave1_records": 82,
+        "wave1_trials_total": 1407,
+        "wave1_workers": 25,
+        "wave2_new_idea_slots": 6,
+        "wave2_slots": 24,
+        "wave2_total_trial_budget": 900
+      },
+      "severity": "useful",
+      "title": "Wave 2 plan: deepen the one surviving lead (f08 low-vol flow24), re-test the three near-cost leads, and open six new-mechanism slots"
+    },
+    {
+      "claim": "The binding constraint on wave 1 was infrastructure, not market efficiency: three families produced zero evaluated trials and one produced only void trials, while the single surviving candidate came from a family that happened to get its panel built. Wave 2 should ship a shared cached panel, a streaming loader, a precomputed placebo helper and a reserved filing budget before any worker spends a call on data plumbing.",
+      "decision": "Adopt four changes in wave 2 before any worker spends a call. (1) Ship a read-only shared cache built once by the host: wide close/quote_volume/signed_usd/rv_tick frames at 4h/8h/12h/24h on the closed-bar convention, a per-bar funding matrix per grid with NaN where a symbol has no funding coverage, and a symbol age table. State in the protocol that funding coverage is 39 of 50 symbols so no worker rediscovers it. (2) Mandate a streaming per-symbol loader as the default for any 50-symbol study, with a memory pre-flight (load one symbol, measure RSS, extrapolate) and a stated RAM ceiling next to the run_code budget. (3) Ship a placebo helper with a precomputed day-to-bar map and a persisted RNG state so the 200 shuffles can be split across calls; require placebo mean and std to be reported next to the max. (4) Reserve the final 6 run_code calls for placebo, lint and submit, emit budget notices at 40% and 60%, and refuse a third submission of the same code hash. Also require every negative-result record to state n_rows_used and n_rows_dropped so a silently empty filter cannot be filed as a negative.",
+      "description": "Coordinator-visible process problems in wave 1, taken from the digest's own swarm-improvement and data-issue records. (1) PANEL PLUMBING: multiple workers independently rebuild the same 50-symbol 5m panel from /dataset/discovery/bars_5m. One record estimates 8 of 59 run_code calls on plumbing and 5 of 40 trials filed as a direct result; another estimates 3-5 calls per worker; another estimates 20 of 59 calls on re-sending the same 40-line preamble. (2) MEMORY: the sandbox aborts allocations of a few MiB once roughly 1.5-2 GB RSS is resident. One record reports a failed 4.44 MiB allocation at 2153 MB RSS with 10 symbols loaded; another reports a failed 2.49 MiB allocation at 36 symbols and 20000000 rows; another reports a 147 MiB concat failure and an OSError File too large. Three families (f12, f15, f20) filed 0 evaluated trials because of this class of failure. (3) PLACEBO WALL CLOCK: the 200-shuffle placebo does not fit the 120 s per-call limit. One record reports 3.4 s per shuffle, about 20 of 200 fitting per call, and roughly 20 calls wasted retrying it; f03 therefore filed placebo_max as not computed. (4) BUDGET GUARD: several records report the guard firing at about 91% of budget mid-experiment, with the reporting block never executing, and one reports the same script re-running with identical output for calls 13 through 81. (5) VOID TRIALS: f21 filed 12 trials that all returned identically zero PnL from a Series-vs-DataFrame bug, and f15 filed 0 trials after a one-line broadcast bug consumed about 40 calls. Net effect: 1407 trials, 1 filed candidate, 0 confirmed.",
+      "evidence": "Digest numbers: trials_total 1407 across 25 workers, 82 records, 1 filed candidate. Plumbing estimates: 8 of 59 calls on plumbing and 5 of 40 trials filed (one record); 3-5 calls per worker (another); 20 of 59 calls on repeated preamble and 6 calls wasted on a silently empty filter (another). Memory: failed_allocation_mib 4.44 at rss_mb_10_symbols 2153; failing_allocation_bytes 2613600 at rows_before_failure 20000000 and symbols_loaded_before_failure 36; 147 MiB concat failure and OSError File too large in another record; run_code_calls_wasted_on_oom 40 in another. Placebo: seconds_per_shuffle 3.4, placebo_shuffles_completed 20 of placebo_shuffles_required 200, calls_wasted_on_placebo_retries 20, wall_clock_per_call_s 120. Budget guard: hard_block_pct 91, first_budget_notice_pct 71, calls_spent_after_analysis_complete 60 with analysis_complete_by_call 12. Void: f21 trials_used 12 with all_void true and n_trials_with_valid_pnl 0; f15 trials_used 0 with run_code_calls_used 59; f12 trials_used 0; f20 trials_used 0. Funding coverage: known_funding_cell_fraction_overall 0.37, symbols_with_zero_funding_months 11, n_full_history 23, n_no_funding 12.",
+      "file": "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md",
+      "id": "c100-swarm-improvement",
+      "kill_criterion": "If wave 2 still files any family with 0 evaluated trials for an infrastructure reason, or any record with placebo_max reported as not computed for a candidate-stage variant, the shared-cache and reserved-budget changes have failed and the protocol should be revised again before wave 3.",
+      "kind": "swarm-improvement",
+      "limitations": "These are coordinator-visible process problems read from the digest's own records; I ran no code and cannot verify the memory or wall-clock figures independently. The estimates of calls spent on plumbing are self-reported by individual workers and are not additive across the swarm. The funding-coverage figures conflict between records (39 of 50 with funding in some, 23 full-history and 12 with none in another), so the cache design must reconcile them before wave 2 starts.",
+      "metrics": {
+        "analysis_complete_by_call": 12,
+        "calls_spent_after_analysis_complete": 60,
+        "calls_wasted_on_placebo_retries": 20,
+        "cost_rt_bps_high": 19,
+        "cost_rt_bps_low": 14,
+        "failed_allocation_mib": 4.44,
+        "families_with_void_trials": 1,
+        "families_with_zero_trials": 3,
+        "first_budget_notice_pct": 71,
+        "hard_block_pct": 91,
+        "known_funding_cell_fraction_overall": 0.37,
+        "n_full_history": 23,
+        "n_no_funding": 12,
+        "n_symbols": 50,
+        "placebo_shuffles": 200,
+        "placebo_shuffles_completed": 20,
+        "placebo_shuffles_required": 200,
+        "rows_before_failure": 20000000,
+        "rss_mb_at_10_symbols": 2153,
+        "run_code_calls_wasted_on_oom": 40,
+        "seconds_per_shuffle": 3.4,
+        "symbols_loaded_before_failure": 36,
+        "symbols_with_zero_funding_months": 11,
+        "wall_clock_per_call_s": 120,
+        "wave1_confirmed_candidates": 0,
+        "wave1_filed_candidates": 1,
+        "wave1_records": 82,
+        "wave1_trials_total": 1407,
+        "wave1_workers": 25
+      },
+      "severity": "useful",
+      "title": "Swarm improvement: wave 1 spent 1407 trials for 1 candidate because the budget went to panel plumbing, OOM retries and placebo wall-clock, not to hypotheses"
+    }
+  ]
+}

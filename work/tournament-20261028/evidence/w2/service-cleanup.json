@@ -1,0 +1,8 @@
+{
+  "credential_removed": true,
+  "service_result": "exit-code",
+  "exit_code": "exited",
+  "exit_status": "1",
+  "time_unix": 1793216975.1374617,
+  "scope": "run-owned systemd control group; evidence preserved"
+}

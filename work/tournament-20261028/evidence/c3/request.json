@@ -1,0 +1,9 @@
+{
+  "candidate_id": "dc4268887b3ce98550a3a9ca5a5f602366af315c5f20a2f430fc277d9d1b516a",
+  "seed": 20261045,
+  "run_id": "tourney-20261028-c3",
+  "idle_probe": false,
+  "deadline_seconds": null,
+  "refuse_peak": true,
+  "case_sha256": "8a3548a572e302116d1bb4189afdb98b28c9a2148fb360a1c14ea638e3b9a421"
+}

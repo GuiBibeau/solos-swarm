@@ -1,0 +1,20 @@
+{
+ "schema_version": 1,
+ "scorer_kind": "security-review",
+ "scorer_id": "experiments-portfolio",
+ "scorer_version": "1",
+ "catalog_version": "tournament-c1-2026-10-28-v1",
+ "seed": 20261043,
+ "tasks": {
+  "c100": {
+   "files": [
+    "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md"
+   ]
+  },
+  "c101": {
+   "files": [
+    "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md"
+   ]
+  }
+ }
+}
