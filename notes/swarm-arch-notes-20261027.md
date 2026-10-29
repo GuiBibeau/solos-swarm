@@ -68,3 +68,84 @@ Observations:
 - *System:* data-analysis agents use `run_code` as a REPL, one tiny call every few seconds, and each call grows the context. Proposals: (a) a persistent Python kernel per agent, so state lives between calls and the agent need not re-read files; (b) a per-call result size cap with summaries; (c) set call caps per task type (analysis 1,500, research 300); (d) put "batch your analysis into fewer, larger scripts" in the analysis worker prompt.
 - *System, monitoring:* the operator (me) should have a way to post to the Board mid-run, e.g. `remote.py board-post`, so steering is possible without editing the goal.
 - *Goal structure:* b6 spends ~5× faster per minute than a6. Budget envelopes should follow the task kind (data analysis vs web research). The RSI agent b19 is itself at 290 calls; it is doing analysis rather than observing. Next run: give the self-review role read-only tools (`board_read`, `read_findings`, the ledger) and no `run_code`.
+
+### 10:24–10:32 UTC: tick 3, incident and repair
+- **Incident:** 10 a6 agents (including the coordinator) and 8 b6 agents died with `403 request exceeds Goal limit`.
+  - **Root cause:** `extensions/broker.ts` advertised the model window as 1,048,576 tokens, so pi compaction (reserve 65,536) would fire only near 980k tokens. The broker refuses any request over `max_input_bytes` = 1 MiB (~250–300k tokens), so agents whose context grew with fetched pages or many `run_code` outputs hit that wall first.
+  - **Recovery failed too:** the broker's forced "Filing is now the ONLY remaining action" prompt carried the same oversized context, so it was refused as well, and the agent settled without filing.
+  - **Hidden from monitoring:** these agents showed as "running" until the goal ended. b6 completed with 11 filed and 9 host-recorded PARTIAL stubs, and the host assembled its artifact.
+- **Fix (commit 60056f9):** advertise `contextWindow` = `SWARM_CONTEXT_TOKENS` (default 200,000) and `maxTokens` 65,536, so compaction fires around 135k tokens, well under the cap. Candidate 4ec772e2.
+- **Repair runs** (`work/offpeak-20261027/gen_repair.py`):
+  - **a6r:** 10 tasks, $50 cap. Workers get a "context is capped; keep excerpts short; file early" line.
+  - **b6r:** 9 tasks, $50 cap, `max_calls_per_agent` 1,500, plus a "batch analysis into larger scripts" line.
+  - Each coordinator reads the first run's findings from `/regimes/fm-notes/<run>-filed-findings.json`.
+  - **Spend:** a6 is $10.35 + ≤ $50; b6 is $38.84 + ≤ $50.
+- **b6 coordinator:** it hit the 500-call cap after making 499 `run_code` calls.
+
+Proposals:
+- *System (critical):*
+  1. Derive the advertised context window from the Goal (`max_input_bytes / 4.5`) instead of a constant, and add a test that compaction fires before the broker cap.
+  2. When a request would exceed the cap, the broker should not just refuse. It should send a compaction signal, or replace the history with a summary plus the filing prompt, so the final filing always fits.
+  3. Mark an agent "dead" in progress and state once its pi process has settled without filing; today it shows as "running" until the deadline.
+  4. Add an operator command to retry a single task (`remote.py retry --task`) instead of building a repair goal by hand.
+- *Prompts:* tell agents the context budget in numbers ("~150k tokens; summarise fetched pages to < 5 KB").
+- *Goal structure (RSI):* repair runs should be first-class: a run ending with partials or stubs should emit a ready repair goal for exactly those tasks, seeded with the filed findings.
+
+### 10:37 UTC: tick 4 (repair runs +6 min)
+- **Fix holding:** no new `exceeds Goal limit` errors in a6r or b6r.
+- **a6r:** 7 of 10 filed in ~6 minutes, $2.85. a03 Tessera, a10 Scorch and a19 RSI are still running. The coordinator filed early (it is listed as filed); artifact synthesis comes at the end.
+- **b6r:** 0 of 9 filed, $3.75. Agents are at 95–195 calls each after 6 minutes, so the "batch your analysis" prompt line has not changed behaviour much. They do have the 1,500-call budget.
+- **a6, original:** only a17 is alive (58 calls, still progressing). It will be cancelled once it files.
+
+Observations:
+- *Prompts:* a single "batch into larger scripts" sentence does not change the REPL habit. Next run: make it structural, through a per-agent call budget shown in every tool result ("calls left: N") or a minimum interval between `run_code` calls.
+- *Goal structure:* a coordinator that files its own task early, before the workers, writes its integration record without their findings. Next run: the coordinator's own finding should be due only after `read_findings` shows the other tasks filed; the broker could enforce that.
+
+### 10:47 UTC: tick 5
+- **a6r:** 9 of 10 filed, $4.69; only a03 Tessera is still running.
+- **b6r:** 2 of 9 filed, $9.33 (19%). Agents are at 215–435 calls, well under the 1,500 cap. No context-cap errors.
+- **a6, original:** a17 is still progressing slowly (71 calls).
+- **Box traffic:** 53 GB in the 10:00 UTC hour (47.6 GB in, 5.4 GB out). Mostly the solos-data augment sync and normal research; far under the 1 TB alert. The sync is pulling Polymarket prices (237 files in 15 min). Polymarket is flagged as restricted in the data-licence notes; raise it with the owner.
+
+### 10:57 UTC: tick 6
+- **a6, original:** ended with 9 filed and 11 partial stubs; the host built its artifact.
+- **a6r:** 9 of 10 filed, $5.16. a03 is still running.
+- **b6r:** 2 of 9 filed, $14.07 (28%). Still no context-cap errors.
+- **Box traffic:** the day total rose to 318 GB, with a burst of about 95 GB in the 10:50 five-minute window. It does not come from the swarms or the solos-data services; it comes from other jobs on the box. Still under the 750 GB warning.
+
+### 11:21 UTC: tick 7
+- **a6r:** 9 of 10 filed, $6.20. a03 is still running.
+- **b6r:** 6 filed and 1 partial of 9, $23.42 (47%). No context-cap errors in either run.
+- **Box traffic:** 357 GB for the day.
+- **Controller:** the Mac's network dropped again and killed the round-7 research agent mid-design. The box-side runs were unaffected.
+- *System:* long research agents should run on the box, not from the Mac. Their controller (this session) is a single point of failure on a flaky link.
+
+### 11:22 UTC: tick 8
+- **b6r:** the coordinator b00 went PARTIAL at 94% of its $3 envelope after 603 `run_code` calls. This is the second coordinator in a row (after b6) to burn itself on analysis instead of coordinating.
+- **b6r:** b14 is at 616 calls and b15 at 1,098, both still running.
+- **a6r:** a03 Tessera is at 334 calls, 54% of its envelope.
+
+Proposals:
+- *Goal structure (repeat, now high priority):* coordinators must not get `run_code`, or get a hard cap of about 20 calls. Their envelope should be reserved for synthesis, and the integration record should be written after workers file, not instead of their work.
+- *System:* a per-role tool grant in the Goal (the coordinator role gets `board_*`, `read_findings`, `submit_*`) rather than one grant list for all agents.
+
+### 11:27 UTC: tick 9
+- **a6r:** all 10 filed ($6.40); the run is now in the artifact-synthesis phase.
+- **b6r:** b14 and b15 are still running (654 and 1,117 calls), $23.80.
+
+### 11:40 UTC: tick 10
+- **a6r:** all 10 filed. The coordinator's artifact synthesis is in progress (provider calls are still being dispatched); $7.20 so far.
+- **b6r:** b14 at 85% of its envelope (803 calls) and b15 at 1,179 calls, both still running; $24.75 so far.
+- *System:* the synthesis phase is invisible in progress output ("filed 10, artifact absent"). Add a 'synthesizing' state with elapsed time.
+
+### 11:47 UTC: tick 11
+- **a6r:** still synthesizing the artifact (~20 min, $7.68). Watch for a stalled synthesis.
+- **b6r:** 7 filed + 1 partial; b15 still running (1,209 calls).
+- **Free-data phase 1:** started 125,943 files (mostly small daily bookDepth and metrics files); 58 done so far. Box at 372 GB for the day.
+
+### 11:57 UTC: tick 12
+- **a6r:** completed. All 10 filed, artifact present, $8.16 total. The prop AMM total is $18.84 across a6 and a6r.
+- **b6r:** 7 filed + 1 partial; b15 still running; $25.20.
+- **Box traffic:** 445 GB for the day (the free-data download is active).
+
+- 12:17 UTC tick: a6 completed (9 filed/11 partial, 11 x 403 pre-fix), a6r completed 10/10 ($8.16), b6 completed (11/9, 8 x 403 pre-fix), b6r active (7 filed, 1 partial, 1 running, $25.42/$50, 0 x 403). No steering needed; a6 no longer needs cancel. Transfer 560 GB (ok).

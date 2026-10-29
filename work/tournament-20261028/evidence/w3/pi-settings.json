@@ -1,0 +1,10 @@
+{
+  "compaction": {
+    "enabled": true,
+    "reserveTokens": 65536
+  },
+  "quietStartup": true,
+  "retry": {
+    "enabled": false
+  }
+}

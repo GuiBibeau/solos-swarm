@@ -1,0 +1,18 @@
+- 2026-10-28T06:14Z w1 running: 23 filed / 2 running, $4.56 of $27 cap, 0 x 403, guard 5 GB; driver alive (log gaps 05:10->05:44->06:06 suggest Mac sleep)
+- 2026-10-28T06:25Z w1: spend flat at $4.564 since 06:06 with 2 agents running = broker pausing at peak (06-10Z), 0 x 403, guard 5 GB; driver alive
+- 2026-10-28T06:55Z w1 paused at peak (spend flat $4.564, 23 filed/2 running, 0x403), driver alive, guard 6 GB
+- 2026-10-28T07:24:59Z w1 paused by owner (PAUSE file), spend flat, driver alive
+- 2026-10-28T13:44:44Z w1 done+collected (25/25 filed, $5.25, 2098 calls, cache 97%, 17 agents hit task envelope, 27GB code/ scratch on box excluded from collect via remote.py patch); c1 started on old candidate
+- 2026-10-28T13:55:03Z c1 done ($0.11), w2 started (25 agents, $0.59 of $31.80), 0x403, guard 13 GB; run dirs ~25GB each (code/ copies, excluded from collect)
+- 2026-10-28T14:08:00Z driver switched to candidate dc4268887b3ce98550a3a9ca5a5f602366af315c5f20a2f430fc277d9d1b516a for steps after w2 (w2 keeps 9589...); PRs #13 #14 merged; doctor FAIL on w2 broker socket = probe quirk (w2 healthy, spend rising)
+- 2026-10-28T14:08:33Z driver patched: running step keeps its own candidate (state.running.candidate); w2 stays on 9589..., c2/w3/c3/c4 will use dc426888... (new main build)
+- 2026-10-28T14:25:00Z w2 running: 22 filed/3 running, $4.83 of $31.80, 0x403, guard 14 GB, disk 969G free. NOTE restart candidate for driver is dc426888... (not 9589...)
+- 2026-10-28T14:55:06Z w2: 22 filed/3 running (agents mid run_code, events current), $4.95/$31.80, 0x403, guard 15 GB
+- 2026-10-28T15:25:01Z w2: 23 filed/2 running (long run_code), $5.07/$31.80, 0x403, guard 15 GB; PRs #15 #16 merged
+- 2026-10-28T16:56:05Z w2: 24 filed, agent-21 alone polling a long background job (sleep 280 loops, 61/118 calls), $5.21/$31.80, 0x403, guard 16 GB; wave ceiling ~19:50Z
+- 2026-10-28T17:27:10Z w2: only agent-21 left, polling background job f24/ic3.log via sleep 280 loops (67/118 calls, ~$0.09 total), holds the wave open until its call cap or ~19:50Z deadline; $5.21/$31.80, 0x403, guard 17 GB
+- 2026-10-28T18:15:33Z w2 unchanged: agent-21 still polling, $5.23/$31.80, 0x403, guard 17 GB
+- 2026-10-28T19:57:09Z w2 stopped at deadline (24 filed+1 partial, $5.26), collected; c2 started on NEW candidate dc426888 (first live use)
+- 2026-10-28T21:01:20Z c2 done ($0.16, new candidate ok); w3 started with only 3 referee agents, cap $2.60 (few survivors selected); 0x403, guard 21 GB
+- 2026-10-28T22:25:00Z w3 completed (3/3 filed, $0.35); driver collecting, c3 next
+- 2026-10-28T22:56:50Z ALL DONE: w1-c4 complete, total $11.40 of $94.10 ceiling, 2106 trials, 0 confirmed survivors; monitor cron deleted

@@ -1,0 +1,300 @@
+{
+  "papers": [
+    {
+      "claim": "Collector holds synthesis; no independent evidence produced in this task.",
+      "decision": "Wait for both siblings to file, then synthesize their records into the wave-3 artifact exactly as the host synthesis prompt defines.",
+      "description": "Wave 3 collector (agent-00). No run_code, no fetch, no polling per mission. Holding artifact synthesis for 2 sibling tasks; will follow the host synthesis prompt once every sibling has filed. Wave 3 is the referee wave: pre-registered discovery of net-of-cost signals at 4h-24h on 50 Binance USDT-M perps, cost 14-19 bps round trip plus funding, 200 shuffled-day placebo max, MDE floors 0.12 train h1/h4 and 0.35 held-out/h24, walk-forward by year 2022..2026-01..04, one look at /dataset/confirm (2026-05-01..2026-10-22).",
+      "file": "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md",
+      "id": "w3-collector-digest",
+      "kind": "wave-digest",
+      "limitations": "This record carries no empirical result; it is a coordination marker only.",
+      "metrics": {
+        "fetch_url_calls": 0,
+        "records_filed_by_collector": 1,
+        "run_code_calls": 0,
+        "sibling_tasks": 2
+      },
+      "severity": "background",
+      "status": "awaiting-siblings",
+      "title": "Wave 3 collector: holding artifact synthesis for 2 sibling tasks"
+    },
+    {
+      "claim": "Independent re-derivation of w204-f24-cand-mom7-h24-k5 from its DESCRIPTION alone reproduces the claimed numbers bit-for-bit: gross 145.5 bps/trade, net 126.5 at 19 bps RT, n=1550 daily observations over 2022-01..2026-04, per-year gross 2020 183.4 / 2021 350.7 / 2022 -89.8 / 2023 253.0 / 2024 270.7 / 2025 188.9 / 2026(Jan-Apr) -28.9, beta-neutral 104.6, walk-forward k=3 per year -143.4/256.5/248.4/209.6/-81.4, funding drag 0.31 bps. The effect is not look-ahead (a 1-day signal lead would earn 323.2 net19, the real signal earns 126.5; a 1-day extra lag still earns 105.2), survives purge/embargo at year boundaries (133.3), cost +5 bps (121.5), ex-BTC/ETH/SOL (145.4) and a full parameter neighbourhood (lookback 3-14 x k 3/5/8 all positive, 69-179 net19), and beats the fresh 200-shuffle placebo max (70.6) on the discovery test years. It is however symbol-concentrated (top-3 name share 0.505; ex-top3 53.5 net19 vs its own placebo max 67.8) and only 2 of 5 test years beat their per-year placebo max. On the ONE LOOK at /dataset/confirm (2026-05-01..2026-10-22, 117 days, 1287 leg-trades) the strategy earned gross 243.0 / net19 221.8 bps per trade (hit 0.573, Sharpe 4.5, ex-top3 162.0) but the fresh 200-shuffle placebo on that slice has max 536.1 and median 307.0, so the candidate's own kill criterion #2 fires: NOT CONFIRMED.",
+      "decision": "Verdict NOT CONFIRMED, severity useful. The discovery-side claim is fully reproducible and survives every look-ahead, cost, funding, purge/embargo, beta-neutral and parameter-neighbourhood attack, so it is not an artefact; but it is a concentrated, two-negative-year effect whose ex-top3 variant fails its own placebo, and its own kill criterion #2 fires on the one confirm look. Do not promote to a traded candidate. Next wave: (a) replace the day-shuffle placebo with a dispersion-matched placebo (shuffle the signal's cross-sectional ranks but rescale to the realised cross-sectional dispersion) so the test has power on short slices; (b) test a symbol-level shrinkage or a liquidity/vol filter that keeps the edge without ZEC/FET/PENGU; (c) test 8h and 12h holds with the same placebo; (d) re-run the confirm look on a longer slice once 2026-11..2027 data exists, since 117 days cannot separate 243 bps from a 536 bps placebo max.",
+      "description": "Independent referee report on w204-f24-cand-mom7-h24-k5 (cross-sectional 7-day momentum, long top 5 / short bottom 5 of 50 Binance USDT-M perps, equal weight, 24h hold, non-overlapping daily entries, per-leg average return, entry at the close of the day after the signal day). Step 1 re-derive from the DESCRIPTION only: rebuilt daily closes from closed 5m bars and reproduced the claim exactly - gross 145.5 bps/trade, net 126.5 at 19 bps round trip, n=1550 daily observations over 2022-01..2026-04, 24859 leg-trades, and every per-year number (2020 183.4, 2021 350.7, 2022 -89.8, 2023 253.0, 2024 270.7, 2025 188.9, 2026 Jan-Apr -28.9 gross), plus beta-neutral 104.6 and the walk-forward k=3 series -143.4/256.5/248.4/209.6/-81.4. Step 2 attacks (27 referee trials): look-ahead is ruled out (a 1-day signal lead would earn 323.2 net19, the real signal earns 126.5; an extra 1-day lag still earns 105.2; scrambling the future within symbol leaves 60.4, i.e. a cross-sectional level effect below the placebo max); purge/embargo at year boundaries 133.3; cost 14/19/24 bps -> 131.5/126.5/121.5; funding actually crossed costs only 0.31 bps (coverage 84.7%, 39/50 symbols have a funding table); beta-neutral 104.6; stride-2 entries 125.3 (no overlap inflation); mean net exposure per day 0.974; full-history-only universe (12 symbols) 85.7; ex-BTC/ETH/SOL 145.4; the whole parameter neighbourhood (lookback 3-14 x k 3/5/8) is positive, 69-179 net19, no sign flips; a fresh 200-shuffle placebo gives max 70.6 / p95 58.4 / mean 22.4 with 0/200 draws at or above the realised gross, so the discovery-side claim beats the placebo MAX. The weaknesses are concentration and year coverage: top-3 name share 0.505 (ZEC, FET, PENGU), only 30/50 symbols are individually above +19 bps, the ex-top3 universe earns 53.5 net19 which is BELOW its own placebo max of 67.8, and only 2 of 5 test years (2023, 2025) beat their per-year placebo max. Step 3 ONE LOOK: the frozen evaluation code was hashed (sha256 4ca3c3098522560f7685f74a9635701f89b88b4c6a22f05e4068e79af9ee7a17), printed, and run once on /dataset/confirm (2026-05-01..2026-10-22): 117 days, 1287 leg-trades, gross 243.0 bps, net19 221.8 bps, hit 0.573, Sharpe 4.5, ex-top3 162.0. The fresh 200-shuffle placebo on that slice has max 536.1, p95 463.3 and median 307.0, so the realised net sits at the 25th percentile of the placebo distribution and the candidate's own kill criterion #2 (net below the placebo max on the confirm slice) fires. Kill #1 (net<0) and #3 (top3>60% and ex-top3 negative) do not fire. Verdict: NOT CONFIRMED, severity useful - a reproducible, cost-surviving, non-look-ahead but symbol-concentrated effect that the pre-registered forward test could not separate from a shuffle on a 117-day slice whose cross-sectional dispersion of 24h returns is 3337 bps (vs 2048 bps in discovery 2026 Jan-Apr), which is a power failure of the day-shuffle placebo as much as evidence against the signal. No tuning was done after the look.",
+      "evidence": "re-derivation exact (145.5 gross / 126.5 net19 / 1550 days / per-year identical); look-ahead lead-1d 323.2 vs real 126.5; lag+1d 105.2; placebo max 70.6 < 145.5 gross; ex-top3 53.5 < ex-top3 placebo max 67.8; 2/5 years beat per-year placebo max; look net19 221.8 < look placebo max 536.1",
+      "file": "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md",
+      "id": "r301-referee-mom7-h24-k5",
+      "kill_criterion": "Kill permanently if, on any future out-of-sample slice of at least 250 trading days, the full-universe mom7/k=5/h24 strategy earns less than 0 bps/trade net of 19 bps RT plus funding, OR earns less than the maximum of 200 dispersion-matched shuffled-day placebos, OR if the top-3 symbols carry more than 60% of PnL while the ex-top3 universe is negative. The original day-shuffle placebo kill already fired on 2026-05..2026-10 and is recorded as such.",
+      "kind": "referee-report",
+      "limitations": "1) The confirm slice is only 117 trading days and 1287 leg-trades; the 200-shuffle MAX test is a very high bar there (placebo max 536.1 bps) because the slice's cross-sectional dispersion of 24h returns is 3337 bps (vs 2048 bps in discovery 2026 Jan-Apr), so the placebo keeps a huge random long-short spread. The kill firing is therefore a power failure of the pre-registered test as much as evidence against the signal; I report it as the rule requires and do not reinterpret it as a pass. 2) Universe survivorship: the 50 symbols are those listed today; delisted contracts are absent. 3) Funding is known for 84.7% of leg-rows (39/50 symbols have a funding table); missing funding is treated as zero, which understates drag, though measured drag is only 0.31 bps. 4) Costs are a flat 14-19 bps model, not a measured spread; entries are assumed at the day's last 5m close, not a VWAP. 5) The referee's own trial count (27) is separate from the worker's (25); the pooled tournament count is 2079. 6) I did not test 4h/8h/12h holds for this signal (out of the referee's scope for an h24 candidate). 7) The confirm-slice placebo diagnostic (mean/median/percentile) was computed after the look, on the same frozen signal, and is labelled as a diagnostic, not a second look.",
+      "metrics": {
+        "attack_beta_neutral_net19_bps": 104.6,
+        "attack_ex_btc_eth_sol_net19_bps": 145.4,
+        "attack_ex_top3_syms_net19_bps": 53.5,
+        "attack_full_history_n_symbols": 12,
+        "attack_full_history_only_net19_bps": 85.7,
+        "attack_future_scrambled_net19_bps": 60.4,
+        "attack_lag_plus1d_net19_bps": 105.2,
+        "attack_lead_minus1d_lookahead_net19_bps": 323.2,
+        "attack_mean_net_exposure_per_day": 0.974,
+        "attack_purge_embargo_year_boundary_net19_bps": 133.3,
+        "attack_stride2_entries_net19_bps": 125.3,
+        "beats_placebo_max": true,
+        "boot_blocks_days": 24,
+        "boot_ci95_gross_bps": [
+          41.6,
+          264.6
+        ],
+        "boot_ci95_net19_bps": [
+          22.6,
+          245.6
+        ],
+        "boot_draws": 2000,
+        "cost14_net_bps": 131.5,
+        "cost19_net_bps": 126.5,
+        "cost24_net_bps": 121.5,
+        "decay": {
+          "first_half_net19_bps": 64.5,
+          "second_half_net19_bps": 180.5,
+          "trend": "improving, but 2022 and 2026 Jan-Apr negative"
+        },
+        "discovery_2026_xsec_std_fwd24_bps": 2048,
+        "funding_coverage": 0.847,
+        "funding_drag_bps": 0.31,
+        "funding_net19_bps": 126.8,
+        "kill1_net_below_zero": false,
+        "kill2_net_below_placebo_max": true,
+        "kill3_top3_over_60pct_and_ex_top3_negative": false,
+        "look_confirm_xsec_std_fwd24_bps": 3337,
+        "look_days": 117,
+        "look_ex_top3_net19_bps": 162,
+        "look_gross_bps": 243,
+        "look_hit": 0.573,
+        "look_n_trades": 1287,
+        "look_net_bps": 221.8,
+        "look_placebo_max": 536.1,
+        "look_placebo_mean": 306.3,
+        "look_placebo_median": 307,
+        "look_placebo_p95": 463.3,
+        "look_real_percentile_in_placebo": 0.25,
+        "look_sha256": "4ca3c3098522560f7685f74a9635701f89b88b4c6a22f05e4068e79af9ee7a17",
+        "look_sharpe": 4.5,
+        "look_top3_name_share": 1.242,
+        "look_window": "2026-05-01..2026-10-22",
+        "mde_floor_h24_bps": 35,
+        "mde_ok": true,
+        "neighbourhood_net19_bps": {
+          "lb10_k3": 157.1,
+          "lb10_k5": 123.5,
+          "lb10_k8": 114.4,
+          "lb14_k3": 179.2,
+          "lb14_k5": 121.7,
+          "lb14_k8": 112.4,
+          "lb3_k3": 142.8,
+          "lb3_k5": 93.9,
+          "lb3_k8": 69.3,
+          "lb5_k3": 155.6,
+          "lb5_k5": 125.4,
+          "lb5_k8": 92.2,
+          "lb7_k3": 130.3,
+          "lb7_k5": 126.5,
+          "lb7_k8": 96.5
+        },
+        "per_year_beats_placebo_max": {
+          "2022": false,
+          "2023": true,
+          "2024": false,
+          "2025": true,
+          "2026": false
+        },
+        "per_year_gross_bps": {
+          "2020": 183.4,
+          "2021": 350.7,
+          "2022": -89.8,
+          "2023": 253,
+          "2024": 270.7,
+          "2025": 188.9,
+          "2026": -28.9
+        },
+        "per_year_net19_bps": {
+          "2020": 164.4,
+          "2021": 331.7,
+          "2022": -108.8,
+          "2023": 234,
+          "2024": 251.7,
+          "2025": 169.9,
+          "2026": -47.9
+        },
+        "per_year_real_vs_placebo_max_gross": {
+          "2022": [
+            -89.8,
+            23.2
+          ],
+          "2023": [
+            253,
+            164.3
+          ],
+          "2024": [
+            270.7,
+            292.4
+          ],
+          "2025": [
+            188.9,
+            144.6
+          ],
+          "2026": [
+            -28.9,
+            43.2
+          ]
+        },
+        "placebo_frac_ge_real": 0,
+        "placebo_max": 70.6,
+        "placebo_max_ex_top3": 67.8,
+        "placebo_mean": 22.4,
+        "placebo_p95": 58.4,
+        "placebo_p95_ex_top3": 52.5,
+        "rederive_gross_bps": 145.5,
+        "rederive_matches_claim": true,
+        "rederive_n_days": 1550,
+        "rederive_n_leg_trades": 24859,
+        "rederive_net19_bps": 126.5,
+        "syms_individually_above_19bps": 30,
+        "top3_day_share": 0.142,
+        "top3_name_share": 0.505,
+        "top3_names": [
+          "ZECUSDT",
+          "FETUSDT",
+          "PENGUUSDT"
+        ],
+        "trials_budget": 30,
+        "trials_used": 27,
+        "verdict": "not confirmed",
+        "walk_forward_k_selected": 3,
+        "walk_forward_net19_bps": {
+          "2022": -143.4,
+          "2023": 256.5,
+          "2024": 248.4,
+          "2025": 209.6,
+          "2026": -81.4
+        }
+      },
+      "proof": "\n# Referee re-derivation + attacks for w204-f24-cand-mom7-h24-k5 (xsec 7d momentum, k=5, h24, 50 Binance USDT-M perps)\n# Data: /dataset/discovery/bars_5m/<SYM>/*.parquet (closed 5m bars). Daily close = last 5m close of the UTC day.\n# Signal known at close of day d -> entry at close of day d+1 (sig_day), exit at close of day d+25 (24h hold).\nimport glob, os, numpy as np, pandas as pd\nROOT=\"/dataset/discovery\"; SYMS=sorted(os.listdir(f\"{ROOT}/bars_5m\")); rows=[]\nfor sym in SYMS:\n    df=pd.concat([pd.read_parquet(f,columns=[\"ts_ms\",\"close\"]) for f in sorted(glob.glob(f\"{ROOT}/bars_5m/{sym}/*.parquet\"))]).dropna(subset=[\"close\"])\n    df[\"day\"]=(df.ts_ms//86_400_000).astype(np.int64)\n    o=df.groupby(\"day\").close.last().rename(\"close\").reset_index(); o[\"sym\"]=sym; rows.append(o)\nD=pd.concat(rows,ignore_index=True).sort_values([\"sym\",\"day\"]).reset_index(drop=True)\ng=D.groupby(\"sym\")\nD[\"mom7\"]=g.close.transform(lambda s: s/s.shift(7)-1)      # 7-day momentum, known at close of day d\nD[\"fwd24\"]=g.close.transform(lambda s: s.shift(-24)/s-1)   # close(d+1) -> close(d+25)\nD[\"sig_day\"]=D.day+1\ndef xsec(df,col,k=5,minn=10):\n    d=df.dropna(subset=[col]).copy(); d=d[d.groupby(\"sig_day\")[col].transform(\"count\")>=minn]\n    cnt=d.groupby(\"sig_day\")[col].transform(\"count\")\n    d[\"rk\"]=d.groupby(\"sig_day\")[col].rank(pct=True); d[\"w\"]=0.0\n    d.loc[d.rk>=1-k/cnt,\"w\"]=1.0; d.loc[d.rk<=k/cnt,\"w\"]=-1.0\n    return d\ndef ls(d,fwd=\"fwd24\"):                                     # per-leg average return, non-overlapping daily entries\n    d=d.dropna(subset=[fwd]).copy(); d[\"pnl\"]=d.w*d[fwd]\n    gg=d.groupby(\"sig_day\"); n=gg.w.apply(lambda s:(s!=0).sum())\n    return (gg.pnl.sum()/n.replace(0,np.nan)).dropna()\ndef yr_of(idx): return pd.DatetimeIndex(pd.to_datetime(np.asarray(idx)*86400000,unit=\"ms\")).year\nd=xsec(D,\"mom7\"); r=ls(d); y=yr_of(r.index)\nprint(\"RE-DERIVE gross\",round(r[y>=2022].mean()*1e4,1),\"net19\",round(r[y>=2022].mean()*1e4-19,1),\"n\",int((y>=2022).sum()))\n# ATTACKS (net19 bps/trade, test years 2022+)\nD[\"mom7_lag\"]=D.groupby(\"sym\").mom7.shift(1); print(\"lag+1d\",round(ls(xsec(D,\"mom7_lag\"))[lambda s: yr_of(s.index)>=2022].mean()*1e4-19,1))\nD[\"mom7_lead\"]=D.groupby(\"sym\").mom7.shift(-1); print(\"lead-1d(lookahead)\",round(ls(xsec(D,\"mom7_lead\"))[lambda s: yr_of(s.index)>=2022].mean()*1e4-19,1))\nex3=[\"ZECUSDT\",\"FARTCOINUSDT\",\"PENGUUSDT\"]\nprint(\"ex-top3\",round(ls(xsec(D[~D.sym.isin(ex3)],\"mom7\"))[lambda s: yr_of(s.index)>=2022].mean()*1e4-19,1))\ndd=d.dropna(subset=[\"fwd24\"]).copy(); dd[\"fwd_dm\"]=dd.fwd24-dd.groupby(\"sig_day\").fwd24.transform(\"mean\")\nprint(\"beta-neutral\",round(ls(dd,\"fwd_dm\")[lambda s: yr_of(s.index)>=2022].mean()*1e4-19,1))\n# 200 shuffled-day placebos (whole days permuted within symbol, same code path, same costs)\nS=d.pivot_table(index=\"sig_day\",columns=\"sym\",values=\"mom7\"); F=d.pivot_table(index=\"sig_day\",columns=\"sym\",values=\"fwd24\")\ndays=S.index.values; rng=np.random.default_rng(20261028); outs=[]\nfor b in range(200):\n    Sp=pd.DataFrame(S.values[rng.permutation(len(days))],index=days,columns=S.columns)\n    c=Sp.notna().sum(axis=1).values[:,None]; rk=Sp.rank(axis=1,pct=True)\n    W=pd.DataFrame(0.0,index=days,columns=S.columns).mask(rk.ge(1-5/c),1.0).mask(rk.le(5/c),-1.0).where(Sp.notna(),0.0)\n    P=((W*F).sum(axis=1)/(W!=0).sum(axis=1).replace(0,np.nan)).dropna(); yb=yr_of(P.index); outs.append(P[yb>=2022].mean()*1e4)\nouts=np.array(outs); print(\"placebo max\",round(outs.max(),1),\"p95\",round(np.percentile(outs,95),1))\n\n# ONE LOOK (frozen, sha256 4ca3c3098522560f7685f74a9635701f89b88b4c6a22f05e4068e79af9ee7a17), run once on /dataset/confirm\n# 2026-05-01..2026-10-22. Same signal/costs as the candidate: 19 bps RT + funding actually crossed.\nimport glob, os, numpy as np, pandas as pd\nROOT=\"/dataset/confirm\"; SYMS=sorted(os.listdir(f\"{ROOT}/bars_5m\")); rows=[]\nfor sym in SYMS:\n    fs=sorted(glob.glob(f\"{ROOT}/bars_5m/{sym}/*.parquet\"))\n    if not fs: continue\n    df=pd.concat([pd.read_parquet(f,columns=[\"ts_ms\",\"close\"]) for f in fs]).dropna(subset=[\"close\"])\n    df[\"day\"]=(df.ts_ms//86_400_000).astype(np.int64)\n    o=df.groupby(\"day\").close.last().rename(\"close\").reset_index(); o[\"sym\"]=sym; rows.append(o)\nD=pd.concat(rows,ignore_index=True).sort_values([\"sym\",\"day\"]).reset_index(drop=True)\ng=D.groupby(\"sym\"); D[\"mom7\"]=g.close.transform(lambda s: s/s.shift(7)-1)\nD[\"fwd24\"]=g.close.transform(lambda s: s.shift(-24)/s-1); D[\"sig_day\"]=D.day+1\nd=D.dropna(subset=[\"mom7\"]).copy(); d=d[d.groupby(\"sig_day\").mom7.transform(\"count\")>=10]\ncnt=d.groupby(\"sig_day\").mom7.transform(\"count\"); d[\"rk\"]=d.groupby(\"sig_day\").mom7.rank(pct=True); d[\"w\"]=0.0\nd.loc[d.rk>=1-5/cnt,\"w\"]=1.0; d.loc[d.rk<=5/cnt,\"w\"]=-1.0\ndd=d.dropna(subset=[\"fwd24\"]).copy()\nFR={}\nfor sym in SYMS:\n    fs=sorted(glob.glob(f\"{ROOT}/funding/{sym}/*.parquet\"))\n    if fs: FR[sym]=pd.concat([pd.read_parquet(x) for x in fs])[[\"ts_ms\",\"rate\"]].sort_values(\"ts_ms\")\ndef fc(r):\n    f=FR.get(r.sym)\n    if f is None: return np.nan\n    m=(f.ts_ms>r.sig_day*86400000)&(f.ts_ms<=(r.sig_day+24)*86400000); return f.rate[m].sum()\ndd[\"fund\"]=dd.apply(fc,axis=1); dd[\"pnl\"]=dd.w*(dd.fwd24-dd.fund.fillna(0.0))\ngg=dd.groupby(\"sig_day\"); n=gg.w.apply(lambda s:(s!=0).sum())\nr=(gg.pnl.sum()/n.replace(0,np.nan)).dropna()\ngross=gg.apply(lambda x:(x.w*x.fwd24).sum()/max((x.w!=0).sum(),1)).dropna()\nprint(\"LOOK days\",len(r),\"leg-trades\",int((dd.w!=0).sum()),\"gross\",round(gross.mean()*1e4,1),\"net19\",round(r.mean()*1e4-19,1))\nps=dd.groupby(\"sym\").pnl.sum(); tot=ps.sum(); print(\"top3 name share\",round(ps.nlargest(3).sum()/tot,3))\nS=d.pivot_table(index=\"sig_day\",columns=\"sym\",values=\"mom7\"); F=d.pivot_table(index=\"sig_day\",columns=\"sym\",values=\"fwd24\")\ndays=S.index.values; rng=np.random.default_rng(20261028); outs=[]\nfor b in range(200):\n    Sp=pd.DataFrame(S.values[rng.permutation(len(days))],index=days,columns=S.columns)\n    c=Sp.notna().sum(axis=1).values[:,None]; rk=Sp.rank(axis=1,pct=True)\n    W=pd.DataFrame(0.0,index=days,columns=S.columns).mask(rk.ge(1-5/c),1.0).mask(rk.le(5/c),-1.0).where(Sp.notna(),0.0)\n    P=((W*F).sum(axis=1)/(W!=0).sum(axis=1).replace(0,np.nan)).dropna(); outs.append(P.mean()*1e4)\nouts=np.array(outs); print(\"placebo max\",round(outs.max(),1),\"p95\",round(np.percentile(outs,95),1),\"frac>=real\",round((outs>=gross.mean()*1e4).mean(),3))\n",
+      "relevance": "answers the referee question for the highest-priority candidate in the wave-3 queue: is the widest-margin xsec-momentum lead real, robust and forward-confirmed",
+      "severity": "useful",
+      "spec_code": "\n# Referee re-derivation + attacks for w204-f24-cand-mom7-h24-k5 (xsec 7d momentum, k=5, h24, 50 Binance USDT-M perps)\n# Data: /dataset/discovery/bars_5m/<SYM>/*.parquet (closed 5m bars). Daily close = last 5m close of the UTC day.\n# Signal known at close of day d -> entry at close of day d+1 (sig_day), exit at close of day d+25 (24h hold).\nimport glob, os, numpy as np, pandas as pd\nROOT=\"/dataset/discovery\"; SYMS=sorted(os.listdir(f\"{ROOT}/bars_5m\")); rows=[]\nfor sym in SYMS:\n    df=pd.concat([pd.read_parquet(f,columns=[\"ts_ms\",\"close\"]) for f in sorted(glob.glob(f\"{ROOT}/bars_5m/{sym}/*.parquet\"))]).dropna(subset=[\"close\"])\n    df[\"day\"]=(df.ts_ms//86_400_000).astype(np.int64)\n    o=df.groupby(\"day\").close.last().rename(\"close\").reset_index(); o[\"sym\"]=sym; rows.append(o)\nD=pd.concat(rows,ignore_index=True).sort_values([\"sym\",\"day\"]).reset_index(drop=True)\ng=D.groupby(\"sym\")\nD[\"mom7\"]=g.close.transform(lambda s: s/s.shift(7)-1)      # 7-day momentum, known at close of day d\nD[\"fwd24\"]=g.close.transform(lambda s: s.shift(-24)/s-1)   # close(d+1) -> close(d+25)\nD[\"sig_day\"]=D.day+1\ndef xsec(df,col,k=5,minn=10):\n    d=df.dropna(subset=[col]).copy(); d=d[d.groupby(\"sig_day\")[col].transform(\"count\")>=minn]\n    cnt=d.groupby(\"sig_day\")[col].transform(\"count\")\n    d[\"rk\"]=d.groupby(\"sig_day\")[col].rank(pct=True); d[\"w\"]=0.0\n    d.loc[d.rk>=1-k/cnt,\"w\"]=1.0; d.loc[d.rk<=k/cnt,\"w\"]=-1.0\n    return d\ndef ls(d,fwd=\"fwd24\"):                                     # per-leg average return, non-overlapping daily entries\n    d=d.dropna(subset=[fwd]).copy(); d[\"pnl\"]=d.w*d[fwd]\n    gg=d.groupby(\"sig_day\"); n=gg.w.apply(lambda s:(s!=0).sum())\n    return (gg.pnl.sum()/n.replace(0,np.nan)).dropna()\ndef yr_of(idx): return pd.DatetimeIndex(pd.to_datetime(np.asarray(idx)*86400000,unit=\"ms\")).year\nd=xsec(D,\"mom7\"); r=ls(d); y=yr_of(r.index)\nprint(\"RE-DERIVE gross\",round(r[y>=2022].mean()*1e4,1),\"net19\",round(r[y>=2022].mean()*1e4-19,1),\"n\",int((y>=2022).sum()))\n# ATTACKS (net19 bps/trade, test years 2022+)\nD[\"mom7_lag\"]=D.groupby(\"sym\").mom7.shift(1); print(\"lag+1d\",round(ls(xsec(D,\"mom7_lag\"))[lambda s: yr_of(s.index)>=2022].mean()*1e4-19,1))\nD[\"mom7_lead\"]=D.groupby(\"sym\").mom7.shift(-1); print(\"lead-1d(lookahead)\",round(ls(xsec(D,\"mom7_lead\"))[lambda s: yr_of(s.index)>=2022].mean()*1e4-19,1))\nex3=[\"ZECUSDT\",\"FARTCOINUSDT\",\"PENGUUSDT\"]\nprint(\"ex-top3\",round(ls(xsec(D[~D.sym.isin(ex3)],\"mom7\"))[lambda s: yr_of(s.index)>=2022].mean()*1e4-19,1))\ndd=d.dropna(subset=[\"fwd24\"]).copy(); dd[\"fwd_dm\"]=dd.fwd24-dd.groupby(\"sig_day\").fwd24.transform(\"mean\")\nprint(\"beta-neutral\",round(ls(dd,\"fwd_dm\")[lambda s: yr_of(s.index)>=2022].mean()*1e4-19,1))\n# 200 shuffled-day placebos (whole days permuted within symbol, same code path, same costs)\nS=d.pivot_table(index=\"sig_day\",columns=\"sym\",values=\"mom7\"); F=d.pivot_table(index=\"sig_day\",columns=\"sym\",values=\"fwd24\")\ndays=S.index.values; rng=np.random.default_rng(20261028); outs=[]\nfor b in range(200):\n    Sp=pd.DataFrame(S.values[rng.permutation(len(days))],index=days,columns=S.columns)\n    c=Sp.notna().sum(axis=1).values[:,None]; rk=Sp.rank(axis=1,pct=True)\n    W=pd.DataFrame(0.0,index=days,columns=S.columns).mask(rk.ge(1-5/c),1.0).mask(rk.le(5/c),-1.0).where(Sp.notna(),0.0)\n    P=((W*F).sum(axis=1)/(W!=0).sum(axis=1).replace(0,np.nan)).dropna(); yb=yr_of(P.index); outs.append(P[yb>=2022].mean()*1e4)\nouts=np.array(outs); print(\"placebo max\",round(outs.max(),1),\"p95\",round(np.percentile(outs,95),1))\n",
+      "status": "refereed: re-derived exactly, 27 referee trials, one look on /dataset/confirm taken and logged",
+      "title": "Referee: xsec 7d momentum k=5 h24 on 50 Binance perps reproduces exactly and survives look-ahead/cost/funding attacks, but is symbol-concentrated and NOT CONFIRMED on the 2026-05..10 slice (its own placebo kill fires)"
+    },
+    {
+      "claim": "The candidate w108-f08-cand-flow24-lowvol-h4 reproduces EXACTLY from its description (14.15 bps/trade, n=175,194, per-year 9.21/12.42/16.75/15.95/8.76) and survives every discovery-side attack I could run — look-ahead shifts (14.30 / 13.85), future scramble (14.03), funding on/off (14.51 / 14.46), full-history-only universe (12.60), ex-majors (15.09), ex-top-3-symbols (13.67), purge at year boundaries (14.12), smooth parameter neighbourhood (volrank 0.2..none: 13.75..12.26; horizon 1h..24h: 12.17..25.02), low concentration (top-3-day 0.036, top-3-name 0.145) — and it beats the maximum of 200 fresh shuffled-day placebos computed the protocol's way (placebo max -5.13, z=27.44). But (i) the reported 'net bps' is mislabelled: the number RISES with cost (11.13 at 14 bps, 14.15 at 19, 17.16 at 24, 25.60 at 38), which is impossible for a genuine net edge and shows the metric is a gross drift number, and (ii) the ONE LOOK on /dataset/confirm was never taken because my run_code budget was exhausted, so the verdict is NOT CONFIRMED (invalid as a confirmation) rather than confirmed or refuted.",
+      "decision": "VERDICT: NOT CONFIRMED (the one look was not taken; the candidate is neither confirmed nor refuted). Do NOT promote this candidate to a live or forward-tested signal on the strength of this report. The discovery-side evidence is in fact STRONGER than the worker claimed — exact reproduction, smooth parameter neighbourhood in both the volrank threshold and the horizon, no survivorship or concentration dependence, no split leakage, and a wide pass against a correctly-constructed 200-shuffle day placebo (max -5.13 vs base 14.15, z=27.44) — but two things block promotion: (a) the headline metric is mislabelled, since the number rises with cost and therefore is a gross drift number rather than a net edge, and the honest effect is a 37 bps long-short swing against a -22.76 bps low-vol-regime drift; (b) the future-scramble result (14.03 vs 14.15) shows the per-trade mean is dominated by cross-sectional dispersion, which the day-placebo cannot test. NEXT WAVE, in priority order: (1) a referee with a fresh budget must take the ONE LOOK on /dataset/confirm 2026-05-01..2026-10-22 with a pre-registered script whose sha256 is printed before execution, and must report look_sha256, look_n_trades and look_net_bps; (2) re-state the metric as a long-short spread against the low-vol-regime drift (subtract the -22.76 bps constant-long benchmark) and re-run every attack on that spread, because only then is the cost sensitivity monotone in the right direction; (3) test the cross-sectional version (rank flow24 across symbols each bar, long top decile / short bottom decile) which the day-placebo cannot evaluate and which the future-scramble result suggests is where the real edge lives; (4) fix the block bootstrap (the day-block index does not align with the non-overlapping entry rows) and re-report the CI; (5) re-derive the vol filter with a pre-registered threshold instead of the 0.5 chosen by the worker, and report the family-wise multiple-comparisons correction across the 40 trials; (6) measure real spreads on the top-10 symbols to replace the 19 bps assumption. Kill criterion for the next referee: kill if on the confirmation slice the long-short spread against the regime drift is <= 0 at 19 bps cost plus funding, or if it is below the maximum of 200 fresh shuffled-day placebos computed on that slice, or if the top-3-day share of PnL exceeds 0.30, or if fewer than 60% of traded symbols are positive.",
+      "description": "Independent referee of candidate w108-f08-cand-flow24-lowvol-h4 (family f08: 24h taker signed-flow imbalance traded only in low-volatility regimes, 4h hold, 50 Binance USDT-M perps). STEP 1 RE-DERIVE from the DESCRIPTION only (not the worker's spec code): flow24 = sum(signed_usd)/sum(quote_volume) over 288 closed 5m bars; volrank = rank of 1h tick realised variance (sum of rv_tick over 12 bars) inside its own trailing 2016-bar (7d) window; trade only when volrank<0.5; direction sign(flow24); 4h hold; non-overlapping entries every 48 bars; entry at the open of the bar after the signal bar; cost 19 bps round trip plus funding actually settled in (entry, exit]. RESULT: EXACT REPRODUCTION — 14.15 bps/trade, n=175,194, hit 53.6%, per-year 2022 9.21 / 2023 12.42 / 2024 16.75 / 2025 15.95 / 2026(Jan-Apr) 8.76, per-year n 21855/27166/36342/41173/12645. Every claimed number matches to the last digit, so the worker's arithmetic and data handling are sound. STEP 2 ATTACKS (all on discovery data only, 2020-01-01..2026-04-30): (a) LOOK-AHEAD: shifting the signal by -1 bar (i.e. using one bar of the future) gives 14.30 and by +1 bar (one extra bar of delay) gives 13.85 — the edge is flat in the shift, so it is not a one-bar leak, but it is also not a fast-decaying microstructure effect; it is a slow, persistent flow effect. Scrambling the future (permuting forward returns across symbols within each entry row) gives 14.03, i.e. the same number, which shows the per-trade mean is dominated by the cross-sectional dispersion of the forward return, not by the timing of the sign — this is the single most important caveat and it is the same caveat the worker flagged. (b) COST SENSITIVITY: 14 bps 11.13, 19 bps 14.15, 24 bps 17.16, 38 bps 25.60 — the number RISES with cost, which is arithmetically impossible for a real net-of-cost edge and proves the reported 'net bps' is not a net edge at all: it is the mean of sign(flow24) * (forward return - cost - funding), and because the mean forward return in the low-vol regime is strongly positive (-22.76 bps for a constant long, see (f)), subtracting a cost from a positive-drift return cannot lower the mean. The candidate's headline is therefore a GROSS drift number wearing a cost label. (c) FUNDING: removing funding gives 14.51, doubling it gives 14.46 — funding is immaterial (|effect| < 0.4 bps), so the funding handling is not the problem. (d) SURVIVORSHIP: full-history-only universe (20 symbols with data from 2020) gives 12.60 with every year positive (8.85/11.10/14.81/12.31/7.85); excluding BTC/ETH/SOL gives 15.09; dropping the top-3 PnL symbols (XRPUSDT, AVAXUSDT, DOGEUSDT) gives 13.67 — the result is not carried by the majors or by three names. (e) CONCENTRATION: top-3-day share 0.036, top-3-symbol share 0.145, 39 symbols traded, 76% of symbols positive (the worker claimed 97.4%; my recomputation on the same PnL matrix gives 0.76, a discrepancy worth noting but not decisive). (f) THE DECISIVE ATTACK: a constant long in the same low-vol regime (signal = +1 whenever volrank<0.5) earns -22.76 bps/trade over 175,241 trades. So the low-vol regime is a NEGATIVE-drift regime, and the flow signal's +14.15 is a 37 bps swing against that drift. That is a large, real-looking conditional effect and it is the strongest evidence in favour of the candidate. (g) PARAMETER NEIGHBOURHOOD: volrank threshold 0.2/0.3/0.4/0.5/0.6/0.7/0.8/none gives 13.75/14.69/14.61/14.15/13.68/13.33/12.93/12.26 — smooth and monotone, no cliff, so the 0.5 threshold is not a fitted spike. Horizon 1h/2h/4h/8h/12h/24h gives 12.17/13.32/14.15/16.77/20.54/25.02 — monotone increasing in horizon, which is consistent with a slow flow effect but also means the h4 choice is not special. (h) PURGE/EMBARGO: only 6 entries cross a year boundary; dropping them gives 14.12 (per-year 9.22/12.20/16.71/15.96/8.76), so there is no split leakage. (i) PLACEBO, fresh shuffles (seed 424242, 200 permutations of whole days of the signal within symbol, same code path, same costs): placebo max -5.13, p95 -7.19, mean -8.50, z=27.44 against the base 14.15. The unconditioned flow24 signal also beats its own fresh placebo (12.29 vs max -5.64, z=33.99). NOTE: my placebo max is NEGATIVE while the worker reported +13.62; the worker's placebo evidently permuted the PnL rows rather than the signal rows, which preserves the cross-sectional ordering of the forward return and therefore produces a placebo mean of +11.2. My version permutes the signal, which is the protocol's wording ('permute whole days of the signal within symbol'), and it is the correct test. Under the correct test the candidate beats the placebo max by ~19 bps, not by 0.5 bps. (j) BLOCK BOOTSTRAP: my 7-day block bootstrap of the per-trade mean returned a 90% CI of [-25.46, -20.16] with p(<=0)=1.0, which is INCONSISTENT with the point estimate of +14.15 and with the placebo z of 27.4; the bootstrap code path is therefore buggy (most likely the day-block index does not align with the entry rows after the non-overlapping subsample) and I report it as a failed check rather than as evidence. STEP 3 ONE LOOK: NOT TAKEN. My run_code budget was exhausted (blocked at 90%) before I could write, hash and execute the confirmation-slice evaluation, so there is no look_sha256, no look_n_trades and no look_net_bps. Per the protocol a referee verdict of 'confirmed' requires the single look; without it the honest verdict is INVALID-AS-CONFIRMATION: the candidate is neither confirmed nor refuted, and the confirmation slice 2026-05-01..2026-10-22 remains unspent and available to the next referee. VERDICT: not confirmed (look not taken). The candidate's discovery-side evidence is stronger than the worker claimed (correct placebo test passes by a wide margin, parameter neighbourhood is smooth, no survivorship or concentration dependence, no split leakage), but its headline metric is mislabelled (cost sensitivity is inverted, so 'net bps' is a gross drift number) and the future-scramble result shows the per-trade mean is dominated by cross-sectional dispersion rather than by timing. The next referee must (1) take the one look with a pre-registered script, (2) report the metric as a long-short spread against the low-vol-regime drift (-22.76 bps) rather than as an absolute net number, and (3) fix the block bootstrap.",
+      "file": "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md",
+      "id": "r302-referee-w108-f08-flow24-lowvol-h4",
+      "kill_criterion": "Kill if, on the confirmation slice 2026-05-01..2026-10-22, the long-short spread of sign(flow24) in low-vol regimes against the low-vol-regime constant-long drift is <= 0 at 19 bps round-trip cost plus funding actually settled, or if it is below the maximum of 200 fresh shuffled-day placebos computed on that slice, or if the top-3-day share of PnL exceeds 0.30, or if fewer than 60% of traded symbols are positive. Additionally kill if the cost-sensitivity curve is not monotone decreasing in cost (which would confirm the metric is a gross drift number rather than a net edge).",
+      "kind": "referee-report",
+      "limitations": "(1) THE ONE LOOK WAS NOT TAKEN. My run_code budget was exhausted (blocked at 90%) before I could write, hash and execute the confirmation-slice evaluation, so /dataset/confirm 2026-05-01..2026-10-22 is still unspent and the candidate is neither confirmed nor refuted. This is the single largest limitation of this report and the next referee must take the look. (2) The candidate's headline metric is mislabelled: the reported 'net bps' RISES with cost (11.13 at 14 bps to 25.60 at 38 bps), which cannot happen for a genuine net edge; the metric is sign(flow24) * (forward return - cost - funding) and the low-vol regime has a strongly positive mean forward return for a constant long (-22.76 bps means the constant long LOSES 22.76, so the flow signal's +14.15 is a 37 bps swing against a negative drift). The correct framing is a long-short spread against the regime drift, not an absolute net number. (3) The future-scramble attack returns 14.03, essentially the same as the base 14.15, which shows the per-trade mean is dominated by the cross-sectional dispersion of the forward return rather than by the timing of the sign; the day-placebo cannot distinguish these because it preserves the cross-section. (4) My fresh placebo max is -5.13 while the worker reported +13.62; the worker evidently permuted PnL rows rather than signal rows, which preserves the cross-sectional forward-return ordering. My version follows the protocol wording ('permute whole days of the signal within symbol') and is the correct test, but the discrepancy means the worker's placebo_max of 13.62 is not comparable to mine. (5) My 7-day block bootstrap returned a 90% CI of [-25.46, -20.16] with p(<=0)=1.0, which is inconsistent with the point estimate and the placebo z; the bootstrap code path is buggy and I report it as a failed check, not as evidence. (6) I recompute 76% of traded symbols positive where the worker claimed 97.4%; the discrepancy is unexplained and the worker's figure should not be relied on. (7) Universe is the 50 symbols listed today: survivorship bias remains even though the full-history-only subset (20 symbols) still gives 12.60 with every year positive. (8) Costs are a 14-19 bps model, not a measurement: no bid/ask, no queue, no slippage, and the 38 bps stress case assumes the same fills. (9) Funding is taken from the monthly fundingRate dumps; symbols/months without funding rows are dropped (NaN), never treated as zero, and funding turns out to be immaterial (|effect| < 0.4 bps). (10) 2026 covers only Jan-Apr (112 days). (11) Agg-trade timestamps are first-fill times; prices are perp trade prices, not mark/index. (12) I spent 30 referee trials (my full budget) and the worker spent 40; the candidate is the best of 40 in its family, so a multiple-comparisons correction across the family is still owed.",
+      "metrics": {
+        "attack_cost14": 11.13,
+        "attack_cost19": 14.15,
+        "attack_cost24": 17.16,
+        "attack_cost38": 25.6,
+        "attack_ex_majors": 15.09,
+        "attack_ex_top3_names": [
+          "XRPUSDT",
+          "AVAXUSDT",
+          "DOGEUSDT"
+        ],
+        "attack_ex_top3_symbols": 13.67,
+        "attack_full_history_n_symbols": 20,
+        "attack_full_history_only": 12.6,
+        "attack_funding_x2": 14.46,
+        "attack_future_scramble": 14.03,
+        "attack_horizon_neighbourhood": {
+          "h1": 12.17,
+          "h12": 20.54,
+          "h2": 13.32,
+          "h24": 25.02,
+          "h4": 14.15,
+          "h8": 16.77
+        },
+        "attack_long_only_lowvol": -22.76,
+        "attack_long_only_lowvol_n": 175241,
+        "attack_no_funding": 14.51,
+        "attack_purged_entries_dropped": 6,
+        "attack_purged_year_boundaries": 14.12,
+        "attack_shift_minus1_bar": 14.3,
+        "attack_shift_plus1_bar": 13.85,
+        "attack_volrank_neighbourhood": {
+          "0.2": 13.75,
+          "0.3": 14.69,
+          "0.4": 14.61,
+          "0.5": 14.15,
+          "0.6": 13.68,
+          "0.7": 13.33,
+          "0.8": 12.93,
+          "none": 12.26
+        },
+        "block_bootstrap_ci90": [
+          -25.46,
+          -20.16
+        ],
+        "block_bootstrap_status": "failed check, inconsistent with point estimate and placebo z; code path buggy, not evidence",
+        "cost_sensitivity_inverted": true,
+        "decay_first_half": 12.96,
+        "decay_second_half": 15.26,
+        "decay_trend": "flat to improving",
+        "frac_symbols_positive_referee": 0.76,
+        "frac_symbols_positive_worker": 0.974,
+        "look_n_trades": 0,
+        "look_net_bps": 0,
+        "look_sha256": "not taken",
+        "look_taken": false,
+        "mde_floor_heldout": 0.35,
+        "mde_ok": true,
+        "n_symbols_traded": 39,
+        "placebo_fresh_max": -5.13,
+        "placebo_fresh_mean": -8.5,
+        "placebo_fresh_p95": -7.19,
+        "placebo_fresh_seed": 424242,
+        "placebo_fresh_z": 27.44,
+        "placebo_method_discrepancy": "worker permuted PnL rows (preserves cross-sectional forward-return ordering, placebo mean +11.2); referee permuted signal rows per protocol wording (placebo mean -8.5)",
+        "placebo_uncond_base": 12.29,
+        "placebo_uncond_max": -5.64,
+        "placebo_uncond_z": 33.99,
+        "rederive_hit": 0.536,
+        "rederive_matches_claim": true,
+        "rederive_n_trades": 175194,
+        "rederive_net_bps": 14.15,
+        "rederive_per_year": {
+          "2022": 9.21,
+          "2023": 12.42,
+          "2024": 16.75,
+          "2025": 15.95,
+          "2026": 8.76
+        },
+        "rederive_per_year_n": {
+          "2022": 21855,
+          "2023": 27166,
+          "2024": 36342,
+          "2025": 41173,
+          "2026": 12645
+        },
+        "referee_trials_budget": 30,
+        "referee_trials_used": 30,
+        "top3_day_share": 0.036,
+        "top3_name_share": 0.145,
+        "verdict": "not confirmed (one look not taken)",
+        "worker_placebo_max": 13.62,
+        "worker_placebo_mean": 11.22,
+        "worker_trials_budget": 40,
+        "worker_trials_used": 40
+      },
+      "proof": "Self-contained referee re-derivation and attacks (numpy/pandas + /dataset only, no network). Loads 5m bars for all 50 symbols onto a 5-minute grid 2020-01-01..2026-04-30, builds flow24 and volrank from the DESCRIPTION, evaluates non-overlapping 48-bar entries with 19 bps round trip plus funding actually settled, then runs the attacks.\n\nimport numpy as np, pandas as pd, glob, json\nm=json.load(open('/dataset/manifest.json')); SYMS=list(m['symbols'].keys())\nT0=1577836800000; T1=1776902400000; STEP=300000\nGRID=np.arange(T0,T1,STEP,dtype=np.int64); N=len(GRID); S=len(SYMS)\ndef load(root,cols):\n    out={c:np.full((N,S),np.nan,np.float32) for c in cols}\n    for j,s in enumerate(SYMS):\n        fs=sorted(glob.glob(f'{root}/bars_5m/{s}/*.parquet'))\n        if not fs: continue\n        d=pd.concat([pd.read_parquet(f,columns=['ts_ms']+cols) for f in fs],ignore_index=True)\n        d=d[(d.ts_ms>=T0)&(d.ts_ms<T1)].sort_values('ts_ms')\n        i=((d.ts_ms.values-T0)//STEP).astype(np.int64)\n        for c in cols: out[c][i,j]=d[c].values\n    return out\nD=load('/dataset/discovery',['close','quote_volume','signed_usd','rv_tick'])\nC,QV,SD,RV=D['close'],D['quote_volume'],D['signed_usd'],D['rv_tick']\nlogC=np.log(C.astype(np.float64)).astype(np.float32)\ndef rsum(x,w): return pd.DataFrame(x).rolling(w,min_periods=max(2,w//2)).sum().values.astype(np.float32)\ndef rrank(x,w): return pd.DataFrame(x).rolling(w,min_periods=max(5,w//2)).apply(lambda a:(a[:-1]<a[-1]).mean(),raw=True).values.astype(np.float32)\nvolrank=rrank(rsum(RV,12),2016)\nflow24=rsum(SD,288)/(rsum(QV,288)+1e-9)\nF={}\nfor s in SYMS:\n    fs=sorted(glob.glob(f'/dataset/discovery/funding/{s}/*.parquet'))\n    if fs:\n        d=pd.concat([pd.read_parquet(f) for f in fs],ignore_index=True).sort_values('ts_ms')\n        F[s]=(d.ts_ms.values.astype(np.int64),d.rate.values.astype(np.float64))\ndef fmat(H):\n    FM=np.full((N,S),np.nan,np.float32)\n    for j,s in enumerate(SYMS):\n        if s not in F: continue\n        ts,rt=F[s]; cum=np.concatenate([[0.0],np.cumsum(rt)])\n        ent=GRID+STEP; ex=ent+H*STEP\n        FM[:,j]=(cum[np.searchsorted(ts,ex,side='right')]-cum[np.searchsorted(ts,ent,side='right')]).astype(np.float32)\n    return FM\ndef fwd(H):\n    r=np.full(logC.shape,np.nan,np.float32); r[:-H]=logC[H:]-logC[:-H]; return r\ndef ev(sig,H,cost=19.0,FM=None,ret=None,mask=None):\n    if ret is None: ret=fwd(H)\n    if FM is None: FM=fmat(H)\n    net=ret*1e4-cost-FM*1e4\n    idxs=np.arange(0,N-H,H)\n    pnl=np.sign(sig[idxs])*net[idxs]; ok=~np.isnan(pnl)\n    if mask is not None: ok=ok&mask[idxs]\n    return pnl,ok,idxs\ndef st(pnl,ok,idxs):\n    yr=np.array(pd.to_datetime(GRID,unit='ms').year)[idxs][:,None]*np.ones_like(pnl)\n    v=pnl[ok]\n    return {'net':round(float(v.mean()),2),'n':int(ok.sum()),'hit':round(float((v>0).mean()),3),\n            'per_year':{int(y):round(float(pnl[ok&(yr==y)].mean()),2) for y in [2022,2023,2024,2025,2026] if (ok&(yr==y)).sum()>0}}\nFM48=fmat(48); sig=np.where(volrank<0.5,flow24,np.nan)\npnl,ok,idxs=ev(sig,48,FM=FM48); print('BASE',st(pnl,ok,idxs))\nfor c in [14.0,19.0,24.0,38.0]: print('cost',c,st(*ev(sig,48,cost=c,FM=FM48)))\nfor sh in [-1,1]:\n    s2=np.roll(sig,sh,axis=0); s2[sh:,:]=np.nan if sh<0 else s2[sh:,:]; s2[:sh,:]=np.nan if sh>0 else s2[:sh,:]\n    print('shift',sh,st(*ev(s2,48,FM=FM48)))\nprint('long-only low-vol',st(*ev(np.where(volrank<0.5,1.0,np.nan),48,FM=FM48)))\nfor vr in [0.2,0.3,0.4,0.5,0.6,0.7,0.8,1.01]: print('vr',vr,st(*ev(np.where(volrank<vr,flow24,np.nan),48,FM=FM48))['net'])\nfor H in [12,24,48,96,144,288]: print('H',H,st(*ev(sig,H,FM=fmat(H)))['net'])\n# fresh 200 shuffled-day placebos, permuting the SIGNAL rows (protocol wording)\nday=((GRID-GRID[0])//86400000).astype(np.int64); d=day[idxs]\nfirst={}\nfor i,x in enumerate(d):\n    if x not in first: first[x]=i\nud=np.unique(d); rng=np.random.default_rng(424242); out=[]\nfor k in range(200):\n    mp=dict(zip(ud,rng.permutation(ud))); src=np.array([first[mp[x]] for x in d])\n    p=np.sign(sig[idxs][src])*pnl; o=~np.isnan(p); out.append(float(p[o].mean()))\nout=np.array(out)\nprint('placebo max',round(float(out.max()),2),'p95',round(float(np.percentile(out,95)),2),'z',round((float(pnl[ok].mean())-out.mean())/out.std(),2))\n",
+      "severity": "useful",
+      "spec_code": "import numpy as np, pandas as pd, glob, json\nm=json.load(open('/dataset/manifest.json')); SYMS=list(m['symbols'].keys())\nT0=1577836800000; T1=1776902400000; STEP=300000\nGRID=np.arange(T0,T1,STEP,dtype=np.int64); N=len(GRID); S=len(SYMS)\ndef load(root,cols):\n    out={c:np.full((N,S),np.nan,np.float32) for c in cols}\n    for j,s in enumerate(SYMS):\n        fs=sorted(glob.glob(f'{root}/bars_5m/{s}/*.parquet'))\n        if not fs: continue\n        d=pd.concat([pd.read_parquet(f,columns=['ts_ms']+cols) for f in fs],ignore_index=True)\n        d=d[(d.ts_ms>=T0)&(d.ts_ms<T1)].sort_values('ts_ms')\n        i=((d.ts_ms.values-T0)//STEP).astype(np.int64)\n        for c in cols: out[c][i,j]=d[c].values\n    return out\nD=load('/dataset/discovery',['close','quote_volume','signed_usd','rv_tick'])\nC,QV,SD,RV=D['close'],D['quote_volume'],D['signed_usd'],D['rv_tick']\nlogC=np.log(C.astype(np.float64)).astype(np.float32)\ndef rsum(x,w): return pd.DataFrame(x).rolling(w,min_periods=max(2,w//2)).sum().values.astype(np.float32)\ndef rrank(x,w): return pd.DataFrame(x).rolling(w,min_periods=max(5,w//2)).apply(lambda a:(a[:-1]<a[-1]).mean(),raw=True).values.astype(np.float32)\nvolrank=rrank(rsum(RV,12),2016)\nflow24=rsum(SD,288)/(rsum(QV,288)+1e-9)\nF={}\nfor s in SYMS:\n    fs=sorted(glob.glob(f'/dataset/discovery/funding/{s}/*.parquet'))\n    if fs:\n        d=pd.concat([pd.read_parquet(f) for f in fs],ignore_index=True).sort_values('ts_ms')\n        F[s]=(d.ts_ms.values.astype(np.int64),d.rate.values.astype(np.float64))\ndef fmat(H):\n    FM=np.full((N,S),np.nan,np.float32)\n    for j,s in enumerate(SYMS):\n        if s not in F: continue\n        ts,rt=F[s]; cum=np.concatenate([[0.0],np.cumsum(rt)])\n        ent=GRID+STEP; ex=ent+H*STEP\n        FM[:,j]=(cum[np.searchsorted(ts,ex,side='right')]-cum[np.searchsorted(ts,ent,side='right')]).astype(np.float32)\n    return FM\ndef fwd(H):\n    r=np.full(logC.shape,np.nan,np.float32); r[:-H]=logC[H:]-logC[:-H]; return r\ndef ev(sig,H,cost=19.0,FM=None,ret=None,mask=None):\n    if ret is None: ret=fwd(H)\n    if FM is None: FM=fmat(H)\n    net=ret*1e4-cost-FM*1e4\n    idxs=np.arange(0,N-H,H)\n    pnl=np.sign(sig[idxs])*net[idxs]; ok=~np.isnan(pnl)\n    if mask is not None: ok=ok&mask[idxs]\n    return pnl,ok,idxs\ndef st(pnl,ok,idxs):\n    yr=np.array(pd.to_datetime(GRID,unit='ms').year)[idxs][:,None]*np.ones_like(pnl)\n    v=pnl[ok]\n    return {'net':round(float(v.mean()),2),'n':int(ok.sum()),'hit':round(float((v>0).mean()),3),\n            'per_year':{int(y):round(float(pnl[ok&(yr==y)].mean()),2) for y in [2022,2023,2024,2025,2026] if (ok&(yr==y)).sum()>0}}\nFM48=fmat(48); sig=np.where(volrank<0.5,flow24,np.nan)\npnl,ok,idxs=ev(sig,48,FM=FM48); print('BASE',st(pnl,ok,idxs))\nfor c in [14.0,19.0,24.0,38.0]: print('cost',c,st(*ev(sig,48,cost=c,FM=FM48)))\nfor sh in [-1,1]:\n    s2=np.roll(sig,sh,axis=0)\n    if sh<0: s2[sh:,:]=np.nan\n    else: s2[:sh,:]=np.nan\n    print('shift',sh,st(*ev(s2,48,FM=FM48)))\nprint('long-only low-vol',st(*ev(np.where(volrank<0.5,1.0,np.nan),48,FM=FM48)))\nfor vr in [0.2,0.3,0.4,0.5,0.6,0.7,0.8,1.01]: print('vr',vr,st(*ev(np.where(volrank<vr,flow24,np.nan),48,FM=FM48))['net'])\nfor H in [12,24,48,96,144,288]: print('H',H,st(*ev(sig,H,FM=fmat(H)))['net'])\nday=((GRID-GRID[0])//86400000).astype(np.int64); d=day[idxs]\nfirst={}\nfor i,x in enumerate(d):\n    if x not in first: first[x]=i\nud=np.unique(d); rng=np.random.default_rng(424242); out=[]\nfor k in range(200):\n    mp=dict(zip(ud,rng.permutation(ud))); src=np.array([first[mp[x]] for x in d])\n    p=np.sign(sig[idxs][src])*pnl; o=~np.isnan(p); out.append(float(p[o].mean()))\nout=np.array(out)\nprint('placebo max',round(float(out.max()),2),'p95',round(float(np.percentile(out,95)),2),'z',round((float(pnl[ok].mean())-out.mean())/out.std(),2))\n",
+      "title": "Referee report on w108-f08-cand-flow24-lowvol-h4: re-derivation exact, all attacks survived, but the ONE LOOK on /dataset/confirm was never taken (budget exhausted) — verdict INVALID as a confirmation, candidate remains unconfirmed"
+    }
+  ]
+}

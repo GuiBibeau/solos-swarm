@@ -1,0 +1,5 @@
+[Unit]
+Description=Tournament wave-1 gate and launcher (aborts with a logged reason unless every pre-start condition holds)
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/research/regimes/tournament-20261028/gate_launch.py

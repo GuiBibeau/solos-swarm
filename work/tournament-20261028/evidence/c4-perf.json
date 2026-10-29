@@ -1,0 +1,52 @@
+{
+ "step": "c4",
+ "wall_minutes": 1.5,
+ "agents": 2,
+ "filed": 2,
+ "partial": 0,
+ "failed_unfiled": 0,
+ "model_calls": 14,
+ "spent_usd": 0.14,
+ "spent_per_filed_usd": 0.069,
+ "calls_per_filed": 7.0,
+ "cache_hit_rate": 0.7717,
+ "prompt_tokens": 1156625,
+ "completion_tokens": 26663,
+ "stalled_agents_gt_10min_gap": [],
+ "max_event_gap_s": 50,
+ "provider_denied": {},
+ "tool_budget_blocked": 0,
+ "http_403_goal_limit": 0,
+ "time_to_first_finding_min": 0.6,
+ "time_to_median_finding_min": 0.6,
+ "coordinator": {
+  "calls": 9,
+  "run_code_calls": 0,
+  "spent_usd": 0.082,
+  "filed": true
+ },
+ "run_code": {
+  "total": 0,
+  "queue_wait_ms_p50": null,
+  "queue_wait_ms_p90": null,
+  "queue_wait_ms_max": null
+ },
+ "tool_counts": {
+  "claim_task": 2,
+  "board_read": 2,
+  "board_post": 2,
+  "submit_finding": 2,
+  "read_findings": 1,
+  "submit_artifact": 1
+ },
+ "goal_status": "completed",
+ "artifact": true,
+ "agent_spend_usd": {
+  "agent-00": 0.082,
+  "agent-01": 0.056
+ },
+ "confirm_slice_mentions_by_agent": {
+  "agent-00": 10,
+  "agent-01": 10
+ }
+}

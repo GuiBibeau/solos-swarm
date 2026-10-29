@@ -1,0 +1,6 @@
+{
+  "idle_probe": false,
+  "reason": "host-side Goal deadline expired",
+  "runtime_verdict": "FAIL",
+  "stopped_ms": 1793216975055
+}

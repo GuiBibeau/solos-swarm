@@ -1,0 +1,189 @@
+{
+  "papers": [
+    {
+      "assumptions": [
+        "The digest metrics quoted here are the records' own reported numbers and are not re-derived by the coordinator.",
+        "cost_rt_bps_high=19 and cost_rt_bps_low=14 are the round-trip cost bounds used when a record reports net bps/trade.",
+        "mde_heldout_h24=0.35 and mde_train_h1_h4=0.12 are the MDE thresholds behind each record's mde_ok flag.",
+        "A record's beats_placebo_max flag is taken at face value for ranking purposes; placebo validity is a separate gate listed in limitations."
+      ],
+      "claim": "Only two of the 159 digest records satisfy beats_placebo_max=true, mde_ok=true and net bps/trade > 0 on their own reported metrics, and both are contradicted by later robustness records in the same digest, so wave 2 closes with zero candidates that survive its own gates unopposed.",
+      "decision": "Ranked referee queue, highest priority first: (1) w204-f24-cand-mom7-h24-k5 — widest margin in the digest (net 126.5 bps vs placebo_max 70.6, mde_ok true) but its own ex-top3 variant fails placebo and w203 finds 0 of 5 years beating the per-year placebo max, so referee it as a likely concentration artifact. (2) w108-f08-cand-flow24-lowvol-h4 — clears the bar (net 14.15 bps vs placebo_max 13.62, mde_ok true) but by 0.53 bps while its own placebo mean is +11.22, so referee it as a null-calibration question first and a signal question second. No further candidates are ranked: nothing else in the digest reports all three of beats_placebo_max=true, mde_ok=true and net bps/trade > 0. Assignments: empty — the two gates below are the whole remaining job and do not need to be split across agents.",
+      "description": "Coordinator wave-plan for wave 2 (close). Decision is a ranked list of candidate ids the referees should look at first, one line of reason each, followed by the mechanism clusters that make several candidates duplicates of one another. Ranking rule, stated so it can be audited: a candidate is ranked only if its own record reports beats_placebo_max=true, mde_ok=true, and a positive net bps/trade at the stated round-trip cost (cost_rt_bps_high=19, cost_rt_bps_low=14). Candidates that fail any of the three are not ranked; they are negative or background and are listed only as context. Ranked order: (1) w204-f24-cand-mom7-h24-k5 — net 126.5 bps against placebo_max 70.6 with mde_ok true, the widest margin in the digest, but its own ex-top3 variant fails placebo and w203 reports 0 of 5 years beating the per-year placebo max, so it is a candidate to attack, not to promote. (2) w108-f08-cand-flow24-lowvol-h4 — net 14.15 bps against placebo_max 13.62 with mde_ok true, a 0.53 bps margin that sits inside null noise because w108's own placebo mean is +11.22 rather than 0. No other candidate in the digest satisfies all three conditions on its own reported metrics. Assignments are left empty: the referee work is fully specified by the ranked list and the two gates below, and no additional agent split is needed at close.",
+      "evidence": "Mechanism clusters (duplicates the referees should treat as one hypothesis each, not as independent confirmations): (A) cross-sectional flow / low-volatility family — w108-f08-cand-flow24-lowvol-h4 is the only member that clears the bar, and w108's own placebo mean of +11.22 shows the null for this family is not centred at 0, so any sibling that also reports a small positive margin is the same result, not a new one. (B) momentum-k5 family — w204-f24-cand-mom7-h24-k5 is the only member that clears the bar, and its ex-top3 variant failing placebo means the family's apparent edge is carried by a small number of days, matching w217's top3_day_share 0.521 with -3.43 bps on full-history symbols. (C) placebo-invalidity cluster — w209 (placebo_max == placebo_mean == placebo_p95 == observed, -14.35), w224 (placebo_max == observed, std 0) and w202 (within-symbol day shuffle is the wrong null for cross-sectional signals) all describe the same defect: a null that cannot reject. Every candidate whose only support is beats_placebo_max inherits this defect, which is why the queue is two names and not more. Digest constants used: n_symbols=50, horizons_h=[4,8,12,24], cost_rt_bps_high=19, cost_rt_bps_low=14, mde_heldout_h24=0.35, mde_train_h1_h4=0.12, placebo_shuffles=200, confirm_from=2026-05-01, last_data_day=2026-10-22, lockbox_windows_dropped=3.",
+      "file": "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md",
+      "id": "w2-close-wave-plan-referee-queue",
+      "kill_criterion": "Drop a ranked candidate if a referee shows either (a) its placebo distribution is degenerate or mis-centred, so beats_placebo_max is not evidence — the pattern already measured by w209 (placebo_max == placebo_mean == placebo_p95 == observed, -14.35), w224 (placebo_max == observed with std 0) and w108 itself (placebo mean +11.22, not 0) — or (b) its edge is concentrated, so the pooled placebo max is passed by a cell that fails the per-year placebo max, as w203 reports for 5 of 5 years, or that carries top3_day_share 0.521 and is -3.43 bps on full-history symbols, as w217 reports. If either holds, the candidate moves to negative and the queue is empty.",
+      "kind": "wave-plan",
+      "limitations": [
+        "The coordinator did not re-run any candidate; every number here is quoted from the digest record that reported it.",
+        "The ranking rule is deliberately mechanical (three flags) and therefore cannot distinguish a genuinely large edge from a large edge produced by a broken null; that distinction is exactly what the two ranked referees are asked to settle.",
+        "The digest contains 159 records and trials_total 2079, so the two survivors are consistent with multiple-testing luck at placebo_shuffles=200 and should be treated as such until the per-year placebo gate is applied.",
+        "Assignments are empty by choice; if the referee budget allows, the two ranked candidates should be attacked in parallel rather than sequentially, since neither depends on the other's outcome."
+      ],
+      "severity": "useful",
+      "status": "complete",
+      "title": "Wave 2 close: referee queue — two candidates clear their own placebo/MDE bar, both contested by later robustness records"
+    },
+    {
+      "area": "harness-plumbing",
+      "assumptions": [
+        "The panel build is deterministic given the same data window, so a host-side cache is equivalent to per-agent construction.",
+        "Agents will use a provided read-only path if the prompt names it explicitly."
+      ],
+      "claim": "Most of the wave-2 budget went into rebuilding the same 50-symbol panel 25 times, and the failures show up as zero-trial filings rather than as errors.",
+      "decision": "Adopt for wave 3: host-side panel cache plus shared cost/placebo helper, with the prompt naming the path.",
+      "description": "Evidence: in wave 2 the run filed 24 records for spent_usd 5.26 (spent_per_filed_usd 0.219) with run_code total 2254 and calls_per_filed 97.4, yet a large share of the filed records report 0 trials evaluated because the 50-symbol 5m panel could not be built inside the agent's own budget (w112, w120, w201, w207, w208, w210, w213, w214, w215, w221). Those records consume a filing slot and a full agent budget while contributing no testable claim, which is the main reason spent_per_filed_usd (0.219) did not improve on wave 1 (0.21) despite cache_hit_rate 0.9847. Change: the host pre-builds, once per wave, a per-symbol float32 feature/panel cache (1m and 5m bars, the four horizons 4/8/12/24h, the 14 and 19 bps cost columns) and exposes it as a read-only path plus a shared cost/placebo helper module; agents load it instead of re-deriving panels. Expected effect: zero-trial filings drop toward 0, run_code total falls well below 2254, and spent_per_filed_usd falls below 0.219 because the dominant per-agent cost (panel construction) is paid once instead of 25 times. Test: rerun a wave with the cache present and compare (a) count of filed records whose trials_evaluated == 0, (b) run_code total, (c) spent_per_filed_usd against the wave-2 values 0.219 / 2254 / 24 filed; success is a strict reduction in all three with filed count not falling.",
+      "evidence": "w2 performance block: filed 24, spent_usd 5.26, spent_per_filed_usd 0.219, calls_per_filed 97.4, run_code total 2254, cache_hit_rate 0.9847; w1 spent_per_filed_usd 0.21. Digest records w112, w120, w201, w207, w208, w210, w213, w214, w215, w221 each report 0 trials evaluated because the 50-symbol 5m panel could not be built.",
+      "file": "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md",
+      "id": "c201-s01-panel-cache",
+      "kill_criterion": "If a wave with the cache still shows more than 2 filed records with trials_evaluated == 0, or spent_per_filed_usd does not fall below 0.219, revert to per-agent construction.",
+      "kind": "swarm-improvement",
+      "limitations": "Does not by itself fix placebo validity or repeated-call waste; those are separate records. Assumes the host has disk for a 50-symbol 1m+5m float32 cache.",
+      "metrics": {
+        "w1_spent_per_filed_usd": 0.21,
+        "w2_cache_hit_rate": 0.9847,
+        "w2_calls_per_filed": 97.4,
+        "w2_filed": 24,
+        "w2_run_code_total": 2254,
+        "w2_spent_per_filed_usd": 0.219,
+        "w2_spent_usd": 5.26,
+        "zero_trial_records_cited": 10
+      },
+      "relevance": "Directly targets the largest measured inefficiency in wave 2 (cost per filed record) without changing any evaluation rule.",
+      "severity": "useful",
+      "status": "proposed",
+      "title": "Pre-build the per-symbol feature panel on the host so filings stop returning zero evaluated trials"
+    },
+    {
+      "area": "statistical-validity",
+      "assumptions": [
+        "A non-degenerate permutation null is constructible for every signal family used in the wave.",
+        "Flagging invalid nulls is preferable to silently scoring them."
+      ],
+      "claim": "A placebo null with zero spread or non-zero mean cannot falsify anything, and wave 2 filed such nulls as if they were evidence.",
+      "decision": "Adopt: placebo-validity assertion is a hard LINT gate in wave 3.",
+      "description": "Evidence: three independent wave-2 records show the placebo null silently failing. w209 reports placebo_max == placebo_mean == placebo_p95 == observed at -14.35, i.e. a null with zero spread that can never be beaten. w224 reports placebo_max == observed with std 0 for fixed-time-of-day signals, the same degeneracy. w108 reports a placebo mean of +11.22, i.e. a null that is not centred at zero, so a candidate can clear it by bias alone. w202 argues explicitly that a within-symbol day shuffle is the wrong null for cross-sectional signals. Change: add a placebo-validity assertion to LINT that runs before any candidate is scored: require placebo_std > 0 and |placebo_mean| below a small tolerance of the observed scale, and require the joint cross-symbol day permutation (not within-symbol shuffle) for any cross-sectional signal; a record whose null fails the assertion is filed as invalid-null rather than as a pass or a fail. Expected effect: the two candidates that agent-00's close flagged as eligible-by-own-metrics (w108-f08-cand-flow24-lowvol-h4 with net 14.15 bps vs placebo_max 13.62, and w204-f24-cand-mom7-h24-k5 with net 126.5 bps vs placebo_max 70.6) are exactly the kind of thin margins a biased null can manufacture, so a validity gate should shrink the eligible set to claims whose null is demonstrably non-degenerate. Test: replay the 159-record digest through the new assertion and count how many records change status; then check that w209, w224 and w108 are all flagged invalid-null and that no record with placebo_std == 0 survives as a pass.",
+      "evidence": "w209: placebo_max == placebo_mean == placebo_p95 == observed == -14.35. w224: placebo_max == observed, std 0, fixed-time-of-day signals. w108: placebo mean +11.22. w202: within-symbol day shuffle is the wrong null for cross-sectional signals. Digest: n_records 159, trials_total 2079.",
+      "file": "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md",
+      "id": "c201-s02-placebo-validity-lint",
+      "kill_criterion": "If the assertion flags more than half of the 159 digest records as invalid-null, the tolerance is mis-set and the gate must be recalibrated before use.",
+      "kind": "swarm-improvement",
+      "limitations": "Choosing the tolerance for |placebo_mean| requires calibration on the existing 159 records; too tight a tolerance will invalidate legitimate skewed nulls.",
+      "metrics": {
+        "digest_n_records": 159,
+        "digest_trials_total": 2079,
+        "w108_cand_net_bps": 14.15,
+        "w108_cand_placebo_max": 13.62,
+        "w108_placebo_mean": 11.22,
+        "w204_cand_net_bps": 126.5,
+        "w204_cand_placebo_max": 70.6,
+        "w209_observed": -14.35,
+        "w224_placebo_std": 0
+      },
+      "relevance": "Protects the core claim of the tournament: that a discovered signal beats a real null, not a degenerate one.",
+      "severity": "breakthrough",
+      "status": "proposed",
+      "title": "LINT must reject placebo nulls that are degenerate or not centred at zero"
+    },
+    {
+      "area": "budget-efficiency",
+      "assumptions": [
+        "Identical script plus identical stdout implies no new information, so refusing the call loses nothing.",
+        "Agents will adapt by varying the experiment rather than by perturbing the script cosmetically."
+      ],
+      "claim": "A large share of wave-2 run_code calls were byte-identical repeats, so the budget was spent re-deriving results the agent already had.",
+      "decision": "Adopt: duplicate (script_hash, stdout_hash) calls are served from cache and not charged.",
+      "description": "Evidence: wave 2 spent_usd 5.26 across 24 filings with run_code total 2254 and calls_per_filed 97.4, and the digest shows a large fraction of those calls were byte-identical repeats: w101 (~10 repeats), w110 (~60), w205 (~40), w212 (~50), w215 (55), w219 (~60), w222 (~40), w208 (85). tool_budget_blocked was 18 and provider_denied was empty, so the waste was not caused by provider throttling. Change: the harness keeps a per-agent set of (script_hash, stdout_hash) pairs; a call whose pair is already present returns the cached stdout with a 'duplicate' marker and is not charged against the agent budget. Expected effect: with calls_per_filed at 97.4 and roughly 400 of the 2254 run_code calls being repeats by the counts above, removing them should cut run_code total and spent_per_filed_usd materially below 0.219 while leaving the number of distinct experiments unchanged. Test: instrument a wave to log (script_hash, stdout_hash) per call, count duplicates, then enable the refusal and compare run_code total, spent_per_filed_usd and filed count against 2254 / 0.219 / 24; success is fewer charged calls with filed count not falling and no increase in failed_unfiled (wave 2 had 0).",
+      "evidence": "w2 performance block: run_code total 2254, calls_per_filed 97.4, spent_usd 5.26, spent_per_filed_usd 0.219, tool_budget_blocked 18, provider_denied {}. Digest repeat counts: w101 ~10, w110 ~60, w205 ~40, w212 ~50, w215 55, w219 ~60, w222 ~40, w208 85.",
+      "file": "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md",
+      "id": "c201-s03-refuse-identical-reruns",
+      "kill_criterion": "If enabling the refusal raises failed_unfiled above 0 or lowers filed count below the wave-2 value of 24, revert.",
+      "kind": "swarm-improvement",
+      "limitations": "A cosmetic edit (e.g. a changed comment or seed) defeats the hash; the gate catches exact repeats only. Does not address repeats that differ only in a printed timestamp.",
+      "metrics": {
+        "repeat_counts_cited": {
+          "w101": 10,
+          "w110": 60,
+          "w205": 40,
+          "w208": 85,
+          "w212": 50,
+          "w215": 55,
+          "w219": 60,
+          "w222": 40
+        },
+        "w2_calls_per_filed": 97.4,
+        "w2_failed_unfiled": 0,
+        "w2_run_code_total": 2254,
+        "w2_spent_per_filed_usd": 0.219,
+        "w2_tool_budget_blocked": 18
+      },
+      "prompt_patch": "Before running code, check whether you already have this exact result: if the script and its output would be identical to a previous call, do not re-run it. Spend the saved budget on a genuinely different test (new horizon, new symbol subset, new null). If a panel build fails, file the failure as a limitation in one record and move on rather than retrying the same build.",
+      "relevance": "Cheapest available reduction in cost per filed record; requires no change to the statistics or the evaluation rules.",
+      "severity": "useful",
+      "status": "proposed",
+      "title": "Refuse and do not charge byte-identical re-runs of the same script"
+    },
+    {
+      "area": "statistical-validity",
+      "assumptions": [
+        "Each evaluation year has enough observations for a per-year placebo max to be meaningful.",
+        "top3_day_share is computable for every filed cell from the stored per-day returns."
+      ],
+      "claim": "Pooled placebo maxima and unconstrained concentration let wave 2 file cells whose edge is one good year or a handful of days.",
+      "decision": "Adopt: per-year placebo max is the pass criterion and concentration gates are hard, not advisory.",
+      "description": "Evidence: w203 shows a cell that passes the pooled placebo max but fails the per-year placebo max in 5 of 5 years, i.e. the pooled null is dominated by one favourable year. w217 shows a cell that beats the pooled placebo max yet has top3_day_share 0.521 and returns -3.43 bps on full-history symbols, i.e. the edge is concentrated in a few days and reverses out of sample. Change: replace the pooled placebo max with a per-year placebo max as the pass criterion (a candidate must beat the placebo max in each year it is evaluated on), and add hard concentration gates on top3_day_share and on the full-history-symbol return so a concentrated or sign-flipping cell cannot be filed as a pass. Expected effect: the two candidates agent-00's close flagged as eligible-by-own-metrics both have thin or contested margins (w108-f08-cand-flow24-lowvol-h4 net 14.15 bps vs placebo_max 13.62; w204-f24-cand-mom7-h24-k5 net 126.5 bps vs placebo_max 70.6 but its ex-top3 variant fails placebo), so per-year scoring plus concentration gates should remove exactly the claims that later robustness records already contradict. Test: re-score the 159-record digest under per-year placebo max plus the concentration gates and check that w203 and w217 flip to fail, that the w204 ex-top3 variant fails, and that any surviving pass has top3_day_share below the gate and a non-negative full-history-symbol return.",
+      "evidence": "w203: pooled placebo max passes a cell that fails per-year placebo max in 5 of 5 years; 14 to 19 bps costs 5.0 bps while funding x2 moves only +1.2 bps. w217: beats pooled placebo max but top3_day_share 0.521 and -3.43 bps on full-history symbols. w204: ex-top3 variant fails placebo. Digest: n_records 159, trials_total 2079.",
+      "file": "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md",
+      "id": "c201-s04-per-year-placebo-and-concentration",
+      "kill_criterion": "If per-year scoring leaves zero passes across two consecutive waves while the pooled criterion left several, re-examine whether the per-year null is over-conservative before keeping the gate.",
+      "kind": "swarm-improvement",
+      "limitations": "Per-year placebo max is a stricter bar and will reduce the pass rate; with mde_heldout_h24 0.35 the wave may end with no passes, which is an acceptable outcome but must be pre-registered as such.",
+      "metrics": {
+        "mde_heldout_h24": 0.35,
+        "w108_cand_net_bps": 14.15,
+        "w108_cand_placebo_max": 13.62,
+        "w203_cost_14_to_19_bps": 5,
+        "w203_funding_x2_effect_bps": 1.2,
+        "w203_years_failing_per_year_placebo": 5,
+        "w204_cand_net_bps": 126.5,
+        "w204_cand_placebo_max": 70.6,
+        "w217_full_history_symbol_bps": -3.43,
+        "w217_top3_day_share": 0.521
+      },
+      "relevance": "Directly addresses the failure mode where a filed pass is contradicted by a later robustness record in the same wave.",
+      "severity": "breakthrough",
+      "status": "proposed",
+      "title": "Score against per-year placebo maxima and add hard concentration gates"
+    },
+    {
+      "area": "cost-realism",
+      "assumptions": [
+        "Roll-implied spread from the same bar data is an acceptable lower-bound proxy for realised round-trip cost.",
+        "Adding a diagnostic column does not change the pre-registered pass criterion."
+      ],
+      "claim": "The pre-registered 14/19 bps cost band is far above measured spreads on the liquid names the wave actually trades, and the wave cannot currently say how much of a candidate's net is a cost artefact.",
+      "decision": "Adopt as a diagnostic column in wave 3; 14/19 bps remain the pass criterion.",
+      "description": "Evidence: w215 measures Roll-implied spreads of 2.05 to 6.82 bps on the top-10 names in 2024, far below the pre-registered cost_rt_bps_low 14 and cost_rt_bps_high 19. w203 shows the cost assumption is the binding constraint: moving from 14 to 19 bps costs 5.0 bps of net return while doubling funding moves only +1.2 bps. So the wave is simultaneously too pessimistic on the names where it measures spreads and unable to say how much of a candidate's net survives at the true cost. Change: every filed record carries a third net column computed at the measured Roll spread for the symbols it actually trades, alongside the pre-registered 14 and 19 bps columns; the pre-registered columns remain the pass criterion so no evaluation rule changes. Expected effect: candidates whose net is thin at 19 bps but clearly positive at measured spread become distinguishable from candidates that are thin at every cost level, which sharpens the ranking without loosening the bar. Test: recompute the digest's net columns with the measured-spread column added and check that (a) no record's pass/fail status changes, since 14/19 remain the criterion, and (b) the spread between the 19 bps net and the measured-spread net is reported per record; a candidate that is positive at measured spread but negative at 19 bps is flagged as cost-sensitive rather than as a pass.",
+      "evidence": "w215: Roll spread 2.05 to 6.82 bps on top-10 names in 2024 versus the 14/19 bps assumption. w203: 14 to 19 bps costs 5.0 bps of net return; funding x2 moves only +1.2 bps. Constants: cost_rt_bps_low 14, cost_rt_bps_high 19.",
+      "file": "https://raw.githubusercontent.com/binance/binance-public-data/master/README.md",
+      "id": "c201-s05-measured-spread-cost-column",
+      "kill_criterion": "If the measured-spread column changes any record's pass/fail status, it has been wired in as a criterion by mistake and must be demoted back to diagnostic.",
+      "kind": "swarm-improvement",
+      "limitations": "Roll spread is a lower bound and ignores impact and fees, so the measured column must never be used as the pass criterion; it is diagnostic only.",
+      "metrics": {
+        "cost_rt_bps_high": 19,
+        "cost_rt_bps_low": 14,
+        "w203_cost_14_to_19_bps": 5,
+        "w203_funding_x2_effect_bps": 1.2,
+        "w215_roll_spread_high_bps": 6.82,
+        "w215_roll_spread_low_bps": 2.05,
+        "w215_symbols": "top-10 names in 2024"
+      },
+      "relevance": "Makes the cost sensitivity of each candidate explicit without weakening the pre-registered bar.",
+      "severity": "useful",
+      "status": "proposed",
+      "title": "Report a measured-spread cost column next to the 14/19 bps assumption"
+    }
+  ]
+}

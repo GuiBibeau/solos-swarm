@@ -1,0 +1,36 @@
+{
+  "artifacts": {
+    "config.yaml": "5265ecd1c0ea253692192913b395e828cdf77069a42c0d305cdab75080625e1a"
+  },
+  "catalog_version": "tournament-c3-2026-10-28-v1",
+  "deadline_seconds": 5400,
+  "deferred": [
+    "Raft/QUIC and multi-host HA",
+    "500-agent acceptance",
+    "SVID and signed audit witness",
+    "Firecracker tools/full Tier P",
+    "local provider and air gap",
+    "policy actors/module unloading/retractions",
+    "history optimization and three-family rotation"
+  ],
+  "extension_sha256": "529c6cc35ba4c46c42819e56bd14f30fdbdd3b3d6771818e2c964ada957d04b6",
+  "isolation": "bubblewrap-unshare-all",
+  "live": true,
+  "model": "deepseek-flash",
+  "model_revision": "deepseek/deepseek-flash (API alias, weights unavailable)",
+  "package_lock_sha256": "6b64c67b9500db87edb8d9bf37011843708df3d76afc0e9ae10f79f22556504b",
+  "pi_version": "1.1.0",
+  "price_table": {
+    "cache_hit_microusd_per_million": 30000,
+    "input_microusd_per_million": 300000,
+    "output_microusd_per_million": 1200000,
+    "revision": "deepseek-2026-10-27-conservative-peak-cache-aware"
+  },
+  "provider": "deepseek",
+  "runtime_sha256": "04a07f76930b0effcbf29ccb74851068fbaaf69bd0bca76ef174cd3c4b2e877d",
+  "schema_version": 1,
+  "scorer_version": "1",
+  "seed": 20261045,
+  "started_ms": 1793226484076,
+  "topology": "single-host"
+}

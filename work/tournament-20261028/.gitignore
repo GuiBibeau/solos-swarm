@@ -1,0 +1,11 @@
+# Temporary and bulky run outputs; raw agent logs stay outside git (see README "Raw logs").
+__pycache__/
+*.pyc
+drive-state.json
+LAUNCH_APPROVED
+evidence/**/agent-*.rpc.jsonl
+evidence/**/agent-*.stderr
+evidence/**/stdout.log
+evidence/**/stderr.log
+evidence/**/start.log
+evidence/**/events.jsonl

@@ -1,0 +1,449 @@
+{
+  "schema_version": 1,
+  "verdict": "FAIL",
+  "runtime_verdict": "FAIL",
+  "goal_verdict": "INCONCLUSIVE",
+  "evidence_verdict": "INCONCLUSIVE",
+  "cleanup_verdict": "FAIL",
+  "run_id": "tourney-20261028-w3",
+  "scorer_id": null,
+  "scorer_version": null,
+  "seed": null,
+  "checks": [
+    {
+      "check": "read:manifest.json",
+      "dimension": "evidence",
+      "verdict": "PASS",
+      "reason": "Required evidence loaded"
+    },
+    {
+      "check": "read:state.json",
+      "dimension": "evidence",
+      "verdict": "PASS",
+      "reason": "Required evidence loaded"
+    },
+    {
+      "check": "read:runtime-report.json",
+      "dimension": "runtime",
+      "verdict": "PASS",
+      "reason": "Required evidence loaded"
+    },
+    {
+      "check": "read:cleanup.json",
+      "dimension": "cleanup",
+      "verdict": "PASS",
+      "reason": "Required evidence loaded"
+    },
+    {
+      "check": "read:artifacts/final.json",
+      "dimension": "goal",
+      "verdict": "PASS",
+      "reason": "Required evidence loaded"
+    },
+    {
+      "check": "read:config.yaml",
+      "dimension": "evidence",
+      "verdict": "PASS",
+      "reason": "Required evidence loaded"
+    },
+    {
+      "check": "private-evaluator",
+      "dimension": "evidence",
+      "verdict": "INCONCLUSIVE",
+      "reason": "Malformed private evaluator payload"
+    },
+    {
+      "check": "event-chain",
+      "dimension": "evidence",
+      "verdict": "PASS",
+      "reason": "Verified 796 entries; head=34fb2a6dbdcddd4d753e07628344cf3fcf72551d5c3fedbda94860b71b8f23f1"
+    },
+    {
+      "check": "live-provider",
+      "dimension": "runtime",
+      "verdict": "PASS",
+      "reason": "A fixture or replay run cannot qualify"
+    },
+    {
+      "check": "single-host-profile",
+      "dimension": "evidence",
+      "verdict": "PASS",
+      "reason": "This checker qualifies only the single-host preview"
+    },
+    {
+      "check": "isolation-profile",
+      "dimension": "evidence",
+      "verdict": "PASS",
+      "reason": "Required tested isolation profile recorded"
+    },
+    {
+      "check": "pinned-pi",
+      "dimension": "evidence",
+      "verdict": "PASS",
+      "reason": "Expected Pi 1.1.0"
+    },
+    {
+      "check": "digest:runtime",
+      "dimension": "evidence",
+      "verdict": "PASS",
+      "reason": "Candidate digest must match frozen manifest"
+    },
+    {
+      "check": "digest:extension",
+      "dimension": "evidence",
+      "verdict": "PASS",
+      "reason": "Candidate digest must match frozen manifest"
+    },
+    {
+      "check": "digest:package_lock",
+      "dimension": "evidence",
+      "verdict": "PASS",
+      "reason": "Candidate digest must match frozen manifest"
+    },
+    {
+      "check": "required-artifact-digests",
+      "dimension": "evidence",
+      "verdict": "PASS",
+      "reason": "Manifest must bind the public Goal"
+    },
+    {
+      "check": "digest:config.yaml",
+      "dimension": "evidence",
+      "verdict": "PASS",
+      "reason": "Artifact digest must match manifest"
+    },
+    {
+      "check": "runtime-outcome",
+      "dimension": "runtime",
+      "verdict": "PASS",
+      "reason": "None"
+    },
+    {
+      "check": "workers-stopped",
+      "dimension": "cleanup",
+      "verdict": "PASS",
+      "reason": "Cleanup must confirm no remaining run-owned workers"
+    },
+    {
+      "check": "admitted-identities",
+      "dimension": "runtime",
+      "verdict": "FAIL",
+      "reason": "One distinct admitted identity per admitted agent required"
+    },
+    {
+      "check": "goal-completed",
+      "dimension": "runtime",
+      "verdict": "PASS",
+      "reason": "Goal must have completed"
+    },
+    {
+      "check": "settled-ledger",
+      "dimension": "evidence",
+      "verdict": "PASS",
+      "reason": "Unknown or unsettled holds block qualification"
+    },
+    {
+      "check": "nonreplayed-receipts",
+      "dimension": "runtime",
+      "verdict": "PASS",
+      "reason": "Each completed inference must have a unique upstream receipt"
+    },
+    {
+      "check": "intent-identities",
+      "dimension": "evidence",
+      "verdict": "PASS",
+      "reason": "Unique effect IDs must belong to admitted agents"
+    },
+    {
+      "check": "ledger-total",
+      "dimension": "evidence",
+      "verdict": "PASS",
+      "reason": "Settled intent costs must sum to recorded spend"
+    },
+    {
+      "check": "spend-cap",
+      "dimension": "runtime",
+      "verdict": "PASS",
+      "reason": "Recorded spend must remain inside the registered cap"
+    },
+    {
+      "check": "inference:agent-00",
+      "dimension": "runtime",
+      "verdict": "PASS",
+      "reason": "Real completed inference with consistent count, receipt and usage required"
+    },
+    {
+      "check": "turn-cap:agent-00",
+      "dimension": "runtime",
+      "verdict": "PASS",
+      "reason": "Agent call count must match recorded intents and admitted turn ceiling"
+    },
+    {
+      "check": "lifetime:agent-00",
+      "dimension": "cleanup",
+      "verdict": "PASS",
+      "reason": "Recorded process start and termination required"
+    },
+    {
+      "check": "contribution:agent-00",
+      "dimension": "goal",
+      "verdict": "INCONCLUSIVE",
+      "reason": "An independently verifiable attributed shard result is required"
+    },
+    {
+      "check": "inference:agent-01",
+      "dimension": "runtime",
+      "verdict": "PASS",
+      "reason": "Real completed inference with consistent count, receipt and usage required"
+    },
+    {
+      "check": "turn-cap:agent-01",
+      "dimension": "runtime",
+      "verdict": "PASS",
+      "reason": "Agent call count must match recorded intents and admitted turn ceiling"
+    },
+    {
+      "check": "lifetime:agent-01",
+      "dimension": "cleanup",
+      "verdict": "PASS",
+      "reason": "Recorded process start and termination required"
+    },
+    {
+      "check": "contribution:agent-01",
+      "dimension": "goal",
+      "verdict": "INCONCLUSIVE",
+      "reason": "An independently verifiable attributed shard result is required"
+    },
+    {
+      "check": "inference:agent-02",
+      "dimension": "runtime",
+      "verdict": "PASS",
+      "reason": "Real completed inference with consistent count, receipt and usage required"
+    },
+    {
+      "check": "turn-cap:agent-02",
+      "dimension": "runtime",
+      "verdict": "PASS",
+      "reason": "Agent call count must match recorded intents and admitted turn ceiling"
+    },
+    {
+      "check": "lifetime:agent-02",
+      "dimension": "cleanup",
+      "verdict": "PASS",
+      "reason": "Recorded process start and termination required"
+    },
+    {
+      "check": "contribution:agent-02",
+      "dimension": "goal",
+      "verdict": "INCONCLUSIVE",
+      "reason": "An independently verifiable attributed shard result is required"
+    },
+    {
+      "check": "inference:agent-03",
+      "dimension": "runtime",
+      "verdict": "FAIL",
+      "reason": "Real completed inference with consistent count, receipt and usage required"
+    },
+    {
+      "check": "turn-cap:agent-03",
+      "dimension": "runtime",
+      "verdict": "FAIL",
+      "reason": "Agent call count must match recorded intents and admitted turn ceiling"
+    },
+    {
+      "check": "lifetime:agent-03",
+      "dimension": "cleanup",
+      "verdict": "FAIL",
+      "reason": "Recorded process start and termination required"
+    },
+    {
+      "check": "contribution:agent-03",
+      "dimension": "goal",
+      "verdict": "INCONCLUSIVE",
+      "reason": "An independently verifiable attributed shard result is required"
+    },
+    {
+      "check": "inference:agent-04",
+      "dimension": "runtime",
+      "verdict": "FAIL",
+      "reason": "Real completed inference with consistent count, receipt and usage required"
+    },
+    {
+      "check": "turn-cap:agent-04",
+      "dimension": "runtime",
+      "verdict": "FAIL",
+      "reason": "Agent call count must match recorded intents and admitted turn ceiling"
+    },
+    {
+      "check": "lifetime:agent-04",
+      "dimension": "cleanup",
+      "verdict": "FAIL",
+      "reason": "Recorded process start and termination required"
+    },
+    {
+      "check": "contribution:agent-04",
+      "dimension": "goal",
+      "verdict": "INCONCLUSIVE",
+      "reason": "An independently verifiable attributed shard result is required"
+    },
+    {
+      "check": "inference:agent-05",
+      "dimension": "runtime",
+      "verdict": "FAIL",
+      "reason": "Real completed inference with consistent count, receipt and usage required"
+    },
+    {
+      "check": "turn-cap:agent-05",
+      "dimension": "runtime",
+      "verdict": "FAIL",
+      "reason": "Agent call count must match recorded intents and admitted turn ceiling"
+    },
+    {
+      "check": "lifetime:agent-05",
+      "dimension": "cleanup",
+      "verdict": "FAIL",
+      "reason": "Recorded process start and termination required"
+    },
+    {
+      "check": "contribution:agent-05",
+      "dimension": "goal",
+      "verdict": "INCONCLUSIVE",
+      "reason": "An independently verifiable attributed shard result is required"
+    },
+    {
+      "check": "inference:agent-06",
+      "dimension": "runtime",
+      "verdict": "FAIL",
+      "reason": "Real completed inference with consistent count, receipt and usage required"
+    },
+    {
+      "check": "turn-cap:agent-06",
+      "dimension": "runtime",
+      "verdict": "FAIL",
+      "reason": "Agent call count must match recorded intents and admitted turn ceiling"
+    },
+    {
+      "check": "lifetime:agent-06",
+      "dimension": "cleanup",
+      "verdict": "FAIL",
+      "reason": "Recorded process start and termination required"
+    },
+    {
+      "check": "contribution:agent-06",
+      "dimension": "goal",
+      "verdict": "INCONCLUSIVE",
+      "reason": "An independently verifiable attributed shard result is required"
+    },
+    {
+      "check": "inference:agent-07",
+      "dimension": "runtime",
+      "verdict": "FAIL",
+      "reason": "Real completed inference with consistent count, receipt and usage required"
+    },
+    {
+      "check": "turn-cap:agent-07",
+      "dimension": "runtime",
+      "verdict": "FAIL",
+      "reason": "Agent call count must match recorded intents and admitted turn ceiling"
+    },
+    {
+      "check": "lifetime:agent-07",
+      "dimension": "cleanup",
+      "verdict": "FAIL",
+      "reason": "Recorded process start and termination required"
+    },
+    {
+      "check": "contribution:agent-07",
+      "dimension": "goal",
+      "verdict": "INCONCLUSIVE",
+      "reason": "An independently verifiable attributed shard result is required"
+    },
+    {
+      "check": "inference:agent-08",
+      "dimension": "runtime",
+      "verdict": "FAIL",
+      "reason": "Real completed inference with consistent count, receipt and usage required"
+    },
+    {
+      "check": "turn-cap:agent-08",
+      "dimension": "runtime",
+      "verdict": "FAIL",
+      "reason": "Agent call count must match recorded intents and admitted turn ceiling"
+    },
+    {
+      "check": "lifetime:agent-08",
+      "dimension": "cleanup",
+      "verdict": "FAIL",
+      "reason": "Recorded process start and termination required"
+    },
+    {
+      "check": "contribution:agent-08",
+      "dimension": "goal",
+      "verdict": "INCONCLUSIVE",
+      "reason": "An independently verifiable attributed shard result is required"
+    },
+    {
+      "check": "inference:agent-09",
+      "dimension": "runtime",
+      "verdict": "FAIL",
+      "reason": "Real completed inference with consistent count, receipt and usage required"
+    },
+    {
+      "check": "turn-cap:agent-09",
+      "dimension": "runtime",
+      "verdict": "FAIL",
+      "reason": "Agent call count must match recorded intents and admitted turn ceiling"
+    },
+    {
+      "check": "lifetime:agent-09",
+      "dimension": "cleanup",
+      "verdict": "FAIL",
+      "reason": "Recorded process start and termination required"
+    },
+    {
+      "check": "contribution:agent-09",
+      "dimension": "goal",
+      "verdict": "INCONCLUSIVE",
+      "reason": "An independently verifiable attributed shard result is required"
+    },
+    {
+      "check": "overlapping-lifetimes",
+      "dimension": "runtime",
+      "verdict": "FAIL",
+      "reason": "Every admitted agent lifetime must overlap"
+    },
+    {
+      "check": "one-finding-per-task",
+      "dimension": "goal",
+      "verdict": "PASS",
+      "reason": "Every distinct task must contribute exactly once"
+    },
+    {
+      "check": "claim-attribution",
+      "dimension": "runtime",
+      "verdict": "PASS",
+      "reason": "Finding producers must be the authoritative Task claimants"
+    },
+    {
+      "check": "artifact-state-reference",
+      "dimension": "evidence",
+      "verdict": "PASS",
+      "reason": "Persisted artifact must equal the retained final artifact"
+    },
+    {
+      "check": "event-completeness",
+      "dimension": "evidence",
+      "verdict": "PASS",
+      "reason": "All provider, lifecycle, Task, Finding and synthesis effects have evidence"
+    }
+  ],
+  "coverage": "single-host-1-30-agent-live-preview",
+  "deferred": [
+    "500-agent/three-node acceptance",
+    "Raft/QUIC and HA",
+    "local-provider/air-gap",
+    "full Tier P security",
+    "signed audit witness",
+    "three-family rotation"
+  ]
+}
