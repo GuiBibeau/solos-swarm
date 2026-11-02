@@ -38,6 +38,9 @@ pub enum Role {
     Worker,
     /// Agent mode's Router: the extension gives it the Router tool set.
     Router,
+    /// Agent mode's worker on one Ticket: the extension gives it the worker
+    /// tool set.
+    TicketWorker,
 }
 
 impl Role {
@@ -46,6 +49,7 @@ impl Role {
             Role::Coordinator => "coordinator",
             Role::Worker => "worker",
             Role::Router => "router",
+            Role::TicketWorker => "ticket-worker",
         }
     }
 
@@ -55,6 +59,7 @@ impl Role {
         match self {
             Role::Coordinator | Role::Worker => None,
             Role::Router => Some("router"),
+            Role::TicketWorker => Some("worker"),
         }
     }
 }
@@ -86,6 +91,19 @@ pub trait AgentHarness {
         spec: &SessionSpec,
         events: mpsc::Sender<Observation>,
     ) -> impl Future<Output = Result<Self::Session>> + Send;
+}
+
+/// One harness can serve several adapters, such as the Router and the
+/// workers of one agent.
+impl<H: AgentHarness> AgentHarness for std::sync::Arc<H> {
+    type Session = H::Session;
+    fn start(
+        &self,
+        spec: &SessionSpec,
+        events: mpsc::Sender<Observation>,
+    ) -> impl Future<Output = Result<Self::Session>> + Send {
+        (**self).start(spec, events)
+    }
 }
 
 pub trait Session {
@@ -423,7 +441,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_the_router_role_adds_a_toolset_to_the_launch() {
+    fn only_the_agent_roles_add_a_toolset_to_the_launch() {
         let spec = |role| SessionSpec {
             id: "s".into(),
             role,
@@ -463,6 +481,19 @@ mod tests {
         without[role] = "worker".into();
         assert_eq!(without, worker, "the toolset is the only other difference");
         assert!(!worker.iter().any(|arg| arg == "SWARM_TOOLSET"));
+        let coordinator = args(Role::Coordinator);
+        assert!(!coordinator.iter().any(|arg| arg == "SWARM_TOOLSET"));
+
+        let ticket = args(Role::TicketWorker);
+        let mut as_router = ticket.clone();
+        assert_eq!(as_router[role], "ticket-worker");
+        assert_eq!(as_router[at + 1], "worker");
+        as_router[role] = "router".into();
+        as_router[at + 1] = "router".into();
+        assert_eq!(
+            as_router, router,
+            "role and toolset are the only differences"
+        );
     }
 
     #[test]

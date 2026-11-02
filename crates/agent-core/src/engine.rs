@@ -246,6 +246,29 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
         })
     }
 
+    /// The host restarted while `assignment` was pending or running, so its
+    /// worker is gone: end it with `reason` and start the next one, with
+    /// `recovery` set, in one transaction, so a crash between the two cannot
+    /// leave the work stopped. Returns `None` when the budget now needs
+    /// approval first.
+    pub fn restart(
+        &mut self,
+        ticket: &TicketId,
+        assignment: &AssignmentId,
+        reason: &str,
+    ) -> Result<Option<AssignmentId>, Error> {
+        self.run(|tx, policy| {
+            let mut t = tx.open_ticket(ticket)?;
+            if latest_mut(&mut t, assignment)?.state == AssignmentState::Ended {
+                return Err(Error::Refused("the assignment has ended".into()));
+            }
+            tx.end_assignment(&mut t, reason);
+            let id = tx.start(&mut t, policy);
+            tx.save_ticket(t);
+            Ok(id)
+        })
+    }
+
     /// An Assignment runs; its waiting Inputs go out.
     pub fn assignment_started(
         &mut self,

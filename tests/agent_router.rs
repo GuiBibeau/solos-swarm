@@ -8,7 +8,7 @@
 use serde_json::{Value, json};
 use solos_agent_core::model::{DecisionKind, MessageKind, OutboundMessage, ThreadKey};
 use solos_agent_store::{SpendState, SqliteStore};
-use solos_swarm::agent::{AgentConfig, ROUTER_DIR, RouterHost, STORE_FILE, Summary, serve_with};
+use solos_swarm::agent::{AgentConfig, PiHost, ROUTER_DIR, STORE_FILE, Summary, serve_with};
 use solos_swarm::gateway::{Dispatch, Provider};
 use solos_swarm::harness::scripted::{Call, ScriptedHarness};
 use solos_swarm::harness::{AgentHarness, PiHarness};
@@ -182,7 +182,7 @@ budgets: {session_microusd: 500000, router_daily_microusd: 1000000}
         H: AgentHarness + Send + Sync + 'static,
         H::Session: Send + 'static,
     {
-        let host = RouterHost {
+        let host = PiHost {
             harness,
             provider: judge,
             pi_root: pi_root.to_owned(),

@@ -1,21 +1,24 @@
 //! The agent broker over HTTP on its Unix socket, with a scripted provider:
 //! the Router account's holds and settlements, its daily cap across a
-//! restart, the pause gate, identities, and the two Router tools against a
-//! running runtime.
+//! restart, the pause gate, identities, the two Router tools against a
+//! running runtime, and a worker's account and tools.
 
 use anyhow::Result;
 use serde_json::{Value, json};
 use solos_agent_core::AllowlistPolicy;
 use solos_agent_core::model::{
-    Actor, Addressed, Approval, Candidate, ChannelRef, DecisionKind, MessageKind, OutboundMessage,
-    ThreadKey, Trigger, TriggerId,
+    Actor, Addressed, Approval, AssignmentId, Candidate, ChannelRef, DecisionKind, InputBody,
+    MessageKind, OutboundMessage, ReportStatus, ThreadKey, TicketId, Trigger, TriggerId,
 };
 use solos_agent_store::{SpendState, SqliteStore};
 use solos_swarm::agent::broker::{
     self, Account, AgentBroker, BrokerParts, DecideTerms, Grant, ModelTerms, Principal,
+    WorkerParts, WorkerSeat,
 };
 use solos_swarm::agent::jsonl::{JsonlChannel, JsonlSource};
-use solos_swarm::agent::ports::{BoxFuture, Channel, FactSink, Router};
+use solos_swarm::agent::ports::{
+    BoxFuture, Channel, Delivery, Executor, Fact, FactSink, Launch, Router,
+};
 use solos_swarm::agent::scripted::{ScriptedExecutor, ScriptedRouter};
 use solos_swarm::agent::{Adapters, AgentConfig, RunOptions, Runtime, STORE_FILE};
 use solos_swarm::gateway::{Dispatch, PriceTable, Provider, Upstream, upstream_body};
@@ -158,13 +161,30 @@ impl Scratch {
         router: Arc<dyn Router>,
         until_idle: bool,
     ) -> Runtime {
+        self.runtime_with(
+            policy,
+            router,
+            Arc::new(ScriptedExecutor),
+            until_idle,
+            false,
+        )
+    }
+    /// `follow`: the triggers file is read again as it grows.
+    fn runtime_with(
+        &self,
+        policy: AllowlistPolicy,
+        router: Arc<dyn Router>,
+        executor: Arc<dyn Executor>,
+        until_idle: bool,
+        follow: bool,
+    ) -> Runtime {
         let channel: Arc<dyn Channel> =
             Arc::new(JsonlChannel::open(self.root.join("outbox.jsonl")).unwrap());
         let adapters = Adapters {
-            sources: vec![Box::new(JsonlSource::new(self.triggers(), false))],
+            sources: vec![Box::new(JsonlSource::new(self.triggers(), follow))],
             channels: BTreeMap::from([("slack".to_owned(), channel)]),
             router,
-            executor: Arc::new(ScriptedExecutor),
+            executor,
         };
         let options = RunOptions {
             until_idle,
@@ -221,16 +241,20 @@ fn request(id: &str, thread: &str, text: &str) -> Trigger {
     }
 }
 
+fn terms() -> ModelTerms {
+    ModelTerms {
+        upstream: Upstream::deepseek("deepseek-flash"),
+        prices: PRICES,
+        max_input_bytes: 65_536,
+        max_output_tokens: MAX_OUTPUT,
+    }
+}
+
 fn grant(daily_microusd: u64) -> Grant {
     Grant {
         principal: Principal::Router,
         account: Account::Router { daily_microusd },
-        terms: ModelTerms {
-            upstream: Upstream::deepseek("deepseek-flash"),
-            prices: PRICES,
-            max_input_bytes: 65_536,
-            max_output_tokens: MAX_OUTPUT,
-        },
+        terms: terms(),
         system_prompt: Some("You are the Router.".into()),
     }
 }
@@ -239,6 +263,7 @@ fn grant(daily_microusd: u64) -> Grant {
 struct Served {
     server: tokio::task::JoinHandle<()>,
     client: reqwest::Client,
+    broker: AgentBroker,
 }
 
 impl Served {
@@ -292,6 +317,10 @@ fn serve_deciding(
         provider,
         facts,
         decide,
+        workers: Some(WorkerParts {
+            terms: terms(),
+            code: None,
+        }),
     })
     .unwrap();
     broker.admit(TOKEN.into(), grant(daily)).unwrap();
@@ -304,7 +333,11 @@ fn serve_deciding(
         .unix_socket(socket)
         .build()
         .unwrap();
-    Served { server, client }
+    Served {
+        server,
+        client,
+        broker,
+    }
 }
 
 /// A broker whose runtime never runs: enough for model calls.
@@ -674,4 +707,348 @@ async fn a_pause_file_in_the_state_dir_starts_no_eval_until_it_lifts() {
     tokio::time::timeout(LIMIT, lifted).await.unwrap().unwrap();
     let kinds: Vec<_> = scratch.sent().iter().map(|m| m.kind).collect();
     assert_eq!(kinds, [MessageKind::Acknowledgement, MessageKind::Result]);
+}
+
+const WORKER: &str = "worker-token";
+
+/// Starts every Assignment and leaves it running, so the test can play its
+/// worker over HTTP.
+#[derive(Default)]
+struct Starting {
+    launches: Mutex<Vec<Launch>>,
+}
+
+impl Executor for Starting {
+    fn launch(&self, launch: Launch, facts: FactSink) -> BoxFuture<'_, Result<()>> {
+        self.launches.lock().unwrap().push(launch.clone());
+        Box::pin(async move {
+            facts
+                .send(Fact::Started {
+                    ticket: launch.ticket,
+                    assignment: launch.assignment,
+                })
+                .await
+        })
+    }
+    fn deliver(&self, _: Delivery, _: FactSink) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn stop(&self, _: TicketId, _: AssignmentId, _: String) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// Poll the store until `ready` finds something.
+async fn until<T>(scratch: &Scratch, what: &str, ready: impl Fn(&SqliteStore) -> Option<T>) -> T {
+    for _ in 0..1_000 {
+        if let Some(found) = ready(&scratch.store()) {
+            return found;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("{what} never happened")
+}
+
+/// The first Ticket, once its latest Assignment runs, and a seat for it.
+async fn running(scratch: &Scratch) -> (TicketId, WorkerSeat) {
+    until(scratch, "the assignment started", |store| {
+        let ticket = store.tickets().ok()?.into_iter().next()?;
+        let running = ticket.running_assignment()?.id.clone();
+        let work = scratch.state().join("work");
+        let seat = WorkerSeat::new(ticket.id.clone(), running, work, 500_000);
+        Some((ticket.id, seat))
+    })
+    .await
+}
+
+fn alice_policy() -> AllowlistPolicy {
+    AllowlistPolicy {
+        people: ["slack:alice".to_owned()].into(),
+        ..AllowlistPolicy::default()
+    }
+}
+
+fn model_request_for(tool: &str, text: &str) -> Value {
+    let mut request = model_request(text);
+    request["tools"][0]["function"]["name"] = json!(tool);
+    request
+}
+
+#[tokio::test]
+async fn a_worker_reports_with_the_ledgers_spend_and_calls_only_its_own_tools() {
+    let scratch = Scratch::new("worker");
+    scratch.append(&request("t-ask", "T1", "Fix the flaky retry test"));
+    let runtime = scratch.runtime_with(
+        alice_policy(),
+        Arc::new(ScriptedRouter::new(500_000)),
+        Arc::new(Starting::default()),
+        false,
+        false,
+    );
+    let served = serve(&scratch, Scripted::new(), runtime.facts(), 1_000_000);
+
+    with_runtime(runtime, async {
+        let (ticket, seat) = running(&scratch).await;
+        let seat = served
+            .broker
+            .admit_worker(WORKER.into(), seat, "You are a worker.".into())
+            .unwrap();
+        let (status, session) = served.post("session", Some(WORKER), json!({})).await;
+        assert_eq!(
+            (status, session),
+            (200, json!({"system_prompt":"You are a worker."}))
+        );
+
+        let asks = model_request_for("worker_report", "fix it");
+        let (status, reply) = served.post("model", Some(WORKER), asks).await;
+        assert_eq!(status, 200, "{reply}");
+        let account = format!("ticket:{ticket}");
+        assert_eq!(scratch.store().committed(&account, 0).unwrap(), COST);
+        assert_eq!(scratch.store().committed("router", 0).unwrap(), 0);
+
+        for (path, token) in [
+            ("tool/router_decide", WORKER),
+            ("tool/router_read", WORKER),
+            ("tool/claim_task", WORKER),
+            ("tool/worker_report", TOKEN),
+            ("tool/run_code", TOKEN),
+        ] {
+            let (status, _) = served.post(path, Some(token), json!({})).await;
+            assert_eq!(status, 403, "{path} with {token}");
+        }
+        let (status, reply) = served.post("model", Some(WORKER), model_request("x")).await;
+        assert_eq!(
+            status, 403,
+            "a worker may not offer the Router's tools: {reply}"
+        );
+        let (status, refused) = served
+            .post("tool/run_code", Some(WORKER), json!({"code":"true"}))
+            .await;
+        assert_eq!(status, 403);
+        assert!(refused["error"].as_str().unwrap().contains("not available"));
+        for bad in [
+            json!({"status":"progress","text":"   "}),
+            json!({"status":"done","text":"t"}),
+            json!({"status":"progress","text":"t","spent_microusd":0}),
+        ] {
+            let (status, _) = served
+                .post("tool/worker_report", Some(WORKER), bad.clone())
+                .await;
+            assert_eq!(status, 422, "{bad}");
+        }
+
+        seat.begin_turn();
+        let progress = json!({"status":"progress","text":"x".repeat(9_000)});
+        let (status, reply) = served
+            .post("tool/worker_report", Some(WORKER), progress)
+            .await;
+        assert_eq!(status, 200, "{reply}");
+        assert_eq!(reply["spent_microusd"], COST, "the spend is the ledger's");
+        assert!(reply["shortened"].is_string(), "{reply}");
+        assert!(seat.quiet_turn(), "a turn with only progress is quiet");
+        let ready = json!({"status":"ready","text":"Fixed: the retry waited on a dropped timer."});
+        let (status, reply) = served
+            .post("tool/worker_report", Some(WORKER), ready.clone())
+            .await;
+        assert_eq!(status, 200, "{reply}");
+        assert!(reply["next"].as_str().unwrap().contains("Stop here"));
+        assert!(!seat.quiet_turn(), "a ready turn is not quiet");
+        let (status, refused) = served.post("tool/worker_report", Some(WORKER), ready).await;
+        assert_eq!(status, 409, "the ticket has ended: {refused}");
+
+        served.broker.revoke(WORKER);
+        let (status, _) = served.post("session", Some(WORKER), json!({})).await;
+        assert_eq!(status, 403, "a revoked token is refused");
+    })
+    .await;
+
+    let store = scratch.store();
+    let ticket = &store.tickets().unwrap()[0];
+    let kept: Vec<_> = ticket.assignments[0]
+        .reports
+        .iter()
+        .map(|r| (r.status, r.spent_microusd, r.text.chars().count()))
+        .collect();
+    assert_eq!(
+        kept,
+        [
+            (ReportStatus::Progress, COST, 8_003),
+            (ReportStatus::Ready, COST, 43)
+        ]
+    );
+    let sent = scratch.sent();
+    let kinds: Vec<_> = sent.iter().map(|m| m.kind).collect();
+    assert_eq!(kinds, [MessageKind::Acknowledgement, MessageKind::Result]);
+    assert!(sent[1].text.starts_with("Fixed: the retry"));
+}
+
+#[tokio::test]
+async fn a_worker_past_its_ticket_budget_is_refused_and_the_router_still_calls() {
+    let scratch = Scratch::new("worker-budget");
+    let provider = Scripted::new();
+    let (_runtime, served) = model_only(&scratch, provider.clone(), 1_000_000);
+    // One call fits; a second hold on top of the first call's cost does not.
+    let budget = hold_for("fix it") + COST - 1;
+    let seat = WorkerSeat::new(
+        TicketId::new("tk_tiny"),
+        AssignmentId::new("as_1"),
+        scratch.state(),
+        budget,
+    );
+    served
+        .broker
+        .admit_worker(WORKER.into(), seat, "You are a worker.".into())
+        .unwrap();
+    let worker = || {
+        served.post(
+            "model",
+            Some(WORKER),
+            model_request_for("worker_report", "fix it"),
+        )
+    };
+
+    assert_eq!(worker().await.0, 200);
+    let (status, refused) = worker().await;
+    assert_eq!(status, 403, "{refused}");
+    let why = refused["error"].as_str().unwrap();
+    assert!(why.contains("tk_tiny's budget is reached"), "{why}");
+    assert!(why.contains(&format!("{COST} of {budget}")), "{why}");
+
+    let (status, reply) = served.model("judge").await;
+    assert_eq!(status, 200, "the Router has its own account: {reply}");
+    assert_eq!(
+        provider.calls(),
+        2,
+        "the refused call never reached the provider"
+    );
+    let store = scratch.store();
+    assert_eq!(store.committed("ticket:tk_tiny", 0).unwrap(), COST);
+    assert_eq!(store.committed("router", 0).unwrap(), COST);
+}
+
+#[tokio::test]
+async fn a_handed_back_follow_up_reaches_a_fresh_eval_once() {
+    let scratch = Scratch::new("handback");
+    scratch.append(&request("t-ask", "T1", "Fix the flaky retry test"));
+    let runtime = scratch.runtime_with(
+        alice_policy(),
+        Arc::new(ScriptedRouter::new(500_000)),
+        Arc::new(Starting::default()),
+        false,
+        true,
+    );
+    let served = serve(&scratch, Scripted::new(), runtime.facts(), 1_000_000);
+
+    with_runtime(runtime, async {
+        let (ticket, seat) = running(&scratch).await;
+        served
+            .broker
+            .admit_worker(WORKER.into(), seat, "You are a worker.".into())
+            .unwrap();
+        scratch.append(&request("t-more", "T1", "Also rotate the staging keys"));
+        let more = TriggerId::new("t-more");
+        until(&scratch, "the follow-up reached the ticket", |store| {
+            let found = store.read_ticket(&ticket).ok()??;
+            let reached = found
+                .inputs
+                .iter()
+                .any(|i| matches!(&i.body, InputBody::Trigger { trigger } if *trigger == more));
+            reached.then_some(())
+        })
+        .await;
+
+        let back = json!({"trigger":"t-more","reason":"a separate request"});
+        let (status, reply) = served
+            .post("tool/worker_handback", Some(WORKER), back.clone())
+            .await;
+        assert_eq!(status, 200, "{reply}");
+        assert_eq!(reply["queued"], true);
+        let fresh = until(&scratch, "a fresh eval decided the follow-up", |store| {
+            store
+                .decisions()
+                .ok()?
+                .into_iter()
+                .find(|d| d.triggers == [more.clone()] && d.eval.is_some())
+        })
+        .await;
+        assert_eq!(fresh.kind, DecisionKind::Accept, "{fresh:?}");
+
+        let (status, again) = served
+            .post("tool/worker_handback", Some(WORKER), back)
+            .await;
+        assert_eq!((status, again["queued"].clone()), (200, json!(false)));
+        let elsewhere = json!({"trigger":"t-nowhere","reason":"not mine"});
+        let (status, _) = served
+            .post("tool/worker_handback", Some(WORKER), elsewhere)
+            .await;
+        assert_eq!(status, 409, "a trigger that never reached the ticket");
+        let unreasoned = json!({"trigger":"t-more","reason":" "});
+        let (status, _) = served
+            .post("tool/worker_handback", Some(WORKER), unreasoned)
+            .await;
+        assert_eq!(status, 422);
+    })
+    .await;
+
+    let decisions = scratch.store().decisions().unwrap();
+    let judged = decisions
+        .iter()
+        .filter(|d| d.triggers == [TriggerId::new("t-more")])
+        .count();
+    assert_eq!(judged, 1, "the follow-up was judged once: {decisions:?}");
+}
+
+/// Serves `body` to every request on a loopback port.
+async fn web(body: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let app = axum::Router::new().fallback(move || {
+        let body = body.clone();
+        async move { body }
+    });
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (url, server)
+}
+
+#[tokio::test]
+async fn fetch_url_keeps_swarm_modes_limits_for_a_worker() {
+    let scratch = Scratch::new("fetch");
+    let (_runtime, served) = model_only(&scratch, Scripted::new(), 1_000_000);
+    let seat = WorkerSeat::new(
+        TicketId::new("tk_1"),
+        AssignmentId::new("as_1"),
+        scratch.state(),
+        500_000,
+    );
+    served
+        .broker
+        .admit_worker(WORKER.into(), seat, "You are a worker.".into())
+        .unwrap();
+    let mebibyte = 1_048_576;
+    let (url, server) = web(vec![b'x'; mebibyte]).await;
+
+    let (status, page) = served
+        .post("tool/fetch_url", Some(WORKER), json!({"url": url}))
+        .await;
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(page["status"], 200);
+    assert_eq!(page["body_bytes"], 98_304, "the per-call default bound");
+    assert_eq!(page["truncated"], true);
+    let whole = json!({"url": url, "max_bytes": 8 * mebibyte});
+    let mut read = 98_304;
+    while read < solos_swarm::broker::FETCH_TOTAL_BYTES {
+        let (status, page) = served
+            .post("tool/fetch_url", Some(WORKER), whole.clone())
+            .await;
+        assert_eq!(status, 200, "{page}");
+        assert_eq!(page["body_bytes"], mebibyte, "no call reads past 1 MiB");
+        read += mebibyte as u64;
+    }
+    let (status, refused) = served.post("tool/fetch_url", Some(WORKER), whole).await;
+    assert_eq!(status, 403);
+    let why = refused["error"].as_str().unwrap();
+    assert!(why.contains("read budget exhausted after 32 MiB"), "{why}");
+    server.abort();
 }

@@ -45,6 +45,12 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   Triggers on the pull request's Thread) with ETags, rate-limit waits and an atomic cursor in the state directory; the
   Channel comments with a hidden marker, so a crash never posts twice. Schedules fire named slots (`every`, `daily_at`
   UTC) as System Triggers a restart cannot repeat, with an optional `reply_to`. No new dependencies.
+- Agent mode, P3d: Pi workers. `executor: {kind: pi, ...}` runs each session Ticket on a keyless, bwrap-sandboxed Pi
+  worker in its own directory under the state dir (optional prepare command, `max_workers` at once), admitted by the
+  agent broker as a Worker on the Ticket's account with `worker_report`, `worker_handback`, `run_code` and
+  `fetch_url` (`SWARM_TOOLSET=worker`); a start relaunches the work the last run left running with `recovery` set
+  (new `Engine::restart`). `run_code` takes configured mounts and a caller-owned scratch directory; swarm runs keep
+  their exact sandbox command.
 - `collect` leaves the per-run `code/` scratch directory on the host and writes `collect-manifest.json`; `--include-code` opts back in.
 - Docs: pause mode, self-update operations, dashboard tunnel, tournament runbook, replay status.
 

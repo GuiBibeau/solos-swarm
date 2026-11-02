@@ -1,18 +1,18 @@
 //! `agent serve` end to end on the SQLite Store with the scripted adapters:
-//! intake, judging, launch, delivery, replies, crashes, restarts, retries and
-//! pause.
+//! intake, judging, launch, delivery, replies, crashes, restarts, the
+//! recovery of lost Assignments, retries and pause.
 
 use anyhow::{Result, anyhow};
 use solos_agent_core::AllowlistPolicy;
 use solos_agent_core::model::{
     Actor, Addressed, AssignmentId, AssignmentState, ChannelRef, DecisionKind, DomainEvent, Effect,
-    InputBody, MessageKind, OutboundMessage, ThreadKey, TicketId, TicketOutcome, Trigger,
-    TriggerId,
+    InputBody, MessageKind, OutboundMessage, ReportIn, ReportStatus, ThreadKey, TicketId,
+    TicketOutcome, Trigger, TriggerId,
 };
 use solos_agent_store::SqliteStore;
 use solos_swarm::agent::jsonl::{JsonlChannel, JsonlSource};
 use solos_swarm::agent::ports::{
-    BoxFuture, Channel, Delivery, Executor, FactSink, Launch, SendOptions, SendOutcome,
+    BoxFuture, Channel, Delivery, Executor, Fact, FactSink, Launch, SendOptions, SendOutcome,
 };
 use solos_swarm::agent::scripted::{ScriptedExecutor, ScriptedRouter};
 use solos_swarm::agent::{Adapters, RunOptions, Runtime, STORE_FILE, ServeOptions, Summary, serve};
@@ -112,6 +112,15 @@ budgets: {{session_microusd: {BUDGET}}}
         executor: Arc<dyn Executor>,
         channel: Arc<dyn Channel>,
     ) -> Runtime {
+        self.runtime_until(paused, executor, channel, true)
+    }
+    fn runtime_until(
+        &self,
+        paused: bool,
+        executor: Arc<dyn Executor>,
+        channel: Arc<dyn Channel>,
+        until_idle: bool,
+    ) -> Runtime {
         let adapters = Adapters {
             sources: vec![Box::new(JsonlSource::new(self.triggers(), false))],
             channels: BTreeMap::from([("slack".to_owned(), channel)]),
@@ -119,7 +128,7 @@ budgets: {{session_microusd: {BUDGET}}}
             executor,
         };
         let options = RunOptions {
-            until_idle: true,
+            until_idle,
             tick: Duration::from_millis(10),
             retry_base: Duration::from_millis(50),
             retry_max: Duration::from_secs(1),
@@ -612,4 +621,164 @@ async fn a_reply_to_a_source_with_no_channel_is_dropped_and_the_runtime_still_go
     let store = scratch.store();
     let ended = store.tickets().unwrap()[0].ended.clone();
     assert!(ended.is_some(), "the work itself still completed");
+}
+
+/// Starts every Assignment, reports `status` on it if given, and keeps
+/// every Launch it is handed.
+#[derive(Default)]
+struct Starts {
+    status: Option<ReportStatus>,
+    launches: Mutex<Vec<Launch>>,
+}
+
+impl Executor for Starts {
+    fn launch(&self, launch: Launch, facts: FactSink) -> BoxFuture<'_, Result<()>> {
+        self.launches.lock().unwrap().push(launch.clone());
+        let status = self.status;
+        Box::pin(async move {
+            let (ticket, assignment) = (launch.ticket, launch.assignment);
+            facts
+                .send(Fact::Started {
+                    ticket: ticket.clone(),
+                    assignment: assignment.clone(),
+                })
+                .await?;
+            if let Some(status) = status {
+                let report = ReportIn {
+                    status,
+                    text: format!("{status:?}"),
+                    question: None,
+                    spent_microusd: 0,
+                };
+                facts
+                    .send(Fact::Report {
+                        ticket,
+                        assignment,
+                        report,
+                    })
+                    .await?;
+            }
+            Ok(())
+        })
+    }
+    fn deliver(&self, _: Delivery, _: FactSink) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn stop(&self, _: TicketId, _: AssignmentId, _: String) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// Run until the first Ticket's Assignment runs with `reports` Reports and
+/// the acknowledgement is out, then drop the runtime, as a crash would.
+async fn crash_while_running(scratch: &Scratch, executor: Arc<Starts>, reports: usize) {
+    let runtime = scratch.runtime_until(false, executor, jsonl(scratch), false);
+    let running = async {
+        for _ in 0..1_000 {
+            let ticket = scratch.store().tickets().unwrap().into_iter().next();
+            let ran = ticket.is_some_and(|t| {
+                t.running_assignment()
+                    .is_some_and(|a| a.reports.len() == reports)
+            });
+            if ran && !scratch.sent().is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the assignment never ran");
+    };
+    tokio::select! {
+        ended = runtime.run(std::future::pending()) => panic!("the runtime ended: {ended:?}"),
+        () = running => {}
+    }
+}
+
+#[tokio::test]
+async fn a_running_assignment_cut_short_by_a_crash_restarts_as_a_recovery_and_replies_once() {
+    let scratch = Scratch::new("recover");
+    scratch.append(&[request("t-request", "T1", "Fix the flaky test")]);
+    crash_while_running(&scratch, Arc::new(Starts::default()), 0).await;
+    assert_eq!(
+        replies(&scratch.sent()),
+        [("T1".to_owned(), MessageKind::Acknowledgement)]
+    );
+
+    let after = Arc::new(Starts {
+        status: Some(ReportStatus::Ready),
+        ..Starts::default()
+    });
+    until_idle(scratch.runtime(false, after.clone(), jsonl(&scratch))).await;
+
+    assert_eq!(replies(&scratch.sent()), ack_and_result("T1"));
+    let launches = after.launches.lock().unwrap().clone();
+    let [launch] = &launches[..] else {
+        panic!("{launches:?}")
+    };
+    assert!(launch.recovery, "the new Assignment is a recovery");
+    let store = scratch.store();
+    let ticket = &store.tickets().unwrap()[0];
+    let reasons: Vec<_> = ticket
+        .assignments
+        .iter()
+        .map(|a| (a.state, a.ended_reason.clone()))
+        .collect();
+    assert_eq!(
+        reasons,
+        [
+            (AssignmentState::Ended, Some("host restarted".to_owned())),
+            (AssignmentState::Ended, Some("ready".to_owned()))
+        ]
+    );
+    assert_eq!(launch.assignment, ticket.assignments[1].id);
+    assert_eq!(
+        ticket.ended.as_ref().map(|e| e.outcome),
+        Some(TicketOutcome::Completed)
+    );
+    assert_settled(&store);
+}
+
+#[tokio::test]
+async fn a_waiting_assignment_ends_at_a_restart_and_the_next_input_starts_a_recovery() {
+    let scratch = Scratch::new("recover-idle");
+    scratch.append(&[request("t-request", "T1", "Fix the flaky test")]);
+    let waits = Arc::new(Starts {
+        status: Some(ReportStatus::Waiting),
+        ..Starts::default()
+    });
+    crash_while_running(&scratch, waits, 1).await;
+
+    let quiet = Arc::new(Starts::default());
+    until_idle(scratch.runtime(false, quiet.clone(), jsonl(&scratch))).await;
+    assert!(quiet.launches.lock().unwrap().is_empty(), "nothing to redo");
+    let ticket = scratch.store().tickets().unwrap()[0].clone();
+    assert_eq!(ticket.assignments.len(), 1);
+    assert_eq!(
+        ticket.assignments[0].ended_reason.as_deref(),
+        Some("host restarted")
+    );
+    assert!(ticket.ended.is_none(), "the Ticket stays open");
+
+    scratch.append(&[request("t-more", "T1", "It fails on CI too")]);
+    let woken = Arc::new(Starts {
+        status: Some(ReportStatus::Ready),
+        ..Starts::default()
+    });
+    until_idle(scratch.runtime(false, woken.clone(), jsonl(&scratch))).await;
+    let launches = woken.launches.lock().unwrap().clone();
+    let [launch] = &launches[..] else {
+        panic!("{launches:?}")
+    };
+    assert!(launch.recovery);
+    let carried: Vec<_> = launch
+        .inputs
+        .iter()
+        .filter_map(|d| d.trigger.as_ref().map(|t| t.id.as_str().to_owned()))
+        .collect();
+    assert_eq!(
+        carried,
+        ["t-more"],
+        "the launch carries the Ticket's inputs"
+    );
+    assert_eq!(replies(&scratch.sent()), ack_and_result("T1"));
+    assert_settled(&scratch.store());
 }

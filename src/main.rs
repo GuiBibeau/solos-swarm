@@ -120,14 +120,15 @@ enum AgentCommand {
         /// and exit. For tests and dry runs.
         #[arg(long)]
         until_idle: bool,
-        /// A Pi Router: the checkout that holds `node_modules` and `extensions`.
+        /// A Pi Router or Pi workers: the checkout that holds `node_modules`
+        /// and `extensions`.
         #[arg(long)]
         pi_root: Option<PathBuf>,
-        /// A Pi Router: the node binary.
+        /// A Pi Router or Pi workers: the node binary.
         #[arg(long)]
         node: Option<PathBuf>,
-        /// A Pi Router: the model key. Read once and deleted; it stays in
-        /// this process and never enters the sandbox.
+        /// A Pi Router or Pi workers: the model key both use. Read once and
+        /// deleted; it stays in this process and never enters a sandbox.
         #[arg(long)]
         credential_file: Option<PathBuf>,
     },
