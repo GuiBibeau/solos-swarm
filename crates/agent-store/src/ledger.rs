@@ -249,6 +249,15 @@ impl SqliteStore {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// The rows of one account made at or after `since_ms`, oldest first.
+    pub fn spend_since(&self, account: &str, since_ms: Ms) -> Result<Vec<Spend>, StoreError> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT {COLUMNS} FROM spend WHERE account = ?1 AND at_ms >= ?2 ORDER BY id"
+        ))?;
+        let rows = stmt.query_map(params![account, since_ms], spend)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     pub fn hold(&self, id: HoldId) -> Result<Option<Spend>, StoreError> {
         Ok(self
             .conn
