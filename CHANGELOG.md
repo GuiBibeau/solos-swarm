@@ -31,6 +31,15 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   WebSocket, every envelope acknowledged, reconnect with backoff) and a Web API Channel that replies in the thread,
   never posts a message twice after a crash, and offers Approve and Stop buttons that the runtime applies as
   `approve` and `stop_ticket`; `tokio-tungstenite` 0.29.0 on the existing rustls.
+- Agent mode, P3c: a Pi Router. `router: {kind: pi, ...}` in `agent.yaml` and `agent serve --pi-root --node
+  --credential-file` run the Router as one long-lived, keyless, bwrap-sandboxed Pi session that judges batched
+  Candidate cards through `router_decide` and `router_read` on a new agent broker (`src/agent/broker.rs`). The
+  broker holds and settles every Router model call against `budgets.router_daily_microusd` in a `spend` table
+  (agent store schema v2), so the cap survives a restart, and refuses calls while the state dir is paused, which
+  also holds the agent's Effects. A Router accept above `policy.auto_approve_microusd` stands only when a Slack
+  channel and a `slack:` approver can take the approval its Ticket then waits for; otherwise it is refused.
+  `SWARM_TOOLSET=router` selects the Router's tools in `extensions/broker.ts`; unset keeps the swarm set. Pricing,
+  the upstream request, the providers and the pause gate moved to `src/gateway/` and swarm mode calls them unchanged.
 - `collect` leaves the per-run `code/` scratch directory on the host and writes `collect-manifest.json`; `--include-code` opts back in.
 - Docs: pause mode, self-update operations, dashboard tunnel, tournament runbook, replay status.
 

@@ -19,6 +19,9 @@ pub enum Call {
     ReadFindings,
     /// `submit_artifact` with the exact union of the findings last read.
     SubmitArtifact,
+    /// Each tool call the turn's model reply asked for, with its arguments,
+    /// as Pi would run them.
+    Replied,
 }
 
 /// `script[k]` is what a session calls on its `k`-th prompt. A prompt past the
@@ -28,11 +31,22 @@ pub type Script = Vec<Vec<Call>>;
 /// Scripts by session id. A session with no script only calls the model.
 pub struct ScriptedHarness {
     scripts: BTreeMap<String, Script>,
+    every_turn: Vec<Call>,
 }
 
 impl ScriptedHarness {
     pub fn new(scripts: BTreeMap<String, Script>) -> Self {
-        Self { scripts }
+        Self {
+            scripts,
+            every_turn: Vec::new(),
+        }
+    }
+
+    /// Make these calls on every turn no script names, such as every turn of
+    /// a long-lived session whose id is not known in advance.
+    pub fn every_turn(mut self, calls: Vec<Call>) -> Self {
+        self.every_turn = calls;
+        self
     }
 }
 
@@ -56,10 +70,11 @@ impl AgentHarness for ScriptedHarness {
         };
         let script = self.scripts.get(&spec.id).cloned().unwrap_or_default();
         let (prompts, inbox) = mpsc::unbounded_channel();
+        let every_turn = self.every_turn.clone();
         Ok(ScriptedSession {
             id: spec.id.clone(),
             prompts,
-            task: tokio::spawn(agent.run(script, inbox, events)),
+            task: tokio::spawn(agent.run(script, every_turn, inbox, events)),
         })
     }
 }
@@ -108,12 +123,13 @@ impl Agent {
     async fn run(
         mut self,
         script: Script,
+        every_turn: Vec<Call>,
         mut inbox: mpsc::UnboundedReceiver<String>,
         events: mpsc::Sender<Observation>,
     ) {
         let mut turns = script.into_iter();
         while let Some(prompt) = inbox.recv().await {
-            let calls = turns.next().unwrap_or_default();
+            let calls = turns.next().unwrap_or_else(|| every_turn.clone());
             if let Err(error) = self.turn(&prompt, &calls).await {
                 events.send((self.id, Err(error))).await.ok();
                 return;
@@ -130,13 +146,30 @@ impl Agent {
     }
 
     async fn turn(&mut self, prompt: &str, calls: &[Call]) -> Result<()> {
-        self.post(
-            "model",
-            json!({"model":self.model,"messages":[{"role":"user","content":prompt}]}),
-        )
-        .await?;
+        let reply = self
+            .post(
+                "model",
+                json!({"model":self.model,"messages":[{"role":"user","content":prompt}]}),
+            )
+            .await?;
         for call in calls {
             match call {
+                Call::Replied => {
+                    let asked = reply["choices"][0]["message"]["tool_calls"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default();
+                    for tool in asked {
+                        let name = tool["function"]["name"]
+                            .as_str()
+                            .context("a tool call names no tool")?;
+                        let arguments = tool["function"]["arguments"]
+                            .as_str()
+                            .context("a tool call has no arguments")?;
+                        let body: Value = serde_json::from_str(arguments)?;
+                        self.post(&format!("tool/{name}"), body).await?;
+                    }
+                }
                 Call::ClaimTask => {
                     let task = self.post("tool/claim_task", json!({})).await?;
                     let id = task["id"].as_str().context("claim_task returned no Task")?;

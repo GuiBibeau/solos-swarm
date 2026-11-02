@@ -3,12 +3,13 @@ mod smoke;
 
 use solos_swarm::{
     broker,
+    gateway::provider_for,
     harness::{PiHarness, Role, SessionSpec, bounded_line},
     swarm::{self, GoalRun, GoalStatus},
 };
 
 use anyhow::{Context, Result, ensure};
-use broker::{Goal, OpenAiCompatible, Upstream, write_json};
+use broker::{Goal, Upstream, write_json};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use std::{
@@ -119,32 +120,26 @@ enum AgentCommand {
         /// and exit. For tests and dry runs.
         #[arg(long)]
         until_idle: bool,
+        /// A Pi Router: the checkout that holds `node_modules` and `extensions`.
+        #[arg(long)]
+        pi_root: Option<PathBuf>,
+        /// A Pi Router: the node binary.
+        #[arg(long)]
+        node: Option<PathBuf>,
+        /// A Pi Router: the model key. Read once and deleted; it stays in
+        /// this process and never enters the sandbox.
+        #[arg(long)]
+        credential_file: Option<PathBuf>,
     },
 }
 
-/// The admitted endpoint of each shipped provider profile. A profile's dialect
-/// is fixed here rather than read from the Goal, so a Goal cannot make the
-/// transport speak a dialect its provider does not.
-fn endpoint(provider: &str) -> Result<&'static str> {
-    match provider {
-        "deepseek" => Ok("https://api.deepseek.com/chat/completions"),
-        "venice" => Ok("https://api.venice.ai/api/v1/chat/completions"),
-        other => anyhow::bail!("provider outside the deployment allowlist: {other}"),
-    }
-}
-/// Build the transport for a resolved upstream, so both shipped profiles share
-/// one receipt, bound and error path.
-fn provider_for(
-    upstream: &Upstream,
-    client: reqwest::Client,
-    key: Zeroizing<String>,
-) -> OpenAiCompatible {
-    OpenAiCompatible {
-        endpoint: endpoint(&upstream.provider).expect("resolved upstream endpoint"),
-        dialect: upstream.dialect,
-        client,
-        key,
-    }
+/// Read a one-use credential file and delete it, whether or not the read
+/// worked, so no later error can leave the key on disk.
+fn consume_credential(path: &Path) -> Result<Zeroizing<String>> {
+    let result = fs::read_to_string(path);
+    let _ = fs::remove_file(path);
+    let raw = Zeroizing::new(result.context("cannot read broker credential")?);
+    Ok(Zeroizing::new(raw.trim().to_owned()))
 }
 
 /// One legacy preview run: a frozen Goal, the pinned Pi tree and one credential.
@@ -172,10 +167,7 @@ async fn run(options: RunOptions) -> Result<()> {
     } = options;
     // Consume the one-use credential before any launch or config error can retain it.
     let key = if let Some(path) = credential_file {
-        let result = fs::read_to_string(&path);
-        let _ = fs::remove_file(&path);
-        let raw = Zeroizing::new(result.context("cannot read broker credential")?);
-        Zeroizing::new(raw.trim().to_owned())
+        consume_credential(&path)?
     } else {
         Zeroizing::new(String::new())
     };
@@ -194,7 +186,7 @@ async fn run(options: RunOptions) -> Result<()> {
         }
         (Some(upstream), None) => upstream.clone(),
         (None, Some(supplied)) => broker::upstream_profile(supplied, &goal.model)?,
-        (None, None) => broker::Upstream::deepseek(&goal.model),
+        (None, None) => Upstream::deepseek(&goal.model),
     };
     goal.upstream = Some(resolved.clone());
     goal.validate()?;
@@ -207,7 +199,7 @@ async fn run(options: RunOptions) -> Result<()> {
         (1..=goal.deadline_seconds).contains(&deadline),
         "deadline cannot widen the Goal"
     );
-    let provider = Arc::new(provider_for(&resolved, swarm::http_client()?, key));
+    let provider = Arc::new(provider_for(&resolved, swarm::http_client()?, key)?);
     let run = GoalRun {
         goal,
         config,
@@ -259,9 +251,23 @@ async fn execute(command: Action) -> Result<()> {
                     config,
                     state_dir,
                     until_idle,
+                    pi_root,
+                    node,
+                    credential_file,
                 },
         } => {
-            let summary = solos_swarm::agent::serve(&config, &state_dir, until_idle).await?;
+            // Before the config is read, so no config error can leave the key on disk.
+            let credential = credential_file
+                .as_deref()
+                .map(consume_credential)
+                .transpose()?;
+            let options = solos_swarm::agent::ServeOptions {
+                until_idle,
+                pi_root,
+                node,
+                credential,
+            };
+            let summary = solos_swarm::agent::serve(&config, &state_dir, options).await?;
             println!("{}", json!(summary));
             Ok(())
         }

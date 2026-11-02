@@ -1,3 +1,4 @@
+use crate::ledger::HoldId;
 use crate::queue::EffectId;
 
 #[derive(Debug)]
@@ -12,6 +13,8 @@ pub enum StoreError {
     /// The file system refused write-ahead logging.
     Journal(String),
     NoEffect(EffectId),
+    /// The hold is closed already, or there is none with this id.
+    NotHeld(HoldId),
     /// The event log fails verification at this row.
     Chain {
         seq: u64,
@@ -30,6 +33,7 @@ impl std::fmt::Display for StoreError {
             ),
             Self::Journal(mode) => write!(f, "journal mode is {mode}, not wal"),
             Self::NoEffect(id) => write!(f, "no effect {id}"),
+            Self::NotHeld(id) => write!(f, "hold {id} is not open"),
             Self::Chain { seq, reason } => write!(f, "event {seq} {reason}"),
         }
     }

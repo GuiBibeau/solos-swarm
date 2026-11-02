@@ -1,8 +1,37 @@
 import { request } from "node:http";
-import { Type, lazyStream, openAICompletionsApi } from "@earendil-works/pi-ai/compat";
+import { StringEnum, Type, lazyStream, openAICompletionsApi } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const BOARD_MESSAGE_LIMIT = 2_048;
+
+// Agent mode's Router. It decides and reads; it has no run_code and no fetch_url.
+const ROUTER_TOOLS = [
+  {
+    name: "router_decide",
+    description: "Decide one candidate by its eval id: accept it as work, ignore it, or stop one of the Tickets on its thread. Call it once per candidate. A refused decision comes back as an error that says why; correct the call and try again.",
+    parameters: Type.Object({
+      eval: Type.String({ minLength: 1, description: "The eval id on the candidate's first line." }),
+      decision: StringEnum(["accept", "ignore", "stop"] as const),
+      reason: Type.String({ minLength: 1, description: "One sentence: why." }),
+      title: Type.Optional(Type.String({ description: "accept: a short title for the work." })),
+      scope: Type.Optional(Type.String({ description: "accept: what the worker must do, in your words and complete on its own." })),
+      plan: Type.Optional(StringEnum(["session", "swarm"] as const, { description: "accept: session (one worker, the default) or swarm (wide research and tournaments only)." })),
+      agents: Type.Optional(Type.Integer({ minimum: 1, maximum: 30, description: "accept with plan swarm: how many agents." })),
+      budget_microusd: Type.Optional(Type.Integer({ minimum: 1, description: "accept: the Ticket's whole budget in microusd. Omit it for the default." })),
+      acknowledge: Type.Optional(Type.String({ description: "accept: the first reply, instead of the standard one. An empty string sends none." })),
+      rules: Type.Optional(Type.Array(Type.String(), { description: "accept of inferred work: the proactive rules it matches." })),
+      ticket: Type.Optional(Type.String({ description: "stop: the id of the Ticket to stop." })),
+    }),
+  },
+  {
+    name: "router_read",
+    description: "Read one trigger, thread or ticket by id. The answer names its neighbours by id; follow them one hop at a time when a candidate needs more context.",
+    parameters: Type.Object({
+      id: Type.String({ minLength: 1 }),
+      kind: Type.Optional(StringEnum(["trigger", "thread", "ticket"] as const, { description: "Which kind of id it is, when it could be more than one." })),
+    }),
+  },
+];
 
 async function broker(path: string, payload: unknown, signal?: AbortSignal): Promise<Response> {
   const socketPath = process.env.SWARM_SOCKET;
@@ -34,6 +63,9 @@ async function broker(path: string, payload: unknown, signal?: AbortSignal): Pro
 }
 
 export default function swarmBroker(pi: ExtensionAPI) {
+  // Unset is a swarm agent. Anything but a known set is refused, so a typo cannot widen the tools.
+  const toolset = process.env.SWARM_TOOLSET;
+  if (toolset !== undefined && toolset !== "router") throw new Error(`Unknown SWARM_TOOLSET: ${toolset}`);
   pi.registerProvider("swarm", {
     baseUrl: "http://swarm.invalid/v1", api: "swarm-broker", apiKey: "$SWARM_TOKEN",
     models: [{
@@ -95,7 +127,7 @@ export default function swarmBroker(pi: ExtensionAPI) {
     },
   });
 
-  const tools = [
+  const tools = toolset === "router" ? ROUTER_TOOLS : [
     { name: "claim_task", description: "Claim your assigned task. Returns its ID and input payload. Claim exactly once before any other tool.", parameters: Type.Object({}) },
     { name: "board_read", description: "Read shared progress messages for this Goal.", parameters: Type.Object({}) },
     // Deliberately no maxLength here: a schema rejection is a tool error the
@@ -120,6 +152,11 @@ export default function swarmBroker(pi: ExtensionAPI) {
         notice = `Message shortened to the ${BOARD_MESSAGE_LIMIT}-character Board limit; continue.`;
       }
       const response = await broker(`/tool/${tool.name}`, payload, signal);
+      if (!response.ok && toolset === "router") {
+        // The Router corrects a refused decision from the Engine's reason, so the reason is the tool error.
+        const refusal = await response.json().catch(() => ({}));
+        throw new Error(`Broker refused ${tool.name}: ${refusal.error ?? `HTTP ${response.status}`}`);
+      }
       if (!response.ok) throw new Error(`Broker denied ${tool.name}: HTTP ${response.status}`);
       const result = await response.json();
       if (notice && result && typeof result === "object") result.notice = notice;
@@ -127,6 +164,20 @@ export default function swarmBroker(pi: ExtensionAPI) {
     },
   });
   pi.on("session_start", () => pi.setActiveTools(tools.map((tool) => tool.name)));
+  if (toolset === "router") {
+    // The host writes the Router's instructions; the session fetches them from its broker once.
+    let systemPrompt: string | undefined;
+    pi.on("before_agent_start", async () => {
+      if (systemPrompt === undefined) {
+        const response = await broker("/session", {});
+        if (!response.ok) throw new Error(`Broker refused the session: HTTP ${response.status}`);
+        const session = await response.json();
+        if (typeof session.system_prompt !== "string") throw new Error("Broker sent no system prompt");
+        systemPrompt = session.system_prompt;
+      }
+      return { systemPrompt };
+    });
+  }
   pi.on("tool_call", (event) => {
     if (!tools.some((tool) => tool.name === event.toolName)) return { block: true, reason: "Tool is outside the swarm grants" };
   });

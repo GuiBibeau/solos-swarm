@@ -15,7 +15,7 @@ use solos_swarm::agent::ports::{
     BoxFuture, Channel, Delivery, Executor, FactSink, Launch, SendOptions, SendOutcome,
 };
 use solos_swarm::agent::scripted::{ScriptedExecutor, ScriptedRouter};
-use solos_swarm::agent::{Adapters, RunOptions, Runtime, STORE_FILE, Summary, serve};
+use solos_swarm::agent::{Adapters, RunOptions, Runtime, STORE_FILE, ServeOptions, Summary, serve};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
@@ -97,7 +97,11 @@ budgets: {{session_microusd: {BUDGET}}}
     }
     async fn serve(&self, paused: bool) -> Summary {
         let config = self.config(paused);
-        tokio::time::timeout(LIMIT, serve(&config, &self.state(), true))
+        let options = ServeOptions {
+            until_idle: true,
+            ..ServeOptions::default()
+        };
+        tokio::time::timeout(LIMIT, serve(&config, &self.state(), options))
             .await
             .expect("serve did not go idle")
             .unwrap()
