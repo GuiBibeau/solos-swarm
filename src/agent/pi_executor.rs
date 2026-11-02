@@ -36,6 +36,7 @@ const PREPARE_WAIT: Duration = Duration::from_secs(300);
 const INPUT_TEXT_CHARS: usize = 4_000;
 const FAILURE_CHARS: usize = 400;
 const QUIET_TURN: &str = "The turn ended without a report.";
+const JOB_TURN: &str = "The turn ended while a background job runs; its end comes back as input.";
 
 /// What a worker is told before its first prompt.
 pub const WORKER_INSTRUCTIONS: &str = "\
@@ -618,7 +619,7 @@ impl Turns<'_> {
                         for note in notes {
                             self.facts.send(note).await?;
                         }
-                        if queued.is_empty() && !woken && !seat.jobs_running() && seat.quiet_turn() {
+                        if queued.is_empty() && !woken && seat.quiet_turn() {
                             self.quiet().await?;
                         }
                     }
@@ -632,13 +633,19 @@ impl Turns<'_> {
         }
     }
 
-    /// A turn left the Ticket as if working, nothing waits to be prompted
-    /// and no job runs, so it counts as `waiting`.
+    /// A turn left the Ticket as if working and nothing waits to be
+    /// prompted, so it counts as `waiting`; or as `progress` while a job
+    /// runs, since the worker is still at work and the job's end wakes it.
     async fn quiet(&self) -> Result<()> {
         let spent = self.broker.spent(self.seat).await?;
+        let (status, text) = if self.seat.jobs_running() {
+            (ReportStatus::Progress, JOB_TURN)
+        } else {
+            (ReportStatus::Waiting, QUIET_TURN)
+        };
         let report = ReportIn {
-            status: ReportStatus::Waiting,
-            text: QUIET_TURN.into(),
+            status,
+            text: text.into(),
             question: None,
             spent_microusd: spent,
         };
