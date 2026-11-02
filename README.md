@@ -27,6 +27,9 @@ A Rust control plane, scheduler, and capability broker for governed agent swarms
 - **Replay-scored policy loop** for the tournament self-review. [replay/README.md](replay/README.md)
 - **Tournament runbook** from the first live run. [docs/running-a-tournament.md](docs/running-a-tournament.md)
 - The original `mvp` cluster path (Raft over QUIC, witness, evaluator), documented in `docs/ARCHITECTURE.md`.
+- **Agent mode (in progress)**: a long-lived agent for Slack, GitHub and schedules that runs each request on one
+  worker or on a governed swarm, sharing this broker, ledger, harness and sandbox. The pure domain is
+  `crates/agent-core`. Plan: [docs/agent-mode/README.md](docs/agent-mode/README.md).
 
 See [CHANGELOG.md](CHANGELOG.md) for what changed and when.
 
@@ -135,6 +138,8 @@ Dashboard checks: `node --test tests/dashboard-spatial.test.mjs tests/dashboard-
 | Document | Scope |
 |---|---|
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Domain model, Raft over mTLS QUIC, Tier-P sandboxes, and spend ledger. |
+| [`docs/agent-mode/README.md`](docs/agent-mode/README.md) | Agent mode plan: ports, shared kernel, roadmap P0-P10. |
+| [`docs/adr/0001-hexagonal-ports-and-two-modes.md`](docs/adr/0001-hexagonal-ports-and-two-modes.md) | One hexagon, two modes (swarm and agent). |
 | [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | Identity provisioning, offline startup, cluster recovery, and operations. |
 | [`docs/CAMPAIGNS.md`](docs/CAMPAIGNS.md) | Matched 1-vs-10 worker evaluation design and schemas. |
 | [`docs/pause-mode.md`](docs/pause-mode.md) | `control.json`, `PAUSE`, `SWARM_REFUSE_PEAK`, the 503 reply, unpaused deadlines. |
