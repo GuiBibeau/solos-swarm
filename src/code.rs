@@ -1068,7 +1068,7 @@ async fn execute_watched(
         }
     };
     if status.is_none() {
-        let _ = child.start_kill();
+        kill_sandbox(&mut child).await;
         let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
     }
     let (stdout, stdout_truncated) = finish_capture(stdout_task, progress, Stream::Stdout).await;
@@ -1091,6 +1091,59 @@ async fn execute_watched(
         "truncated": stdout_truncated || stderr_truncated,
     });
     Ok((receipt, was_stopped))
+}
+
+/// Kill a sandbox and everything it started. bwrap ties its namespace's
+/// life to its own only once setup is done, so a plain kill in its first
+/// milliseconds leaves the namespace running. Freeze it first, so it
+/// clones nothing more, then kill what it cloned, the namespace's init,
+/// whose death ends every process in the namespace, and then it.
+#[cfg(target_os = "linux")]
+async fn kill_sandbox(child: &mut tokio::process::Child) {
+    if let Some(pid) = child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()) {
+        // SAFETY: kill(2) takes no pointers. `pid` is our child and tokio
+        // has not reaped it (it clears the id when it does), so the pid
+        // names no other process.
+        unsafe { libc::kill(pid, libc::SIGSTOP) };
+        for _ in 0..200 {
+            if frozen_or_gone(pid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        for inner in cloned(pid) {
+            // SAFETY: kill(2) takes no pointers. Only its parent, our
+            // stopped child, can reap `inner`, so the pid still names it.
+            unsafe { libc::kill(inner, libc::SIGKILL) };
+        }
+    }
+    let _ = child.start_kill();
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn kill_sandbox(child: &mut tokio::process::Child) {
+    let _ = child.start_kill();
+}
+
+#[cfg(target_os = "linux")]
+fn frozen_or_gone(pid: libc::pid_t) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return true;
+    };
+    // The state follows the command name, which may hold spaces or parentheses.
+    let state = stat
+        .rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next());
+    matches!(state, None | Some("T" | "t" | "Z" | "X"))
+}
+
+#[cfg(target_os = "linux")]
+fn cloned(pid: libc::pid_t) -> Vec<libc::pid_t> {
+    fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|inner| inner.parse().ok())
+        .collect()
 }
 
 async fn capture<R: AsyncRead + Unpin>(
