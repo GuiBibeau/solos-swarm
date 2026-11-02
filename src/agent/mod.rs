@@ -4,19 +4,24 @@
 //! adapters.
 
 pub mod config;
+pub mod github;
 pub mod jsonl;
 pub mod ports;
 pub mod runtime;
+pub mod schedule;
 pub mod scripted;
 pub mod slack;
+pub mod utc;
 
 pub use config::AgentConfig;
 pub use runtime::{Adapters, RunOptions, Runtime, Summary};
 
 use anyhow::{Context, Result};
 use config::{ChannelConfig, ExecutorConfig, RouterConfig, SourceConfig};
+use github::{GithubApi, GithubChannel, GithubSource};
 use jsonl::{JsonlChannel, JsonlSource};
 use ports::{Channel, Executor, Router, Source};
+use schedule::ScheduleSource;
 use scripted::{ScriptedExecutor, ScriptedRouter};
 use slack::{SlackApi, SlackChannel, SlackSource, Token};
 use solos_agent_store::SqliteStore;
@@ -24,6 +29,7 @@ use std::collections::BTreeMap;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// The Store's file in the state directory.
 pub const STORE_FILE: &str = "agent.db";
@@ -34,7 +40,7 @@ pub const STORE_FILE: &str = "agent.db";
 pub async fn serve(config: &Path, state_dir: &Path, until_idle: bool) -> Result<Summary> {
     let config = AgentConfig::load(config)?;
     // First, so the token files are consumed before anything else can fail.
-    let adapters = adapters(&config, !until_idle)?;
+    let adapters = adapters(&config, state_dir, !until_idle)?;
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -51,10 +57,12 @@ pub async fn serve(config: &Path, state_dir: &Path, until_idle: bool) -> Result<
 }
 
 /// `follow`: Sources keep reading what arrives later. Reads and deletes the
-/// Slack token files.
-pub fn adapters(config: &AgentConfig, follow: bool) -> Result<Adapters> {
+/// Slack and GitHub token files. Sources keep their read positions in
+/// `state_dir`.
+pub fn adapters(config: &AgentConfig, state_dir: &Path, follow: bool) -> Result<Adapters> {
     let mut sources: Vec<Box<dyn Source>> = Vec::new();
     let mut slack_api = None;
+    let mut github_api = None;
     for source in &config.sources {
         match source {
             SourceConfig::Jsonl { path } => sources.push(Box::new(JsonlSource::new(path, follow))),
@@ -71,6 +79,26 @@ pub fn adapters(config: &AgentConfig, follow: bool) -> Result<Adapters> {
                 sources.push(Box::new(slack));
                 slack_api = Some(api);
             }
+            SourceConfig::Github {
+                repos,
+                token_file,
+                api_base,
+                poll_secs,
+            } => {
+                let api = Arc::new(GithubApi::new(api_base, github::Token::take(token_file)?)?);
+                let cursor = state_dir.join(github::CURSOR_FILE);
+                let source = GithubSource::new(api.clone(), repos.clone(), cursor, follow)
+                    .with_poll(Duration::from_secs(*poll_secs));
+                sources.push(Box::new(source));
+                github_api = Some(api);
+            }
+            SourceConfig::Schedule { schedules } => {
+                let schedules = schedules
+                    .iter()
+                    .map(config::ScheduleConfig::schedule)
+                    .collect::<Result<_>>()?;
+                sources.push(Box::new(ScheduleSource::new(schedules, follow)));
+            }
         }
     }
     let mut channels: BTreeMap<String, Arc<dyn Channel>> = BTreeMap::new();
@@ -81,6 +109,11 @@ pub fn adapters(config: &AgentConfig, follow: bool) -> Result<Adapters> {
                 slack_api
                     .clone()
                     .context("the slack channel needs a slack source")?,
+            )),
+            ChannelConfig::Github {} => Arc::new(GithubChannel::new(
+                github_api
+                    .clone()
+                    .context("the github channel needs a github source")?,
             )),
         };
         channels.insert(channel.source().to_owned(), adapter);
