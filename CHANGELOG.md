@@ -8,6 +8,11 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
 - Agent mode, P0: workspace crate `crates/agent-core` (pure domain, ports and Engine for Triggers, Threads, Evals,
   Tickets and Assignments, with `Plan::Session` or `Plan::Swarm`), ADR 0001 and the plan in `docs/agent-mode/`.
   Root lints move to `[workspace.lints]`; `cargo test`/`clippy` cover both crates. Swarm mode is unchanged.
+- Agent mode, P1: the `AgentHarness` port in `src/harness.rs` (`SessionSpec`, `SessionEvent`, `Session`). `PiHarness`
+  is the Pi launch moved out of `main.rs` unchanged: same argv and env (pinned by a golden test), transcript and stderr
+  files, caps, messages, Store events and shutdown accounting. `harness::scripted::ScriptedHarness` plays scripted
+  tool calls against the real broker, and a new end-to-end test runs `work()` with three scripted agents and
+  `smoke::Scripted`.
 - `collect` leaves the per-run `code/` scratch directory on the host and writes `collect-manifest.json`; `--include-code` opts back in.
 - Docs: pause mode, self-update operations, dashboard tunnel, tournament runbook, replay status.
 

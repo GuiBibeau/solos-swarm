@@ -10,7 +10,7 @@ use tokio::{
     sync::{Mutex, Semaphore},
 };
 
-struct Scripted;
+pub struct Scripted;
 impl Provider for Scripted {
     fn dispatch(&self, _: Value) -> Pin<Box<dyn Future<Output = Result<Value>> + Send>> {
         Box::pin(async {

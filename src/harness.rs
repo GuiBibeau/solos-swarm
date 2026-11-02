@@ -17,6 +17,8 @@ use tokio::{
     task::JoinHandle,
 };
 
+pub mod scripted;
+
 /// What a session reports, whatever harness runs it. The end of a session's
 /// stream is not an event: it arrives as an `Err` on the channel.
 #[derive(Clone, Debug, PartialEq, Eq)]

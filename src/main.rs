@@ -1173,6 +1173,209 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn three_scripted_agents_complete_a_goal_through_work_and_the_real_broker() {
+        use solos_swarm::harness::scripted::{Call, ScriptedHarness};
+        let dir = std::env::temp_dir().join(format!(
+            "ss-e2e-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        fs::create_dir(&dir).unwrap();
+        let goal: Goal = serde_json::from_value(json!({
+            "schema_version":1,"intent":"scripted end to end","worker_prompt":"file one record",
+            "synthesis_prompt":"submit the exact union","scope":"synthetic-fixtures-only",
+            "model":"deepseek-flash","agent_count":3,"deadline_seconds":60,"budget_microusd":1_000_000,
+            "max_calls_per_agent":8,"max_input_bytes":65536,"max_output_tokens":2048,
+            "input_price_microusd_per_million":300_000,"output_price_microusd_per_million":1_200_000,
+            "grants":["claim_task","board_read","board_post","submit_finding","read_findings","submit_artifact"],
+            "tasks":[{"id":"synthesis","input":{"role":"coordinator"}},{"id":"lens-1","input":{}},{"id":"lens-2","input":{}}],
+            "seed":1,"catalog_version":"e2e","scorer_version":"1"
+        }))
+        .unwrap();
+        goal.validate().unwrap();
+        fs::write(dir.join("config.yaml"), serde_json::to_vec(&goal).unwrap()).unwrap();
+        let mut state = Store::new(&dir, &goal).unwrap();
+        state.goal_status = "running".into();
+        let ids = ["agent-00", "agent-01", "agent-02"];
+        let tokens: Vec<String> = ids.into_iter().map(|id| state.admit(id).unwrap()).collect();
+        let store = Arc::new(Mutex::new(state));
+        let socket = dir.join("b.sock");
+        let app = router(Broker {
+            goal: Arc::new(goal.clone()),
+            store: store.clone(),
+            provider: Arc::new(smoke::Scripted),
+            slots: Arc::new(Semaphore::new(goal.agent_count)),
+            client: reqwest::Client::new(),
+            code: None,
+        });
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let record = |id: &str| json!({"id":format!("{id}-paper"),"severity":"useful"});
+        let scripts = ids
+            .into_iter()
+            .map(|id| {
+                let mut turns = vec![vec![
+                    Call::ClaimTask,
+                    Call::SubmitFinding(json!({"papers":[record(id)]})),
+                ]];
+                if id == "agent-00" {
+                    turns.push(vec![Call::ReadFindings, Call::SubmitArtifact]);
+                }
+                (id.to_string(), turns)
+            })
+            .collect();
+        let harness = ScriptedHarness::new(scripts);
+        let (tx, mut rx) = mpsc::channel(256);
+        let mut sessions = Vec::new();
+        for (n, (id, token)) in ids.into_iter().zip(tokens).enumerate() {
+            let spec = SessionSpec {
+                id: id.to_string(),
+                role: if n == 0 {
+                    Role::Coordinator
+                } else {
+                    Role::Worker
+                },
+                grants: goal.grants.clone(),
+                token,
+                model: goal.model.clone(),
+                run_dir: dir.clone(),
+                broker_socket: socket.clone(),
+                pi_settings: dir.join("pi-settings.json"),
+                node: PathBuf::new(),
+                pi_root: PathBuf::new(),
+            };
+            sessions.push(harness.start(&spec, tx.clone()).await.unwrap());
+        }
+        drop(tx);
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            work(&mut sessions, &store, &mut rx, &goal, false),
+        )
+        .await
+        .expect("work() did not finish")
+        .unwrap();
+        assert_eq!(stop_sessions(sessions, &store).await.unwrap(), 0);
+        server.abort();
+
+        let state = store.lock().await;
+        let filed: BTreeMap<&str, &Value> = state
+            .findings
+            .iter()
+            .map(|finding| (finding.agent_id.as_str(), &finding.result))
+            .collect();
+        assert_eq!(filed.len(), 3);
+        for id in ids {
+            assert_eq!(filed[id], &json!({"papers":[record(id)]}), "{id}");
+        }
+        let artifact: Value =
+            serde_json::from_slice(&fs::read(dir.join("artifacts/final.json")).unwrap()).unwrap();
+        assert_eq!(artifact.as_object().unwrap().len(), 1);
+        let mut have: Vec<String> = artifact["papers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(Value::to_string)
+            .collect();
+        let mut want: Vec<String> = ids.into_iter().map(|id| record(id).to_string()).collect();
+        have.sort();
+        want.sort();
+        assert_eq!(have, want);
+        assert_eq!(state.artifact.as_ref(), Some(&artifact));
+        assert_eq!(state.held_microusd, 0);
+        assert_eq!(state.intents.len(), 4, "one model call per turn");
+        assert!(
+            state
+                .intents
+                .iter()
+                .all(|intent| intent.state == "completed")
+        );
+        let settled: u64 = state
+            .intents
+            .iter()
+            .map(|intent| intent.cost_microusd)
+            .sum();
+        assert!(settled > 0);
+        assert_eq!(state.spent_microusd, settled);
+        drop(state);
+
+        // resume_plan re-verifies every event's sequence and hash, and that
+        // state.json was written at the last event.
+        let plan = broker::resume_plan(&dir).unwrap();
+        let events: Vec<Value> = fs::read_to_string(dir.join("events.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(!plan.truncated_tail);
+        assert_eq!(plan.last_seq, events.len() as u64);
+        assert_eq!(plan.held_microusd, 0);
+        assert_eq!(plan.finished_agents, ids);
+
+        // Sessions run concurrently, so order is checked per agent, plus the
+        // one cross-agent rule: synthesis is prompted after every filing.
+        let mut owner = BTreeMap::new();
+        let mut timeline: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for event in &events {
+            let (kind, data) = (event["kind"].as_str().unwrap(), &event["data"]);
+            if kind == "provider_reserved" {
+                owner.insert(
+                    data["intent_id"].as_str().unwrap().to_owned(),
+                    data["agent_id"].as_str().unwrap().to_owned(),
+                );
+            }
+            let agent = data["agent_id"]
+                .as_str()
+                .or_else(|| {
+                    let intent = data["intent_id"].as_str()?;
+                    owner.get(intent).map(String::as_str)
+                })
+                .unwrap_or("host");
+            let label = data["tool"]
+                .as_str()
+                .map_or(kind.to_owned(), |tool| format!("{kind}:{tool}"));
+            timeline.entry(agent.to_owned()).or_default().push(label);
+        }
+        let turn = [
+            "agent_prompt",
+            "provider_reserved",
+            "provider_request",
+            "provider_dispatched",
+            "provider_settled",
+            "provider_response",
+        ];
+        let filing = ["tool_completed:claim_task", "tool_completed:submit_finding"];
+        let synthesis = [
+            "tool_completed:read_findings",
+            "tool_completed:submit_artifact",
+        ];
+        let worker: Vec<&str> =
+            [&["agent_started"][..], &turn, &filing, &["agent_stopped"]].concat();
+        let coordinator: Vec<&str> = [
+            &["agent_started"][..],
+            &turn,
+            &filing,
+            &turn,
+            &synthesis,
+            &["agent_stopped"],
+        ]
+        .concat();
+        assert_eq!(timeline.keys().collect::<Vec<_>>(), ids);
+        assert_eq!(timeline["agent-00"], coordinator);
+        assert_eq!(timeline["agent-01"], worker);
+        assert_eq!(timeline["agent-02"], worker);
+        let last_filing = events
+            .iter()
+            .rposition(|event| event["data"]["tool"] == "submit_finding")
+            .unwrap();
+        let synthesis_prompt = events
+            .iter()
+            .position(|event| event["data"]["message"] == "submit the exact union")
+            .unwrap();
+        assert!(last_filing < synthesis_prompt);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     // Broker socket placement (main #5).
     #[test]
     fn broker_socket_binds_inside_private_run_dir() {
