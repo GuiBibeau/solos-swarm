@@ -161,6 +161,13 @@ pub enum Fact {
         text: String,
     },
     Command(Command),
+    /// The Watchdog retries a stalled Assignment, unless it has moved on
+    /// since it had `reports` Reports.
+    Retry {
+        ticket: TicketId,
+        assignment: AssignmentId,
+        reports: usize,
+    },
 }
 
 /// A person's command through a Source's own controls, such as a Slack

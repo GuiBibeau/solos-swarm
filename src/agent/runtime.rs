@@ -5,6 +5,7 @@ use super::ports::{
     Answer, Applied, Channel, Command, Delivered, Delivery, Executor, Fact, FactSink, Failure,
     Inbound, Launch, Order, Router, SendOptions, SendOutcome, Source,
 };
+use super::watchdog;
 use crate::broker::now_ms;
 use crate::gateway;
 use anyhow::{Context, Result, bail};
@@ -375,6 +376,14 @@ impl Runtime {
                 self.engine.note(&ticket, text).map(done),
             ),
             Fact::Command(command) => return self.command(command).map(|()| Ok(Applied::Done)),
+            Fact::Retry {
+                ticket,
+                assignment,
+                reports,
+            } => (
+                format!("watchdog retry of {assignment} on {ticket}"),
+                self.retry_stalled(&ticket, &assignment, reports).map(done),
+            ),
         };
         match result {
             Ok(applied) => Ok(Ok(applied)),
@@ -384,6 +393,20 @@ impl Runtime {
                 Ok(Err(err.to_string()))
             }
         }
+    }
+
+    /// The Watchdog's retry, unless the Assignment moved on since it looked.
+    fn retry_stalled(
+        &mut self,
+        ticket: &TicketId,
+        assignment: &AssignmentId,
+        reports: usize,
+    ) -> Result<(), Error> {
+        let found = self.engine.repos().ticket(ticket);
+        if !found.is_some_and(|t| watchdog::still_stalled(&t, assignment, reports)) {
+            return Err(Error::Refused(format!("{assignment} is no longer stalled")));
+        }
+        self.engine.retry(ticket).map(drop)
     }
 
     /// Apply a person's command and answer in the thread it came from.
