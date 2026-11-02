@@ -13,7 +13,7 @@ and its MIT-licensed prototype `deepseek-ai/dsh-superagent-prototype` (docs 000-
 
 | Phase | State |
 |---|---|
-| P0 Core and plan | **This PR.** `crates/agent-core`: domain, ports, Engine, in-memory store, allowlist Policy, 33 tests (11 are regressions from adversarial review). Swarm mode untouched. |
+| P0 Core and plan | **This PR.** `crates/agent-core`: domain, ports, Engine, in-memory store, allowlist Policy, 91 tests and a seeded fuzzer. Most tests are regressions from the adversarial review and the swarm review of PR #18. Swarm mode untouched. |
 | P1-P10 | Planned, below. |
 
 ## What "super-agent" means here
@@ -27,8 +27,8 @@ The article's four properties, and what already exists in solos-swarm to build e
 | Proactive: acts on events, quiet otherwise | Two-stage filter (code gate, then model), accept modes | Grants, Board entries that never grant authority, taint markings (mvp) |
 | Persistent: always on, self-healing | Durable state and effects, Watchdog, BYOM execution | Pause/drain, outage pause after 5 failures, resume of a stopped run's state, self-update channels, progress |
 
-What solos-swarm adds that the prototype does not have: hard budgets (holds and settlement per account, cache-aware
-pricing, peak-hour refusal), a keyless broker (no credential ever enters a worker), `bwrap` isolation, and an audit
+What solos-swarm adds that the prototype does not have: hard budgets (a hold and a settlement per model call against the Goal cap
+and per-task envelopes, cache-aware pricing, peak-hour refusal), a keyless broker (no credential ever enters a worker), `bwrap` isolation, and an audit
 chain. Agent mode keeps all of them: every Router, Worker and swarm call goes through the same broker.
 
 ## Concepts
@@ -39,7 +39,7 @@ Agent mode uses the prototype's vocabulary, so its documents carry over:
 |---|---|---|
 | Trigger | `Trigger` | Immutable, idempotent by Source id. Its text is data and grants nothing. |
 | Thread | `Thread` | At most one Eval at a time; Triggers arriving meanwhile join the next batch. |
-| Subscription, pass-through | `Thread.subscriptions` | An allowed person's message on a subscribed Thread goes straight to the Ticket, with no Router turn. Bots, CI and unlisted people reach it as context and are also judged on their own. Only an allowed person resumes ended work or ends a hold, because a resume spends budget. This is stricter than the prototype, which lets anyone in the Thread resume. |
+| Subscription, pass-through | `Thread.subscriptions` | An allowed person's message on a subscribed Thread goes straight to the Ticket, with no Router turn. Bots, CI and unlisted people reach it as context and are also judged on their own. Only an allowed person resumes ended work or ends a hold, because a resume spends budget. This is stricter than the prototype, where any person (not a bot or CI) may resume. |
 | Two-stage filter | `Policy::gate`, then `Effect::Assess` | The gate is code: allowlists, bot lists, accept mode. Only admitted batches cost a model call. |
 | Router | Router session + `Engine::decide` | Long-lived, light model, router-only tools, no `run_code`. Batches candidates per turn. |
 | Worker | `Plan::Session` Assignment | Own directory, full work tools, one Ticket. Never talks to people; reports. |
@@ -110,7 +110,8 @@ flowchart TB
 ### Dependency rules
 
 - `crates/agent-core` imports nothing but `serde`, `serde_json` and `sha2`, and does no I/O. `tests/boundary.rs`
-  enforces it.
+  checks the dependency list and every `std::` path in `src/` (grouped imports too) against an allowlist of pure
+  modules. It is a source scan, not a proof.
 - The swarm core reaches the same rule in P2: the pure parts of `broker.rs` (claims, envelopes, progress,
   artifact union) move out of the HTTP and file code.
 - Adapters depend on ports, never on each other. Composition roots (`run`, `agent serve`) are the only places that
@@ -125,10 +126,10 @@ and external work leaves as `Effect`s. The shell ports are async and live in the
 
 | Port | Shape (sketch) | First adapter | Today's code it comes from |
 |---|---|---|---|
-| `AgentHarness` | `open(SessionSpec) -> Session`; `Session::{prompt, next_event, stop}`; events `TurnEnded`, `Exited`, `Error` | `PiHarness` | `main.rs` `sandbox()` (106), `Worker` (267), `rpc` (272), `bounded_line` (236), the reader tasks (663-755) |
-| `ModelGateway` | One broker, many accounts: `reserve(account, request)`, `settle(intent, usage)`; pause and peak gates | today's broker | `broker.rs` `Store::reserve`/`settle`/`envelope`/`cost`, `Intent`, `effective_control` |
+| `AgentHarness` | `open(SessionSpec) -> Session`; `Session::{prompt, next_event, stop}`; events `TurnEnded`, `Exited`, `Error` | `PiHarness` | `main.rs` `sandbox()` (106), `Worker` (267), `rpc` (272), `bounded_line` (236), the reader tasks (704-753, inside the spawn loop 675-755) |
+| `ModelGateway` | One broker, many accounts: `reserve(account, request)`, `settle(intent, usage)`; pause and peak gates | today's broker | `broker.rs` `Store::reserve`/`settle`/`envelope`, `Goal::cost`/`settled_cost`, `Intent`, `effective_control` |
 | `ModelUpstream` | `dispatch(body) -> receipt` | `OpenAiCompatible` | `broker::Provider` (1012); merged with `provider::Provider` (mvp) for llama.cpp |
-| `ExecutionEnvironment` | `run(code) -> receipt`; `start(code) -> job`, `wait(job)`, `stop(job)` | local `bwrap` | `code.rs` `CodeExecutor`, plus the four hand-built `bwrap` lines (`main.rs:106`, `main.rs:972`, `code.rs:313`, `sandbox.rs:315`) |
+| `ExecutionEnvironment` | `run(code) -> receipt`; `start(code) -> job`, `wait(job)`, `stop(job)` | local `bwrap` | `code.rs` `CodeExecutor`, plus the five hand-built `bwrap` command lines (`main.rs:116` in `sandbox()`, `main.rs:972`, `code.rs:313`, `sandbox.rs:315` in `prepare_process`, `wasi_worker.rs:316`) |
 | `EventLog` | `append(kind, data) -> seq`; `verify()` | `events.jsonl` hash chain | `Store::record` (452), `broker_control::read_chain`/`load_image` |
 | `Source` | `run(sink, cancel)`; `context(trigger, part)` for bounded recall | CLI/jsonl, then Slack | new |
 | `Channel` | `send(OutboundMessage) -> Sent \| Gone`; shapes text per medium (chat at most 100 words, PRs structured) | stdout, then Slack | new |
@@ -144,7 +145,7 @@ broker endpoint and token, and sandbox mounts. That one type replaces the `agent
 | Shared piece | Swarm mode uses it for | Agent mode uses it for |
 |---|---|---|
 | Broker and ledger | Goal cap, per-task envelopes | Router daily cap, one envelope per Ticket, swarm Goals carved from a Ticket's envelope |
-| Pause, drain, peak refusal, outage pause | Runs | The whole agent. No new Evals or resumes while paused, the effect runner holds every Effect, and Sources keep recording |
+| Pause, drain, peak refusal, outage pause | Runs | The whole agent. No new Evals while paused. The core still records Triggers, resumes and wakes, and the effect runner holds every Effect until the pause lifts |
 | `AgentHarness` | N swarm agents | The Router, Workers, and swarm agents |
 | `ExecutionEnvironment` | `run_code` | Worker `run_code`, background jobs, remote nodes |
 | Event log | `events.jsonl` | The same chain format with agent kinds, so dashboard, recover and replay readers keep working |
@@ -159,12 +160,17 @@ schema for the external readers), and `solos-swarm smoke` passing.
 
 **P0: core and plan (this PR).** Workspace with `crates/agent-core`, ADR 0001, and this plan. The Engine covers:
 - intake: idempotent, pass-through, multi-Thread;
-- Evals: one per Thread, batched by strength, with gate-rejected Triggers kept out of the Router's view;
+- Evals: one per Thread, batched by strength (weaker Triggers wait, unless a new Ticket adopts them), with
+  gate-rejected Triggers kept out of the Router's view;
 - Router verdicts: accept, ignore, stop;
 - budget approval, checked at every launch against the current threshold;
 - Assignments, Reports, resume, handback, retry, and Policy changes during an Eval.
 
-Pause stops new Evals and resumes; the effect runner holds Effects. Swarm code is unchanged.
+A handed-back Trigger is judged once, on its primary Thread, however many Tickets hand it back. Pause stops new
+Evals; the effect runner holds Effects. Swarm code is unchanged.
+
+Open in P0: a Ticket whose Trigger names no reply channel (a schedule, for example) asks nobody when it needs a
+person. P4 gives every Source an operator channel, and P6's Watchdog reports Tickets that wait for a person.
 
 **P1: the harness seam.** Add the `AgentHarness` port and move the Pi launch out of `main.rs` into `PiHarness`
 without changing behaviour. Add `ScriptedHarness`, which emits Pi RPC frames, and the end-to-end test `run`/`work()`
@@ -220,8 +226,8 @@ research or tournaments, not a bug fix. Swarms above the threshold wait for appr
 pull request bound to its Ticket. Structured PR comments. A cron Source for proactive sweeps.
 
 **P9: separate execution.** `solos-swarm node` is a daemon on a user's machine (BYOM) or a cloud box. It runs
-commands and holds no session state, and connects over the `mvp` QUIC mTLS transport with SPIFFE identities
-(`transport.rs`, `identity.rs`). When an intermittently online node reconnects, the Tickets waiting for it resume.
+commands and holds no session state, and connects over the `mvp` QUIC mTLS transport (`cluster.rs`) with SPIFFE
+identities (`identity.rs`). `transport.rs` is the local mTLS socket transport. When an intermittently online node reconnects, the Tickets waiting for it resume.
 Credentials stay on the node and tools use them through scoped identities (`tool_identity.rs`), never in context.
 
 **P10: benchmark.** Reproduce the article's ablation:
@@ -235,7 +241,8 @@ Credentials stay on the node and tools use them through scoped identities (`tool
 ## Security model
 
 - Trigger text is data. It cannot change a permission, a budget or the Policy (the core has no path for it).
-  Approvals and stops by people are adapter commands, authenticated by the adapter, not parsed from text.
+  An approval is an adapter command, authenticated by the adapter, never text. A stop is either an adapter
+  command (`stop_ticket`) or a Router `Verdict::Stop` on an Eval of explicit strength.
 - Only explicit strength stops work; bots and CI can at most make inferred candidates, and those start nothing
   outside `auto` mode with a matching enabled rule.
 - Workers stay keyless: the broker holds the model key, and P9 keeps tool credentials on the node.

@@ -8,15 +8,18 @@
 
 solos-swarm runs batch swarms: one Goal, N sandboxed Pi agents, a deadline, one artifact (`solos-swarm run`). We
 also want the long-lived "super-agent" described in DeepSeek's *Exploring Super-agent Design* (November 2026) and
-its `dsh-superagent-prototype`. That design has a Router that receives events from Slack, GitHub and schedules,
+its `dsh-superagent-prototype`. That design has a Router that receives events from chat and GitHub (the prototype
+ships GitHub and Feishu Sources; Slack and schedules are ours to add),
 isolated Worker sessions per task, two-stage event filtering, Thread subscriptions with pass-through, async tools,
 separate compute, state and execution, and a Watchdog.
 
 The live `run` path is about 5k lines (`src/main.rs`, `src/broker.rs`, `src/broker_control.rs`, `src/code.rs`,
 `src/progress.rs`). It hard-wires Pi (a free `sandbox()` function returning a `bwrap` `Command`), one hosted
-OpenAI-compatible upstream (`broker::Provider`), a Goal-shaped `Store` that holds the event log, the ledger and the
+OpenAI-compatible upstream (`provider_for` always builds `OpenAiCompatible` behind the existing `broker::Provider`
+trait), a Goal-shaped `Store` that holds the event log, the ledger and the
 swarm's task board together, and `agent-NN` identities. The `mvp` cluster path (about 55k lines) has its own copies
-of the provider trait, broker, Pi launcher, extension and ledger, and is not used by `run`.
+of the provider trait, broker, Pi launcher, extension and ledger. `run` uses it only for
+`provider::completion_usage`.
 
 ## Decision
 
@@ -33,12 +36,12 @@ of the provider trait, broker, Pi launcher, extension and ledger, and is not use
    call, under the Ticket's budget. `solos-swarm run` stays as a thin composition root for batch use.
 4. **One workspace, one binary, one CI.** The pure agent domain is the workspace crate `crates/agent-core`
    (`solos-agent-core`). Its `tests/boundary.rs` refuses any dependency outside `serde`, `serde_json` and `sha2`, and
-   any `std::fs`/`net`/`process`/`env` use. Adapters and the swarm core stay in the root crate until they are
+   any `std::` path outside an allowlist of pure modules (a source scan, not a proof). Adapters and the swarm core stay in the root crate until they are
    stable enough to split. `default-members` makes `cargo test` and `cargo clippy` cover both.
 5. **Functional core, effect queue.** Agent-core commands return their external work as `Effect`s committed in the
    same `ChangeSet` as the state change ("stored first, done after"). Adapters perform effects and report facts back
-   through Engine commands. This replaces the prototype's callback ports and keeps the core synchronous and
-   deterministic.
+   through Engine commands. The prototype's core is synchronous too, but its ports enqueue work as calls. Returning
+   Effects as data lets tests and the fuzzer assert on exactly what would leave the core, with no fakes.
 6. **The swarm path moves first.** Each shared port gets its first consumer in swarm mode, with a parity check,
    before agent mode uses it. Swarm mode must not regress at any step.
 
