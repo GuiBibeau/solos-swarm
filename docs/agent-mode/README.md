@@ -14,7 +14,8 @@ and its MIT-licensed prototype `deepseek-ai/dsh-superagent-prototype` (docs 000-
 | Phase | State |
 |---|---|
 | P0 Core and plan | **This PR.** `crates/agent-core`: domain, ports, Engine, in-memory store, allowlist Policy, 91 tests and a seeded fuzzer. Most tests are regressions from the adversarial review and the swarm review of PR #18. Swarm mode untouched. |
-| P1-P10 | Planned, below. |
+| P1 Harness seam | **Done.** `src/harness.rs`: the `AgentHarness` port, `PiHarness` (the Pi launch moved out of `main.rs`, argv and env pinned by a golden test) and `harness::scripted::ScriptedHarness`. `run`, `work()`, `settled` and `rpc` use the port. A new end-to-end test runs `work()` with three scripted agents through the real broker, with no Pi, node or bwrap. Swarm runs unchanged. |
+| P2-P10 | Planned, below. |
 
 ## What "super-agent" means here
 
@@ -126,10 +127,10 @@ and external work leaves as `Effect`s. The shell ports are async and live in the
 
 | Port | Shape (sketch) | First adapter | Today's code it comes from |
 |---|---|---|---|
-| `AgentHarness` | `open(SessionSpec) -> Session`; `Session::{prompt, next_event, stop}`; events `TurnEnded`, `Exited`, `Error` | `PiHarness` | `main.rs` `sandbox()` (106), `Worker` (267), `rpc` (272), `bounded_line` (236), the reader tasks (704-753, inside the spawn loop 675-755) |
+| `AgentHarness` | `start(SessionSpec, events) -> Session`; `Session::{prompt, stop, join}`; events `TurnEnded`, `Rejected`, and an `Err` when a session's stream ends | `PiHarness`, `ScriptedHarness` | `src/harness.rs` (P1) |
 | `ModelGateway` | One broker, many accounts: `reserve(account, request)`, `settle(intent, usage)`; pause and peak gates | today's broker | `broker.rs` `Store::reserve`/`settle`/`envelope`, `Goal::cost`/`settled_cost`, `Intent`, `effective_control` |
 | `ModelUpstream` | `dispatch(body) -> receipt` | `OpenAiCompatible` | `broker::Provider` (1012); merged with `provider::Provider` (mvp) for llama.cpp |
-| `ExecutionEnvironment` | `run(code) -> receipt`; `start(code) -> job`, `wait(job)`, `stop(job)` | local `bwrap` | `code.rs` `CodeExecutor`, plus the five hand-built `bwrap` command lines (`main.rs:116` in `sandbox()`, `main.rs:972`, `code.rs:313`, `sandbox.rs:315` in `prepare_process`, `wasi_worker.rs:316`) |
+| `ExecutionEnvironment` | `run(code) -> receipt`; `start(code) -> job`, `wait(job)`, `stop(job)` | local `bwrap` | `code.rs` `CodeExecutor`, plus the five hand-built `bwrap` command lines (`harness.rs:106` in `PiHarness::command`, `main.rs:746`, `code.rs:313`, `sandbox.rs:315` in `prepare_process`, `wasi_worker.rs:316`) |
 | `EventLog` | `append(kind, data) -> seq`; `verify()` | `events.jsonl` hash chain | `Store::record` (452), `broker_control::read_chain`/`load_image` |
 | `Source` | `run(sink, cancel)`; `context(trigger, part)` for bounded recall | CLI/jsonl, then Slack | new |
 | `Channel` | `send(OutboundMessage) -> Sent \| Gone`; shapes text per medium (chat at most 100 words, PRs structured) | stdout, then Slack | new |
@@ -173,9 +174,9 @@ Open in P0: a Ticket whose Trigger names no reply channel (a schedule, for examp
 person. P4 gives every Source an operator channel, and P6's Watchdog reports Tickets that wait for a person.
 
 **P1: the harness seam.** Add the `AgentHarness` port and move the Pi launch out of `main.rs` into `PiHarness`
-without changing behaviour. Add `ScriptedHarness`, which emits Pi RPC frames, and the end-to-end test `run`/`work()`
-lacks today: a scripted harness and the `smoke::Scripted` provider through the real broker. It runs on macOS too.
-Swarm mode is the first consumer.
+without changing behaviour. Add `ScriptedHarness`, which needs no Pi, node or bwrap and calls the real broker the way
+the Pi extension does, and the end-to-end test `run`/`work()` lacked: three scripted agents and the `smoke::Scripted`
+provider through the real broker. It runs on macOS too. Swarm mode is the first consumer. Done.
 
 **P2: the shared kernel.**
 - One `bwrap` builder.

@@ -13,6 +13,7 @@ pub mod domain;
 pub mod evaluator;
 pub mod evaluator_runtime;
 pub mod flow;
+pub mod harness;
 pub mod identity;
 pub mod kernel;
 pub mod ledger;
