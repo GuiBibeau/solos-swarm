@@ -3392,6 +3392,8 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2",
+ "solos-agent-core",
+ "solos-agent-store",
  "time",
  "tokenizers",
  "tokio",
