@@ -31,6 +31,11 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   WebSocket, every envelope acknowledged, reconnect with backoff) and a Web API Channel that replies in the thread,
   never posts a message twice after a crash, and offers Approve and Stop buttons that the runtime applies as
   `approve` and `stop_ticket`; `tokio-tungstenite` 0.29.0 on the existing rustls.
+- Agent mode, P8: GitHub and schedules (`kind: github` source and channel, `kind: schedule` source). The GitHub Source
+  polls the listed repositories' issues, pull requests, comments, review comments and failed workflow runs (CI as bot
+  Triggers on the pull request's Thread) with ETags, rate-limit waits and an atomic cursor in the state directory; the
+  Channel comments with a hidden marker, so a crash never posts twice. Schedules fire named slots (`every`, `daily_at`
+  UTC) as System Triggers a restart cannot repeat, with an optional `reply_to`. No new dependencies.
 - `collect` leaves the per-run `code/` scratch directory on the host and writes `collect-manifest.json`; `--include-code` opts back in.
 - Docs: pause mode, self-update operations, dashboard tunnel, tournament runbook, replay status.
 
