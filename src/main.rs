@@ -3,12 +3,13 @@ mod smoke;
 
 use solos_swarm::{
     broker,
+    gateway::provider_for,
     harness::{PiHarness, Role, SessionSpec, bounded_line},
     swarm::{self, GoalRun, GoalStatus},
 };
 
 use anyhow::{Context, Result, ensure};
-use broker::{Goal, OpenAiCompatible, Upstream, write_json};
+use broker::{Goal, Upstream, write_json};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use std::{
@@ -122,31 +123,6 @@ enum AgentCommand {
     },
 }
 
-/// The admitted endpoint of each shipped provider profile. A profile's dialect
-/// is fixed here rather than read from the Goal, so a Goal cannot make the
-/// transport speak a dialect its provider does not.
-fn endpoint(provider: &str) -> Result<&'static str> {
-    match provider {
-        "deepseek" => Ok("https://api.deepseek.com/chat/completions"),
-        "venice" => Ok("https://api.venice.ai/api/v1/chat/completions"),
-        other => anyhow::bail!("provider outside the deployment allowlist: {other}"),
-    }
-}
-/// Build the transport for a resolved upstream, so both shipped profiles share
-/// one receipt, bound and error path.
-fn provider_for(
-    upstream: &Upstream,
-    client: reqwest::Client,
-    key: Zeroizing<String>,
-) -> OpenAiCompatible {
-    OpenAiCompatible {
-        endpoint: endpoint(&upstream.provider).expect("resolved upstream endpoint"),
-        dialect: upstream.dialect,
-        client,
-        key,
-    }
-}
-
 /// One legacy preview run: a frozen Goal, the pinned Pi tree and one credential.
 struct RunOptions {
     config: PathBuf,
@@ -194,7 +170,7 @@ async fn run(options: RunOptions) -> Result<()> {
         }
         (Some(upstream), None) => upstream.clone(),
         (None, Some(supplied)) => broker::upstream_profile(supplied, &goal.model)?,
-        (None, None) => broker::Upstream::deepseek(&goal.model),
+        (None, None) => Upstream::deepseek(&goal.model),
     };
     goal.upstream = Some(resolved.clone());
     goal.validate()?;
@@ -207,7 +183,7 @@ async fn run(options: RunOptions) -> Result<()> {
         (1..=goal.deadline_seconds).contains(&deadline),
         "deadline cannot widen the Goal"
     );
-    let provider = Arc::new(provider_for(&resolved, swarm::http_client()?, key));
+    let provider = Arc::new(provider_for(&resolved, swarm::http_client()?, key)?);
     let run = GoalRun {
         goal,
         config,
