@@ -51,6 +51,12 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   `fetch_url` (`SWARM_TOOLSET=worker`); a start relaunches the work the last run left running with `recovery` set
   (new `Engine::restart`). `run_code` takes configured mounts and a caller-owned scratch directory; swarm runs keep
   their exact sandbox command.
+- Agent mode, P6: the Watchdog (`src/agent/watchdog.rs`, `watchdog:` in agent.yaml). A pure assessment of the Store
+  (Tickets waiting for a person, stalled Assignments, failing Effects, `unavailable` Decisions, spend near a cap,
+  long pauses) runs inside `agent serve` and tells the operator's conversation each new alert once, recorded in a
+  `watchdog_alerts` table (agent store schema v3) so a restart repeats none; `retry_stalled` retries a stalled
+  Assignment once per Ticket through the runtime. `solos-swarm agent status` reports what is running and why from a
+  read-only Store, as text or `--json`.
 - `collect` leaves the per-run `code/` scratch directory on the host and writes `collect-manifest.json`; `--include-code` opts back in.
 - Docs: pause mode, self-update operations, dashboard tunnel, tournament runbook, replay status.
 

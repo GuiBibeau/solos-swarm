@@ -2,8 +2,10 @@
 //! cannot silently fall back to a default.
 
 mod sources;
+mod watchdog;
 
 pub use sources::{Interval, ReplyTo, ScheduleConfig, TimeOfDay};
+pub use watchdog::{OperatorConfig, ThresholdsConfig, WatchdogConfig};
 
 use super::{github, slack};
 use crate::code::{self, Mount};
@@ -24,6 +26,9 @@ pub struct AgentConfig {
     pub router: RouterConfig,
     pub executor: ExecutorConfig,
     pub budgets: Budgets,
+    /// Without it, no Watchdog runs.
+    #[serde(default)]
+    pub watchdog: Option<WatchdogConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -269,6 +274,7 @@ impl AgentConfig {
         );
         self.validate_github()?;
         self.validate_schedules(&served)?;
+        self.validate_watchdog(&served)?;
         ensure!(
             self.budgets.session_microusd > 0,
             "budgets.session_microusd must be above zero"

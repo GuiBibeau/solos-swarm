@@ -87,6 +87,15 @@ impl SqliteStore {
         rows.map(|row| parse(row?)).collect()
     }
 
+    /// Effects not done yet, in commit order.
+    pub fn pending_effects(&self) -> Result<Vec<QueuedEffect>, StoreError> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT {COLUMNS} FROM effects WHERE done = 0 ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([], raw)?;
+        rows.map(|row| parse(row?)).collect()
+    }
+
     pub fn effect(&self, id: EffectId) -> Result<Option<QueuedEffect>, StoreError> {
         let row = self
             .conn
