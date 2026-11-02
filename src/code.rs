@@ -2,14 +2,18 @@
 //!
 //! A worker never gets a host shell. `run_code` starts one separate bwrap
 //! process per call with an empty environment, no network namespace, no broker
-//! socket, no provider credential and no host home. Only the decoded dataset,
-//! the regimes checkout and its Python environment are mounted read-only; the
-//! only writable mount is that agent's scratch directory.
+//! socket, no provider credential and no host home. Only the configured
+//! mounts are read-only binds; the only writable mount is the caller's
+//! scratch directory. A swarm run mounts the decoded dataset, the regimes
+//! checkout and its Python environment, and gives each `agent-NN` a scratch
+//! directory under the run; agent mode mounts what its config names and
+//! gives each Ticket's worker that Ticket's directory.
 //!
 //! The tool is deliberately single-purpose: one `/usr/bin/bash -c` command,
 //! bounded input and output, a wall-clock timeout, and a small JSON receipt.
 
 use anyhow::{Context, Result, bail, ensure};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     ffi::OsString,
@@ -48,13 +52,56 @@ const DEFAULT_VENV_ROOT: &str = "/home/debian/research/regimes/repo/.venv";
 const DEFAULT_UV_ROOT: &str = "/home/debian/.local/share/uv/python";
 const DEFAULT_BWRAP: &str = "/usr/bin/bwrap";
 const DEFAULT_PRLIMIT: &str = "/usr/bin/prlimit";
+/// How many sandboxes may run at once.
+pub const CONCURRENCY_RANGE: std::ops::RangeInclusive<usize> = 1..=8;
+/// The address-space caps a sandbox may run under.
+pub const MEMORY_RANGE: std::ops::RangeInclusive<u64> = 256 * 1024 * 1024..=16 * 1024 * 1024 * 1024;
+/// Root names the sandbox's own mounts use, so no bind may take them.
+const RESERVED_TARGETS: [&str; 11] = [
+    "bin", "dev", "etc", "lib", "lib64", "proc", "runtime", "sbin", "tmp", "usr", "work",
+];
+
+/// One read-only bind: the host's `source` appears at `target`.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Mount {
+    /// One directory under `/`, such as `/data`.
+    pub target: PathBuf,
+    pub source: PathBuf,
+}
+impl Mount {
+    pub fn validate(&self) -> Result<()> {
+        let mut parts = self.target.components();
+        let name = match (parts.next(), parts.next(), parts.next()) {
+            (Some(Component::RootDir), Some(Component::Normal(name)), None) => name.to_str(),
+            _ => None,
+        };
+        let Some(name) = name else {
+            bail!(
+                "run_code mount target {} is not one directory under /",
+                self.target.display()
+            );
+        };
+        ensure!(
+            !RESERVED_TARGETS.contains(&name),
+            "run_code mount target {} is a system path",
+            self.target.display()
+        );
+        ensure!(
+            self.source.is_absolute(),
+            "run_code mount source {} is not an absolute path",
+            self.source.display()
+        );
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct CodeConfig {
-    pub dataset_root: PathBuf,
-    pub repo_root: PathBuf,
-    pub venv_root: PathBuf,
+    /// Read-only binds, in this order.
+    pub mounts: Vec<Mount>,
     pub uv_root: Option<PathBuf>,
+    /// Every scratch directory lies under it.
     pub scratch_root: PathBuf,
     pub concurrency: usize,
     pub memory_bytes: u64,
@@ -62,6 +109,20 @@ pub struct CodeConfig {
     pub prlimit: PathBuf,
 }
 impl CodeConfig {
+    /// `mounts` and the default limits and binaries.
+    pub fn new(scratch_root: PathBuf, mounts: Vec<Mount>) -> Self {
+        Self {
+            mounts,
+            uv_root: None,
+            scratch_root,
+            concurrency: DEFAULT_CONCURRENCY,
+            memory_bytes: DEFAULT_MEMORY_BYTES,
+            bwrap: PathBuf::from(DEFAULT_BWRAP),
+            prlimit: PathBuf::from(DEFAULT_PRLIMIT),
+        }
+    }
+    /// A swarm run's, from `SWARM_CODE_*`: the decoded dataset, the regimes
+    /// checkout and its Python environment.
     fn from_env(run_dir: &Path) -> Result<Self> {
         let dataset_root = env_path("SWARM_CODE_DATASET_ROOT", DEFAULT_DATASET_ROOT);
         let repo_root = env_path("SWARM_CODE_REPO_ROOT", DEFAULT_REPO_ROOT);
@@ -78,13 +139,31 @@ impl CodeConfig {
         );
         let memory_bytes = env_u64("SWARM_CODE_MEMORY_BYTES", DEFAULT_MEMORY_BYTES)?;
         ensure!(
-            (256 * 1024 * 1024..=16 * 1024 * 1024 * 1024).contains(&memory_bytes),
+            MEMORY_RANGE.contains(&memory_bytes),
             "SWARM_CODE_MEMORY_BYTES must be 256 MiB..=16 GiB"
         );
+        ensure!(
+            dataset_root.is_dir(),
+            "run_code dataset root is missing: {}",
+            dataset_root.display()
+        );
+        ensure!(
+            repo_root.is_dir(),
+            "run_code regimes root is missing: {}",
+            repo_root.display()
+        );
+        ensure!(
+            venv_root.is_dir(),
+            "run_code Python environment is missing: {}",
+            venv_root.display()
+        );
+        ensure!(
+            venv_root.join("bin/python").exists(),
+            "run_code Python interpreter is missing: {}",
+            venv_root.join("bin/python").display()
+        );
         Ok(Self {
-            dataset_root,
-            repo_root,
-            venv_root,
+            mounts: swarm_mounts(dataset_root, repo_root, venv_root),
             uv_root: uv_root.is_dir().then_some(uv_root),
             scratch_root,
             concurrency: concurrency as usize,
@@ -93,6 +172,19 @@ impl CodeConfig {
             prlimit: env_path("SWARM_CODE_PRLIMIT", DEFAULT_PRLIMIT),
         })
     }
+}
+fn swarm_mounts(dataset: PathBuf, regimes: PathBuf, venv: PathBuf) -> Vec<Mount> {
+    [
+        ("/dataset", dataset),
+        ("/regimes", regimes),
+        ("/venv", venv),
+    ]
+    .into_iter()
+    .map(|(target, source)| Mount {
+        target: PathBuf::from(target),
+        source,
+    })
+    .collect()
 }
 fn env_path(name: &str, default: &str) -> PathBuf {
     std::env::var_os(name)
@@ -221,30 +313,18 @@ pub struct CodeExecutor {
     permits: Arc<Semaphore>,
 }
 impl CodeExecutor {
+    /// A swarm run's executor, configured from the environment.
     pub fn new(run_dir: &Path) -> Result<Self> {
         Self::from_config(CodeConfig::from_env(run_dir)?)
     }
-    fn from_config(config: CodeConfig) -> Result<Self> {
-        ensure!(
-            config.dataset_root.is_dir(),
-            "run_code dataset root is missing: {}",
-            config.dataset_root.display()
-        );
-        ensure!(
-            config.repo_root.is_dir(),
-            "run_code regimes root is missing: {}",
-            config.repo_root.display()
-        );
-        ensure!(
-            config.venv_root.is_dir(),
-            "run_code Python environment is missing: {}",
-            config.venv_root.display()
-        );
-        ensure!(
-            config.venv_root.join("bin/python").exists(),
-            "run_code Python interpreter is missing: {}",
-            config.venv_root.join("bin/python").display()
-        );
+    pub fn from_config(config: CodeConfig) -> Result<Self> {
+        for mount in &config.mounts {
+            ensure!(
+                mount.source.exists(),
+                "run_code mount source is missing: {}",
+                mount.source.display()
+            );
+        }
         ensure!(
             config.bwrap.is_file(),
             "run_code bubblewrap is missing: {}",
@@ -262,11 +342,41 @@ impl CodeExecutor {
             config,
         })
     }
-    /// Run one request for one agent. Non-zero exits and timeouts are normal
-    /// results; only a launch or sandbox failure is an error.
+    /// Run one request for one swarm agent, in its scratch directory under
+    /// the run. Non-zero exits and timeouts are normal results; only a launch
+    /// or sandbox failure is an error.
     pub async fn run(&self, agent_id: &str, args: &Value) -> Result<Value> {
         let request = CodeRequest::parse(args)?;
         let scratch = self.scratch(agent_id)?;
+        self.execute(&scratch, request).await
+    }
+    /// Run one request with `scratch` as `/work`: a directory the caller made
+    /// under the scratch root, such as a Ticket's, kept between calls.
+    pub async fn run_in(&self, scratch: &Path, args: &Value) -> Result<Value> {
+        let request = CodeRequest::parse(args)?;
+        let scratch = self.owned_scratch(scratch)?;
+        self.execute(&scratch, request).await
+    }
+    /// `scratch` itself, not a link, and inside the scratch root once every
+    /// link and `..` above it is resolved.
+    fn owned_scratch(&self, scratch: &Path) -> Result<PathBuf> {
+        let metadata = fs::symlink_metadata(scratch)
+            .with_context(|| format!("run_code scratch is missing: {}", scratch.display()))?;
+        ensure!(
+            metadata.is_dir(),
+            "run_code scratch is not a directory: {}",
+            scratch.display()
+        );
+        let root = fs::canonicalize(&self.config.scratch_root)?;
+        let real = fs::canonicalize(scratch)?;
+        ensure!(
+            real.starts_with(&root) && real != root,
+            "run_code scratch is outside its root: {}",
+            scratch.display()
+        );
+        Ok(real)
+    }
+    async fn execute(&self, scratch: &Path, request: CodeRequest) -> Result<Value> {
         let queued = std::time::Instant::now();
         let _permit = self
             .permits
@@ -274,8 +384,8 @@ impl CodeExecutor {
             .await
             .context("run_code scheduler closed")?;
         let queue_wait_ms = queued.elapsed().as_millis() as u64;
-        write_files(&scratch, &request.files)?;
-        let command = self.command(&scratch, &request.code);
+        write_files(scratch, &request.files)?;
+        let command = self.command(scratch, &request.code);
         let mut receipt = execute(command, request.stdin, request.timeout).await?;
         // `duration_ms` is sandbox time only; queue_wait_ms is the time spent
         // waiting for one of `concurrency` slots (78% of run_code wall time in
@@ -350,9 +460,9 @@ impl CodeExecutor {
         );
         args.push(scratch.into());
         args.push("/work".into());
-        bound_alias(&mut args, "/dataset", &self.config.dataset_root);
-        bound_alias(&mut args, "/regimes", &self.config.repo_root);
-        bound_alias(&mut args, "/venv", &self.config.venv_root);
+        for mount in &self.config.mounts {
+            bound_alias(&mut args, &mount.target, &mount.source);
+        }
         if let Some(root) = &self.config.uv_root {
             // The venv's interpreter is an absolute symlink into uv's Python
             // store. Bind the whole store at its real path so that link resolves.
@@ -433,7 +543,7 @@ impl CodeExecutor {
         args
     }
 }
-fn bound_alias(args: &mut Vec<OsString>, alias: &str, source: &Path) {
+fn bound_alias(args: &mut Vec<OsString>, alias: &Path, source: &Path) {
     args.push("--dir".into());
     args.push(alias.into());
     args.push("--ro-bind".into());
@@ -609,11 +719,12 @@ async fn read_bounded<R: AsyncRead + Unpin>(
 mod tests {
     use super::*;
 
-    fn test_config(dir: &Path) -> CodeConfig {
+    /// A swarm run's mounts, with the system binaries standing in for the
+    /// research trees so the sandbox runs on any Linux host.
+    fn swarm_config(dir: &Path) -> CodeConfig {
+        let usr = || PathBuf::from("/usr");
         CodeConfig {
-            dataset_root: PathBuf::from("/usr"),
-            repo_root: PathBuf::from("/usr"),
-            venv_root: PathBuf::from("/usr"),
+            mounts: swarm_mounts(usr(), usr(), usr()),
             uv_root: None,
             scratch_root: dir.to_path_buf(),
             concurrency: 1,
@@ -622,13 +733,30 @@ mod tests {
             prlimit: PathBuf::from("/usr/bin/prlimit"),
         }
     }
-    fn executor(dir: &Path) -> CodeExecutor {
+    /// An agent worker's: one configured mount, nothing else.
+    fn worker_config(dir: &Path) -> CodeConfig {
+        let mut config = CodeConfig::new(
+            dir.to_path_buf(),
+            vec![Mount {
+                target: PathBuf::from("/data"),
+                source: PathBuf::from("/usr/share"),
+            }],
+        );
+        config.concurrency = 1;
+        config
+    }
+    fn executor(config: CodeConfig) -> CodeExecutor {
         // The unit tests exercise the argument and I/O contract without a
         // Linux bwrap binary or a real Python installation.
         CodeExecutor {
-            config: test_config(dir),
+            config,
             permits: Arc::new(Semaphore::new(1)),
         }
+    }
+    fn scratch_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
     #[test]
     fn request_rejects_escapes_and_bounds() {
@@ -646,8 +774,7 @@ mod tests {
     }
     #[test]
     fn files_stay_inside_scratch_and_replace_old_links() {
-        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-        fs::create_dir_all(&dir).unwrap();
+        let dir = scratch_dir();
         let outside = dir.join("outside");
         fs::write(&outside, "secret").unwrap();
         let scratch = dir.join("work");
@@ -672,26 +799,244 @@ mod tests {
     }
     #[test]
     fn sandbox_has_no_network_broker_or_provider_environment() {
-        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-        fs::create_dir_all(&dir).unwrap();
-        let args = executor(&dir).bwrap_args(Path::new("/tmp/scratch"), "python -c pass");
-        let text = args
+        let dir = scratch_dir();
+        for (mode, config) in [
+            ("swarm", swarm_config(&dir)),
+            ("worker", worker_config(&dir)),
+        ] {
+            let args = executor(config).bwrap_args(Path::new("/tmp/scratch"), "python -c pass");
+            let text = args
+                .iter()
+                .map(|arg| arg.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("--unshare-all"), "{mode}");
+            assert!(text.contains("--die-with-parent"), "{mode}");
+            assert!(text.contains("--ro-bind\n/usr\n/usr"), "{mode}");
+            assert!(!text.contains("--ro-bind\n/tmp/scratch\n/work"), "{mode}");
+            assert!(text.contains("--bind\n/tmp/scratch\n/work"), "{mode}");
+            assert_eq!(
+                text.matches("\n--bind\n").count(),
+                1,
+                "{mode}: one writable mount"
+            );
+            assert!(text.contains("--setenv\nHOME\n/work"), "{mode}");
+            assert!(text.contains("--setenv\nCUDA_VISIBLE_DEVICES\n"), "{mode}");
+            assert!(!text.contains("SWARM_TOKEN"), "{mode}");
+            assert!(!text.contains("SWARM_SOCKET"), "{mode}");
+            assert!(!text.contains("broker.sock"), "{mode}");
+            assert!(!text.contains("--share-net"), "{mode}");
+        }
+        let worker = executor(worker_config(&dir)).bwrap_args(Path::new("/s"), "true");
+        let worker: Vec<String> = worker
             .iter()
-            .map(|arg| arg.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains("--unshare-all"));
-        assert!(text.contains("--die-with-parent"));
-        assert!(text.contains("--ro-bind\n/usr\n/usr"));
-        assert!(!text.contains("--ro-bind\n/tmp/scratch\n/work"));
-        assert!(text.contains("--bind\n/tmp/scratch\n/work"));
-        assert!(text.contains("--setenv\nHOME\n/work"));
-        assert!(text.contains("--setenv\nCUDA_VISIBLE_DEVICES\n"));
-        assert!(!text.contains("SWARM_TOKEN"));
-        assert!(!text.contains("SWARM_SOCKET"));
-        assert!(!text.contains("broker.sock"));
-        assert!(!text.contains("--share-net"));
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let at = worker.iter().position(|arg| arg == "/data").unwrap();
+        assert_eq!(
+            worker[at - 1..at + 4],
+            ["--dir", "/data", "--ro-bind", "/usr/share", "/data"]
+        );
+        assert!(!worker.iter().any(|arg| arg == "/dataset" || arg == "/venv"));
         fs::remove_dir_all(&dir).unwrap();
+    }
+    /// The whole command a swarm run's `run_code` starts, as it was before
+    /// the mounts became configurable.
+    #[test]
+    fn the_swarm_sandbox_command_is_unchanged() {
+        let mut config = swarm_config(Path::new("/runs/r1/code"));
+        config.mounts = swarm_mounts(
+            PathBuf::from("/data/phoenix"),
+            PathBuf::from("/srv/regimes"),
+            PathBuf::from("/srv/regimes/.venv"),
+        );
+        config.uv_root = Some(PathBuf::from("/opt/uv/python"));
+        let command = executor(config).command(Path::new("/runs/r1/code/agent-03"), "echo ok");
+        let command = command.as_std();
+        assert_eq!(command.get_program(), "/usr/bin/prlimit");
+        let args: Vec<&str> = command
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+        let golden = [
+            "--as=4294967296",
+            "--fsize=268435456",
+            "--cpu=300",
+            "--nofile=512",
+            "--",
+            "/usr/bin/bwrap",
+            "--unshare-all",
+            "--die-with-parent",
+            "--new-session",
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            "--ro-bind-try",
+            "/etc",
+            "/etc",
+            "--ro-bind-try",
+            "/lib",
+            "/lib",
+            "--ro-bind-try",
+            "/lib64",
+            "/lib64",
+            "--symlink",
+            "usr/bin",
+            "/bin",
+            "--symlink",
+            "usr/sbin",
+            "/sbin",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--size",
+            "268435456",
+            "--tmpfs",
+            "/tmp",
+            "--dir",
+            "/work",
+            "--bind",
+            "/runs/r1/code/agent-03",
+            "/work",
+            "--dir",
+            "/dataset",
+            "--ro-bind",
+            "/data/phoenix",
+            "/dataset",
+            "--dir",
+            "/regimes",
+            "--ro-bind",
+            "/srv/regimes",
+            "/regimes",
+            "--dir",
+            "/venv",
+            "--ro-bind",
+            "/srv/regimes/.venv",
+            "/venv",
+            "--dir",
+            "/opt",
+            "--dir",
+            "/opt/uv",
+            "--ro-bind",
+            "/opt/uv/python",
+            "/opt/uv/python",
+            "--chdir",
+            "/work",
+            "--clearenv",
+            "--setenv",
+            "PATH",
+            "/venv/bin:/usr/local/bin:/usr/bin:/bin",
+            "--setenv",
+            "HOME",
+            "/work",
+            "--setenv",
+            "TMPDIR",
+            "/tmp",
+            "--setenv",
+            "LANG",
+            "C.UTF-8",
+            "--setenv",
+            "LC_ALL",
+            "C.UTF-8",
+            "--setenv",
+            "PYTHONNOUSERSITE",
+            "1",
+            "--setenv",
+            "PYTHONDONTWRITEBYTECODE",
+            "1",
+            "--setenv",
+            "PYTHONUNBUFFERED",
+            "1",
+            "--setenv",
+            "PYTHONPATH",
+            "/regimes/src:/regimes",
+            "--setenv",
+            "MPLBACKEND",
+            "Agg",
+            "--setenv",
+            "OPENBLAS_NUM_THREADS",
+            "4",
+            "--setenv",
+            "OMP_NUM_THREADS",
+            "4",
+            "--setenv",
+            "MKL_NUM_THREADS",
+            "4",
+            "--setenv",
+            "NUMEXPR_NUM_THREADS",
+            "4",
+            "--setenv",
+            "VECLIB_MAXIMUM_THREADS",
+            "4",
+            "--setenv",
+            "RAYON_NUM_THREADS",
+            "4",
+            "--setenv",
+            "CUDA_VISIBLE_DEVICES",
+            "",
+            "/usr/bin/bash",
+            "-c",
+            "echo ok",
+        ];
+        assert_eq!(args, golden);
+        assert_eq!(command.get_envs().count(), 0);
+        assert!(format!("{command:?}").starts_with("env -i "), "{command:?}");
+    }
+    #[test]
+    fn a_swarm_scratch_is_an_agent_id_and_a_worker_scratch_is_its_own_directory_under_the_root() {
+        let dir = scratch_dir();
+        let swarm = executor(swarm_config(&dir));
+        assert_eq!(swarm.scratch("agent-07").unwrap(), dir.join("agent-07"));
+        for bad in ["agent-", "agent-x1", "../agent-01", "tk_0123"] {
+            assert!(swarm.scratch(bad).is_err(), "accepted {bad}");
+        }
+        let root = dir.join("tickets");
+        let work = root.join("tk_1/work");
+        fs::create_dir_all(&work).unwrap();
+        let outside = dir.join("elsewhere");
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("tk_1/linked")).unwrap();
+        let worker = executor(worker_config(&root));
+        assert_eq!(
+            worker.owned_scratch(&work).unwrap(),
+            fs::canonicalize(&work).unwrap()
+        );
+        for (case, path) in [
+            ("missing", root.join("tk_2/work")),
+            ("the root itself", root.clone()),
+            ("outside the root", outside.clone()),
+            ("a dotted escape", root.join("tk_1/work/../../../elsewhere")),
+            ("a link", root.join("tk_1/linked")),
+        ] {
+            assert!(worker.owned_scratch(&path).is_err(), "{case}: accepted");
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn a_mount_is_one_directory_under_the_root_that_no_system_path_takes() {
+        let mount = |target: &str, source: &str| Mount {
+            target: PathBuf::from(target),
+            source: PathBuf::from(source),
+        };
+        mount("/data", "/srv/data").validate().unwrap();
+        mount("/repo", "/home/me/repo").validate().unwrap();
+        for (target, source) in [
+            ("/work", "/srv"),
+            ("/usr", "/srv"),
+            ("/tmp", "/srv"),
+            ("/runtime", "/srv"),
+            ("/", "/srv"),
+            ("data", "/srv"),
+            ("/data/inner", "/srv"),
+            ("/../data", "/srv"),
+            ("/data", "relative/source"),
+        ] {
+            assert!(
+                mount(target, source).validate().is_err(),
+                "accepted {target} <- {source}"
+            );
+        }
     }
     #[tokio::test]
     async fn bounded_reader_truncates_and_drains() {
@@ -709,23 +1054,28 @@ mod tests {
         if !Path::new("/usr/bin/bwrap").is_file() || !Path::new("/usr/bin/prlimit").is_file() {
             return;
         }
-        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-        fs::create_dir_all(&dir).unwrap();
-        let executor = executor(&dir);
-        let result = executor
-            .run(
-                "agent-00",
-                &json!({
-                    "code": "cat input.txt && printf ' %s' \"$HOME\" && test -z \"$SWARM_TOKEN\" && test ! -S /broker.sock",
-                    "files": {"input.txt": "hello"},
-                    "timeout_seconds": 10
-                }),
-            )
-            .await
-            .unwrap();
+        let code = json!({
+            "code": "cat input.txt && printf ' %s' \"$HOME\" && test -z \"$SWARM_TOKEN\" && test ! -S /broker.sock",
+            "files": {"input.txt": "hello"},
+            "timeout_seconds": 10
+        });
+        let dir = scratch_dir();
+        let swarm = executor(swarm_config(&dir));
+        let result = swarm.run("agent-00", &code).await.unwrap();
         assert_eq!(result["exit_code"], json!(0), "{result}");
         assert_eq!(result["stdout"], json!("hello /work"));
         assert_eq!(result["timed_out"], json!(false));
+
+        let work = dir.join("tk_1/work");
+        fs::create_dir_all(&work).unwrap();
+        let worker = executor(worker_config(&dir));
+        let result = worker.run_in(&work, &code).await.unwrap();
+        assert_eq!(result["exit_code"], json!(0), "{result}");
+        assert_eq!(result["stdout"], json!("hello /work"));
+        let kept = json!({"code": "echo kept > note && test -d /data && test ! -e /dataset"});
+        let result = worker.run_in(&work, &kept).await.unwrap();
+        assert_eq!(result["exit_code"], json!(0), "{result}");
+        assert_eq!(fs::read_to_string(work.join("note")).unwrap(), "kept\n");
         fs::remove_dir_all(&dir).unwrap();
     }
 }
