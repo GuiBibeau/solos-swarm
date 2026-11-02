@@ -50,6 +50,11 @@ enum Action {
         #[command(subcommand)]
         command: mvp::MvpCommand,
     },
+    /// Agent mode: a long-running agent that takes work from its Sources.
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
     Run {
         #[arg(long)]
         config: PathBuf,
@@ -96,6 +101,24 @@ enum Action {
         node: PathBuf,
         #[arg(long)]
         url: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentCommand {
+    /// Take Triggers from the configured Sources, judge them, run the work and
+    /// reply. Serves until SIGINT or SIGTERM.
+    Serve {
+        /// The Policy, Sources, Channels, Router, Executor and budgets.
+        #[arg(long)]
+        config: PathBuf,
+        /// Holds the agent's SQLite Store; created if missing.
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// Read the Sources once, finish what they started, print a summary
+        /// and exit. For tests and dry runs.
+        #[arg(long)]
+        until_idle: bool,
     },
 }
 
@@ -230,6 +253,18 @@ async fn execute(command: Action) -> Result<()> {
             anyhow::bail!("guard must enter before async runtime")
         }
         Action::Mvp { command } => mvp::execute(command).await,
+        Action::Agent {
+            command:
+                AgentCommand::Serve {
+                    config,
+                    state_dir,
+                    until_idle,
+                },
+        } => {
+            let summary = solos_swarm::agent::serve(&config, &state_dir, until_idle).await?;
+            println!("{}", json!(summary));
+            Ok(())
+        }
         Action::Run {
             config,
             run_dir,
