@@ -161,6 +161,10 @@ pub struct Thread {
     pub evals_started: u32,
     pub consecutive_expiries: u32,
     /// Tickets that receive this Thread's Triggers as context.
+    /// Triggers a Ticket handed back here. Each is judged once after a
+    /// handback, however many Tickets hand it back.
+    #[serde(default)]
+    pub handed_back: BTreeSet<TriggerId>,
     pub subscriptions: BTreeSet<TicketId>,
     pub decisions: Vec<DecisionId>,
 }

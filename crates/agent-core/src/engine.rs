@@ -120,15 +120,12 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
                         });
                         true
                     } else {
-                        owner && !policy.paused() && !ticket.has_live_assignment()
+                        owner && !ticket.has_live_assignment()
                     };
                     if wake {
-                        tx.start(&mut ticket, policy, true);
+                        tx.start(&mut ticket, policy);
                     }
-                    let body = InputBody::Trigger {
-                        trigger: trigger.id.clone(),
-                    };
-                    tx.add_input(&mut ticket, body, owner);
+                    tx.add_trigger_input(&mut ticket, &trigger.id, owner);
                     reached.push(id.clone());
                     tx.save_ticket(ticket);
                 }
@@ -214,8 +211,7 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
                 by: by.clone(),
             });
             tx.add_input(&mut t, InputBody::Approved { by }, true);
-            let recovery = !t.assignments.is_empty();
-            tx.launch(&mut t, recovery);
+            tx.launch(&mut t);
             tx.save_ticket(t);
             Ok(())
         })
@@ -244,7 +240,7 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
                 return Err(Error::Refused("the ticket waits for approval".into()));
             }
             tx.end_assignment(&mut t, "retried");
-            let id = tx.start(&mut t, policy, true);
+            let id = tx.start(&mut t, policy);
             tx.save_ticket(t);
             Ok(id)
         })
@@ -299,15 +295,22 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
                 kind: "trigger",
                 id: trigger.to_string(),
             })?;
-            let target = original
+            let primary = original
                 .threads
-                .iter()
-                .find(|key| t.threads.contains(*key))
-                .or(original.threads.first())
+                .first()
                 .cloned()
                 .ok_or_else(|| Error::Invalid(format!("trigger {trigger} names no thread")))?;
-            let mut thread = tx.thread(&target).unwrap_or_else(|| Thread::new(target));
-            thread.queued.push(trigger.clone());
+            let mut thread = tx.thread(&primary).unwrap_or_else(|| Thread::new(primary));
+            let judging = thread
+                .eval
+                .as_ref()
+                .is_some_and(|e| e.triggers.contains(trigger));
+            let queued = thread.handed_back.insert(trigger.clone())
+                && !judging
+                && !thread.queued.contains(trigger);
+            if queued {
+                thread.queued.push(trigger.clone());
+            }
             tx.save_thread(thread);
             tx.event(DomainEvent::HandedBack {
                 ticket: t.id.clone(),
@@ -315,7 +318,7 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
                 reason: reason.to_owned(),
             });
             tx.save_ticket(t);
-            Ok(true)
+            Ok(queued)
         })
     }
 
@@ -367,7 +370,8 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
                 assignment: assignment.clone(),
                 status: report.status,
             });
-            if let Some(question) = &report.question {
+            let ends = matches!(report.status, ReportStatus::Ready | ReportStatus::Dropped);
+            if !ends && let Some(question) = &report.question {
                 t.attention = Some(question.clone());
                 tx.send(&mut t, MessageKind::Attention, question.clone());
             }
@@ -411,7 +415,35 @@ fn needs_approval(ticket: &Ticket, policy: &impl Policy) -> bool {
 }
 
 fn may_resume(policy: &impl Policy, owner: bool, ticket: &Ticket) -> bool {
-    owner && !policy.paused() && policy.revalidate(&ticket.mandate)
+    owner && policy.revalidate(&ticket.mandate)
+}
+
+fn validate(accept: &Accept) -> Result<(), Error> {
+    if accept.title.trim().is_empty() || accept.scope.trim().is_empty() {
+        return Err(Error::Invalid("an accept needs a title and a scope".into()));
+    }
+    if let Plan::Swarm { agents, .. } = accept.plan
+        && !(1..=MAX_SWARM_AGENTS).contains(&agents)
+    {
+        return Err(Error::Invalid(format!(
+            "a swarm has 1 to {MAX_SWARM_AGENTS} agents, not {agents}"
+        )));
+    }
+    if accept.budget_microusd == 0 {
+        return Err(Error::Invalid("an accept needs a budget".into()));
+    }
+    Ok(())
+}
+
+/// Put `triggers` back at the front of the queue, each at most once.
+fn requeue(thread: &mut Thread, triggers: Vec<TriggerId>) {
+    let mut queued = triggers;
+    for id in std::mem::take(&mut thread.queued) {
+        if !queued.contains(&id) {
+            queued.push(id);
+        }
+    }
+    thread.queued = queued;
 }
 
 fn latest_mut<'t>(
@@ -554,14 +586,13 @@ impl<R: Repositories> Tx<'_, R> {
 
     /// Launch the next Assignment, unless the budget needs a person's
     /// approval under the current threshold. Then ask once and wait.
-    fn start(
-        &mut self,
-        ticket: &mut Ticket,
-        policy: &impl Policy,
-        recovery: bool,
-    ) -> Option<AssignmentId> {
+    fn start(&mut self, ticket: &mut Ticket, policy: &impl Policy) -> Option<AssignmentId> {
         if !needs_approval(ticket, policy) {
-            return Some(self.launch(ticket, recovery));
+            if ticket.approval == Approval::Waiting {
+                ticket.approval = Approval::NotNeeded;
+                ticket.attention = None;
+            }
+            return Some(self.launch(ticket));
         }
         if ticket.approval != Approval::Waiting {
             ticket.approval = Approval::Waiting;
@@ -577,30 +608,55 @@ impl<R: Repositories> Tx<'_, R> {
         None
     }
 
-    /// A Ticket accepted while Triggers waited on its Threads gets them as if
-    /// it had existed. An allowed person's follow-up leaves the queue.
-    fn adopt_queued(&mut self, thread: &mut Thread, ticket: &mut Ticket, policy: &impl Policy) {
-        let mut kept = Vec::new();
-        for id in std::mem::take(&mut thread.queued) {
-            let Some(trigger) = self.trigger(&id) else {
+    /// A Ticket accepted while Triggers on its Threads waited for an Eval
+    /// gets them as if it had existed. An allowed person's follow-up leaves
+    /// the queue, unless a Ticket handed it back to be judged.
+    fn adopt_waiting(&mut self, ticket: &mut Ticket, policy: &impl Policy) {
+        for key_ in ticket.threads.clone() {
+            let Some(on) = self.thread(&key_) else {
                 continue;
             };
-            let owner = allowed_person(policy, &trigger);
-            self.add_input(
-                ticket,
-                InputBody::Trigger {
-                    trigger: id.clone(),
-                },
-                owner,
-            );
-            if !owner {
-                kept.push(id);
+            for id in on.triggers {
+                let Some(trigger) = self.trigger(&id) else {
+                    continue;
+                };
+                let Some(mut waits) = trigger.threads.first().and_then(|k| self.thread(k)) else {
+                    continue;
+                };
+                let queued = waits.queued.contains(&id);
+                let judging = waits
+                    .eval
+                    .as_ref()
+                    .is_some_and(|e| e.triggers.contains(&id));
+                if !queued && !judging {
+                    continue;
+                }
+                let owner =
+                    queued && !waits.handed_back.contains(&id) && allowed_person(policy, &trigger);
+                if self.add_trigger_input(ticket, &id, owner) && owner {
+                    waits.queued.retain(|q| *q != id);
+                    self.save_thread(waits);
+                }
             }
         }
-        thread.queued = kept;
     }
 
-    fn launch(&mut self, ticket: &mut Ticket, recovery: bool) -> AssignmentId {
+    /// A Ticket holds each Trigger once, however many of its Threads carry it.
+    fn add_trigger_input(&mut self, ticket: &mut Ticket, trigger: &TriggerId, owner: bool) -> bool {
+        let held = ticket.inputs.iter().any(
+            |input| matches!(&input.body, InputBody::Trigger { trigger: id } if id == trigger),
+        );
+        if !held {
+            let body = InputBody::Trigger {
+                trigger: trigger.clone(),
+            };
+            self.add_input(ticket, body, owner);
+        }
+        !held
+    }
+
+    fn launch(&mut self, ticket: &mut Ticket) -> AssignmentId {
+        let recovery = !ticket.assignments.is_empty();
         let n = ticket.assignments.len() + 1;
         let id = AssignmentId(key("as", &[ticket.id.as_str(), &n.to_string()]));
         ticket.assignments.push(Assignment {
@@ -708,9 +764,7 @@ impl<R: Repositories> Tx<'_, R> {
                 };
                 self.record(&mut thread, decision);
             } else {
-                let mut queued = eval.triggers;
-                queued.append(&mut thread.queued);
-                thread.queued = queued;
+                requeue(&mut thread, eval.triggers);
             }
         }
         if thread.queued.is_empty() {
@@ -728,15 +782,11 @@ impl<R: Repositories> Tx<'_, R> {
             }
         }
         let version = policy.version();
-        if let Some((first, _)) = rejected.first() {
+        if !rejected.is_empty() {
             let decision = Decision {
                 id: DecisionId(key(
                     "dc",
-                    &[
-                        key_.as_str(),
-                        first.as_str(),
-                        &thread.evals_started.to_string(),
-                    ],
+                    &[key_.as_str(), "gate", &thread.decisions.len().to_string()],
                 )),
                 thread: key_.clone(),
                 eval: None,
@@ -758,6 +808,7 @@ impl<R: Repositories> Tx<'_, R> {
             self.record(&mut thread, decision);
         }
         let Some(strength) = admitted.iter().map(|(s, _)| *s).max() else {
+            thread.consecutive_expiries = 0;
             self.save_thread(thread);
             return Ok(None);
         };
@@ -837,27 +888,32 @@ impl<R: Repositories> Tx<'_, R> {
             policy_version: version.clone(),
             at_ms: self.now,
         };
+        thread.consecutive_expiries = 0;
         if current.policy_version != version {
-            let mut queued = current.triggers;
-            queued.append(&mut thread.queued);
-            thread.queued = queued;
+            requeue(&mut thread, current.triggers);
             decision.kind = DecisionKind::Unavailable;
             decision.reason = "the policy changed during the eval".into();
             self.record(&mut thread, decision);
             self.save_thread(thread);
             return Ok(id);
         }
-        thread.consecutive_expiries = 0;
         match verdict {
             Verdict::Ignore { reason } => decision.reason = reason,
             Verdict::Stop { ticket, reason } => {
                 if current.strength != Strength::Explicit {
                     return Err(Error::Refused("only an explicit request stops work".into()));
                 }
-                if !thread.subscriptions.contains(&ticket) {
-                    return Err(Error::Refused(format!("{ticket} is not on {key_}")));
-                }
                 let mut t = self.require_ticket(&ticket)?;
+                let on_batch = current
+                    .triggers
+                    .iter()
+                    .filter_map(|id| self.trigger(id))
+                    .any(|trigger| trigger.threads.iter().any(|k| t.threads.contains(k)));
+                if !on_batch {
+                    return Err(Error::Refused(format!(
+                        "{ticket} follows no Thread of this batch"
+                    )));
+                }
                 if !t.stopped_by_person() {
                     self.end_ticket(&mut t, EndedBy::Person, TicketOutcome::Stopped, &reason);
                     self.save_ticket(t);
@@ -867,6 +923,7 @@ impl<R: Repositories> Tx<'_, R> {
                 decision.ticket = Some(ticket);
             }
             Verdict::Accept(accept) => {
+                validate(&accept)?;
                 if current.strength == Strength::Inferred && !policy.admits_inferred(&accept.rules)
                 {
                     decision.would_accept = true;
@@ -892,19 +949,6 @@ impl<R: Repositories> Tx<'_, R> {
         accept: Accept,
         policy: &impl Policy,
     ) -> Result<TicketId, Error> {
-        if accept.title.trim().is_empty() || accept.scope.trim().is_empty() {
-            return Err(Error::Invalid("an accept needs a title and a scope".into()));
-        }
-        if let Plan::Swarm { agents, .. } = accept.plan
-            && !(1..=MAX_SWARM_AGENTS).contains(&agents)
-        {
-            return Err(Error::Invalid(format!(
-                "a swarm has 1 to {MAX_SWARM_AGENTS} agents, not {agents}"
-            )));
-        }
-        if accept.budget_microusd == 0 {
-            return Err(Error::Invalid("an accept needs a budget".into()));
-        }
         let primary = self.trigger(&eval.primary).ok_or_else(|| Error::Missing {
             kind: "trigger",
             id: eval.primary.to_string(),
@@ -964,18 +1008,12 @@ impl<R: Repositories> Tx<'_, R> {
         {
             self.send(&mut ticket, MessageKind::Acknowledgement, ack);
         }
-        let mut others = Vec::new();
-        for key_ in ticket.threads.iter().filter(|k| **k != thread.key) {
-            if let Some(other) = self.thread(key_) {
-                others.push(other);
-            }
+        self.save_thread(thread.clone());
+        self.adopt_waiting(&mut ticket, policy);
+        if let Some(saved) = self.thread(&thread.key) {
+            *thread = saved;
         }
-        self.adopt_queued(thread, &mut ticket, policy);
-        for mut other in others {
-            self.adopt_queued(&mut other, &mut ticket, policy);
-            self.save_thread(other);
-        }
-        self.start(&mut ticket, policy, false);
+        self.start(&mut ticket, policy);
         self.save_ticket(ticket);
         Ok(id)
     }

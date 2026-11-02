@@ -947,7 +947,7 @@ fn handing_back_a_bot_trigger_queues_nothing() {
 }
 
 #[test]
-fn a_pause_starts_no_evals_and_resumes_nothing() {
+fn a_pause_starts_no_evals_but_still_records_work() {
     let mut w = World::new(policy());
     let (ticket, assignment) = started_ticket(&mut w, "th1");
     w.engine
@@ -969,13 +969,36 @@ fn a_pause_starts_no_evals_and_resumes_nothing() {
     assert_eq!(
         intake,
         Intake::Stored {
-            reached: vec![],
-            queued: true
+            reached: vec![ticket.clone()],
+            queued: false
         }
     );
-    assert!(w.engine.evaluate_due().unwrap().is_empty());
-    assert!(w.effects().is_empty());
+    assert_eq!(
+        launched(&w.effects()).len(),
+        1,
+        "the effect runner holds it"
+    );
+    let nudge = slack(
+        "m1",
+        Actor::person("mallory"),
+        Addressed::Mention,
+        "th2",
+        "@agent hi",
+    );
+    w.engine.receive(nudge).unwrap();
+    assert!(
+        w.engine.evaluate_due().unwrap().is_empty(),
+        "no Eval while paused"
+    );
     w.engine.set_policy(policy());
+    let nudge = slack(
+        "a2",
+        Actor::person("alice"),
+        Addressed::Mention,
+        "th3",
+        "@agent hi",
+    );
+    w.engine.receive(nudge).unwrap();
     assert_eq!(
         w.engine.evaluate_due().unwrap().len(),
         1,

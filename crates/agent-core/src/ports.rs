@@ -47,8 +47,8 @@ pub enum Gate {
 /// text cannot change any of it.
 pub trait Policy {
     fn version(&self) -> String;
-    /// Processing pause: no new Evals and no resumes. The effect runner
-    /// holds every Effect until the pause lifts, and Sources keep recording.
+    /// Processing pause: no new Evals. The effect runner holds every Effect
+    /// until the pause lifts, and Sources keep recording.
     fn paused(&self) -> bool;
     fn gate(&self, trigger: &Trigger, has_tickets: bool) -> Gate;
     /// Whether an inferred accept may act on the rules the Router matched.

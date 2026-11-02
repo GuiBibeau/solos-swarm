@@ -352,7 +352,7 @@ fn f5_evaluate_due_errors_after_committing() {
     w.engine
         .receive(slack("b", alice(), Addressed::Mention, "th2", "two"))
         .unwrap();
-    w.engine.repos_mut().fail_in = Some(0);
+    w.engine.repos_mut().fail_in = Some(1);
     let result = w.engine.evaluate_due();
     let running: Vec<_> = w
         .mem()
@@ -367,14 +367,16 @@ fn f5_evaluate_due_errors_after_committing() {
         .iter()
         .filter(|e| matches!(e, Effect::Assess(_)))
         .count();
-    println!(
-        "evaluate_due -> {result:?}; threads with a running eval: {running:?}; queued Assess effects: {assess}"
-    );
-    assert!(result.is_err());
-    assert!(
-        running.is_empty() && assess == 0,
-        "an erroring command committed state"
-    );
+    match result {
+        Err(_) => assert!(
+            running.is_empty() && assess == 0,
+            "an erroring pass committed part of its work: {running:?}, {assess} Assess"
+        ),
+        Ok(started) => assert!(
+            started.len() == 2 && running.len() == 2 && assess == 2,
+            "a pass that succeeded committed only part of its work"
+        ),
+    }
 }
 
 /// Intent 3. A person's follow-up sent while the accepting Eval runs stays

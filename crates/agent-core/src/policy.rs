@@ -78,19 +78,14 @@ impl Policy for AllowlistPolicy {
     /// accept mode, the rules and the approval threshold. Pausing, approvers
     /// and timeouts do not change it, so they never discard running Evals.
     fn version(&self) -> String {
-        let join = |set: &BTreeSet<String>| set.iter().cloned().collect::<Vec<_>>().join("\n");
-        let mode = format!("{:?}", self.accept_mode);
-        let budget = self.auto_approve_microusd.to_string();
-        key(
-            "pv",
-            &[
-                &join(&self.people),
-                &join(&self.bots),
-                &mode,
-                &join(&self.rules),
-                &budget,
-            ],
-        )
+        let basis = serde_json::json!([
+            self.people,
+            self.bots,
+            self.accept_mode,
+            self.rules,
+            self.auto_approve_microusd,
+        ]);
+        key("pv", &[&basis.to_string()])
     }
     fn paused(&self) -> bool {
         self.paused
