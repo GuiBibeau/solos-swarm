@@ -81,11 +81,16 @@ pub struct Launch {
     pub assignment: AssignmentId,
     pub title: String,
     pub scope: String,
+    /// The proactive rules the Router matched, for inferred work.
+    pub rules: Vec<String>,
     pub plan: Plan,
     pub budget_microusd: MicroUsd,
-    /// A resume or restart: check the working directory before repeating
-    /// outside actions.
+    /// A resume or restart, or a Launch an earlier run may have performed:
+    /// check the working directory before repeating outside actions.
     pub recovery: bool,
+    /// Every Input the Ticket holds so far, in order. Those not yet handed
+    /// to an Assignment also come in a Delivery once this one starts.
+    pub inputs: Vec<Delivered>,
 }
 
 /// Inputs for a running Assignment, in order.

@@ -6,6 +6,7 @@
 pub mod broker;
 pub mod config;
 pub mod jsonl;
+pub mod pi_executor;
 pub mod pi_router;
 pub mod ports;
 pub mod runtime;

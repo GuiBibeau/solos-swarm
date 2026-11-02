@@ -35,7 +35,7 @@ use std::time::Instant;
 const THREADS: [&str; 3] = ["th1", "th2", "th3"];
 
 /// Every public Engine command, by the name `Op::name` gives it.
-const COMMANDS: [&str; 13] = [
+const COMMANDS: [&str; 14] = [
     "receive",
     "evaluate_due",
     "decide(accept)",
@@ -48,6 +48,7 @@ const COMMANDS: [&str; 13] = [
     "handback",
     "assignment_started",
     "assignment_ended",
+    "restart",
     "report",
 ];
 
@@ -90,6 +91,7 @@ enum Op {
     Handback(TicketId, TriggerId),
     Started(TicketId, AssignmentId),
     Ended(TicketId, AssignmentId),
+    Restart(TicketId, AssignmentId),
     Report(TicketId, AssignmentId, ReportIn),
     SetPolicy(AllowlistPolicy),
     Advance(u64),
@@ -114,6 +116,7 @@ impl Op {
             Op::Handback(..) => "handback",
             Op::Started(..) => "assignment_started",
             Op::Ended(..) => "assignment_ended",
+            Op::Restart(..) => "restart",
             Op::Report(..) => "report",
             Op::SetPolicy(_) => "set_policy",
             Op::Advance(_) => "advance_clock",
@@ -140,6 +143,7 @@ fn apply<R: Repositories>(
         Op::Handback(t, trigger) => e.handback(t, trigger, "not mine").map(|b| b.to_string()),
         Op::Started(t, a) => e.assignment_started(t, a).map(unit),
         Op::Ended(t, a) => e.assignment_ended(t, a, "process exited").map(unit),
+        Op::Restart(t, a) => e.restart(t, a, "host restarted").map(|a| format!("{a:?}")),
         Op::Report(t, a, r) => e.report(t, a, r.clone()).map(unit),
         Op::SetPolicy(p) => {
             e.set_policy(p.clone());
@@ -428,7 +432,11 @@ fn gen_op(rng: &mut Lcg, w: &mut Walk) -> Op {
         76..=78 => {
             let t = pick_ticket(rng, r, Ticket::has_live_assignment);
             let a = pick_assignment(rng, r, &t);
-            Op::Ended(t, a)
+            if rng.chance(50) {
+                Op::Ended(t, a)
+            } else {
+                Op::Restart(t, a)
+            }
         }
         79..=82 => Op::SetPolicy(mutate_policy(rng, w.mem.policy())),
         83..=89 => Op::Advance(rng.pick(&[1, 1_000, 40_000, 130_000])),

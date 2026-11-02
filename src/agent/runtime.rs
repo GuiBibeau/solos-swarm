@@ -11,8 +11,8 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use solos_agent_core::ids::key;
 use solos_agent_core::model::{
-    Actor, Approval, AssignmentId, Candidate, Effect, InputBody, MessageId, MessageKind, Ms,
-    OutboundMessage, Stage, TicketId, Trigger,
+    Actor, Approval, AssignmentId, AssignmentState, Candidate, Effect, Input, InputBody, MessageId,
+    MessageKind, Ms, OutboundMessage, Stage, Ticket, TicketId, Trigger,
 };
 use solos_agent_core::{AllowlistPolicy, Engine, Error, Intake, Policy, Repositories};
 use solos_agent_store::{EffectId, QueuedEffect, SqliteStore};
@@ -28,6 +28,8 @@ use tokio::time::MissedTickBehavior;
 pub type AgentEngine = Engine<SqliteStore, AllowlistPolicy, fn() -> Ms>;
 
 const MAX_IN_FLIGHT: usize = 64;
+/// Why a start ends the Assignments the last run left without a worker.
+pub const HOST_RESTARTED: &str = "host restarted";
 
 pub struct Adapters {
     pub sources: Vec<Box<dyn Source>>,
@@ -153,6 +155,7 @@ impl Runtime {
     /// start.
     pub async fn run(mut self, stop: impl Future<Output = ()>) -> Result<Summary> {
         self.recovered = self.engine.repos().effects()?.last().map(|q| q.id);
+        self.recover()?;
         let facts = self.facts.clone();
         let mut inbound = self.inbound.take().context("a runtime runs once")?;
         let (trigger_tx, mut triggers) = mpsc::channel::<Vec<Trigger>>(16);
@@ -201,6 +204,63 @@ impl Runtime {
             .count();
         self.summary.effects_pending = pending as u64;
         Ok(self.summary)
+    }
+
+    /// Workers die with the process that ran them. An Assignment the last
+    /// run left running, or pending with its Launch performed, ends as
+    /// `host restarted`, oldest Ticket first. One that was working starts
+    /// again at once with `recovery` set; one that waited for input, an
+    /// answer or a person starts again with the next Input that wakes it. A
+    /// pending one whose Launch is still queued is left to that Launch.
+    fn recover(&mut self) -> Result<()> {
+        let store = self.engine.repos();
+        let queued: BTreeSet<AssignmentId> = store
+            .effects()?
+            .into_iter()
+            .filter(|q| !q.done)
+            .filter_map(|q| match q.effect {
+                Effect::Launch { assignment, .. } => Some(assignment),
+                _ => None,
+            })
+            .collect();
+        let mut lost = Vec::new();
+        for id in store.open_tickets()? {
+            let Some(ticket) = store.ticket(&id) else {
+                continue;
+            };
+            let Some(latest) = ticket.latest_assignment() else {
+                continue;
+            };
+            let gone = match latest.state {
+                AssignmentState::Running => true,
+                AssignmentState::Pending => !queued.contains(&latest.id),
+                AssignmentState::Ended => false,
+            };
+            if gone {
+                let working = matches!(ticket.stage(), Stage::Queued | Stage::Working);
+                lost.push((ticket.created_ms, id, latest.id.clone(), working));
+            }
+        }
+        lost.sort();
+        for (_, ticket, assignment, working) in lost {
+            let result = if working {
+                self.engine
+                    .restart(&ticket, &assignment, HOST_RESTARTED)
+                    .map(drop)
+            } else {
+                self.engine
+                    .assignment_ended(&ticket, &assignment, HOST_RESTARTED)
+            };
+            let what = format!("recovery of {assignment} on {ticket}");
+            settle(&what, result)?;
+            let next = if working {
+                "a recovery starts now"
+            } else {
+                "its next input starts a recovery"
+            };
+            eprintln!("agent: {assignment} of {ticket} ended: {HOST_RESTARTED}; {next}");
+        }
+        Ok(())
     }
 
     /// Follow the control directory's pause gate, reading it at most once a
@@ -435,14 +495,26 @@ impl Runtime {
                 recovery,
             } => {
                 let found = store.ticket(&ticket).context("no such ticket")?;
+                if !live(&found, &assignment) {
+                    return Ok(Job::Skip(format!(
+                        "{assignment} of {ticket} has ended; it is not launched"
+                    )));
+                }
+                let inputs = found
+                    .inputs
+                    .iter()
+                    .map(|input| self.delivered(input.clone()))
+                    .collect::<Result<_>>()?;
                 Job::Launch(Launch {
                     ticket,
                     assignment,
                     title: found.title,
                     scope: found.mandate.scope,
+                    rules: found.mandate.rules,
                     plan,
                     budget_microusd,
-                    recovery,
+                    recovery: recovery || repeat,
+                    inputs,
                 })
             }
             Effect::Deliver {
@@ -460,15 +532,7 @@ impl Runtime {
                             .find(|input| input.id == *id)
                             .cloned()
                             .with_context(|| format!("{ticket} has no input {id}"))?;
-                        let trigger = match &input.body {
-                            InputBody::Trigger { trigger } => Some(
-                                store
-                                    .trigger(trigger)
-                                    .with_context(|| format!("no trigger {trigger}"))?,
-                            ),
-                            _ => None,
-                        };
-                        Ok(Delivered { input, trigger })
+                        self.delivered(input)
                     })
                     .collect::<Result<_>>()?;
                 Job::Deliver(Delivery {
@@ -500,6 +564,20 @@ impl Runtime {
                 Job::Send(message, SendOptions { repeat, approval })
             }
         })
+    }
+
+    /// An Input with the Trigger it names.
+    fn delivered(&self, input: Input) -> Result<Delivered> {
+        let trigger = match &input.body {
+            InputBody::Trigger { trigger } => Some(
+                self.engine
+                    .repos()
+                    .trigger(trigger)
+                    .with_context(|| format!("no trigger {trigger}"))?,
+            ),
+            _ => None,
+        };
+        Ok(Delivered { input, trigger })
     }
 
     fn inbound(&mut self, message: Inbound) -> Result<()> {
@@ -633,6 +711,14 @@ fn may_stop(policy: &AllowlistPolicy, source: &str, by: &Actor) -> bool {
             || policy.people.contains(&format!("{source}:{}", by.id)))
 }
 
+/// `assignment` is `ticket`'s latest and has not ended, so a worker may
+/// still start for it.
+fn live(ticket: &Ticket, assignment: &AssignmentId) -> bool {
+    ticket
+        .latest_assignment()
+        .is_some_and(|a| a.id == *assignment && a.state != AssignmentState::Ended)
+}
+
 fn backoff(options: &RunOptions, attempts: u32) -> Duration {
     options
         .retry_base
@@ -650,11 +736,17 @@ enum Job {
         reason: String,
     },
     Send(OutboundMessage, SendOptions),
+    /// Nothing to perform any more, and why.
+    Skip(String),
 }
 
 impl Job {
     async fn perform(self, shared: Shared, facts: FactSink) -> Result<()> {
         match self {
+            Job::Skip(why) => {
+                eprintln!("agent: {why}");
+                Ok(())
+            }
             Job::Assess(candidate) => shared.router.assess(candidate, facts).await,
             Job::Launch(launch) => shared.executor.launch(launch, facts).await,
             Job::Deliver(delivery) => shared.executor.deliver(delivery, facts).await,

@@ -835,6 +835,54 @@ fn report(status: ReportStatus) -> ReportIn {
 }
 
 #[test]
+fn a_restart_ends_the_lost_assignment_and_launches_a_recovery_in_one_commit() {
+    let mut w = World::new(policy());
+    let (ticket, first) = started_ticket(&mut w, "th1");
+
+    let second = w
+        .engine
+        .restart(&ticket, &first, "host restarted")
+        .unwrap()
+        .unwrap();
+
+    let effects = w.effects();
+    let stops: Vec<_> = effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Stop {
+                assignment, reason, ..
+            } => Some((assignment.clone(), reason.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(stops, [(first.clone(), "host restarted".to_owned())]);
+    assert!(
+        effects.iter().any(|e| matches!(e,
+            Effect::Launch { assignment, recovery: true, .. } if *assignment == second)),
+        "{effects:?}"
+    );
+    let t = &w.engine.repos().tickets[&ticket];
+    assert_eq!(
+        t.assignments[0].ended_reason.as_deref(),
+        Some("host restarted")
+    );
+    assert_eq!(t.stage(), Stage::Queued);
+    assert!(
+        w.engine.restart(&ticket, &first, "again").is_err(),
+        "only the latest assignment restarts"
+    );
+    w.engine
+        .assignment_ended(&ticket, &second, "host restarted")
+        .unwrap();
+    assert!(
+        w.engine.restart(&ticket, &second, "again").is_err(),
+        "an ended assignment does not restart"
+    );
+    w.engine.stop_ticket(&ticket, "stopped").unwrap();
+    assert!(w.engine.restart(&ticket, &second, "again").is_err());
+}
+
+#[test]
 fn an_unlisted_follow_up_neither_resumes_work_nor_ends_a_hold() {
     let mut w = World::new(policy());
     let (ticket, assignment) = started_ticket(&mut w, "th1");
