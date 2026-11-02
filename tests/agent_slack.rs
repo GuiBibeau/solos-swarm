@@ -25,7 +25,7 @@ use solos_swarm::agent::scripted::{ScriptedExecutor, ScriptedRouter};
 use solos_swarm::agent::slack::{
     APPROVE_ACTION, METADATA_EVENT, STOP_ACTION, SlackApi, SlackChannel, SlackSource, Token,
 };
-use solos_swarm::agent::{Adapters, RunOptions, Runtime, STORE_FILE, Summary, serve};
+use solos_swarm::agent::{Adapters, RunOptions, Runtime, STORE_FILE, ServeOptions, Summary, serve};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write;
 use std::net::SocketAddr;
@@ -1247,8 +1247,12 @@ budgets: {{session_microusd: {BUDGET}}}
     };
 
     let state = scratch.root.join("state");
+    let options = ServeOptions {
+        until_idle: true,
+        ..ServeOptions::default()
+    };
     let (summary, posts) = tokio::time::timeout(LIMIT, async {
-        tokio::join!(serve(&config, &state, true), driver)
+        tokio::join!(serve(&config, &state, options), driver)
     })
     .await
     .expect("agent serve did not go idle");

@@ -8,11 +8,13 @@
 
 mod chain;
 mod error;
+mod ledger;
 mod queue;
 mod schema;
 
 pub use chain::Chain;
 pub use error::StoreError;
+pub use ledger::{HoldId, HoldRequest, Reservation, Spend, SpendState, Tokens};
 pub use queue::{EffectId, QueuedEffect};
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -84,6 +86,23 @@ impl SqliteStore {
     /// Every Decision, by id.
     pub fn decisions(&self) -> Result<Vec<Decision>, StoreError> {
         self.bodies("SELECT body FROM decisions ORDER BY id")
+    }
+
+    /// One Trigger. Unlike the port's read, a failed read is an error here.
+    pub fn read_trigger(&self, id: &TriggerId) -> Result<Option<Trigger>, StoreError> {
+        self.body("SELECT body FROM triggers WHERE id = ?1", id.as_str())
+    }
+
+    pub fn read_thread(&self, key: &ThreadKey) -> Result<Option<Thread>, StoreError> {
+        self.body("SELECT body FROM threads WHERE key = ?1", key.as_str())
+    }
+
+    pub fn read_ticket(&self, id: &TicketId) -> Result<Option<Ticket>, StoreError> {
+        self.body("SELECT body FROM tickets WHERE id = ?1", id.as_str())
+    }
+
+    pub fn read_decision(&self, id: &DecisionId) -> Result<Option<Decision>, StoreError> {
+        self.body("SELECT body FROM decisions WHERE id = ?1", id.as_str())
     }
 
     /// Tickets that have not ended, by id.

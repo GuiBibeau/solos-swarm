@@ -213,3 +213,153 @@ test("provider rejects malformed responses and handles denial and cancellation w
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+const routerNames = ["router_decide", "router_read"];
+
+test("the router tool set talks to the broker, takes its system prompt and sees a refused decision as a tool error", { timeout: 30_000 }, async (t) => {
+  const dir = await mkdtemp(`${tmpdir()}/swarm-router-`);
+  const socket = `${dir}/broker.sock`;
+  let modelCalls = 0;
+  let sessionCalls = 0;
+  const toolCalls: string[] = [];
+  const refusal = "refused: ev_1 is not running";
+  const server = createServer(async (req, res) => {
+    try {
+      assert.equal(req.headers.authorization, "Bearer router-test-token");
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const body = JSON.parse(Buffer.concat(chunks).toString());
+      res.setHeader("Content-Type", "application/json");
+      if (req.url === "/session") {
+        sessionCalls++;
+        res.end(JSON.stringify({ system_prompt: "You are the test Router. Decide every candidate." }));
+      } else if (req.url === "/model") {
+        modelCalls++;
+        assert.deepEqual(body.tools.map((tool: { function: { name: string } }) => tool.function.name).sort(), routerNames);
+        const decide = body.tools.find((tool: { function: { name: string } }) => tool.function.name === "router_decide");
+        assert.deepEqual(decide.function.parameters.properties.decision.enum, ["accept", "ignore", "stop"]);
+        const system = body.messages.find((message: { role: string }) => message.role === "system");
+        assert.ok(JSON.stringify(system?.content ?? "").includes("You are the test Router."), JSON.stringify(body.messages));
+        if (modelCalls === 1) {
+          const calls = [
+            { id: "call-read", type: "function", function: { name: "router_read", arguments: JSON.stringify({ id: "t1" }) } },
+            { id: "call-decide", type: "function", function: { name: "router_decide", arguments: JSON.stringify({ eval: "ev_1", decision: "ignore", reason: "chatter" }) } },
+          ];
+          res.end(JSON.stringify({
+            id: "completion-1", created: 1, model: "deepseek-flash", swarm_cost_microusd: 30,
+            choices: [{ index: 0, message: { role: "assistant", content: null, tool_calls: calls }, finish_reason: "tool_calls" }],
+            usage: { prompt_tokens: 20, completion_tokens: 20, total_tokens: 40 },
+          }));
+        } else {
+          const results = body.messages.filter((message: { role: string }) => message.role === "tool")
+            .map((message: { content: unknown }) => typeof message.content === "string" ? message.content : JSON.stringify(message.content));
+          assert.equal(results.length, 2);
+          assert.ok(results.some((text: string) => text.includes(refusal)), `the model must see the Engine's refusal: ${results}`);
+          assert.ok(results.some((text: string) => text.includes("\"kind\":\"trigger\"")));
+          res.end(JSON.stringify({
+            id: "completion-2", created: 1, model: "deepseek-flash", swarm_cost_microusd: 30,
+            choices: [{ index: 0, message: { role: "assistant", content: "Decided." }, finish_reason: "stop" }],
+            usage: { prompt_tokens: 20, completion_tokens: 5, total_tokens: 25 },
+          }));
+        }
+      } else {
+        const name = req.url?.split("/").at(-1) ?? "";
+        toolCalls.push(name);
+        if (name === "router_read") {
+          assert.deepEqual(body, { id: "t1" });
+          res.end(JSON.stringify({ kind: "trigger", id: "t1", threads: ["T1"], tickets: [] }));
+        } else {
+          assert.equal(name, "router_decide");
+          assert.deepEqual(body, { eval: "ev_1", decision: "ignore", reason: "chatter" });
+          res.statusCode = 409;
+          res.end(JSON.stringify({ error: refusal }));
+        }
+      }
+    } catch (error) {
+      res.statusCode = 500;
+      res.end(JSON.stringify({ error: String(error) }));
+    }
+  });
+  await new Promise<void>((done) => server.listen(socket, done));
+  const child = spawn(process.execPath, [
+    resolve("node_modules/@earendil-works/pi-coding-agent/dist/cli.js"),
+    "--offline", "--mode", "rpc", "--provider", "swarm", "--model", "deepseek-flash", "--thinking", "off",
+    "--no-session", "--no-builtin-tools", "--no-extensions", "--no-mcp", "--no-skills", "--no-prompt-templates",
+    "--no-themes", "--no-context-files", "--no-approve", "--extension", resolve("extensions/broker.ts"),
+  ], { cwd: dir, signal: t.signal, env: { PATH: process.env.PATH, HOME: dir, PI_CODING_AGENT_DIR: `${dir}/config`, SWARM_SOCKET: socket, SWARM_TOKEN: "router-test-token", SWARM_ROLE: "router", SWARM_GRANTS: "router_decide,router_read", SWARM_TOOLSET: "router", PI_TELEMETRY: "0" }, stdio: ["pipe", "pipe", "pipe"] });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const records: any[] = [];
+  const settled = new Promise<void>((done, reject) => {
+    let pending = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      pending += chunk;
+      let newline;
+      while ((newline = pending.indexOf("\n")) >= 0) {
+        const line = pending.slice(0, newline);
+        pending = pending.slice(newline + 1);
+        if (!line) continue;
+        try {
+          const record = JSON.parse(line);
+          records.push(record);
+          if (record.type === "response" && record.success === false) reject(new Error(JSON.stringify(record)));
+          if (record.type === "extension_error") reject(new Error(JSON.stringify(record)));
+          if (record.type === "agent_settled") done();
+        } catch (error) { reject(error); }
+      }
+    });
+    child.on("error", reject);
+    child.on("exit", (code) => reject(new Error(`Pi exited ${code}: ${stderr}`)));
+  });
+  try {
+    child.stdin.write(`${JSON.stringify({ id: "prompt-1", type: "prompt", message: "eval ev_1 thread T1 strength explicit" })}\n`);
+    await settled;
+    assert.equal(modelCalls, 2, `${stderr}\n${JSON.stringify(records.filter((record) => record.type === "message_end"))}`);
+    assert.equal(sessionCalls, 1);
+    assert.deepEqual(toolCalls.sort(), routerNames);
+    const ends = records.filter((record) => record.type === "tool_execution_end");
+    const decided = ends.find((record) => record.toolName === "router_decide");
+    assert.equal(decided?.isError, true, JSON.stringify(ends));
+  } finally {
+    child.kill("SIGKILL");
+    await new Promise<void>((done) => server.close(() => done()));
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("SWARM_TOOLSET=router registers only the Router tools, whatever the role and grants say", () => {
+  const saved = { role: process.env.SWARM_ROLE, grants: process.env.SWARM_GRANTS, toolset: process.env.SWARM_TOOLSET };
+  process.env.SWARM_ROLE = "coordinator";
+  process.env.SWARM_GRANTS = names.join(",");
+  process.env.SWARM_TOOLSET = "router";
+  const declared: string[] = [];
+  const events: string[] = [];
+  let guard: ((event: { toolName: string }) => unknown) | undefined;
+  const restore = (name: string, value: string | undefined) => { if (value === undefined) delete process.env[name]; else process.env[name] = value; };
+  try {
+    swarmBroker({
+      registerProvider() {}, registerTool(tool) { declared.push(tool.name); },
+      on(event, handler) { events.push(event); if (event === "tool_call") guard = handler; },
+    } as ExtensionAPI);
+    assert.deepEqual(declared.sort(), routerNames);
+    assert.ok(events.includes("before_agent_start"), "the Router takes its system prompt from the broker");
+    for (const forged of ["run_code", "fetch_url", "claim_task", "submit_artifact"]) {
+      assert.equal((guard?.({ toolName: forged }) as { block: boolean }).block, true, forged);
+    }
+    assert.equal(guard?.({ toolName: "router_decide" }), undefined);
+    process.env.SWARM_TOOLSET = "worker";
+    assert.throws(() => swarmBroker({ registerProvider() {}, registerTool() {}, on() {} } as ExtensionAPI), /Unknown SWARM_TOOLSET/);
+    delete process.env.SWARM_TOOLSET;
+    const swarm: string[] = [];
+    const swarmEvents: string[] = [];
+    swarmBroker({ registerProvider() {}, registerTool(tool) { swarm.push(tool.name); }, on(event) { swarmEvents.push(event); } } as ExtensionAPI);
+    assert.deepEqual(swarm.sort(), [...names].sort(), "unset keeps the swarm tool set");
+    assert.ok(!swarmEvents.includes("before_agent_start"), "a swarm agent keeps Pi's own system prompt");
+  } finally {
+    restore("SWARM_ROLE", saved.role);
+    restore("SWARM_GRANTS", saved.grants);
+    restore("SWARM_TOOLSET", saved.toolset);
+  }
+});

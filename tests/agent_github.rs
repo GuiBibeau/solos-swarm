@@ -26,7 +26,7 @@ use solos_swarm::agent::ports::{
 };
 use solos_swarm::agent::scripted::{ScriptedExecutor, ScriptedRouter};
 use solos_swarm::agent::utc;
-use solos_swarm::agent::{Adapters, RunOptions, Runtime, STORE_FILE, Summary, serve};
+use solos_swarm::agent::{Adapters, RunOptions, Runtime, STORE_FILE, ServeOptions, Summary, serve};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write;
@@ -1629,7 +1629,11 @@ budgets: {{session_microusd: {BUDGET}}}
     .unwrap();
     let state = scratch.root.join("state");
 
-    let summary = tokio::time::timeout(LIMIT, serve(&config, &state, true))
+    let options = ServeOptions {
+        until_idle: true,
+        ..ServeOptions::default()
+    };
+    let summary = tokio::time::timeout(LIMIT, serve(&config, &state, options))
         .await
         .expect("agent serve did not go idle")
         .unwrap();

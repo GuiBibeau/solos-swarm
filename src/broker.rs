@@ -13,15 +13,12 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
-    future::Future,
     io::Write,
     path::{Path, PathBuf},
-    pin::Pin,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex, Semaphore};
-use zeroize::Zeroizing;
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -45,59 +42,13 @@ pub fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Dialect {
-    /// DeepSeek hosted: `thinking` is a parameter on the same chat body.
-    DeepSeek,
-    /// Any other OpenAI-compatible gateway; reasoning is steered by `reasoning_effort`.
-    OpenAi,
-}
-/// The exact admitted upstream a Goal spends against. The provider is named
-/// explicitly because it is what the receipt, ledger and checker attribute.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Upstream {
-    pub provider: String,
-    pub model: String,
-    pub dialect: Dialect,
-}
-impl Upstream {
-    pub fn deepseek(model: &str) -> Self {
-        Self {
-            provider: "deepseek".into(),
-            model: model.into(),
-            dialect: Dialect::DeepSeek,
-        }
-    }
-}
-/// Model IDs of the admitted Venice catalog. Newer revisions carry a date
-/// suffix, so selection is prefix-anchored rather than an exact match.
-pub fn venice_model(model: &str) -> bool {
-    model.starts_with("deepseek-v4-1-flash-uncensored") || model.starts_with("zai-org-glm-5")
-}
-/// Resolve a deployment provider id and model into its admitted upstream, so an
-/// operator selects a shipped profile by name instead of restating its dialect.
-/// An unknown provider fails rather than silently defaulting, because the wrong
-/// dialect would send a vendored parameter openai-compatible gateways ignore.
-pub fn upstream_profile(provider: &str, model: &str) -> Result<Upstream> {
-    ensure!(!model.is_empty(), "provider model is empty");
-    Ok(if provider == "deepseek" {
-        Upstream::deepseek(model)
-    } else if provider == "venice" {
-        ensure!(
-            venice_model(model),
-            "model is outside the admitted Venice catalog"
-        );
-        Upstream {
-            provider: provider.into(),
-            model: model.into(),
-            dialect: Dialect::OpenAi,
-        }
-    } else {
-        bail!("provider outside the deployment allowlist: {provider}")
-    })
-}
+// The upstream profiles, their transport, pricing and the pause gate are
+// shared with agent mode; these names keep every existing caller working.
+#[allow(unused_imports)]
+pub use solos_swarm::gateway::{
+    Dialect, OpenAiCompatible, PriceTable, Provider, Upstream, effective_control, peak_retry_after,
+    reasoning_model, upstream_profile, venice_model,
+};
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Goal {
@@ -223,22 +174,7 @@ impl Goal {
                 && (1..=393_216).contains(&self.max_output_tokens),
             "invalid request limits"
         );
-        ensure!(
-            self.input_price_microusd_per_million >= 300_000
-                && self.output_price_microusd_per_million >= 1_200_000,
-            "price table below admitted conservative peak rates"
-        );
-        ensure!(
-            self.input_price_microusd_per_million <= 10_000_000
-                && self.output_price_microusd_per_million <= 10_000_000,
-            "invalid price table"
-        );
-        if let Some(hit) = self.cache_hit_price_microusd_per_million {
-            ensure!(
-                (6_000..=self.input_price_microusd_per_million).contains(&hit),
-                "cache-hit rate outside admitted peak prices"
-            );
-        }
+        self.prices().validate()?;
         // The six historical grants always exist; `fetch_url` and `run_code`
         // are optional so a Goal frozen before those tools existed keeps
         // validating unchanged.
@@ -285,19 +221,19 @@ impl Goal {
             .clone()
             .unwrap_or_else(|| Upstream::deepseek(&self.model))
     }
+    pub fn prices(&self) -> PriceTable {
+        PriceTable {
+            input_microusd_per_million: self.input_price_microusd_per_million,
+            output_microusd_per_million: self.output_price_microusd_per_million,
+            cache_hit_microusd_per_million: self.cache_hit_price_microusd_per_million,
+        }
+    }
+    #[cfg(test)]
     fn cost(&self, input: u64, output: u64) -> u64 {
-        // Charge all input at peak cache-miss rates; this deliberately overstates the invoice.
-        (input * self.input_price_microusd_per_million).div_ceil(1_000_000)
-            + (output * self.output_price_microusd_per_million).div_ceil(1_000_000)
+        self.prices().hold(input, output)
     }
     fn settled_cost(&self, input: u64, cached: u64, output: u64) -> u64 {
-        let hit_rate = self
-            .cache_hit_price_microusd_per_million
-            .unwrap_or(self.input_price_microusd_per_million);
-        // Round the combined input charge once so splitting a prompt never increases its cost.
-        ((input - cached) * self.input_price_microusd_per_million + cached * hit_rate)
-            .div_ceil(1_000_000)
-            + (output * self.output_price_microusd_per_million).div_ceil(1_000_000)
+        self.prices().settled(input, cached, output)
     }
 }
 
@@ -621,8 +557,9 @@ impl Store {
                 "agent turn ceiling exhausted"
             );
         }
-        // UTF-8 bytes plus chat framing overbounds byte-BPE input; reject usage above this bound.
-        let hold = goal.cost(input_bytes as u64 + 4096, goal.max_output_tokens);
+        let hold = goal
+            .prices()
+            .request_hold(input_bytes, goal.max_output_tokens);
         ensure!(
             self.spent_microusd + self.held_microusd + hold <= goal.budget_microusd,
             "Goal spend ceiling exhausted"
@@ -665,30 +602,20 @@ impl Store {
             self.intents[index].state == "dispatched",
             "intent already settled or not dispatched"
         );
-        let usage = solos_swarm::provider::completion_usage(&response["usage"])?;
-        let input = usage.input_tokens;
-        let output = usage.output_tokens;
-        let cached = usage.cached_input_tokens;
-        ensure!(
-            input <= 1_000_000 && output <= goal.max_output_tokens,
-            "provider usage exceeds contract"
+        let receipt = solos_swarm::gateway::Receipt::read(response, goal.max_output_tokens)?;
+        let cost = goal.settled_cost(
+            receipt.input_tokens,
+            receipt.cached_input_tokens,
+            receipt.output_tokens,
         );
-        let request_id = response["id"]
-            .as_str()
-            .filter(|v| !v.is_empty())
-            .context("missing provider receipt")?
-            .to_owned();
-        let cost = goal.settled_cost(input, cached, output);
         let intent = &mut self.intents[index];
         let exceeds_hold = cost > intent.hold_microusd;
         let id = intent.agent_id.clone();
         self.held_microusd -= intent.hold_microusd;
         self.spent_microusd += cost;
         intent.cost_microusd = cost;
-        intent.usage = Some(
-            json!({"input_tokens":input,"cached_input_tokens":cached,"uncached_input_tokens":input-cached,"output_tokens":output}),
-        );
-        intent.request_id = Some(request_id);
+        intent.usage = Some(receipt.usage());
+        intent.request_id = Some(receipt.request_id);
         intent.state = "completed".into();
         self.agents.get_mut(&id).unwrap().successful_model_calls += 1;
         if exceeds_hold || self.spent_microusd + self.held_microusd > goal.budget_microusd {
@@ -1008,77 +935,6 @@ fn deferred_record(task: &Task, reason: &str, partial: Option<&str>) -> Value {
     record
 }
 
-type Dispatch = Pin<Box<dyn Future<Output = Result<Value>> + Send>>;
-pub trait Provider: Send + Sync {
-    fn dispatch(&self, body: Value) -> Dispatch;
-}
-/// An OpenAI-compatible hosted endpoint. `dialect` is the only difference
-/// between the shipped profiles, so one transport serves both and neither
-/// duplicates the receipt, bound or error handling.
-pub struct OpenAiCompatible {
-    pub endpoint: &'static str,
-    pub dialect: Dialect,
-    pub client: reqwest::Client,
-    pub key: Zeroizing<String>,
-}
-impl Provider for OpenAiCompatible {
-    fn dispatch(&self, body: Value) -> Dispatch {
-        let endpoint = self.endpoint;
-        let dialect = self.dialect;
-        let client = self.client.clone();
-        let key = self.key.clone();
-        Box::pin(async move {
-            // `thinking` is DeepSeek's own dialect and Venice rejects it outright
-            // ("Invalid request parameters", HTTP 400), so an OpenAI-compatible
-            // route REPLACES it rather than augmenting: the field is removed and
-            // the intent re-expressed as `reasoning_effort`, because a reasoning
-            // model would otherwise leave reasoning at its costlier default. A
-            // non-reasoning model rejects `reasoning_effort: "none"`, so that is
-            // only sent where the Goal declared reasoning off.
-            let mut body = body;
-            if dialect == Dialect::OpenAi {
-                let disabled = body["thinking"]["type"] == json!("disabled");
-                if let Some(object) = body.as_object_mut() {
-                    object.remove("thinking");
-                }
-                if disabled && reasoning_model(body["model"].as_str().unwrap_or_default()) {
-                    body["reasoning_effort"] = json!("none");
-                }
-            }
-            let mut response = client
-                .post(endpoint)
-                .bearer_auth(key.as_str())
-                .json(&body)
-                .send()
-                .await
-                .map_err(|_| anyhow::anyhow!("provider transport failure; outcome unknown"))?;
-            ensure!(
-                response.status().is_success(),
-                "provider returned HTTP {}; outcome requires reconciliation",
-                response.status().as_u16()
-            );
-            let mut bytes = Vec::new();
-            while let Some(chunk) = response
-                .chunk()
-                .await
-                .map_err(|_| anyhow::anyhow!("provider response interrupted"))?
-            {
-                ensure!(
-                    bytes.len() + chunk.len() <= 262_144,
-                    "provider response exceeds limit"
-                );
-                bytes.extend_from_slice(&chunk);
-            }
-            serde_json::from_slice(&bytes).context("invalid provider response")
-        })
-    }
-}
-/// Models whose `reasoning_effort` field is meaningful on an OpenAI-compatible
-/// gateway. Kept beside the catalog admission so adding a model to one without
-/// the other is visible.
-pub fn reasoning_model(model: &str) -> bool {
-    model.starts_with("deepseek-v4-1-flash") || model.starts_with("zai-org-glm-5")
-}
 #[derive(Clone)]
 pub struct Broker {
     pub goal: Arc<Goal>,
@@ -1100,46 +956,6 @@ fn denied(error: anyhow::Error) -> (StatusCode, Json<Value>) {
     )
 }
 
-/// Seconds until the weekday peak window ends when `now_secs` (Unix, UTC) falls inside one: Mon-Fri 01:00-04:00 and
-/// 06:00-10:00. No model call may start inside it when `SWARM_REFUSE_PEAK=1`, so no tokens are bought at peak price.
-pub fn peak_retry_after(now_secs: u64) -> Option<u64> {
-    let weekday = (now_secs / 86_400 + 4) % 7; // 1970-01-01 was a Thursday; 0 = Sunday
-    if !(1..=5).contains(&weekday) {
-        return None;
-    }
-    let second_of_day = now_secs % 86_400;
-    [(3_600, 14_400), (21_600, 36_000)]
-        .into_iter()
-        .find(|(start, end)| (*start..*end).contains(&second_of_day))
-        .map(|(_, end)| end - second_of_day)
-}
-/// The one pause test. `control.json` in the run directory is the source of truth: an operator or the broker
-/// itself (provider outage, drain) writes `{"mode":"pause"|"drain"}` there. Two inputs feed the same answer: a
-/// `PAUSE` file (the older operator switch) and, with `SWARM_REFUSE_PEAK=1`, a peak window. Returns the polling
-/// interval the client should wait (at most 60 s). A paused request is refused BEFORE any reservation, so it
-/// costs no call, no hold and no ledger entry.
-pub fn effective_control(dir: &Path, now_secs: u64) -> Option<u64> {
-    let mode = fs::read_to_string(dir.join("control.json"))
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .and_then(|control| control["mode"].as_str().map(str::to_owned));
-    if matches!(mode.as_deref(), Some("pause" | "drain")) {
-        return Some(30);
-    }
-    if dir.join("PAUSE").exists() {
-        return Some(60);
-    }
-    if std::env::var("SWARM_REFUSE_PEAK").as_deref() == Ok("1") {
-        return peak_retry_after(now_secs).map(|s| s.clamp(1, 60));
-    }
-    None
-}
-fn unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
 async fn model(
     State(broker): State<Broker>,
     headers: HeaderMap,
@@ -1158,35 +974,16 @@ async fn model(
             store.dir.clone(),
         )
     };
-    if let Some(wait) = effective_control(&run_dir, unix_secs()) {
+    if let Some(wait) = effective_control(&run_dir, solos_swarm::gateway::unix_secs()) {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(
-                json!({"paused":true,"retry_after_s":wait,"reason":"model calls are paused (operator pause or peak window)"}),
-            ),
+            Json(solos_swarm::gateway::paused_reply(wait)),
         ));
     }
-    if body["model"] != broker.goal.model
-        || !body["messages"].is_array()
-        || body["messages"].as_array().unwrap().is_empty()
-    {
-        return Err(denied(anyhow::anyhow!(
-            "model or message shape outside contract"
-        )));
-    }
-    if let Some(tools) = body.get("tools") {
-        let tools = tools
-            .as_array()
-            .ok_or_else(|| denied(anyhow::anyhow!("invalid tool schema")))?;
-        for tool in tools {
-            let name = tool["function"]["name"]
-                .as_str()
-                .ok_or_else(|| denied(anyhow::anyhow!("invalid tool name")))?;
-            if !broker.goal.grants.iter().any(|g| g == name) {
-                return Err(denied(anyhow::anyhow!("unadmitted provider tool")));
-            }
-        }
-    }
+    solos_swarm::gateway::admit_request(&body, &broker.goal.model, |name| {
+        broker.goal.grants.iter().any(|g| g == name)
+    })
+    .map_err(denied)?;
     let _permit = broker.slots.acquire().await.map_err(|e| denied(e.into()))?;
     let index = {
         let mut store = broker.store.lock().await;
@@ -1211,7 +1008,11 @@ async fn model(
         };
         // The wire model comes from the declared upstream, not the Goal alias:
         // a Goal may name one model while the provider is selected separately.
-        body = json!({"model":broker.goal.resolved().model,"messages":body["messages"],"tools":body.get("tools").cloned().unwrap_or(json!([])),"max_tokens":broker.goal.max_output_tokens,"thinking":{"type":"disabled"},"temperature":0,"stream":false});
+        body = solos_swarm::gateway::upstream_body(
+            &broker.goal.resolved().model,
+            &body,
+            broker.goal.max_output_tokens,
+        );
         let intent_id = store.intents[index].id.clone();
         store
             .record(
