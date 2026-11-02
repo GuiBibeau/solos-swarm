@@ -132,6 +132,22 @@ enum AgentCommand {
         #[arg(long)]
         credential_file: Option<PathBuf>,
     },
+    /// What the agent is doing and why: open Tickets, recent Decisions,
+    /// pending and failing Effects, the Router's spend today, the pause, and
+    /// the alerts the Watchdog would raise now. Reads the Store and writes
+    /// nothing, so it is safe while the agent serves.
+    Status {
+        /// The agent's state directory.
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// The agent's config, for the Router's daily cap, the Watchdog's
+        /// thresholds and a pause set in it.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Read a one-use credential file and delete it, whether or not the read
@@ -270,6 +286,24 @@ async fn execute(command: Action) -> Result<()> {
             };
             let summary = solos_swarm::agent::serve(&config, &state_dir, options).await?;
             println!("{}", json!(summary));
+            Ok(())
+        }
+        Action::Agent {
+            command:
+                AgentCommand::Status {
+                    state_dir,
+                    config,
+                    json,
+                },
+        } => {
+            use solos_swarm::agent::{AgentConfig, status};
+            let config = config.as_deref().map(AgentConfig::load).transpose()?;
+            let report = status::read(&state_dir, config.as_ref(), broker::now_ms())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", status::render(&report));
+            }
             Ok(())
         }
         Action::Run {

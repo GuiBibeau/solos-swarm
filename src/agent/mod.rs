@@ -14,7 +14,9 @@ pub mod runtime;
 pub mod schedule;
 pub mod scripted;
 pub mod slack;
+pub mod status;
 pub mod utc;
+pub mod watchdog;
 
 pub use config::AgentConfig;
 pub use runtime::{Adapters, HOST_RESTARTED, RunOptions, Runtime, Summary};
@@ -160,6 +162,7 @@ where
         until_idle,
         ..RunOptions::default()
     };
+    let watchdog = watchdog::Running::start(&config, state_dir, &io.channels, &facts)?;
     let runtime = Runtime::with_sink(
         store,
         config.policy.clone(),
@@ -173,6 +176,9 @@ where
         None => None,
     };
     let summary = runtime.run(shutdown()).await;
+    if let Some(watchdog) = watchdog {
+        watchdog.stop().await;
+    }
     if let Some(served) = served {
         served.stop().await;
     }
