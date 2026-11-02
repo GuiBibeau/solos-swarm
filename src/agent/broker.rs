@@ -146,8 +146,13 @@ impl Account {
     pub fn key(&self) -> String {
         match self {
             Self::Router { .. } => "router".into(),
-            Self::Ticket { id, .. } => format!("ticket:{id}"),
+            Self::Ticket { id, .. } => Self::ticket_key(id),
         }
+    }
+
+    /// The key of `ticket`'s account.
+    pub fn ticket_key(ticket: &TicketId) -> String {
+        format!("ticket:{ticket}")
     }
 
     /// Spend from the first time on counts against the cap.
@@ -388,6 +393,12 @@ impl AgentBroker {
         let (account, since) = (seat.account().key(), seat.since_ms);
         self.store(move |store| store.committed(&account, since))
             .await
+    }
+
+    /// What every Assignment of `ticket` has committed on its account.
+    pub async fn ticket_committed(&self, ticket: &TicketId) -> Result<MicroUsd> {
+        let account = Account::ticket_key(ticket);
+        self.store(move |store| store.committed(&account, 0)).await
     }
 
     /// The routes, for the grants admitted so far and any worker.

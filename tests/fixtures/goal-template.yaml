@@ -1,0 +1,24 @@
+# A swarm Goal template for agent mode (executor.swarm.templates). Each
+# placeholder prints a quoted, escaped YAML value: use one as a whole value,
+# and join text with ~ inside the braces.
+schema_version: 1
+intent: {{ title }}
+worker_prompt: {{ "Claim your task, then file one record for your part. Ticket " ~ ticket ~ ": " ~ scope }}
+synthesis_prompt: Call read_findings, then submit_artifact with every record of every finding.
+scope: synthetic-fixtures-only
+model: deepseek-flash
+agent_count: {{ agents }}
+deadline_seconds: 600
+budget_microusd: {{ budget_microusd }}
+max_calls_per_agent: 16
+max_input_bytes: 262144
+max_output_tokens: 2048
+input_price_microusd_per_million: 300000
+output_price_microusd_per_million: 1200000
+grants: [claim_task, board_read, board_post, submit_finding, read_findings, submit_artifact]
+tasks:
+{% for n in range(agents) %}  - id: {{ "part-" ~ n }}
+    input: {part: {{ n }}, of: {{ agents }}, question: {{ scope }}}
+{% endfor %}seed: 1
+catalog_version: agent-swarm
+scorer_version: "1"
