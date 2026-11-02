@@ -114,8 +114,19 @@ impl Runtime {
         adapters: Adapters,
         options: RunOptions,
     ) -> Self {
+        Self::with_sink(store, policy, adapters, options, FactSink::channel())
+    }
+
+    /// A runtime whose fact sink was made first, so adapters that need it,
+    /// such as a broker, can be built before the runtime.
+    pub(crate) fn with_sink(
+        store: SqliteStore,
+        policy: AllowlistPolicy,
+        adapters: Adapters,
+        options: RunOptions,
+        (facts, inbound): (FactSink, mpsc::Receiver<Inbound>),
+    ) -> Self {
         let clock: fn() -> Ms = now_ms;
-        let (facts, inbound) = FactSink::channel();
         Self {
             configured_pause: policy.paused,
             engine: Engine::new(store, policy, clock),

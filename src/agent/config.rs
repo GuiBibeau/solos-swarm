@@ -6,6 +6,7 @@ mod sources;
 pub use sources::{Interval, ReplyTo, ScheduleConfig, TimeOfDay};
 
 use super::{github, slack};
+use crate::code::{self, Mount};
 use crate::gateway::{PriceTable, upstream_profile};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
@@ -134,7 +135,64 @@ fn default_max_output_tokens() -> u64 {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExecutorConfig {
     Scripted {},
+    /// One keyless, sandboxed Pi worker session per Assignment, whose model
+    /// calls go through the agent broker against its Ticket's budget.
+    Pi {
+        /// As the Router's; when both are Pi they name the same provider,
+        /// since one credential serves both.
+        provider: String,
+        model: String,
+        prices: PriceTable,
+        #[serde(default = "default_max_input_bytes")]
+        max_input_bytes: usize,
+        #[serde(default = "default_max_output_tokens")]
+        max_output_tokens: u64,
+        /// Worker sessions that may live at once; a launch past it waits.
+        #[serde(default = "default_max_workers")]
+        max_workers: usize,
+        /// A shell command run once per Ticket in its directory before its
+        /// first worker, with `SOLOS_TICKET` and `SOLOS_WORK_DIR` (the
+        /// worker's `/work`) set, such as a `git worktree add`.
+        #[serde(default)]
+        prepare: Option<String>,
+        /// The workers' `run_code`. Without it they have none.
+        #[serde(default)]
+        run_code: Option<RunCodeConfig>,
+    },
 }
+
+/// What a worker's `run_code` sandbox mounts and how many run at once.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunCodeConfig {
+    /// Read-only binds, each `{target: /name, source: /absolute/host/path}`.
+    #[serde(default)]
+    pub mounts: Vec<Mount>,
+    /// A uv Python store that a mounted venv's interpreter links into,
+    /// bound read-only at its own path.
+    #[serde(default)]
+    pub uv_root: Option<PathBuf>,
+    /// Sandboxes at once, across all workers.
+    #[serde(default = "default_code_concurrency")]
+    pub concurrency: usize,
+    #[serde(default = "default_code_memory")]
+    pub memory_bytes: u64,
+}
+
+fn default_max_workers() -> usize {
+    2
+}
+
+fn default_code_concurrency() -> usize {
+    code::DEFAULT_CONCURRENCY
+}
+
+fn default_code_memory() -> u64 {
+    code::DEFAULT_MEMORY_BYTES
+}
+
+/// The most workers one agent may run at once.
+const MAX_WORKERS: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -257,7 +315,96 @@ impl AgentConfig {
                 );
             }
         }
+        self.validate_executor()
+    }
+
+    fn validate_executor(&self) -> Result<()> {
+        let ExecutorConfig::Pi {
+            provider,
+            model,
+            prices,
+            max_input_bytes,
+            max_output_tokens,
+            max_workers,
+            prepare,
+            run_code,
+        } = &self.executor
+        else {
+            return Ok(());
+        };
+        upstream_profile(provider, model).context("executor")?;
+        prices.validate().context("executor.prices")?;
+        ensure!(
+            (1..=16_777_216).contains(max_input_bytes) && (1..=393_216).contains(max_output_tokens),
+            "executor.max_input_bytes or executor.max_output_tokens is out of range"
+        );
+        ensure!(
+            (1..=MAX_WORKERS).contains(max_workers),
+            "executor.max_workers must be 1..={MAX_WORKERS}"
+        );
+        if let RouterConfig::Pi {
+            provider: router, ..
+        } = &self.router
+        {
+            ensure!(
+                router == provider,
+                "the router and the workers share one credential, so they name one provider, \
+                 not {router} and {provider}"
+            );
+        }
+        ensure!(
+            prepare
+                .as_ref()
+                .is_none_or(|command| !command.trim().is_empty()),
+            "executor.prepare is empty"
+        );
+        if let Some(run_code) = run_code {
+            let mut targets = BTreeSet::new();
+            for mount in &run_code.mounts {
+                mount.validate().context("executor.run_code")?;
+                ensure!(
+                    targets.insert(&mount.target),
+                    "executor.run_code mounts {} twice",
+                    mount.target.display()
+                );
+            }
+            ensure!(
+                run_code
+                    .uv_root
+                    .as_ref()
+                    .is_none_or(|root| root.is_absolute()),
+                "executor.run_code.uv_root must be an absolute path"
+            );
+            ensure!(
+                code::CONCURRENCY_RANGE.contains(&run_code.concurrency),
+                "executor.run_code.concurrency must be 1..=8"
+            );
+            ensure!(
+                code::MEMORY_RANGE.contains(&run_code.memory_bytes),
+                "executor.run_code.memory_bytes must be 256 MiB..=16 GiB"
+            );
+        }
         Ok(())
+    }
+
+    /// The provider and model whose credential `--credential-file` holds:
+    /// the Pi Router's, else the Pi workers'. `None` when nothing is Pi.
+    pub fn pi_upstream(&self) -> Option<(&str, &str)> {
+        match (&self.router, &self.executor) {
+            (
+                RouterConfig::Pi {
+                    provider, model, ..
+                },
+                _,
+            )
+            | (
+                _,
+                ExecutorConfig::Pi {
+                    provider, model, ..
+                },
+            ) => Some((provider, model)),
+            _ => None,
+        }
     }
 
     /// Whether a person can approve a budget above
@@ -283,7 +430,8 @@ impl AgentConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentConfig, ChannelConfig, RouterConfig, SourceConfig};
+    use super::{AgentConfig, ChannelConfig, ExecutorConfig, RouterConfig, SourceConfig};
+    use std::path::PathBuf;
 
     const VALID: &str = "
 policy:
@@ -470,6 +618,130 @@ budgets: {session_microusd: 500000}
             assert_ne!(
                 yaml,
                 pi(|yaml| yaml),
+                "{case}: the case did not change the config"
+            );
+            assert!(parse(&yaml).is_err(), "{case}: accepted\n{yaml}");
+        }
+    }
+
+    const WORKERS: &str = "executor:
+  kind: pi
+  provider: deepseek
+  model: deepseek-flash
+  prices: {input_microusd_per_million: 300000, output_microusd_per_million: 1200000}
+  max_workers: 3
+  prepare: git -C /srv/repo worktree add \"$SOLOS_WORK_DIR\"
+  run_code:
+    mounts: [{target: /repo, source: /srv/repo}]
+    concurrency: 2
+";
+
+    fn workers(edit: impl Fn(String) -> String) -> String {
+        edit(pi(|yaml| {
+            yaml.replace("executor: {kind: scripted}\n", WORKERS)
+        }))
+    }
+
+    #[test]
+    fn pi_workers_load_with_their_limits_and_mounts() {
+        let config = parse(&workers(|yaml| yaml)).unwrap();
+        let ExecutorConfig::Pi {
+            provider,
+            max_input_bytes,
+            max_workers,
+            prepare,
+            run_code,
+            ..
+        } = &config.executor
+        else {
+            panic!("{:?}", config.executor)
+        };
+        assert_eq!(
+            (provider.as_str(), *max_input_bytes, *max_workers),
+            ("deepseek", 1_048_576, 3)
+        );
+        assert!(prepare.as_deref().unwrap().contains("worktree add"));
+        let run_code = run_code.as_ref().unwrap();
+        assert_eq!(run_code.mounts[0].target, PathBuf::from("/repo"));
+        assert_eq!(
+            (run_code.concurrency, run_code.memory_bytes),
+            (2, 4 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(config.pi_upstream(), Some(("deepseek", "deepseek-flash")));
+        let alone = workers(|yaml| yaml.replace(PI, "router: {kind: scripted}\n"));
+        let alone = parse(&alone).unwrap();
+        assert_eq!(alone.pi_upstream(), Some(("deepseek", "deepseek-flash")));
+        let bare = WORKERS.split("  max_workers").next().unwrap().to_owned();
+        let bare = parse(&workers(|yaml| yaml.replace(WORKERS, &bare))).unwrap();
+        let ExecutorConfig::Pi {
+            max_workers,
+            run_code,
+            prepare,
+            ..
+        } = bare.executor
+        else {
+            panic!()
+        };
+        assert_eq!((max_workers, run_code, prepare), (2, None, None));
+        assert_eq!(parse(VALID).unwrap().pi_upstream(), None);
+    }
+
+    #[test]
+    fn pi_workers_refuse_what_they_cannot_run_under() {
+        for (case, yaml) in [
+            (
+                "another provider than the router's",
+                workers(|yaml| {
+                    yaml.replace("  provider: deepseek\n  model: deepseek-flash\n  prices: {input_microusd_per_million: 300000, output_microusd_per_million: 1200000}\n  max_workers", "  provider: venice\n  model: deepseek-v4-1-flash-uncensored\n  prices: {input_microusd_per_million: 300000, output_microusd_per_million: 1200000}\n  max_workers")
+                }),
+            ),
+            (
+                "no worker slot",
+                workers(|yaml| yaml.replace("max_workers: 3", "max_workers: 0")),
+            ),
+            (
+                "too many worker slots",
+                workers(|yaml| yaml.replace("max_workers: 3", "max_workers: 65")),
+            ),
+            (
+                "an empty prepare command",
+                workers(|yaml| yaml.replace("prepare: git", "prepare: ' '\n  # git")),
+            ),
+            (
+                "a mount over the work directory",
+                workers(|yaml| yaml.replace("target: /repo", "target: /work")),
+            ),
+            (
+                "a relative mount source",
+                workers(|yaml| yaml.replace("source: /srv/repo}", "source: srv/repo}")),
+            ),
+            (
+                "one target twice",
+                workers(|yaml| {
+                    yaml.replace(
+                        "mounts: [{target: /repo, source: /srv/repo}]",
+                        "mounts: [{target: /repo, source: /srv/a}, {target: /repo, source: /srv/b}]",
+                    )
+                }),
+            ),
+            (
+                "too many sandboxes",
+                workers(|yaml| yaml.replace("concurrency: 2", "concurrency: 9")),
+            ),
+            (
+                "an output limit out of range",
+                workers(|yaml| {
+                    yaml.replace("max_workers: 3", "max_workers: 3\n  max_output_tokens: 0")
+                }),
+            ),
+            (
+                "an unknown field",
+                workers(|yaml| yaml.replace("concurrency: 2", "concurrency: 2\n    network: true")),
+            ),
+        ] {
+            assert_ne!(
+                yaml,
+                workers(|yaml| yaml),
                 "{case}: the case did not change the config"
             );
             assert!(parse(&yaml).is_err(), "{case}: accepted\n{yaml}");

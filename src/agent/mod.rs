@@ -17,16 +17,20 @@ pub mod slack;
 pub mod utc;
 
 pub use config::AgentConfig;
-pub use runtime::{Adapters, RunOptions, Runtime, Summary};
+pub use runtime::{Adapters, HOST_RESTARTED, RunOptions, Runtime, Summary};
 
 use crate::broker::{now_ms, write_json};
+use crate::code::{CodeConfig, CodeExecutor};
 use crate::gateway::{Provider, provider_for, upstream_profile};
 use crate::harness::{AgentHarness, PiHarness, Role, SessionSpec};
 use anyhow::{Context, Result, bail, ensure};
-use broker::{AgentBroker, BrokerParts, DecideTerms, Grant, ModelTerms, Principal, ROUTER_TOOLS};
-use config::{ChannelConfig, ExecutorConfig, RouterConfig, SourceConfig};
+use broker::{
+    AgentBroker, BrokerParts, DecideTerms, Grant, ModelTerms, Principal, ROUTER_TOOLS, WorkerParts,
+};
+use config::{ChannelConfig, ExecutorConfig, RouterConfig, RunCodeConfig, SourceConfig};
 use github::{GithubApi, GithubChannel, GithubSource};
 use jsonl::{JsonlChannel, JsonlSource};
+use pi_executor::{PiExecutor, PiExecutorParts};
 use pi_router::PiRouter;
 use ports::{Channel, Executor, Router, Source};
 use schedule::ScheduleSource;
@@ -46,8 +50,11 @@ pub const STORE_FILE: &str = "agent.db";
 /// The Router's transcripts, stderr and Pi settings, in the state directory.
 pub const ROUTER_DIR: &str = "router";
 
-/// What `agent serve` takes besides its config file. A Pi Router needs the
-/// last three; a scripted one needs none.
+/// Each Ticket's directory, in the state directory.
+pub const TICKETS_DIR: &str = "tickets";
+
+/// What `agent serve` takes besides its config file. A Pi Router or Pi
+/// workers need the last three; scripted ones need none.
 #[derive(Default)]
 pub struct ServeOptions {
     /// Read the Sources once, finish what they started and exit.
@@ -60,8 +67,9 @@ pub struct ServeOptions {
     pub credential: Option<Zeroizing<String>>,
 }
 
-/// Where a Pi Router's sessions run, and the provider its broker calls.
-pub struct RouterHost<H> {
+/// Where the Pi Router's and Pi workers' sessions run, and the provider
+/// their broker calls.
+pub struct PiHost<H> {
     pub harness: H,
     pub provider: Arc<dyn Provider>,
     pub pi_root: PathBuf,
@@ -81,21 +89,19 @@ pub async fn serve(config: &Path, state_dir: &Path, options: ServeOptions) -> Re
     } = options;
     // First, so the token files are consumed before anything else can fail.
     let io = Io::open(&config, state_dir, !until_idle)?;
-    let host = match &config.router {
-        RouterConfig::Scripted {} => None,
-        RouterConfig::Pi {
-            provider, model, ..
-        } => {
+    let host = match config.pi_upstream() {
+        None => None,
+        Some((provider, model)) => {
             let (Some(pi_root), Some(node), Some(key)) = (pi_root, node, credential) else {
-                bail!("a pi router needs --pi-root, --node and --credential-file");
+                bail!("a pi router or pi workers need --pi-root, --node and --credential-file");
             };
             ensure!(
                 std::env::consts::OS == "linux",
-                "the router's isolation requires Linux"
+                "the isolation of pi sessions requires Linux"
             );
             let upstream = upstream_profile(provider, model)?;
             let provider = provider_for(&upstream, crate::swarm::http_client()?, key)?;
-            Some(RouterHost {
+            Some(PiHost {
                 harness: PiHarness,
                 provider: Arc::new(provider),
                 pi_root,
@@ -106,13 +112,14 @@ pub async fn serve(config: &Path, state_dir: &Path, options: ServeOptions) -> Re
     serve_io(config, state_dir, until_idle, io, host).await
 }
 
-/// [`serve`] with the Router's harness and provider given, so tests can
-/// script them. A Pi Router config needs `host`; a scripted one ignores it.
+/// [`serve`] with the Pi sessions' harness and provider given, so tests can
+/// script them. A config with a Pi Router or Pi workers needs `host`; one
+/// with neither ignores it.
 pub async fn serve_with<H>(
     config: AgentConfig,
     state_dir: &Path,
     until_idle: bool,
-    host: Option<RouterHost<H>>,
+    host: Option<PiHost<H>>,
 ) -> Result<Summary>
 where
     H: AgentHarness + Send + Sync + 'static,
@@ -127,7 +134,7 @@ async fn serve_io<H>(
     state_dir: &Path,
     until_idle: bool,
     io: Io,
-    host: Option<RouterHost<H>>,
+    host: Option<PiHost<H>>,
 ) -> Result<Summary>
 where
     H: AgentHarness + Send + Sync + 'static,
@@ -135,31 +142,34 @@ where
 {
     private_dir(state_dir)?;
     let store = SqliteStore::open(state_dir.join(STORE_FILE)).context("cannot open the store")?;
-    let (router, pi) = match (&config.router, host) {
-        (RouterConfig::Scripted {}, _) => {
-            let scripted: Arc<dyn Router> =
-                Arc::new(ScriptedRouter::new(config.budgets.session_microusd));
-            (scripted, None)
-        }
-        (RouterConfig::Pi { .. }, None) => bail!("a pi router needs a session host"),
-        (RouterConfig::Pi { .. }, Some(host)) => {
-            let pi = PiParts::new(&config, state_dir, host)?;
-            (pi.router.clone() as Arc<dyn Router>, Some(pi))
-        }
+    let (facts, inbound) = ports::FactSink::channel();
+    let pi = match (config.pi_upstream(), host) {
+        (None, _) => None,
+        (Some(_), None) => bail!("a pi router or pi workers need a session host"),
+        (Some(_), Some(host)) => Some(PiParts::new(&config, state_dir, host, facts.clone())?),
+    };
+    let router: Arc<dyn Router> = match pi.as_ref().and_then(|pi| pi.router.clone()) {
+        Some(router) => router,
+        None => Arc::new(ScriptedRouter::new(config.budgets.session_microusd)),
+    };
+    let executor: Arc<dyn Executor> = match pi.as_ref().and_then(|pi| pi.executor.clone()) {
+        Some(executor) => executor,
+        None => Arc::new(ScriptedExecutor),
     };
     let runtime_options = RunOptions {
         until_idle,
         ..RunOptions::default()
     };
-    let runtime = Runtime::new(
+    let runtime = Runtime::with_sink(
         store,
         config.policy.clone(),
-        io.adapters(&config, router),
+        io.adapters(router, executor),
         runtime_options,
+        (facts, inbound),
     )
     .with_control_dir(state_dir);
     let served = match pi {
-        Some(pi) => Some(pi.serve(state_dir, runtime.facts())?),
+        Some(pi) => Some(pi.serve(state_dir)?),
         None => None,
     };
     let summary = runtime.run(shutdown()).await;
@@ -177,109 +187,196 @@ fn private_dir(dir: &Path) -> Result<()> {
         .with_context(|| format!("cannot create {}", dir.display()))
 }
 
-/// The Pi Router before its broker serves: the session adapter, the token
-/// it was given, and what the broker admits that token to.
-struct PiParts {
-    router: Arc<PiRouter>,
-    token: String,
-    grant: Grant,
-    provider: Arc<dyn Provider>,
-    decide: DecideTerms,
+/// The Pi Router and the Pi workers before their broker serves: the
+/// adapters, and the broker that admits the Router's token and, as each
+/// Assignment starts, a worker's.
+struct PiParts<H> {
+    broker: AgentBroker,
+    router: Option<Arc<PiRouter>>,
+    executor: Option<Arc<PiExecutor<H>>>,
 }
 
-impl PiParts {
-    fn new<H>(config: &AgentConfig, state_dir: &Path, host: RouterHost<H>) -> Result<Self>
-    where
-        H: AgentHarness + Send + Sync + 'static,
-        H::Session: Send + 'static,
-    {
-        let RouterConfig::Pi {
+impl<H> PiParts<H>
+where
+    H: AgentHarness + Send + Sync + 'static,
+    H::Session: Send + 'static,
+{
+    fn new(
+        config: &AgentConfig,
+        state_dir: &Path,
+        host: PiHost<H>,
+        facts: ports::FactSink,
+    ) -> Result<Self> {
+        let PiHost {
+            harness,
             provider,
-            model,
-            prices,
-            max_input_bytes,
-            max_output_tokens,
-            instructions,
-            rules,
-        } = &config.router
-        else {
-            bail!("the router is not a pi router");
+            pi_root,
+            node,
+        } = host;
+        let harness = Arc::new(harness);
+        let (pi_root, node) = (canonical(&pi_root)?, canonical(&node)?);
+        let tickets_dir = canonical(state_dir)?.join(TICKETS_DIR);
+        let workers = match &config.executor {
+            ExecutorConfig::Scripted {} => None,
+            ExecutorConfig::Pi {
+                provider,
+                model,
+                prices,
+                max_input_bytes,
+                max_output_tokens,
+                run_code,
+                ..
+            } => {
+                let code = match run_code {
+                    None => None,
+                    Some(run_code) => Some(Arc::new(
+                        CodeExecutor::from_config(code_config(run_code, &tickets_dir))
+                            .context("executor.run_code")?,
+                    )),
+                };
+                let terms = ModelTerms {
+                    upstream: upstream_profile(provider, model)?,
+                    prices: *prices,
+                    max_input_bytes: *max_input_bytes,
+                    max_output_tokens: *max_output_tokens,
+                };
+                Some(WorkerParts { terms, code })
+            }
         };
-        let daily_microusd = config
-            .budgets
-            .router_daily_microusd
-            .context("a pi router needs budgets.router_daily_microusd")?;
-        let upstream = upstream_profile(provider, model)?;
-        let decide = DecideTerms::for_config(config);
-        let dir = state_dir.join(ROUTER_DIR);
-        private_dir(&dir)?;
-        let settings = dir.join("pi-settings.json");
-        // Compaction keeps a long-lived session inside the model's window.
-        write_json(
-            &settings,
-            &json!({"retry":{"enabled":false},"compaction":{"enabled":true,"reserveTokens":65_536},"quietStartup":true}),
-        )?;
-        let token = broker::new_token();
-        let spec = SessionSpec {
-            id: format!("router-{}", now_ms()),
-            role: Role::Router,
-            grants: ROUTER_TOOLS.map(String::from).to_vec(),
-            token: token.clone(),
-            model: upstream.model.clone(),
-            run_dir: dir,
-            broker_socket: state_dir.join(broker::SOCKET_FILE),
-            pi_settings: settings,
-            node: canonical(&host.node)?,
-            pi_root: canonical(&host.pi_root)?,
-        };
-        let grant = Grant {
-            principal: Principal::Router,
-            account: broker::Account::Router { daily_microusd },
-            terms: ModelTerms {
-                upstream,
-                prices: *prices,
-                max_input_bytes: *max_input_bytes,
-                max_output_tokens: *max_output_tokens,
-            },
-            system_prompt: Some(pi_router::system_prompt(
-                instructions.as_deref(),
-                &config.policy,
-                rules,
-                decide,
-            )),
-        };
-        Ok(Self {
-            router: Arc::new(PiRouter::start(host.harness, spec)),
-            token,
-            grant,
-            provider: host.provider,
-            decide,
-        })
-    }
-
-    /// Admit the Router's token and serve the broker on the state
-    /// directory's socket. The Router starts its first session only when a
-    /// card arrives, by which time the socket is bound.
-    fn serve(self, state_dir: &Path, facts: ports::FactSink) -> Result<Served> {
+        let worker_model = workers
+            .as_ref()
+            .map(|parts| parts.terms.upstream.model.clone());
         let broker = AgentBroker::new(BrokerParts {
             dir: state_dir.to_owned(),
             store: SqliteStore::open(state_dir.join(STORE_FILE))
                 .context("cannot open the store for the broker")?,
-            provider: self.provider,
+            provider,
             facts,
-            decide: self.decide,
-            workers: None,
+            decide: DecideTerms::for_config(config),
+            workers,
         })?;
-        broker.admit(self.token, self.grant)?;
+        let router = match &config.router {
+            RouterConfig::Scripted {} => None,
+            RouterConfig::Pi { .. } => {
+                let (spec, grant) = router_session(config, state_dir, &node, &pi_root)?;
+                broker.admit(spec.token.clone(), grant)?;
+                // Its first session starts with the first card, by which time the socket is bound.
+                Some(Arc::new(PiRouter::start(harness.clone(), spec)))
+            }
+        };
+        let executor = match (&config.executor, worker_model) {
+            (
+                ExecutorConfig::Pi {
+                    max_workers,
+                    prepare,
+                    ..
+                },
+                Some(model),
+            ) => Some(Arc::new(PiExecutor::new(PiExecutorParts {
+                harness,
+                broker: broker.clone(),
+                tickets_dir,
+                broker_socket: state_dir.join(broker::SOCKET_FILE),
+                node,
+                pi_root,
+                model,
+                max_workers: *max_workers,
+                prepare: prepare.clone(),
+            })?)),
+            _ => None,
+        };
+        Ok(Self {
+            broker,
+            router,
+            executor,
+        })
+    }
+
+    /// Serve the broker on the state directory's socket.
+    fn serve(self, state_dir: &Path) -> Result<Served<H>> {
         let (listener, socket) = broker::bind(state_dir)?;
-        let app = broker.router()?;
+        let app = self.broker.router()?;
         let server = tokio::spawn(async move { axum::serve(listener, app).await });
         Ok(Served {
             router: self.router,
+            executor: self.executor,
             server,
             socket,
         })
     }
+}
+
+/// The workers' `run_code` sandbox, with every scratch directory under the
+/// Tickets' directory.
+fn code_config(run_code: &RunCodeConfig, tickets_dir: &Path) -> CodeConfig {
+    let mut code = CodeConfig::new(tickets_dir.to_owned(), run_code.mounts.clone());
+    code.uv_root = run_code.uv_root.clone();
+    code.concurrency = run_code.concurrency;
+    code.memory_bytes = run_code.memory_bytes;
+    code
+}
+
+/// The Router's session and what the broker admits its token to.
+fn router_session(
+    config: &AgentConfig,
+    state_dir: &Path,
+    node: &Path,
+    pi_root: &Path,
+) -> Result<(SessionSpec, Grant)> {
+    let RouterConfig::Pi {
+        provider,
+        model,
+        prices,
+        max_input_bytes,
+        max_output_tokens,
+        instructions,
+        rules,
+    } = &config.router
+    else {
+        bail!("the router is not a pi router");
+    };
+    let daily_microusd = config
+        .budgets
+        .router_daily_microusd
+        .context("a pi router needs budgets.router_daily_microusd")?;
+    let upstream = upstream_profile(provider, model)?;
+    let dir = state_dir.join(ROUTER_DIR);
+    private_dir(&dir)?;
+    let settings = dir.join("pi-settings.json");
+    // Compaction keeps a long-lived session inside the model's window.
+    write_json(
+        &settings,
+        &json!({"retry":{"enabled":false},"compaction":{"enabled":true,"reserveTokens":65_536},"quietStartup":true}),
+    )?;
+    let spec = SessionSpec {
+        id: format!("router-{}", now_ms()),
+        role: Role::Router,
+        grants: ROUTER_TOOLS.map(String::from).to_vec(),
+        token: broker::new_token(),
+        model: upstream.model.clone(),
+        run_dir: dir,
+        broker_socket: state_dir.join(broker::SOCKET_FILE),
+        pi_settings: settings,
+        node: node.to_owned(),
+        pi_root: pi_root.to_owned(),
+    };
+    let grant = Grant {
+        principal: Principal::Router,
+        account: broker::Account::Router { daily_microusd },
+        terms: ModelTerms {
+            upstream,
+            prices: *prices,
+            max_input_bytes: *max_input_bytes,
+            max_output_tokens: *max_output_tokens,
+        },
+        system_prompt: Some(pi_router::system_prompt(
+            instructions.as_deref(),
+            &config.policy,
+            rules,
+            DecideTerms::for_config(config),
+        )),
+    };
+    Ok((spec, grant))
 }
 
 fn canonical(path: &Path) -> Result<PathBuf> {
@@ -287,15 +384,27 @@ fn canonical(path: &Path) -> Result<PathBuf> {
         .with_context(|| format!("cannot find {}", path.display()))
 }
 
-struct Served {
-    router: Arc<PiRouter>,
+struct Served<H> {
+    router: Option<Arc<PiRouter>>,
+    executor: Option<Arc<PiExecutor<H>>>,
     server: tokio::task::JoinHandle<std::io::Result<()>>,
     socket: PathBuf,
 }
 
-impl Served {
+impl<H> Served<H>
+where
+    H: AgentHarness + Send + Sync + 'static,
+    H::Session: Send + 'static,
+{
+    /// End every session, then the broker. The Engine is not told about
+    /// the workers; the next start recovers their Assignments.
     async fn stop(self) {
-        self.router.shutdown().await;
+        if let Some(router) = &self.router {
+            router.shutdown().await;
+        }
+        if let Some(executor) = &self.executor {
+            executor.shutdown().await;
+        }
         self.server.abort();
         let _ = self.server.await;
         let _ = std::fs::remove_file(&self.socket);
@@ -378,12 +487,8 @@ impl Io {
         Ok(Self { sources, channels })
     }
 
-    /// The runtime's adapters: these, the Executor the config names, and
-    /// `router`.
-    fn adapters(self, config: &AgentConfig, router: Arc<dyn Router>) -> Adapters {
-        let executor: Arc<dyn Executor> = match config.executor {
-            ExecutorConfig::Scripted {} => Arc::new(ScriptedExecutor),
-        };
+    /// The runtime's adapters: these, `router` and `executor`.
+    fn adapters(self, router: Arc<dyn Router>, executor: Arc<dyn Executor>) -> Adapters {
         Adapters {
             sources: self.sources,
             channels: self.channels,
