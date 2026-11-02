@@ -7,6 +7,7 @@ pub mod broker;
 pub mod config;
 pub mod github;
 pub mod goal_template;
+pub mod jobs;
 pub mod jsonl;
 pub mod pi_executor;
 pub mod pi_router;
@@ -256,7 +257,14 @@ where
         let worker_model = workers
             .as_ref()
             .map(|parts| parts.terms.upstream.model.clone());
-        let broker = AgentBroker::new(BrokerParts {
+        let job_limits = match &config.executor {
+            ExecutorConfig::Pi {
+                run_code: Some(run_code),
+                ..
+            } => run_code.job_limits(),
+            _ => jobs::JobLimits::default(),
+        };
+        let parts = BrokerParts {
             dir: state_dir.to_owned(),
             store: SqliteStore::open(state_dir.join(STORE_FILE))
                 .context("cannot open the store for the broker")?,
@@ -264,7 +272,8 @@ where
             facts,
             decide: DecideTerms::for_config(config),
             workers,
-        })?;
+        };
+        let broker = AgentBroker::with_jobs(parts, job_limits)?;
         let swarm = match &config.executor {
             ExecutorConfig::Pi {
                 provider: name,

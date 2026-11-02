@@ -62,6 +62,11 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   YAML template under what the Ticket has left to spend and checked by `Goal::validate`, at most `max_runs` at once,
   its spend charged on the Ticket's account, a Stop that cancels it cleanly, and a restart that relaunches it in a
   new run directory; the Router learns when a swarm pays for itself. `solos-swarm run` is unchanged.
+- Agent mode, P3e: background jobs for workers (`src/agent/jobs.rs`). `job_start`, `job_wait` and `job_stop` run a
+  command in the Ticket's sandbox without blocking the turn, and a `run_code` still running after 5 s moves to the
+  background; a job's end reaches the worker once, in its turn or as a Note that wakes it, and the job dies with its
+  Assignment. Limits under `executor.run_code` (`background_after_secs`, `max_jobs`, `job_max_secs`,
+  `job_output_bytes`); swarm `run_code` is unchanged.
 - `collect` leaves the per-run `code/` scratch directory on the host and writes `collect-manifest.json`; `--include-code` opts back in.
 - Docs: pause mode, self-update operations, dashboard tunnel, tournament runbook, replay status.
 

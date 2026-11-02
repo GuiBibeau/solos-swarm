@@ -154,6 +154,12 @@ pub enum Fact {
         trigger: TriggerId,
         reason: String,
     },
+    /// A fact from the Ticket's own work, such as a background job's end,
+    /// that its worker reads as new input. Grants nothing.
+    Note {
+        ticket: TicketId,
+        text: String,
+    },
     Command(Command),
     /// The Watchdog retries a stalled Assignment, unless it has moved on
     /// since it had `reports` Reports.

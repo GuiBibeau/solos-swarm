@@ -371,6 +371,10 @@ impl Runtime {
                     .handback(&ticket, &trigger, &reason)
                     .map(|queued| Applied::HandedBack { queued }),
             ),
+            Fact::Note { ticket, text } => (
+                format!("note on {ticket}"),
+                self.engine.note(&ticket, text).map(done),
+            ),
             Fact::Command(command) => return self.command(command).map(|()| Ok(Applied::Done)),
             Fact::Retry {
                 ticket,
