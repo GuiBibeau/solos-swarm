@@ -15,7 +15,7 @@ mod watchdog;
 
 pub use chain::Chain;
 pub use error::StoreError;
-pub use ledger::{HoldId, HoldRequest, Reservation, Spend, SpendState, Tokens};
+pub use ledger::{Charge, HoldId, HoldRequest, Reservation, Spend, SpendState, Tokens};
 pub use queue::{EffectId, QueuedEffect};
 pub use watchdog::AlertRow;
 

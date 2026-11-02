@@ -1094,4 +1094,41 @@ mod tests {
         );
         fs::remove_dir_all(dir).unwrap();
     }
+
+    #[tokio::test]
+    async fn a_host_cancel_stops_the_run_like_an_operator_cancel_and_cleans_up() {
+        use solos_swarm::harness::scripted::ScriptedHarness;
+        let (dir, run) = scripted_run(60, true);
+        let cancel = swarm::Cancel::on(async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            "the ticket was stopped".to_owned()
+        });
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            swarm::run_goal_until(
+                run,
+                &ScriptedHarness::new(BTreeMap::new()),
+                Arc::new(smoke::Scripted),
+                cancel,
+            ),
+        )
+        .await
+        .expect("the cancel did not end the run")
+        .unwrap();
+        let GoalStatus::Stopped(error) = &outcome.status else {
+            panic!("{:?}", outcome.status);
+        };
+        assert_eq!(error.to_string(), "the ticket was stopped");
+        assert_eq!((outcome.remaining_workers, outcome.held_microusd), (0, 0));
+        let read = |name: &str| -> Value {
+            serde_json::from_slice(&fs::read(outcome.run_dir.join(name)).unwrap()).unwrap()
+        };
+        assert_eq!(read("cleanup.json")["verdict"], "PASS");
+        assert_eq!(read("state.json")["goal_status"], "stopped");
+        assert_eq!(
+            read("runtime-report.json")["reason"],
+            "the ticket was stopped"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

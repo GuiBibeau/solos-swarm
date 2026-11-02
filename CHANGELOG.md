@@ -57,6 +57,16 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   `watchdog_alerts` table (agent store schema v3) so a restart repeats none; `retry_stalled` retries a stalled
   Assignment once per Ticket through the runtime. `solos-swarm agent status` reports what is running and why from a
   read-only Store, as text or `--json`.
+- Agent mode, P5: swarm Tickets. `executor.swarm` runs each `Plan::Swarm` Assignment as one governed swarm through
+  the new `swarm::run_goal_until` (a cancel input beside the signals `run_goal` keeps), with a Goal rendered from a
+  YAML template under what the Ticket has left to spend and checked by `Goal::validate`, at most `max_runs` at once,
+  its spend charged on the Ticket's account, a Stop that cancels it cleanly, and a restart that relaunches it in a
+  new run directory; the Router learns when a swarm pays for itself. `solos-swarm run` is unchanged.
+- Agent mode, P3e: background jobs for workers (`src/agent/jobs.rs`). `job_start`, `job_wait` and `job_stop` run a
+  command in the Ticket's sandbox without blocking the turn, and a `run_code` still running after 5 s moves to the
+  background; a job's end reaches the worker once, in its turn or as a Note that wakes it, and the job dies with its
+  Assignment. Limits under `executor.run_code` (`background_after_secs`, `max_jobs`, `job_max_secs`,
+  `job_output_bytes`); swarm `run_code` is unchanged.
 - Agent mode, P7a: `solos-swarm mcp`, a hand-written stdio MCP server. `--socket --token-file` offers one principal's
   broker tools (the broker's new `GET /tools`, from a Rust tool registry the Pi extension's schemas are tested
   against), with refusals as `isError` results and pauses waited out; `--state-dir --operator` offers `agent_status`,

@@ -7,6 +7,8 @@ mod watchdog;
 pub use sources::{Interval, ReplyTo, ScheduleConfig, TimeOfDay};
 pub use watchdog::{OperatorConfig, ThresholdsConfig, WatchdogConfig};
 
+use super::goal_template::GoalTemplates;
+use super::jobs::{self, JobLimits};
 use super::{github, mcp, slack};
 use crate::code::{self, Mount};
 use crate::gateway::{PriceTable, upstream_profile};
@@ -16,6 +18,7 @@ use solos_agent_core::AllowlistPolicy;
 use solos_agent_core::model::MicroUsd;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -169,8 +172,27 @@ pub enum ExecutorConfig {
         prepare: Option<String>,
         /// The workers' `run_code`. Without it they have none.
         #[serde(default)]
-        run_code: Option<RunCodeConfig>,
+        run_code: Option<Box<RunCodeConfig>>,
+        /// How `Plan::Swarm` Tickets run. Without it they fail.
+        #[serde(default)]
+        swarm: Option<Box<SwarmConfig>>,
     },
+}
+
+/// `Plan::Swarm` Tickets: each runs a governed swarm whose Goal is rendered
+/// from a template, on the workers' provider and credential.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwarmConfig {
+    /// Goal templates by name, each a YAML file relative to this file.
+    pub templates: BTreeMap<String, PathBuf>,
+    /// The template of a swarm whose Plan names none.
+    #[serde(default)]
+    pub default_template: Option<String>,
+    /// Swarms that may run at once; a launch past it waits. Each swarm is
+    /// many sessions, so this is apart from `max_workers`.
+    #[serde(default = "default_max_swarms")]
+    pub max_runs: usize,
 }
 
 /// What a worker's `run_code` sandbox mounts and how many run at once.
@@ -189,10 +211,61 @@ pub struct RunCodeConfig {
     pub concurrency: usize,
     #[serde(default = "default_code_memory")]
     pub memory_bytes: u64,
+    /// A `run_code` still running after this many seconds moves to the
+    /// background as a job.
+    #[serde(default = "default_background_after_secs")]
+    pub background_after_secs: u64,
+    /// Background jobs one Ticket may hold whose end has not reached its
+    /// worker.
+    #[serde(default = "default_max_jobs")]
+    pub max_jobs: usize,
+    /// The longest a `job_start` job may run, in seconds.
+    #[serde(default = "default_job_max_secs")]
+    pub job_max_secs: u64,
+    /// What a `job_start` job keeps of each output stream until it is read.
+    #[serde(default = "default_job_output_bytes")]
+    pub job_output_bytes: usize,
 }
+
+impl RunCodeConfig {
+    pub fn job_limits(&self) -> JobLimits {
+        JobLimits {
+            background_after: Duration::from_secs(self.background_after_secs),
+            max_jobs: self.max_jobs,
+            max_wall: Duration::from_secs(self.job_max_secs),
+            output_bytes: self.job_output_bytes,
+        }
+    }
+}
+
+fn default_background_after_secs() -> u64 {
+    jobs::DEFAULT_BACKGROUND_AFTER_SECS
+}
+
+fn default_max_jobs() -> usize {
+    jobs::DEFAULT_MAX_JOBS
+}
+
+fn default_job_max_secs() -> u64 {
+    jobs::DEFAULT_JOB_MAX_SECS
+}
+
+fn default_job_output_bytes() -> usize {
+    jobs::DEFAULT_JOB_OUTPUT_BYTES
+}
+
+/// The jobs one Ticket may hold.
+const MAX_JOBS: std::ops::RangeInclusive<usize> = 1..=8;
+/// What a job may keep of a stream: the Pi extension reads at most 4 MiB
+/// of a tool reply.
+const JOB_OUTPUT_BYTES: std::ops::RangeInclusive<usize> = 1_024..=1_048_576;
 
 fn default_max_workers() -> usize {
     2
+}
+
+fn default_max_swarms() -> usize {
+    1
 }
 
 fn default_code_concurrency() -> usize {
@@ -205,6 +278,8 @@ fn default_code_memory() -> u64 {
 
 /// The most workers one agent may run at once.
 const MAX_WORKERS: usize = 64;
+/// The most swarms one agent may run at once.
+const MAX_SWARMS: usize = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -246,6 +321,17 @@ impl AgentConfig {
                 ChannelConfig::Jsonl { path, .. } => *path = base.join(&*path),
                 ChannelConfig::Slack {} | ChannelConfig::Github {} | ChannelConfig::Mcp {} => {}
             }
+        }
+        if let ExecutorConfig::Pi {
+            provider,
+            swarm: Some(swarm),
+            ..
+        } = &mut config.executor
+        {
+            for path in swarm.templates.values_mut() {
+                *path = base.join(&*path);
+            }
+            GoalTemplates::load(swarm, provider)?.check(config.budgets.session_microusd)?;
         }
         Ok(config)
     }
@@ -355,6 +441,7 @@ impl AgentConfig {
             max_workers,
             prepare,
             run_code,
+            swarm,
         } = &self.executor
         else {
             return Ok(());
@@ -410,6 +497,29 @@ impl AgentConfig {
                 code::MEMORY_RANGE.contains(&run_code.memory_bytes),
                 "executor.run_code.memory_bytes must be 256 MiB..=16 GiB"
             );
+            ensure!(
+                (1..=code::MAX_TIMEOUT_SECONDS).contains(&run_code.background_after_secs),
+                "executor.run_code.background_after_secs must be 1..={}",
+                code::MAX_TIMEOUT_SECONDS
+            );
+            ensure!(
+                MAX_JOBS.contains(&run_code.max_jobs),
+                "executor.run_code.max_jobs must be 1..=8"
+            );
+            ensure!(
+                JobLimits::MAX_WALL_SECS.contains(&run_code.job_max_secs),
+                "executor.run_code.job_max_secs must be {}..={}, so a run_code that moves to the \
+                 background keeps its own timeout",
+                JobLimits::MAX_WALL_SECS.start(),
+                JobLimits::MAX_WALL_SECS.end()
+            );
+            ensure!(
+                JOB_OUTPUT_BYTES.contains(&run_code.job_output_bytes),
+                "executor.run_code.job_output_bytes must be 1 KiB..=1 MiB"
+            );
+        }
+        if let Some(swarm) = swarm {
+            swarm.validate()?;
         }
         Ok(())
     }
@@ -455,10 +565,43 @@ impl AgentConfig {
     }
 }
 
+impl SwarmConfig {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.templates.is_empty(),
+            "executor.swarm names no goal template"
+        );
+        for name in self.templates.keys() {
+            ensure!(
+                !name.is_empty()
+                    && name.len() <= 64
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                "goal template name {name:?} is not a short word"
+            );
+        }
+        if let Some(name) = &self.default_template {
+            ensure!(
+                self.templates.contains_key(name),
+                "executor.swarm.default_template {name} is not one of its templates"
+            );
+        }
+        ensure!(
+            (1..=MAX_SWARMS).contains(&self.max_runs),
+            "executor.swarm.max_runs must be 1..={MAX_SWARMS}"
+        );
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AgentConfig, ChannelConfig, ExecutorConfig, RouterConfig, SourceConfig};
+    use super::{
+        AgentConfig, ChannelConfig, ExecutorConfig, JobLimits, RouterConfig, SourceConfig,
+    };
     use std::path::PathBuf;
+    use std::time::Duration;
 
     const VALID: &str = "
 policy:
@@ -772,6 +915,150 @@ budgets: {session_microusd: 500000}
                 "{case}: the case did not change the config"
             );
             assert!(parse(&yaml).is_err(), "{case}: accepted\n{yaml}");
+        }
+    }
+
+    const SWARM: &str = "  swarm:
+    templates: {research: goals/research.yaml}
+    default_template: research
+";
+
+    #[test]
+    fn a_swarm_loads_its_checked_templates_beside_the_config() {
+        let dir = std::env::temp_dir().join(format!("agent-config-swarm-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("goals")).unwrap();
+        let template = include_str!("../../tests/fixtures/goal-template.yaml");
+        std::fs::write(dir.join("goals/research.yaml"), template).unwrap();
+        let load = |yaml: String| {
+            std::fs::write(dir.join("agent.yaml"), yaml).unwrap();
+            AgentConfig::load(&dir.join("agent.yaml"))
+        };
+        let config = load(workers(|yaml| {
+            yaml.replace(
+                "    concurrency: 2\n",
+                &format!("    concurrency: 2\n{SWARM}"),
+            )
+        }))
+        .unwrap();
+        let ExecutorConfig::Pi {
+            swarm: Some(swarm), ..
+        } = &config.executor
+        else {
+            panic!("{:?}", config.executor)
+        };
+        assert_eq!(swarm.templates["research"], dir.join("goals/research.yaml"));
+        assert_eq!(
+            (swarm.default_template.as_deref(), swarm.max_runs),
+            (Some("research"), 1)
+        );
+
+        let with = |edit: &dyn Fn(String) -> String| {
+            workers(|yaml| {
+                yaml.replace(
+                    "    concurrency: 2\n",
+                    &format!("    concurrency: 2\n{}", edit(SWARM.to_owned())),
+                )
+            })
+        };
+        for (case, yaml) in [
+            (
+                "no template",
+                with(&|s| {
+                    s.replace("{research: goals/research.yaml}", "{}")
+                        .replace("    default_template: research\n", "")
+                }),
+            ),
+            (
+                "an unknown default",
+                with(&|s| s.replace("default_template: research", "default_template: audit")),
+            ),
+            ("no run slot", with(&|s| format!("{s}    max_runs: 0\n"))),
+            (
+                "too many run slots",
+                with(&|s| format!("{s}    max_runs: 9\n")),
+            ),
+            (
+                "a template name that is not a word",
+                with(&|s| {
+                    s.replace("{research:", "{\"re search\":")
+                        .replace("default_template: research", "default_template: re search")
+                }),
+            ),
+            (
+                "a missing template",
+                with(&|s| s.replace("goals/research.yaml", "goals/gone.yaml")),
+            ),
+            ("an unknown field", with(&|s| format!("{s}    agents: 3\n"))),
+        ] {
+            assert!(load(yaml.clone()).is_err(), "{case}: accepted\n{yaml}");
+        }
+        std::fs::write(
+            dir.join("goals/research.yaml"),
+            template.replace("{% for n in range(agents) %}", "{% for n in range(2) %}"),
+        )
+        .unwrap();
+        let err = load(with(&|s| s)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("checking goal template research with 1 agents"),
+            "{err:#}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn background_jobs_load_with_their_defaults_and_refuse_limits_out_of_range() {
+        let config = parse(&workers(|yaml| yaml)).unwrap();
+        let ExecutorConfig::Pi {
+            run_code: Some(run_code),
+            ..
+        } = &config.executor
+        else {
+            panic!("{:?}", config.executor)
+        };
+        assert_eq!(run_code.job_limits(), JobLimits::default());
+        assert_eq!(
+            JobLimits::default(),
+            JobLimits {
+                background_after: Duration::from_secs(5),
+                max_jobs: 2,
+                max_wall: Duration::from_secs(1_800),
+                output_bytes: 65_536,
+            }
+        );
+        let set = "concurrency: 2\n    background_after_secs: 10\n    max_jobs: 4\n    \
+                   job_max_secs: 600\n    job_output_bytes: 4096";
+        let config = parse(&workers(|yaml| yaml.replace("concurrency: 2", set))).unwrap();
+        let ExecutorConfig::Pi {
+            run_code: Some(run_code),
+            ..
+        } = &config.executor
+        else {
+            panic!("{:?}", config.executor)
+        };
+        assert_eq!(
+            run_code.job_limits(),
+            JobLimits {
+                background_after: Duration::from_secs(10),
+                max_jobs: 4,
+                max_wall: Duration::from_secs(600),
+                output_bytes: 4_096,
+            }
+        );
+        for bad in [
+            "background_after_secs: 0",
+            "background_after_secs: 301",
+            "max_jobs: 0",
+            "max_jobs: 9",
+            "job_max_secs: 299",
+            "job_max_secs: 86401",
+            "job_output_bytes: 1023",
+            "job_output_bytes: 1048577",
+            "jobs: 3",
+        ] {
+            let yaml = workers(|yaml| {
+                yaml.replace("concurrency: 2", &format!("concurrency: 2\n    {bad}"))
+            });
+            assert!(parse(&yaml).is_err(), "{bad}: accepted");
         }
     }
 

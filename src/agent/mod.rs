@@ -6,6 +6,8 @@
 pub mod broker;
 pub mod config;
 pub mod github;
+pub mod goal_template;
+pub mod jobs;
 pub mod jsonl;
 pub mod mcp;
 pub mod pi_executor;
@@ -16,6 +18,7 @@ pub mod schedule;
 pub mod scripted;
 pub mod slack;
 pub mod status;
+pub mod swarm_executor;
 pub mod utc;
 pub mod watchdog;
 
@@ -32,6 +35,7 @@ use broker::{
 };
 use config::{ChannelConfig, ExecutorConfig, RouterConfig, RunCodeConfig, SourceConfig};
 use github::{GithubApi, GithubChannel, GithubSource};
+use goal_template::GoalTemplates;
 use jsonl::{JsonlChannel, JsonlSource};
 use pi_executor::{PiExecutor, PiExecutorParts};
 use pi_router::PiRouter;
@@ -46,6 +50,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use swarm_executor::{SwarmExecutor, SwarmParts};
 use zeroize::Zeroizing;
 
 /// The Store's file in the state directory.
@@ -253,15 +258,47 @@ where
         let worker_model = workers
             .as_ref()
             .map(|parts| parts.terms.upstream.model.clone());
-        let broker = AgentBroker::new(BrokerParts {
+        let job_limits = match &config.executor {
+            ExecutorConfig::Pi {
+                run_code: Some(run_code),
+                ..
+            } => run_code.job_limits(),
+            _ => jobs::JobLimits::default(),
+        };
+        let parts = BrokerParts {
             dir: state_dir.to_owned(),
             store: SqliteStore::open(state_dir.join(STORE_FILE))
                 .context("cannot open the store for the broker")?,
-            provider,
+            provider: provider.clone(),
             facts,
             decide: DecideTerms::for_config(config),
             workers,
-        })?;
+        };
+        let broker = AgentBroker::with_jobs(parts, job_limits)?;
+        let swarm = match &config.executor {
+            ExecutorConfig::Pi {
+                provider: name,
+                swarm: Some(swarm),
+                ..
+            } => Some(SwarmExecutor::new(SwarmParts {
+                harness: harness.clone(),
+                provider,
+                broker: broker.clone(),
+                templates: GoalTemplates::load(swarm, name)?,
+                tickets_dir: tickets_dir.clone(),
+                state_dir: state_dir.to_owned(),
+                node: node.clone(),
+                pi_root: pi_root.clone(),
+                max_runs: swarm.max_runs,
+                progress_every: swarm_executor::progress_every(
+                    config
+                        .watchdog
+                        .as_ref()
+                        .map(|watchdog| watchdog.thresholds().stalled_ms),
+                ),
+            })?),
+            _ => None,
+        };
         let router = match &config.router {
             RouterConfig::Scripted {} => None,
             RouterConfig::Pi { .. } => {
@@ -289,6 +326,7 @@ where
                 model,
                 max_workers: *max_workers,
                 prepare: prepare.clone(),
+                swarm,
             })?)),
             _ => None,
         };
@@ -380,7 +418,7 @@ fn router_session(
             instructions.as_deref(),
             &config.policy,
             rules,
-            DecideTerms::for_config(config),
+            &DecideTerms::for_config(config),
         )),
     };
     Ok((spec, grant))

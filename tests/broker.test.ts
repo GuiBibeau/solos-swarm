@@ -366,6 +366,8 @@ test("SWARM_TOOLSET=router registers only the Router tools, whatever the role an
 });
 
 const workerNames = ["fetch_url", "run_code", "worker_handback", "worker_report"];
+const jobNames = ["job_start", "job_stop", "job_wait"];
+const allWorkerNames = [...workerNames, ...jobNames].sort();
 
 test("SWARM_TOOLSET=worker registers the worker tools that SWARM_GRANTS names and blocks every other call", () => {
   const saved = { role: process.env.SWARM_ROLE, grants: process.env.SWARM_GRANTS, toolset: process.env.SWARM_TOOLSET };
@@ -384,15 +386,19 @@ test("SWARM_TOOLSET=worker registers the worker tools that SWARM_GRANTS names an
     process.env.SWARM_ROLE = "ticket-worker";
     process.env.SWARM_TOOLSET = "worker";
     delete process.env.SWARM_GRANTS;
-    assert.deepEqual(load().declared, workerNames);
+    assert.deepEqual(load().declared, allWorkerNames);
     process.env.SWARM_GRANTS = "worker_report,worker_handback,fetch_url";
     const narrowed = load();
     assert.deepEqual(narrowed.declared, ["fetch_url", "worker_handback", "worker_report"], "a host without run_code never advertises it");
     assert.ok(narrowed.events.includes("before_agent_start"), "a worker takes its system prompt from the broker");
-    for (const forged of ["run_code", "router_decide", "claim_task", "submit_finding", "board_post"]) {
+    for (const forged of ["run_code", ...jobNames, "router_decide", "claim_task", "submit_finding", "board_post"]) {
       assert.equal(narrowed.guard(forged)?.block, true, forged);
     }
     assert.equal(narrowed.guard("worker_report"), undefined);
+    process.env.SWARM_GRANTS = allWorkerNames.join(",");
+    const full = load();
+    assert.deepEqual(full.declared, allWorkerNames, "a host with run_code grants the job tools too");
+    for (const name of jobNames) assert.equal(full.guard(name), undefined, name);
     process.env.SWARM_ROLE = "coordinator";
     process.env.SWARM_GRANTS = names.join(",");
     assert.deepEqual(load().declared, ["fetch_url", "run_code"], "swarm grants and the coordinator role add no swarm tool");
@@ -534,5 +540,118 @@ test("the router and worker tool schemas match the Rust registry that GET /tools
   } finally {
     restore("SWARM_GRANTS", saved.grants);
     restore("SWARM_TOOLSET", saved.toolset);
+  }
+});
+
+test("the worker's job tools reach the broker with their arguments, and a refused job_wait is a tool error", { timeout: 30_000 }, async (t) => {
+  const dir = await mkdtemp(`${tmpdir()}/swarm-jobs-`);
+  const socket = `${dir}/broker.sock`;
+  let modelCalls = 0;
+  const toolCalls: [string, unknown][] = [];
+  const server = createServer(async (req, res) => {
+    try {
+      assert.equal(req.headers.authorization, "Bearer worker-test-token");
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const body = JSON.parse(Buffer.concat(chunks).toString());
+      res.setHeader("Content-Type", "application/json");
+      if (req.url === "/session") {
+        res.end(JSON.stringify({ system_prompt: "You are the test worker." }));
+      } else if (req.url === "/model") {
+        modelCalls++;
+        assert.deepEqual(body.tools.map((tool: { function: { name: string } }) => tool.function.name).sort(), allWorkerNames);
+        const schema = (name: string) => body.tools.find((tool: { function: { name: string } }) => tool.function.name === name).function.parameters;
+        assert.deepEqual(schema("job_start").required, ["code"]);
+        assert.equal(schema("job_start").properties.timeout_s.type, "integer");
+        assert.deepEqual(schema("job_wait").required, ["job"]);
+        assert.deepEqual([schema("job_wait").properties.wait_s.minimum, schema("job_wait").properties.wait_s.maximum], [0, 120]);
+        assert.deepEqual(schema("job_stop").required, ["job"]);
+        if (modelCalls === 1) {
+          const calls = [
+            { id: "call-start", type: "function", function: { name: "job_start", arguments: JSON.stringify({ code: "make test", timeout_s: 600 }) } },
+            { id: "call-wait", type: "function", function: { name: "job_wait", arguments: JSON.stringify({ job: "jb_1", wait_s: 0 }) } },
+            { id: "call-stop", type: "function", function: { name: "job_stop", arguments: JSON.stringify({ job: "jb_1" }) } },
+            { id: "call-gone", type: "function", function: { name: "job_wait", arguments: JSON.stringify({ job: "jb_gone" }) } },
+          ];
+          res.end(JSON.stringify({
+            id: "completion-1", created: 1, model: "deepseek-flash", swarm_cost_microusd: 30,
+            choices: [{ index: 0, message: { role: "assistant", content: null, tool_calls: calls }, finish_reason: "tool_calls" }],
+            usage: { prompt_tokens: 20, completion_tokens: 20, total_tokens: 40 },
+          }));
+        } else {
+          const results = body.messages.filter((message: { role: string }) => message.role === "tool")
+            .map((message: { content: unknown }) => typeof message.content === "string" ? message.content : JSON.stringify(message.content));
+          assert.equal(results.length, 4);
+          assert.ok(results.some((text: string) => text.includes("\"status\":\"started\"")), `${results}`);
+          assert.ok(results.some((text: string) => text.includes("\"status\":\"stopped\"")), `${results}`);
+          assert.ok(results.some((text: string) => text.includes("no job jb_gone")), `the model must see the refusal: ${results}`);
+          res.end(JSON.stringify({
+            id: "completion-2", created: 1, model: "deepseek-flash", swarm_cost_microusd: 30,
+            choices: [{ index: 0, message: { role: "assistant", content: "Stopped it." }, finish_reason: "stop" }],
+            usage: { prompt_tokens: 20, completion_tokens: 5, total_tokens: 25 },
+          }));
+        }
+      } else {
+        const name = req.url?.split("/").at(-1) ?? "";
+        toolCalls.push([name, body]);
+        if (name === "job_start") res.end(JSON.stringify({ job: "jb_1", status: "started", timeout_s: 600 }));
+        else if (name === "job_stop") res.end(JSON.stringify({ job: "jb_1", status: "stopped", exit_code: -1, stdout: "", stderr: "" }));
+        else if (body.job === "jb_1") res.end(JSON.stringify({ job: "jb_1", status: "running", stdout: "", stderr: "" }));
+        else {
+          res.statusCode = 404;
+          res.end(JSON.stringify({ error: "no job jb_gone of this assignment waits" }));
+        }
+      }
+    } catch (error) {
+      res.statusCode = 500;
+      res.end(JSON.stringify({ error: String(error) }));
+    }
+  });
+  await new Promise<void>((done) => server.listen(socket, done));
+  const child = spawn(process.execPath, [
+    resolve("node_modules/@earendil-works/pi-coding-agent/dist/cli.js"),
+    "--offline", "--mode", "rpc", "--provider", "swarm", "--model", "deepseek-flash", "--thinking", "off",
+    "--no-session", "--no-builtin-tools", "--no-extensions", "--no-mcp", "--no-skills", "--no-prompt-templates",
+    "--no-themes", "--no-context-files", "--no-approve", "--extension", resolve("extensions/broker.ts"),
+  ], { cwd: dir, signal: t.signal, env: { PATH: process.env.PATH, HOME: dir, PI_CODING_AGENT_DIR: `${dir}/config`, SWARM_SOCKET: socket, SWARM_TOKEN: "worker-test-token", SWARM_ROLE: "ticket-worker", SWARM_GRANTS: allWorkerNames.join(","), SWARM_TOOLSET: "worker", PI_TELEMETRY: "0" }, stdio: ["pipe", "pipe", "pipe"] });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const records: any[] = [];
+  const settled = new Promise<void>((done, reject) => {
+    let pending = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      pending += chunk;
+      let newline;
+      while ((newline = pending.indexOf("\n")) >= 0) {
+        const line = pending.slice(0, newline);
+        pending = pending.slice(newline + 1);
+        if (!line) continue;
+        try {
+          const record = JSON.parse(line);
+          records.push(record);
+          if (record.type === "response" && record.success === false) reject(new Error(JSON.stringify(record)));
+          if (record.type === "extension_error") reject(new Error(JSON.stringify(record)));
+          if (record.type === "agent_settled") done();
+        } catch (error) { reject(error); }
+      }
+    });
+    child.on("error", reject);
+    child.on("exit", (code) => reject(new Error(`Pi exited ${code}: ${stderr}`)));
+  });
+  try {
+    child.stdin.write(`${JSON.stringify({ id: "prompt-1", type: "prompt", message: "Ticket tk_1: run the tests in the background." })}\n`);
+    await settled;
+    assert.equal(modelCalls, 2, `${stderr}\n${JSON.stringify(records.filter((record) => record.type === "message_end"))}`);
+    assert.deepEqual(toolCalls.map(([name]) => name).sort(), ["job_start", "job_stop", "job_wait", "job_wait"]);
+    assert.deepEqual(toolCalls.find(([name]) => name === "job_start")?.[1], { code: "make test", timeout_s: 600 });
+    assert.deepEqual(toolCalls.find(([name]) => name === "job_stop")?.[1], { job: "jb_1" });
+    const ends = records.filter((record) => record.type === "tool_execution_end");
+    assert.equal(ends.filter((record) => record.isError).length, 1, JSON.stringify(ends));
+  } finally {
+    child.kill("SIGKILL");
+    await new Promise<void>((done) => server.close(() => done()));
+    await rm(dir, { recursive: true, force: true });
   }
 });

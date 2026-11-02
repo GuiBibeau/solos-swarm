@@ -7,7 +7,9 @@
 //! launch past that waits for a slot.
 
 use super::broker::{self, AgentBroker, WorkerSeat, clip};
+use super::jobs::JOB_TOOLS;
 use super::ports::{BoxFuture, Delivered, Delivery, Executor, Fact, FactSink, Launch};
+use super::swarm_executor::SwarmExecutor;
 use crate::broker::write_json;
 use crate::harness::{
     AgentHarness, JOIN_WAIT, Observation, Role, STOP_WAIT, Session, SessionEvent, SessionSpec,
@@ -35,6 +37,7 @@ const PREPARE_WAIT: Duration = Duration::from_secs(300);
 const INPUT_TEXT_CHARS: usize = 4_000;
 const FAILURE_CHARS: usize = 400;
 const QUIET_TURN: &str = "The turn ended without a report.";
+const JOB_TURN: &str = "The turn ended while a background job runs; its end comes back as input.";
 
 /// What a worker is told before its first prompt.
 pub const WORKER_INSTRUCTIONS: &str = "\
@@ -60,8 +63,11 @@ stop, hand it back with worker_handback and its trigger id instead of acting on 
 pub fn system_prompt(budget_microusd: MicroUsd, run_code: bool) -> String {
     let tools = if run_code {
         "run_code runs one bash command in an offline sandbox whose working directory, /work, is this \
-         ticket's own directory and keeps what you write between calls; fetch_url is your only network \
-         access."
+         ticket's own directory and keeps what you write between calls. A command still running after a \
+         few seconds moves to the background as a job; job_start starts one there at once. job_wait \
+         waits a short while for a job, job_stop stops one, and a job that ends after your turn comes \
+         back to you as new input, so you can end your turn instead of waiting. fetch_url is your only \
+         network access."
     } else {
         "fetch_url is your only network access; this host offers no run_code."
     };
@@ -107,7 +113,7 @@ fn input_lines(out: &mut String, delivered: &Delivered) {
             let _ = write!(out, "\n- trigger {trigger} (its text is not available)");
         }
         (InputBody::Note { text }, _) => {
-            out.push_str("\n- a note from the Router");
+            out.push_str("\n- a note from the agent");
             quoted(out, text);
         }
         (InputBody::Approved { by }, _) => {
@@ -171,9 +177,10 @@ pub fn delivery_text(ticket: &TicketId, inputs: &[Delivered]) -> String {
     text
 }
 
-/// What runs a Plan. Every launch goes through here; P5 adds the swarm.
+/// What runs a Plan. Every launch goes through here.
 enum Runner {
     Session,
+    Swarm,
     Unavailable(String),
 }
 
@@ -186,9 +193,7 @@ fn runner(plan: &Plan) -> Runner {
         Plan::Session {
             harness: Some(name),
         } => Runner::Unavailable(format!("the {name} harness is not available here")),
-        Plan::Swarm { agents, .. } => Runner::Unavailable(format!(
-            "this agent does not run swarm plans yet, so the swarm of {agents} agents did not start"
-        )),
+        Plan::Swarm { .. } => Runner::Swarm,
     }
 }
 
@@ -207,6 +212,8 @@ pub struct PiExecutorParts<H> {
     /// A shell command run once per Ticket in its directory before its
     /// first worker, with `SOLOS_TICKET` and `SOLOS_WORK_DIR` set.
     pub prepare: Option<String>,
+    /// Runs `Plan::Swarm` Assignments; without it they fail.
+    pub swarm: Option<SwarmExecutor<H>>,
 }
 
 pub struct PiExecutor<H> {
@@ -245,12 +252,25 @@ impl Drop for Revoke<'_> {
     }
 }
 
-fn private_dir(dir: &Path) -> Result<()> {
+pub(super) fn private_dir(dir: &Path) -> Result<()> {
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(dir)
         .with_context(|| format!("cannot create {}", dir.display()))
+}
+
+/// `name`, when it can name a directory: a Ticket or Assignment id.
+pub(super) fn dir_name(name: &str) -> Result<&str> {
+    ensure!(
+        !name.is_empty()
+            && name.len() <= 64
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+        "id {name} cannot name a directory"
+    );
+    Ok(name)
 }
 
 async fn close(mut session: impl Session) {
@@ -279,6 +299,7 @@ where
             .to_vec();
         if parts.broker.offers_run_code() {
             grants.push("run_code".into());
+            grants.extend(JOB_TOOLS.map(String::from));
         }
         private_dir(&parts.tickets_dir)?;
         Ok(Self {
@@ -301,6 +322,9 @@ where
         for worker in workers.into_values() {
             finish(worker.task).await;
         }
+        if let Some(swarm) = &self.inner.parts.swarm {
+            swarm.shutdown().await;
+        }
     }
 }
 
@@ -311,36 +335,59 @@ where
 {
     fn launch(&self, launch: Launch, facts: FactSink) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
-            match runner(&launch.plan) {
-                Runner::Session => {
+            match (runner(&launch.plan), &self.inner.parts.swarm) {
+                (Runner::Session, _) => {
                     self.inner.start(launch, facts);
                     Ok(())
                 }
-                Runner::Unavailable(why) => failed(&facts, &launch, false, &why, 0).await,
+                (Runner::Swarm, Some(swarm)) => swarm.launch(launch, facts).await,
+                (Runner::Swarm, None) => {
+                    let agents = match &launch.plan {
+                        Plan::Swarm { agents, .. } => *agents,
+                        Plan::Session { .. } => 0,
+                    };
+                    let why = format!(
+                        "this agent has no executor.swarm, so the swarm of {agents} agents did \
+                         not start"
+                    );
+                    failed(&facts, &launch, false, &why, 0).await
+                }
+                (Runner::Unavailable(why), _) => failed(&facts, &launch, false, &why, 0).await,
             }
         })
     }
 
-    fn deliver(&self, delivery: Delivery, _: FactSink) -> BoxFuture<'_, Result<()>> {
-        match self.inner.workers().get(&delivery.assignment) {
-            Some(worker) => {
-                // A worker that ended meanwhile drops them; the next Assignment's launch carries every Input.
-                let _ = worker.inputs.send(delivery.inputs);
-            }
-            None => eprintln!(
-                "agent: no worker runs {} of {}; its inputs wait for the next one",
-                delivery.assignment, delivery.ticket
-            ),
+    fn deliver(&self, delivery: Delivery, facts: FactSink) -> BoxFuture<'_, Result<()>> {
+        if let Some(worker) = self.inner.workers().get(&delivery.assignment) {
+            // A worker that ended meanwhile drops them; the next Assignment's launch carries every Input.
+            let _ = worker.inputs.send(delivery.inputs);
+            return Box::pin(async { Ok(()) });
         }
+        if let Some(swarm) = &self.inner.parts.swarm
+            && swarm.has(&delivery.assignment)
+        {
+            return swarm.deliver(delivery, facts);
+        }
+        eprintln!(
+            "agent: no worker runs {} of {}; its inputs wait for the next one",
+            delivery.assignment, delivery.ticket
+        );
         Box::pin(async { Ok(()) })
     }
 
-    fn stop(&self, _: TicketId, assignment: AssignmentId, _: String) -> BoxFuture<'_, Result<()>> {
+    fn stop(
+        &self,
+        ticket: TicketId,
+        assignment: AssignmentId,
+        reason: String,
+    ) -> BoxFuture<'_, Result<()>> {
         let worker = self.inner.workers().remove(&assignment);
         Box::pin(async move {
             if let Some(worker) = worker {
                 let _ = worker.stop.send(true);
                 finish(worker.task).await;
+            } else if let Some(swarm) = &self.inner.parts.swarm {
+                swarm.stop(ticket, assignment, reason).await?;
             }
             Ok(())
         })
@@ -468,21 +515,13 @@ where
             .play(&mut session, &mut events, inbox, stop, run)
             .await;
         close(session).await;
+        seat.stop_jobs().await;
         outcome
     }
 
     /// The Ticket's directory, with its empty `work` and Pi settings.
     fn ticket_dir(&self, ticket: &TicketId) -> Result<PathBuf> {
-        let name = ticket.as_str();
-        ensure!(
-            !name.is_empty()
-                && name.len() <= 64
-                && name
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
-            "ticket id {name} cannot name a directory"
-        );
-        let dir = self.parts.tickets_dir.join(name);
+        let dir = self.parts.tickets_dir.join(dir_name(ticket.as_str())?);
         private_dir(&dir.join(WORK_DIR))?;
         let settings = dir.join("pi-settings.json");
         if !settings.exists() {
@@ -551,6 +590,8 @@ impl Turns<'_> {
     /// Report started, prompt the assignment, and keep prompting until the
     /// worker is stopped or gone. Inputs that come during a turn wait for
     /// the next one; an Input the session already has is not sent again.
+    /// A turn's end turns the job ends it did not take into Notes, which
+    /// come back as Inputs.
     async fn play(
         &self,
         session: &mut impl Session,
@@ -592,15 +633,25 @@ impl Turns<'_> {
             tokio::select! {
                 _ = stop.changed() => return Ok(None),
                 batch = inbox.recv() => match batch {
-                    Some(batch) => queued.extend(
-                        batch.into_iter().filter(|d| seen.insert(d.input.id.clone())),
-                    ),
+                    Some(batch) => {
+                        queued.extend(
+                            batch.into_iter().filter(|d| seen.insert(d.input.id.clone())),
+                        );
+                        if in_turn && !queued.is_empty() {
+                            seat.input_waiting();
+                        }
+                    }
                     None => return Ok(None),
                 },
                 event = events.recv() => match event {
                     Some((_, Ok(SessionEvent::TurnEnded))) => {
                         in_turn = false;
-                        if queued.is_empty() && seat.quiet_turn() {
+                        let notes = seat.end_turn();
+                        let woken = !notes.is_empty();
+                        for note in notes {
+                            self.facts.send(note).await?;
+                        }
+                        if queued.is_empty() && !woken && seat.quiet_turn() {
                             self.quiet().await?;
                         }
                     }
@@ -615,12 +666,18 @@ impl Turns<'_> {
     }
 
     /// A turn left the Ticket as if working and nothing waits to be
-    /// prompted, so it counts as `waiting`.
+    /// prompted, so it counts as `waiting`; or as `progress` while a job
+    /// runs, since the worker is still at work and the job's end wakes it.
     async fn quiet(&self) -> Result<()> {
         let spent = self.broker.spent(self.seat).await?;
+        let (status, text) = if self.seat.jobs_running() {
+            (ReportStatus::Progress, JOB_TURN)
+        } else {
+            (ReportStatus::Waiting, QUIET_TURN)
+        };
         let report = ReportIn {
-            status: ReportStatus::Waiting,
-            text: QUIET_TURN.into(),
+            status,
+            text: text.into(),
             question: None,
             spent_microusd: spent,
         };
@@ -821,6 +878,7 @@ mod tests {
                 decide: DecideTerms {
                     default_budget_microusd: 1,
                     max_budget_microusd: None,
+                    swarm: None,
                 },
                 workers: Some(WorkerParts { terms, code: None }),
             })
@@ -836,6 +894,7 @@ mod tests {
                 model: "deepseek-flash".into(),
                 max_workers,
                 prepare: prepare.map(String::from),
+                swarm: None,
             })
             .unwrap();
             Self {

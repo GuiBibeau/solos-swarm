@@ -54,7 +54,28 @@ const WORKER_TOOLS = [
       reason: Type.String({ minLength: 1, description: "One sentence: why it is not yours." }),
     }),
   },
-  { name: "run_code", description: "Run one bash command in an isolated, offline Linux sandbox. /work is your ticket's directory: the only writable path, kept between calls. Other paths the operator mounted are read-only. No network, broker socket, host home or credentials. Files are written into /work before the command. Returns bounded {exit_code,stdout,stderr,timed_out,duration_ms,truncated}. timeout_seconds is 1-300 (default 120).", parameters: Type.Object({ code: Type.String({ minLength: 1 }), files: Type.Optional(Type.Object({}, { additionalProperties: Type.String() })), timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 300 })), stdin: Type.Optional(Type.String()) }) },
+  { name: "run_code", description: "Run one bash command in an isolated, offline Linux sandbox. /work is your ticket's directory: the only writable path, kept between calls. Other paths the operator mounted are read-only. No network, broker socket, host home or credentials. Files are written into /work before the command. Returns bounded {exit_code,stdout,stderr,timed_out,duration_ms,truncated}. timeout_seconds is 1-300 (default 120). A command still running after a few seconds moves to the background and returns {job,status:\"running\",note}: use job_wait or job_stop on it, or end your turn and its result comes back as new input.", parameters: Type.Object({ code: Type.String({ minLength: 1 }), files: Type.Optional(Type.Object({}, { additionalProperties: Type.String() })), timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 300 })), stdin: Type.Optional(Type.String()) }) },
+  {
+    name: "job_start",
+    description: "Start one bash command in the background, in run_code's sandbox with /work as its directory, and return {job,status} at once. Keep working or end your turn: when it ends after your turn, its result comes back to you as new input. Each byte of its output reaches you once, so write long output to a file in /work. A ticket holds a few jobs at a time.",
+    parameters: Type.Object({
+      code: Type.String({ minLength: 1 }),
+      timeout_s: Type.Optional(Type.Integer({ minimum: 1, description: "Kill it after this many seconds. Default and most: the operator's job limit (30 minutes unless set)." })),
+    }),
+  },
+  {
+    name: "job_wait",
+    description: "Wait up to wait_s for a job. Returns its end ({job,status,exit_code,stdout,stderr,...}), or {status:\"running\"} with what it printed since you last looked. It returns early when new input waits for you; end your turn to read it.",
+    parameters: Type.Object({
+      job: Type.String({ minLength: 1, description: "The job id from job_start or run_code." }),
+      wait_s: Type.Optional(Type.Integer({ minimum: 0, maximum: 120, description: "Seconds to wait; 0 only looks. Default 30." })),
+    }),
+  },
+  {
+    name: "job_stop",
+    description: "Kill a job and return its end with what it printed that you had not read.",
+    parameters: Type.Object({ job: Type.String({ minLength: 1 }) }),
+  },
   FETCH_URL,
 ];
 

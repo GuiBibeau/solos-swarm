@@ -7,7 +7,7 @@
 
 use serde_json::{Value, json};
 use solos_agent_core::model::{
-    AssignmentState, DecisionKind, MessageKind, OutboundMessage, ReportStatus, Ticket,
+    AssignmentState, DecisionKind, InputBody, MessageKind, OutboundMessage, ReportStatus, Ticket,
     TicketOutcome, TriggerId,
 };
 use solos_agent_store::{SpendState, SqliteStore};
@@ -637,6 +637,143 @@ async fn a_crash_during_a_running_assignment_restarts_it_as_a_recovery_without_r
     assert_settled(&scratch.store());
 }
 
+fn notes(ticket: &Ticket) -> Vec<&str> {
+    ticket
+        .inputs
+        .iter()
+        .filter_map(|input| match &input.body {
+            InputBody::Note { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The command lines on this host that carry `marker`.
+fn command_lines(marker: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| std::fs::read(entry.path().join("cmdline")).ok())
+        .map(|cmdline| String::from_utf8_lossy(&cmdline).into_owned())
+        .filter(|cmdline| cmdline.contains(marker))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_background_job_that_ends_between_turns_wakes_its_worker_once_with_its_result() {
+    if !sandbox() {
+        return;
+    }
+    let scratch = Scratch::new("job");
+    scratch.ask("t-ask", "T1", "Build the release notes in the background");
+    let model = Model::new(Box::new(|prompt| {
+        if prompt.starts_with("Ticket ") {
+            let build = "sleep 2 && echo notes built > notes.txt && cat notes.txt";
+            vec![("job_start", json!({"code": build}))]
+        } else if prompt.contains("- a note from the agent") && prompt.contains("notes built") {
+            vec![report("ready", "The release notes are built.")]
+        } else {
+            vec![report("failed", "an input without the job's result")]
+        }
+    }));
+
+    let summary = scratch
+        .serve(
+            scratch.config(false, "  run_code: {}\n"),
+            scratch.host(scripted(), model.clone()),
+        )
+        .await;
+
+    assert_eq!((summary.triggers_received, summary.effects_pending), (1, 0));
+    assert_eq!(scratch.replies(), ack_and_result("T1"));
+    assert_eq!(scratch.sent()[1].text, "The release notes are built.");
+    let tickets = scratch.tickets();
+    let [ticket] = &tickets[..] else {
+        panic!("{tickets:?}")
+    };
+    assert_eq!(
+        ticket.ended.as_ref().map(|e| e.outcome),
+        Some(TicketOutcome::Completed)
+    );
+    let [note] = notes(ticket)[..] else {
+        panic!("one note: {:?}", ticket.inputs)
+    };
+    assert!(note.starts_with("Background job jb_"), "{note}");
+    assert!(note.contains("exited with code 0"), "{note}");
+    assert!(note.contains("stdout:\nnotes built"), "{note}");
+    let prompts = model.worker_prompts();
+    let [assignment, woken] = &prompts[..] else {
+        panic!("the assignment and one wake-up: {prompts:?}")
+    };
+    assert!(assignment.starts_with("Ticket "), "{assignment}");
+    assert!(woken.starts_with("New input on ticket"), "{woken}");
+    assert_eq!(
+        prompts.iter().filter(|p| p.contains("notes built")).count(),
+        1,
+        "the result reached the worker once"
+    );
+    let statuses: Vec<_> = ticket.assignments[0]
+        .reports
+        .iter()
+        .map(|r| r.status)
+        .collect();
+    assert_eq!(
+        statuses,
+        [ReportStatus::Progress, ReportStatus::Ready],
+        "a turn that ends with a job running is still work"
+    );
+    assert_eq!(
+        std::fs::read_to_string(scratch.work_dir(ticket).join("notes.txt")).unwrap(),
+        "notes built\n"
+    );
+    assert_settled(&scratch.store());
+}
+
+#[tokio::test]
+async fn ending_a_ticket_kills_its_background_jobs_and_reports_none() {
+    if !sandbox() {
+        return;
+    }
+    let scratch = Scratch::new("job-end");
+    scratch.ask("t-ask", "T1", "Start the long build and hand it over");
+    let marker = format!("job-{}", uuid::Uuid::new_v4().simple());
+    let code = format!("echo > started && exec -a {marker} sleep 300");
+    let model = Model::new(Box::new(move |_| {
+        vec![
+            ("job_start", json!({"code": code})),
+            ("run_code", json!({"code": "sleep 1"})),
+            report("ready", "The build runs."),
+        ]
+    }));
+
+    scratch
+        .serve(
+            scratch.config(false, "  run_code: {}\n"),
+            scratch.host(scripted(), model),
+        )
+        .await;
+
+    assert_eq!(scratch.replies(), ack_and_result("T1"));
+    let mut left = command_lines(&marker);
+    for _ in 0..200 {
+        if left.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        left = command_lines(&marker);
+    }
+    assert!(left.is_empty(), "the job outlived its ticket: {left:?}");
+    let tickets = scratch.tickets();
+    assert!(
+        scratch.work_dir(&tickets[0]).join("started").is_file(),
+        "the job ran"
+    );
+    assert!(notes(&tickets[0]).is_empty(), "{:?}", tickets[0].inputs);
+    assert_settled(&scratch.store());
+}
+
 /// A harness that counts the sessions alive at once.
 struct Counting {
     inner: ScriptedHarness,
@@ -777,7 +914,15 @@ async fn a_real_pi_worker_runs_code_in_its_ticket_directory_and_reports_ready() 
     tools.sort_unstable();
     assert_eq!(
         tools,
-        ["fetch_url", "run_code", "worker_handback", "worker_report"]
+        [
+            "fetch_url",
+            "job_start",
+            "job_stop",
+            "job_wait",
+            "run_code",
+            "worker_handback",
+            "worker_report"
+        ]
     );
     assert_eq!(bodies[0]["messages"][0]["role"], "system");
     assert!(text(&bodies[0]["messages"][0]).starts_with("You are a worker"));
