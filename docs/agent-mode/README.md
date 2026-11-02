@@ -209,7 +209,8 @@ provider through the real broker. It runs on macOS too. Swarm mode is the first 
     `budgets.router_daily_microusd`) and `ticket:<id>` (capped for life by the Mandate budget, for P3d). Holds and
     settlements are rows in the store's `spend` table, so a restart keeps every cap; a closed row is final.
   - Router tools: `router_decide` (one flat object: eval, decision, reason, and the accept or stop fields; an accept
-    above the approval threshold is refused, since `agent serve` cannot take approvals yet) and `router_read` (a
+    above the approval threshold stands only when Slack can take the approval, through a Slack channel and a
+    `slack:` approver, and its Ticket then waits for one; otherwise it is refused) and `router_read` (a
     Trigger, Thread or Ticket with its neighbours' ids). No `run_code`, no `fetch_url`. The Pi extension picks the
     set with `SWARM_TOOLSET=router` and takes the Router's system prompt from the broker.
   - `router_note` and an outage pause in the agent broker are not built yet.

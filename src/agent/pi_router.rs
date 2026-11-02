@@ -61,9 +61,17 @@ pub fn system_prompt(
         .to_owned();
     let _ = write!(
         prompt,
-        "\n\nBudgets: an accept gets {} microusd unless it names budget_microusd, and may name at most {}.",
-        decide.default_budget_microusd, decide.max_budget_microusd
+        "\n\nBudgets: an accept gets {} microusd unless it names budget_microusd",
+        decide.default_budget_microusd
     );
+    let _ = match decide.max_budget_microusd {
+        Some(max) => write!(prompt, ", and may name at most {max}."),
+        None => write!(
+            prompt,
+            "; above {} its ticket waits for a person's approval.",
+            policy.auto_approve_microusd
+        ),
+    };
     if policy.rules.is_empty() {
         prompt.push_str(
             "\nNo proactive rules are enabled: an inferred candidate is recorded, never started.",
@@ -567,7 +575,7 @@ mod tests {
     fn the_system_prompt_adds_budgets_and_only_enabled_rules() {
         let decide = DecideTerms {
             default_budget_microusd: 500_000,
-            max_budget_microusd: 2_000_000,
+            max_budget_microusd: Some(2_000_000),
         };
         let policy = AllowlistPolicy {
             rules: ["ci-red".to_owned(), "stale-pr".to_owned()].into(),
@@ -584,5 +592,17 @@ mod tests {
         let plain = system_prompt(None, &AllowlistPolicy::default(), &BTreeMap::new(), decide);
         assert!(plain.starts_with("You are the Router"));
         assert!(plain.ends_with("an inferred candidate is recorded, never started."));
+        let approvable = DecideTerms {
+            max_budget_microusd: None,
+            ..decide
+        };
+        let gated = system_prompt(None, &policy, &text, approvable);
+        assert!(
+            gated.contains(
+                "unless it names budget_microusd; above 2000000 its ticket waits for a \
+                 person's approval.\n"
+            ),
+            "{gated}"
+        );
     }
 }

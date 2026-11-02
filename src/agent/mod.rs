@@ -203,10 +203,7 @@ impl PiParts {
             .router_daily_microusd
             .context("a pi router needs budgets.router_daily_microusd")?;
         let upstream = upstream_profile(provider, model)?;
-        let decide = DecideTerms {
-            default_budget_microusd: config.budgets.session_microusd,
-            max_budget_microusd: config.policy.auto_approve_microusd,
-        };
+        let decide = DecideTerms::for_config(config);
         let dir = state_dir.join(ROUTER_DIR);
         private_dir(&dir)?;
         let settings = dir.join("pi-settings.json");

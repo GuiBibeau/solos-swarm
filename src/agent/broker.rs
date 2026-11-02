@@ -5,6 +5,7 @@
 //! either. Each token names a principal, and every model call is held and
 //! settled against the principal's account in the agent Store.
 
+use super::AgentConfig;
 use super::ports::{Fact, FactSink};
 use crate::broker::now_ms;
 use crate::gateway::{self, PriceTable, Provider, Receipt, Upstream};
@@ -123,9 +124,23 @@ pub struct Grant {
 pub struct DecideTerms {
     /// An accept that names no budget gets this.
     pub default_budget_microusd: MicroUsd,
-    /// `agent serve` cannot take approvals yet, so an accept above the
-    /// Policy's approval threshold is refused instead of waiting forever.
-    pub max_budget_microusd: MicroUsd,
+    /// The most an accept may name, or no cap. Above the Policy's approval
+    /// threshold a Ticket waits for a person's approval, so where nobody can
+    /// give one the threshold is the cap, instead of a Ticket that waits
+    /// forever.
+    pub max_budget_microusd: Option<MicroUsd>,
+}
+
+impl DecideTerms {
+    /// What `config` lets an accept name: above `policy.auto_approve_microusd`
+    /// only when Slack can take the approval its Ticket then waits for.
+    pub fn for_config(config: &AgentConfig) -> Self {
+        Self {
+            default_budget_microusd: config.budgets.session_microusd,
+            max_budget_microusd: (!config.takes_approvals())
+                .then_some(config.policy.auto_approve_microusd),
+        }
+    }
 }
 
 pub struct BrokerParts {
@@ -503,11 +518,12 @@ impl DecideArgs {
                 let budget = self
                     .budget_microusd
                     .unwrap_or(terms.default_budget_microusd);
-                if budget > terms.max_budget_microusd {
+                if let Some(max) = terms.max_budget_microusd
+                    && budget > max
+                {
                     return Err(format!(
-                        "budget_microusd {budget} is above {}, the most an accept may grant \
-                         without a person's approval",
-                        terms.max_budget_microusd
+                        "budget_microusd {budget} is above {max}, the most an accept may grant \
+                         without a person's approval"
                     ));
                 }
                 let acknowledge = match self.acknowledge {
@@ -750,7 +766,7 @@ mod tests {
 
     const TERMS: DecideTerms = DecideTerms {
         default_budget_microusd: 500_000,
-        max_budget_microusd: 2_000_000,
+        max_budget_microusd: Some(2_000_000),
     };
 
     fn verdict(args: serde_json::Value) -> Result<Verdict, String> {

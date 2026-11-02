@@ -170,10 +170,7 @@ impl AgentConfig {
             slack_sources <= 1,
             "the agent config names two slack sources"
         );
-        let slack_channel = self
-            .channels
-            .iter()
-            .any(|channel| matches!(channel, ChannelConfig::Slack {}));
+        let slack_channel = self.slack_channel();
         ensure!(
             !slack_channel || slack_sources == 1,
             "the slack channel needs the slack source's bot token"
@@ -190,10 +187,7 @@ impl AgentConfig {
                 "{gated}, and only the slack channel's buttons can take one"
             );
             ensure!(
-                self.policy
-                    .approvers
-                    .iter()
-                    .any(|who| who.starts_with("slack:")),
+                self.slack_approver(),
                 "{gated}, and policy.approvers names nobody on slack"
             );
         }
@@ -228,6 +222,26 @@ impl AgentConfig {
             }
         }
         Ok(())
+    }
+
+    /// Whether a person can approve a budget above
+    /// `policy.auto_approve_microusd`: only the slack channel's buttons take
+    /// approvals, from a `slack:` approver.
+    pub fn takes_approvals(&self) -> bool {
+        self.slack_channel() && self.slack_approver()
+    }
+
+    fn slack_channel(&self) -> bool {
+        self.channels
+            .iter()
+            .any(|channel| matches!(channel, ChannelConfig::Slack {}))
+    }
+
+    fn slack_approver(&self) -> bool {
+        self.policy
+            .approvers
+            .iter()
+            .any(|who| who.starts_with("slack:"))
     }
 }
 
@@ -513,5 +527,17 @@ budgets: {session_microusd: 500000}
         ] {
             assert!(parse(&yaml).is_err(), "{case}: accepted\n{yaml}");
         }
+    }
+
+    #[test]
+    fn only_a_slack_channel_with_a_slack_approver_takes_approvals() {
+        assert!(parse(SLACK).unwrap().takes_approvals());
+        let elsewhere = SLACK.replace("approvers: [slack:U1]", "approvers: [github:U1]");
+        assert!(!parse(&elsewhere).unwrap().takes_approvals());
+        let unheard = VALID.replace(
+            "bots: [github:ci]",
+            "bots: [github:ci]\n  approvers: [slack:alice]",
+        );
+        assert!(!parse(&unheard).unwrap().takes_approvals());
     }
 }

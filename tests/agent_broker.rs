@@ -7,8 +7,8 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use solos_agent_core::AllowlistPolicy;
 use solos_agent_core::model::{
-    Actor, Addressed, Candidate, ChannelRef, DecisionKind, MessageKind, OutboundMessage, ThreadKey,
-    Trigger, TriggerId,
+    Actor, Addressed, Approval, Candidate, ChannelRef, DecisionKind, MessageKind, OutboundMessage,
+    ThreadKey, Trigger, TriggerId,
 };
 use solos_agent_store::{SpendState, SqliteStore};
 use solos_swarm::agent::broker::{
@@ -17,7 +17,7 @@ use solos_swarm::agent::broker::{
 use solos_swarm::agent::jsonl::{JsonlChannel, JsonlSource};
 use solos_swarm::agent::ports::{BoxFuture, Channel, FactSink, Router};
 use solos_swarm::agent::scripted::{ScriptedExecutor, ScriptedRouter};
-use solos_swarm::agent::{Adapters, RunOptions, Runtime, STORE_FILE};
+use solos_swarm::agent::{Adapters, AgentConfig, RunOptions, Runtime, STORE_FILE};
 use solos_swarm::gateway::{Dispatch, PriceTable, Provider, Upstream, upstream_body};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -37,6 +37,10 @@ const PRICES: PriceTable = PriceTable {
 /// 100 prompt tokens and 50 completion tokens at `PRICES`.
 const COST: u64 = 90;
 const LIMIT: Duration = Duration::from_secs(30);
+const TERMS: DecideTerms = DecideTerms {
+    default_budget_microusd: 500_000,
+    max_budget_microusd: Some(2_000_000),
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Behaviour {
@@ -142,6 +146,18 @@ impl Scratch {
             .collect()
     }
     fn runtime(&self, router: Arc<dyn Router>, until_idle: bool) -> Runtime {
+        let policy = AllowlistPolicy {
+            people: ["slack:alice".to_owned()].into(),
+            ..AllowlistPolicy::default()
+        };
+        self.runtime_under(policy, router, until_idle)
+    }
+    fn runtime_under(
+        &self,
+        policy: AllowlistPolicy,
+        router: Arc<dyn Router>,
+        until_idle: bool,
+    ) -> Runtime {
         let channel: Arc<dyn Channel> =
             Arc::new(JsonlChannel::open(self.root.join("outbox.jsonl")).unwrap());
         let adapters = Adapters {
@@ -155,11 +171,30 @@ impl Scratch {
             tick: Duration::from_millis(10),
             ..RunOptions::default()
         };
-        let policy = AllowlistPolicy {
-            people: ["slack:alice".to_owned()].into(),
-            ..AllowlistPolicy::default()
-        };
         Runtime::new(self.store(), policy, adapters, options).with_control_dir(self.state())
+    }
+    /// An agent config whose Pi Router decides through this broker: with a
+    /// Slack channel and a `slack:` approver when `slack`, else a jsonl
+    /// outbox that cannot take an approval. Only its Policy and terms are
+    /// used; the runtime keeps this scratch's jsonl adapters.
+    fn config(&self, slack: bool) -> AgentConfig {
+        let io = if slack {
+            "sources:\n  - {kind: slack, channels: [C1], app_token_file: app, bot_token_file: bot}\n\
+             channels:\n  - {kind: slack}\n"
+        } else {
+            "sources:\n  - {kind: jsonl, path: triggers.jsonl}\n\
+             channels:\n  - {kind: jsonl, source: slack, path: outbox.jsonl}\n"
+        };
+        let yaml = format!(
+            "policy:\n  people: [slack:alice]\n  approvers: [slack:boss]\n{io}\
+             router:\n  kind: pi\n  provider: deepseek\n  model: deepseek-flash\n  \
+             prices: {{input_microusd_per_million: 300000, output_microusd_per_million: 1200000}}\n\
+             executor: {{kind: scripted}}\n\
+             budgets: {{session_microusd: 500000, router_daily_microusd: 1000000}}\n"
+        );
+        let path = self.root.join("agent.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        AgentConfig::load(&path).unwrap()
     }
 }
 
@@ -241,15 +276,22 @@ fn model_request(text: &str) -> Value {
 }
 
 fn serve(scratch: &Scratch, provider: Arc<Scripted>, facts: FactSink, daily: u64) -> Served {
+    serve_deciding(scratch, provider, facts, daily, TERMS)
+}
+
+fn serve_deciding(
+    scratch: &Scratch,
+    provider: Arc<Scripted>,
+    facts: FactSink,
+    daily: u64,
+    decide: DecideTerms,
+) -> Served {
     let broker = AgentBroker::new(BrokerParts {
         dir: scratch.state(),
         store: scratch.store(),
         provider,
         facts,
-        decide: DecideTerms {
-            default_budget_microusd: 500_000,
-            max_budget_microusd: 2_000_000,
-        },
+        decide,
     })
     .unwrap();
     broker.admit(TOKEN.into(), grant(daily)).unwrap();
@@ -499,6 +541,73 @@ async fn router_decide_becomes_the_engines_decision_and_a_refused_one_is_a_tool_
     assert_eq!(decision.kind, DecisionKind::Accept);
     assert_eq!(decision.reason, "alice asked");
     assert_eq!(store.tickets().unwrap()[0].title, "Summarise the incident");
+}
+
+/// Above `auto_approve_microusd` a Ticket waits for a person's approval,
+/// which only Slack's buttons take. The terms come from the config: without
+/// Slack approvals the Router's accept above the threshold is refused; with
+/// them it stands, and its Ticket waits.
+#[tokio::test]
+async fn an_accept_above_the_threshold_waits_for_approval_only_where_slack_can_give_it() {
+    const GATED: u64 = 3_000_000;
+    for slack in [false, true] {
+        let scratch = Scratch::new("gated");
+        let config = scratch.config(slack);
+        assert!(GATED > config.policy.auto_approve_microusd);
+        scratch.append(&request("t-ask", "T1", "Rerun the load test"));
+        let router = Arc::new(Holding::default());
+        let runtime = scratch.runtime_under(config.policy.clone(), router.clone(), false);
+        let decide = DecideTerms::for_config(&config);
+        let served = serve_deciding(
+            &scratch,
+            Scripted::new(),
+            runtime.facts(),
+            1_000_000,
+            decide,
+        );
+
+        with_runtime(runtime, async {
+            router.arrived.notified().await;
+            let eval = router.candidates.lock().unwrap()[0].eval.clone();
+            let gated = json!({"eval":eval,"decision":"accept","reason":"alice asked",
+                               "title":"Load test","scope":"Rerun the load test",
+                               "budget_microusd":GATED});
+
+            let (status, answer) = served.post("tool/router_decide", Some(TOKEN), gated).await;
+
+            if !slack {
+                assert_eq!(status, 422, "{answer}");
+                let why = answer["error"].as_str().unwrap();
+                assert!(why.contains("without a person's approval"), "{why}");
+                return;
+            }
+            assert_eq!(status, 200, "{answer}");
+            assert_eq!(answer["kind"], "accept");
+            for _ in 0..500 {
+                if !scratch.sent().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        let tickets = scratch.store().tickets().unwrap();
+        if !slack {
+            assert!(tickets.is_empty(), "{tickets:?}");
+            assert!(scratch.sent().is_empty());
+            continue;
+        }
+        let [ticket] = &tickets[..] else {
+            panic!("{tickets:?}")
+        };
+        assert_eq!(ticket.mandate.budget_microusd, GATED);
+        assert_eq!(ticket.approval, Approval::Waiting);
+        let sent = scratch.sent();
+        let [ask] = &sent[..] else { panic!("{sent:?}") };
+        assert_eq!(ask.kind, MessageKind::Attention);
+        assert!(ask.text.contains("needs approval first"), "{}", ask.text);
+    }
 }
 
 #[tokio::test]
