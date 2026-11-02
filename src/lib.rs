@@ -34,6 +34,7 @@ pub mod scheduler;
 #[cfg(all(test, target_os = "linux"))]
 mod sdk_integration_tests;
 pub mod security;
+pub mod swarm;
 pub mod telemetry;
 pub mod tool_identity;
 pub mod tools;
