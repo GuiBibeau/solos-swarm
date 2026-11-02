@@ -1254,6 +1254,131 @@ mod tests {
         assert!(!unclaimed.contains("lens-04"));
     }
 
+    /// The exact bwrap + Pi argv of one swarm agent, with `role` as the only
+    /// value that differs between the coordinator and a worker.
+    fn golden_pi_args(role: &str) -> Vec<&str> {
+        vec![
+            "--unshare-all",
+            "--die-with-parent",
+            "--new-session",
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            "--ro-bind-try",
+            "/etc",
+            "/etc",
+            "--ro-bind-try",
+            "/lib",
+            "/lib",
+            "--ro-bind-try",
+            "/lib64",
+            "/lib64",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--tmpfs",
+            "/tmp",
+            "--tmpfs",
+            "/work",
+            "--dir",
+            "/work/config",
+            "--dir",
+            "/runtime",
+            "--ro-bind",
+            "/opt/node-v24",
+            "/runtime/node",
+            "--ro-bind",
+            "/srv/pi/node_modules",
+            "/runtime/node_modules",
+            "--ro-bind",
+            "/srv/pi/extensions",
+            "/runtime/extensions",
+            "--ro-bind",
+            "/runs/r1/broker.sock",
+            "/broker.sock",
+            "--ro-bind",
+            "/runs/r1/pi-settings.json",
+            "/work/config/settings.json",
+            "--clearenv",
+            "--setenv",
+            "PATH",
+            "/usr/bin",
+            "--setenv",
+            "HOME",
+            "/work",
+            "--setenv",
+            "PI_CODING_AGENT_DIR",
+            "/work/config",
+            "--setenv",
+            "SWARM_SOCKET",
+            "/broker.sock",
+            "--setenv",
+            "SWARM_TOKEN",
+            "token-0f3a",
+            "--setenv",
+            "SWARM_ROLE",
+            role,
+            "--setenv",
+            "SWARM_GRANTS",
+            "claim_task,board_read,board_post,submit_finding,read_findings,submit_artifact,fetch_url",
+            "--chdir",
+            "/work",
+            "/runtime/node/bin/node",
+            "/runtime/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
+            "--offline",
+            "--mode",
+            "rpc",
+            "--provider",
+            "swarm",
+            "--model",
+            "deepseek-flash",
+            "--thinking",
+            "off",
+            "--no-session",
+            "--no-builtin-tools",
+            "--no-extensions",
+            "--no-mcp",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-context-files",
+            "--no-approve",
+            "--extension",
+            "/runtime/extensions/broker.ts",
+        ]
+    }
+
+    #[test]
+    fn the_pi_launch_keeps_its_exact_program_argv_and_env() {
+        for (id, role) in [("agent-00", "coordinator"), ("agent-03", "worker")] {
+            let command = sandbox(
+                Path::new("/opt/node-v24/bin/node"),
+                Path::new("/srv/pi"),
+                Path::new("/runs/r1/broker.sock"),
+                Path::new("/runs/r1/pi-settings.json"),
+                "claim_task,board_read,board_post,submit_finding,read_findings,submit_artifact,fetch_url",
+                "token-0f3a",
+                id,
+                "deepseek-flash",
+            );
+            let command = command.as_std();
+            assert_eq!(command.get_program(), "bwrap");
+            let args: Vec<&str> = command
+                .get_args()
+                .map(|arg| arg.to_str().unwrap())
+                .collect();
+            assert_eq!(args, golden_pi_args(role), "{id}");
+            let envs: Vec<(&str, Option<&str>)> = command
+                .get_envs()
+                .map(|(key, value)| (key.to_str().unwrap(), value.map(|v| v.to_str().unwrap())))
+                .collect();
+            assert_eq!(envs, [("PATH", Some("/usr/bin:/bin"))], "{id}");
+            // `env_clear` has no stable getter; the unix Debug form prints it as `env -i`.
+            assert!(format!("{command:?}").starts_with("env -i "), "{command:?}");
+        }
+    }
+
     // Broker socket placement (main #5).
     #[test]
     fn broker_socket_binds_inside_private_run_dir() {
