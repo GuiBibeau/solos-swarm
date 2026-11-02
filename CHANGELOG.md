@@ -51,6 +51,11 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   `fetch_url` (`SWARM_TOOLSET=worker`); a start relaunches the work the last run left running with `recovery` set
   (new `Engine::restart`). `run_code` takes configured mounts and a caller-owned scratch directory; swarm runs keep
   their exact sandbox command.
+- Agent mode, P5: swarm Tickets. `executor.swarm` runs each `Plan::Swarm` Assignment as one governed swarm through
+  the new `swarm::run_goal_until` (a cancel input beside the signals `run_goal` keeps), with a Goal rendered from a
+  YAML template under what the Ticket has left to spend and checked by `Goal::validate`, at most `max_runs` at once,
+  its spend charged on the Ticket's account, a Stop that cancels it cleanly, and a restart that relaunches it in a
+  new run directory; the Router learns when a swarm pays for itself. `solos-swarm run` is unchanged.
 - `collect` leaves the per-run `code/` scratch directory on the host and writes `collect-manifest.json`; `--include-code` opts back in.
 - Docs: pause mode, self-update operations, dashboard tunnel, tournament runbook, replay status.
 
