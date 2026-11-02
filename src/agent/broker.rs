@@ -6,6 +6,7 @@
 //! settled against the principal's account in the agent Store.
 
 use super::AgentConfig;
+use super::config::ExecutorConfig;
 use super::ports::{Applied, Fact, FactSink};
 use crate::broker::{FETCH_TOTAL_BYTES, fetch, now_ms};
 use crate::code::CodeExecutor;
@@ -23,7 +24,9 @@ use solos_agent_core::model::{
     Accept, Acknowledge, AssignmentId, EvalId, MicroUsd, Ms, Plan, ReportIn, ReportStatus,
     ThreadKey, Ticket, TicketId, Trigger, TriggerId, Verdict,
 };
-use solos_agent_store::{HoldId, HoldRequest, Reservation, SqliteStore, StoreError, Tokens};
+use solos_agent_store::{
+    Charge, HoldId, HoldRequest, Reservation, SqliteStore, StoreError, Tokens,
+};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -146,8 +149,13 @@ impl Account {
     pub fn key(&self) -> String {
         match self {
             Self::Router { .. } => "router".into(),
-            Self::Ticket { id, .. } => format!("ticket:{id}"),
+            Self::Ticket { id, .. } => Self::ticket_key(id),
         }
+    }
+
+    /// The key of `ticket`'s account.
+    pub fn ticket_key(ticket: &TicketId) -> String {
+        format!("ticket:{ticket}")
     }
 
     /// Spend from the first time on counts against the cap.
@@ -191,8 +199,8 @@ pub struct Grant {
     pub system_prompt: Option<String>,
 }
 
-/// The budgets a Router's accept may name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The budgets and plans a Router's accept may name.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecideTerms {
     /// An accept that names no budget gets this.
     pub default_budget_microusd: MicroUsd,
@@ -201,16 +209,55 @@ pub struct DecideTerms {
     /// give one the threshold is the cap, instead of a Ticket that waits
     /// forever.
     pub max_budget_microusd: Option<MicroUsd>,
+    /// What a swarm plan may name, or `None` where no swarm runs.
+    pub swarm: Option<SwarmTerms>,
+}
+
+/// The Goal templates a swarm plan may name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SwarmTerms {
+    pub templates: Vec<String>,
+    /// The one a swarm plan that names none gets.
+    pub default_template: Option<String>,
+}
+
+impl SwarmTerms {
+    /// Refuse a template that is not configured, and a plan that names none
+    /// where there is no default.
+    fn admit(&self, template: Option<&str>) -> std::result::Result<(), String> {
+        match template.or(self.default_template.as_deref()) {
+            Some(name) if self.templates.iter().any(|t| t == name) => Ok(()),
+            Some(name) => Err(format!(
+                "there is no goal template {name}; the templates are {}",
+                self.templates.join(", ")
+            )),
+            None => Err(format!(
+                "a swarm plan here names its goal_template, one of {}",
+                self.templates.join(", ")
+            )),
+        }
+    }
 }
 
 impl DecideTerms {
     /// What `config` lets an accept name: above `policy.auto_approve_microusd`
-    /// only when Slack can take the approval its Ticket then waits for.
+    /// only when Slack can take the approval its Ticket then waits for, and a
+    /// swarm only when `executor.swarm` runs one.
     pub fn for_config(config: &AgentConfig) -> Self {
+        let swarm = match &config.executor {
+            ExecutorConfig::Pi {
+                swarm: Some(swarm), ..
+            } => Some(SwarmTerms {
+                templates: swarm.templates.keys().cloned().collect(),
+                default_template: swarm.default_template.clone(),
+            }),
+            _ => None,
+        };
         Self {
             default_budget_microusd: config.budgets.session_microusd,
             max_budget_microusd: (!config.takes_approvals())
                 .then_some(config.policy.auto_approve_microusd),
+            swarm,
         }
     }
 }
@@ -388,6 +435,34 @@ impl AgentBroker {
         let (account, since) = (seat.account().key(), seat.since_ms);
         self.store(move |store| store.committed(&account, since))
             .await
+    }
+
+    /// What every Assignment of `ticket` has committed on its account.
+    pub async fn ticket_committed(&self, ticket: &TicketId) -> Result<MicroUsd> {
+        let account = Account::ticket_key(ticket);
+        self.store(move |store| store.committed(&account, 0)).await
+    }
+
+    /// Charge `ticket`'s account what a run its own broker settled cost,
+    /// once per `request_id`. Returns whether this call charged it.
+    pub async fn charge_ticket(
+        &self,
+        ticket: &TicketId,
+        provider: &str,
+        cost_microusd: MicroUsd,
+        request_id: String,
+    ) -> Result<bool> {
+        let (account, provider) = (Account::ticket_key(ticket), provider.to_owned());
+        self.store(move |store| {
+            store.charge(&Charge {
+                account: &account,
+                provider: &provider,
+                cost_microusd,
+                request_id: &request_id,
+                at_ms: now_ms(),
+            })
+        })
+        .await
     }
 
     /// The routes, for the grants admitted so far and any worker.
@@ -630,6 +705,8 @@ struct DecideArgs {
     #[serde(default)]
     agents: Option<u16>,
     #[serde(default)]
+    goal_template: Option<String>,
+    #[serde(default)]
     budget_microusd: Option<MicroUsd>,
     #[serde(default)]
     acknowledge: Option<String>,
@@ -640,7 +717,7 @@ struct DecideArgs {
 }
 
 impl DecideArgs {
-    fn verdict(self, terms: DecideTerms) -> std::result::Result<(EvalId, Verdict), String> {
+    fn verdict(self, terms: &DecideTerms) -> std::result::Result<(EvalId, Verdict), String> {
         let reason = self.reason.trim().to_owned();
         if reason.is_empty() {
             return Err("a decision needs a reason".into());
@@ -653,14 +730,22 @@ impl DecideArgs {
             },
             Choice::Accept => {
                 let plan = match (self.plan.unwrap_or(PlanKind::Session), self.agents) {
-                    (PlanKind::Session, None) => Plan::Session { harness: None },
-                    (PlanKind::Session, Some(_)) => {
-                        return Err("agents is for a swarm plan only".into());
+                    (PlanKind::Session, None) if self.goal_template.is_none() => {
+                        Plan::Session { harness: None }
                     }
-                    (PlanKind::Swarm, Some(agents)) => Plan::Swarm {
-                        agents,
-                        goal_template: None,
-                    },
+                    (PlanKind::Session, _) => {
+                        return Err("agents and goal_template are for a swarm plan only".into());
+                    }
+                    (PlanKind::Swarm, Some(agents)) => {
+                        let swarm = terms.swarm.as_ref().ok_or(
+                            "this agent runs no swarms; accept the work as a session instead",
+                        )?;
+                        swarm.admit(self.goal_template.as_deref())?;
+                        Plan::Swarm {
+                            agents,
+                            goal_template: self.goal_template,
+                        }
+                    }
                     (PlanKind::Swarm, None) => return Err("a swarm plan names its agents".into()),
                 };
                 let budget = self
@@ -699,7 +784,7 @@ impl DecideArgs {
 async fn decide(broker: &AgentBroker, args: Value) -> Reply {
     let args: DecideArgs = arguments(args)?;
     let (eval, verdict) = args
-        .verdict(broker.inner.decide)
+        .verdict(&broker.inner.decide)
         .map_err(|why| refuse(StatusCode::UNPROCESSABLE_ENTITY, why))?;
     let answer = broker
         .inner
@@ -1057,18 +1142,28 @@ fn thread_summary(
 
 #[cfg(test)]
 mod tests {
-    use super::{Account, DecideArgs, DecideTerms, clip};
+    use super::{Account, DecideArgs, DecideTerms, SwarmTerms, clip};
     use serde_json::json;
     use solos_agent_core::model::{Acknowledge, Plan, TicketId, Verdict};
 
-    const TERMS: DecideTerms = DecideTerms {
-        default_budget_microusd: 500_000,
-        max_budget_microusd: Some(2_000_000),
-    };
+    fn terms() -> DecideTerms {
+        DecideTerms {
+            default_budget_microusd: 500_000,
+            max_budget_microusd: Some(2_000_000),
+            swarm: Some(SwarmTerms {
+                templates: vec!["audit".into(), "research".into()],
+                default_template: Some("research".into()),
+            }),
+        }
+    }
 
     fn verdict(args: serde_json::Value) -> Result<Verdict, String> {
+        verdict_under(&terms(), args)
+    }
+
+    fn verdict_under(terms: &DecideTerms, args: serde_json::Value) -> Result<Verdict, String> {
         let args: DecideArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
-        args.verdict(TERMS).map(|(_, verdict)| verdict)
+        args.verdict(terms).map(|(_, verdict)| verdict)
     }
 
     #[test]
@@ -1111,6 +1206,20 @@ mod tests {
             }
         );
         assert_eq!(swarm.acknowledge, Acknowledge::Silent);
+        let Verdict::Accept(audit) = verdict(json!({
+            "eval":"ev_1","decision":"accept","reason":"many checks","title":"T","scope":"S",
+            "plan":"swarm","agents":3,"goal_template":"audit"
+        }))
+        .unwrap() else {
+            panic!("not an accept")
+        };
+        assert_eq!(
+            audit.plan,
+            Plan::Swarm {
+                agents: 3,
+                goal_template: Some("audit".into())
+            }
+        );
         assert_eq!(
             verdict(json!({"eval":"ev_1","decision":"ignore","reason":"chatter","title":"x"})),
             Ok(Verdict::Ignore {
@@ -1157,9 +1266,36 @@ mod tests {
                 "unknown decision",
                 json!({"eval":"ev_1","decision":"defer","reason":"r"}),
             ),
+            (
+                "a goal template for a session",
+                json!({"eval":"ev_1","decision":"accept","reason":"r","title":"T","scope":"S","goal_template":"audit"}),
+            ),
+            (
+                "an unknown goal template",
+                json!({"eval":"ev_1","decision":"accept","reason":"r","title":"T","scope":"S","plan":"swarm","agents":2,"goal_template":"tournament"}),
+            ),
         ] {
             assert!(verdict(args).is_err(), "{case}");
         }
+        let swarm = json!({"eval":"ev_1","decision":"accept","reason":"r","title":"T","scope":"S","plan":"swarm","agents":2});
+        let none = DecideTerms {
+            swarm: None,
+            ..terms()
+        };
+        let refused = verdict_under(&none, swarm.clone()).unwrap_err();
+        assert!(refused.contains("runs no swarms"), "{refused}");
+        let undefaulted = DecideTerms {
+            swarm: Some(SwarmTerms {
+                templates: vec!["audit".into()],
+                default_template: None,
+            }),
+            ..terms()
+        };
+        let refused = verdict_under(&undefaulted, swarm).unwrap_err();
+        assert!(
+            refused.contains("names its goal_template, one of audit"),
+            "{refused}"
+        );
     }
 
     #[test]

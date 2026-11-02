@@ -9,8 +9,8 @@ use super::broker::{DecideTerms, clip};
 use super::ports::{BoxFuture, FactSink, Router};
 use crate::harness::{AgentHarness, Session, SessionEvent, SessionSpec};
 use anyhow::{Result, anyhow};
-use solos_agent_core::AllowlistPolicy;
 use solos_agent_core::model::{ActorKind, Addressed, Candidate, Stage, Strength, Trigger};
+use solos_agent_core::{AllowlistPolicy, MAX_SWARM_AGENTS};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::Mutex;
@@ -35,8 +35,10 @@ with their stage.
 
 Decide every candidate exactly once, with router_decide and its eval id:
 - accept: someone asks for work a worker can do, and no ticket on the thread already covers it. Give a short \
-title, a scope the worker can act on without reading the thread, a one-sentence reason, and plan `session` \
-(one worker) unless the work is wide research or a tournament, which may be a `swarm` of agents.
+title, a scope the worker can act on without reading the thread, a one-sentence reason, and a plan. Plan \
+`session` (one worker) fits most work, a bug fix or one focused change above all. A `swarm` runs many agents on \
+one Goal and costs as many sessions, so it pays for itself only when the work splits into many independent \
+parts: wide research across many sources, many independent checks, or a tournament.
 - ignore: thanks, chatter, status updates, questions you cannot act on, or work a ticket on the thread already \
 covers. Say why in one sentence.
 - stop: a person asks to stop one of the thread's tickets. Name the ticket.
@@ -53,7 +55,7 @@ pub fn system_prompt(
     instructions: Option<&str>,
     policy: &AllowlistPolicy,
     rule_text: &BTreeMap<String, String>,
-    decide: DecideTerms,
+    decide: &DecideTerms,
 ) -> String {
     let mut prompt = instructions
         .unwrap_or(DEFAULT_INSTRUCTIONS)
@@ -72,6 +74,32 @@ pub fn system_prompt(
             policy.auto_approve_microusd
         ),
     };
+    match &decide.swarm {
+        None => prompt.push_str("\nThis agent runs no swarms: plan every accept as a session."),
+        Some(swarm) => {
+            let _ = write!(
+                prompt,
+                "\nSwarms: plan `swarm` names its `agents` (at most {MAX_SWARM_AGENTS}) and may name a \
+                 `goal_template`: {}",
+                swarm.templates.join(", ")
+            );
+            if let Some(default) = &swarm.default_template {
+                let _ = write!(prompt, " ({default} when it names none)");
+            }
+            let _ = match decide.max_budget_microusd {
+                Some(max) => write!(
+                    prompt,
+                    ". All its agents share its budget, which may be at most {max} microusd."
+                ),
+                None => write!(
+                    prompt,
+                    ". All its agents share its budget; above {} microusd the swarm waits for a \
+                     person's approval before it starts, so name what the work needs.",
+                    policy.auto_approve_microusd
+                ),
+            };
+        }
+    }
     if policy.rules.is_empty() {
         prompt.push_str(
             "\nNo proactive rules are enabled: an inferred candidate is recorded, never started.",
@@ -341,7 +369,7 @@ async fn drive<H>(
 #[cfg(test)]
 mod tests {
     use super::{PiRouter, batch, card, system_prompt};
-    use crate::agent::broker::DecideTerms;
+    use crate::agent::broker::{DecideTerms, SwarmTerms};
     use crate::agent::ports::{FactSink, Router};
     use crate::harness::{AgentHarness, Observation, Role, Session, SessionEvent, SessionSpec};
     use solos_agent_core::AllowlistPolicy;
@@ -572,35 +600,66 @@ mod tests {
     }
 
     #[test]
-    fn the_system_prompt_adds_budgets_and_only_enabled_rules() {
+    fn the_system_prompt_adds_budgets_swarms_and_only_enabled_rules() {
         let decide = DecideTerms {
             default_budget_microusd: 500_000,
             max_budget_microusd: Some(2_000_000),
+            swarm: None,
         };
         let policy = AllowlistPolicy {
             rules: ["ci-red".to_owned(), "stale-pr".to_owned()].into(),
             ..AllowlistPolicy::default()
         };
         let text = BTreeMap::from([("ci-red".to_owned(), "Fix a red CI run.".to_owned())]);
-        let prompt = system_prompt(Some("Judge."), &policy, &text, decide);
+        let prompt = system_prompt(Some("Judge."), &policy, &text, &decide);
         assert_eq!(
             prompt,
             "Judge.\n\nBudgets: an accept gets 500000 microusd unless it names budget_microusd, \
-             and may name at most 2000000.\nAn inferred candidate starts work only if it matches \
-             enabled rules; name them in `rules`. The enabled rules:\n- ci-red: Fix a red CI run.\n- stale-pr"
+             and may name at most 2000000.\nThis agent runs no swarms: plan every accept as a \
+             session.\nAn inferred candidate starts work only if it matches enabled rules; name \
+             them in `rules`. The enabled rules:\n- ci-red: Fix a red CI run.\n- stale-pr"
         );
-        let plain = system_prompt(None, &AllowlistPolicy::default(), &BTreeMap::new(), decide);
+        let plain = system_prompt(None, &AllowlistPolicy::default(), &BTreeMap::new(), &decide);
         assert!(plain.starts_with("You are the Router"));
+        assert!(
+            plain.contains("A `swarm` runs many agents on one Goal"),
+            "{plain}"
+        );
         assert!(plain.ends_with("an inferred candidate is recorded, never started."));
+        let swarm = Some(SwarmTerms {
+            templates: vec!["audit".into(), "research".into()],
+            default_template: Some("research".into()),
+        });
+        let capped = DecideTerms {
+            swarm: swarm.clone(),
+            ..decide.clone()
+        };
+        let capped = system_prompt(None, &policy, &text, &capped);
+        assert!(
+            capped.contains(
+                "\nSwarms: plan `swarm` names its `agents` (at most 30) and may name a \
+                 `goal_template`: audit, research (research when it names none). All its agents \
+                 share its budget, which may be at most 2000000 microusd.\n"
+            ),
+            "{capped}"
+        );
         let approvable = DecideTerms {
             max_budget_microusd: None,
+            swarm,
             ..decide
         };
-        let gated = system_prompt(None, &policy, &text, approvable);
+        let gated = system_prompt(None, &policy, &text, &approvable);
         assert!(
             gated.contains(
                 "unless it names budget_microusd; above 2000000 its ticket waits for a \
                  person's approval.\n"
+            ),
+            "{gated}"
+        );
+        assert!(
+            gated.contains(
+                "All its agents share its budget; above 2000000 microusd the swarm waits for a \
+                 person's approval before it starts, so name what the work needs.\n"
             ),
             "{gated}"
         );

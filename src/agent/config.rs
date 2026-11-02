@@ -7,6 +7,7 @@ mod watchdog;
 pub use sources::{Interval, ReplyTo, ScheduleConfig, TimeOfDay};
 pub use watchdog::{OperatorConfig, ThresholdsConfig, WatchdogConfig};
 
+use super::goal_template::GoalTemplates;
 use super::{github, slack};
 use crate::code::{self, Mount};
 use crate::gateway::{PriceTable, upstream_profile};
@@ -163,7 +164,26 @@ pub enum ExecutorConfig {
         /// The workers' `run_code`. Without it they have none.
         #[serde(default)]
         run_code: Option<RunCodeConfig>,
+        /// How `Plan::Swarm` Tickets run. Without it they fail.
+        #[serde(default)]
+        swarm: Option<Box<SwarmConfig>>,
     },
+}
+
+/// `Plan::Swarm` Tickets: each runs a governed swarm whose Goal is rendered
+/// from a template, on the workers' provider and credential.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwarmConfig {
+    /// Goal templates by name, each a YAML file relative to this file.
+    pub templates: BTreeMap<String, PathBuf>,
+    /// The template of a swarm whose Plan names none.
+    #[serde(default)]
+    pub default_template: Option<String>,
+    /// Swarms that may run at once; a launch past it waits. Each swarm is
+    /// many sessions, so this is apart from `max_workers`.
+    #[serde(default = "default_max_swarms")]
+    pub max_runs: usize,
 }
 
 /// What a worker's `run_code` sandbox mounts and how many run at once.
@@ -188,6 +208,10 @@ fn default_max_workers() -> usize {
     2
 }
 
+fn default_max_swarms() -> usize {
+    1
+}
+
 fn default_code_concurrency() -> usize {
     code::DEFAULT_CONCURRENCY
 }
@@ -198,6 +222,8 @@ fn default_code_memory() -> u64 {
 
 /// The most workers one agent may run at once.
 const MAX_WORKERS: usize = 64;
+/// The most swarms one agent may run at once.
+const MAX_SWARMS: usize = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -239,6 +265,17 @@ impl AgentConfig {
                 ChannelConfig::Jsonl { path, .. } => *path = base.join(&*path),
                 ChannelConfig::Slack {} | ChannelConfig::Github {} => {}
             }
+        }
+        if let ExecutorConfig::Pi {
+            provider,
+            swarm: Some(swarm),
+            ..
+        } = &mut config.executor
+        {
+            for path in swarm.templates.values_mut() {
+                *path = base.join(&*path);
+            }
+            GoalTemplates::load(swarm, provider)?.check(config.budgets.session_microusd)?;
         }
         Ok(config)
     }
@@ -334,6 +371,7 @@ impl AgentConfig {
             max_workers,
             prepare,
             run_code,
+            swarm,
         } = &self.executor
         else {
             return Ok(());
@@ -390,6 +428,9 @@ impl AgentConfig {
                 "executor.run_code.memory_bytes must be 256 MiB..=16 GiB"
             );
         }
+        if let Some(swarm) = swarm {
+            swarm.validate()?;
+        }
         Ok(())
     }
 
@@ -431,6 +472,36 @@ impl AgentConfig {
             .approvers
             .iter()
             .any(|who| who.starts_with("slack:"))
+    }
+}
+
+impl SwarmConfig {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.templates.is_empty(),
+            "executor.swarm names no goal template"
+        );
+        for name in self.templates.keys() {
+            ensure!(
+                !name.is_empty()
+                    && name.len() <= 64
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+                "goal template name {name:?} is not a short word"
+            );
+        }
+        if let Some(name) = &self.default_template {
+            ensure!(
+                self.templates.contains_key(name),
+                "executor.swarm.default_template {name} is not one of its templates"
+            );
+        }
+        ensure!(
+            (1..=MAX_SWARMS).contains(&self.max_runs),
+            "executor.swarm.max_runs must be 1..={MAX_SWARMS}"
+        );
+        Ok(())
     }
 }
 
@@ -752,6 +823,93 @@ budgets: {session_microusd: 500000}
             );
             assert!(parse(&yaml).is_err(), "{case}: accepted\n{yaml}");
         }
+    }
+
+    const SWARM: &str = "  swarm:
+    templates: {research: goals/research.yaml}
+    default_template: research
+";
+
+    #[test]
+    fn a_swarm_loads_its_checked_templates_beside_the_config() {
+        let dir = std::env::temp_dir().join(format!("agent-config-swarm-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("goals")).unwrap();
+        let template = include_str!("../../tests/fixtures/goal-template.yaml");
+        std::fs::write(dir.join("goals/research.yaml"), template).unwrap();
+        let load = |yaml: String| {
+            std::fs::write(dir.join("agent.yaml"), yaml).unwrap();
+            AgentConfig::load(&dir.join("agent.yaml"))
+        };
+        let config = load(workers(|yaml| {
+            yaml.replace(
+                "    concurrency: 2\n",
+                &format!("    concurrency: 2\n{SWARM}"),
+            )
+        }))
+        .unwrap();
+        let ExecutorConfig::Pi {
+            swarm: Some(swarm), ..
+        } = &config.executor
+        else {
+            panic!("{:?}", config.executor)
+        };
+        assert_eq!(swarm.templates["research"], dir.join("goals/research.yaml"));
+        assert_eq!(
+            (swarm.default_template.as_deref(), swarm.max_runs),
+            (Some("research"), 1)
+        );
+
+        let with = |edit: &dyn Fn(String) -> String| {
+            workers(|yaml| {
+                yaml.replace(
+                    "    concurrency: 2\n",
+                    &format!("    concurrency: 2\n{}", edit(SWARM.to_owned())),
+                )
+            })
+        };
+        for (case, yaml) in [
+            (
+                "no template",
+                with(&|s| {
+                    s.replace("{research: goals/research.yaml}", "{}")
+                        .replace("    default_template: research\n", "")
+                }),
+            ),
+            (
+                "an unknown default",
+                with(&|s| s.replace("default_template: research", "default_template: audit")),
+            ),
+            ("no run slot", with(&|s| format!("{s}    max_runs: 0\n"))),
+            (
+                "too many run slots",
+                with(&|s| format!("{s}    max_runs: 9\n")),
+            ),
+            (
+                "a template name that is not a word",
+                with(&|s| {
+                    s.replace("{research:", "{\"re search\":")
+                        .replace("default_template: research", "default_template: re search")
+                }),
+            ),
+            (
+                "a missing template",
+                with(&|s| s.replace("goals/research.yaml", "goals/gone.yaml")),
+            ),
+            ("an unknown field", with(&|s| format!("{s}    agents: 3\n"))),
+        ] {
+            assert!(load(yaml.clone()).is_err(), "{case}: accepted\n{yaml}");
+        }
+        std::fs::write(
+            dir.join("goals/research.yaml"),
+            template.replace("{% for n in range(agents) %}", "{% for n in range(2) %}"),
+        )
+        .unwrap();
+        let err = load(with(&|s| s)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("checking goal template research with 1 agents"),
+            "{err:#}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

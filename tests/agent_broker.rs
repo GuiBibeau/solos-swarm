@@ -43,6 +43,7 @@ const LIMIT: Duration = Duration::from_secs(30);
 const TERMS: DecideTerms = DecideTerms {
     default_budget_microusd: 500_000,
     max_budget_microusd: Some(2_000_000),
+    swarm: None,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]

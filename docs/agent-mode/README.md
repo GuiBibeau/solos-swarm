@@ -23,7 +23,8 @@ and its MIT-licensed prototype `deepseek-ai/dsh-superagent-prototype` (docs 000-
 | P8 GitHub and schedules | **Done.** `src/agent/github/`: `GithubSource` polls each listed repository's issues and pull requests, issue and review comments `since` a cursor, and its latest workflow runs, over REST (nothing exposed); `GithubChannel` comments on the issue or pull request. Configured as `kind: github` with a personal access token file that is deleted once read. An issue or pull request is the Thread `github:<owner>/<repo>#<number>`; its opening, each comment (`github:<owner>/<repo>:comment:<id>`) and each failed workflow run on a pull request (a bot Trigger on that pull request's Thread) are Triggers. A mention of the agent's login addresses it, `[bot]` accounts are bots, and the agent's own comments are dropped. Listings are conditional (`ETag`), rate limits are waited out, and the read position is an atomic file in the state directory that a restart resumes from without sending a Trigger twice. Each comment ends with a hidden marker naming its `MessageId`, so a crash between a post and its done mark does not post twice. `src/agent/schedule.rs`: `ScheduleSource` (`kind: schedule`) fires named slots, `every` an interval or `daily_at` a UTC time, as System Triggers `schedule:<name>:<slot start>`: a restart cannot fire a slot twice, and missed slots fire once. A schedule may name a `reply_to`. No new dependencies. Tests run against a fake GitHub and a clock the test moves, including one `agent serve` end to end. |
 | P3d Pi workers | **Done.** `src/agent/pi_executor.rs`: `PiExecutor` runs each `Plan::Session` Assignment as a keyless Pi worker session in bwrap, in its Ticket's directory under the state dir, with an optional prepare command run once per Ticket and at most `max_workers` sessions at once (`executor: {kind: pi, ...}`). The agent broker admits each worker as a `Worker` principal on its Ticket's account, so the Mandate budget caps every Assignment of the Ticket together, and serves `worker_report`, `worker_handback`, `run_code` and `fetch_url` (`SWARM_TOOLSET=worker`). A worker is prompted with its Assignment, then with new Inputs between turns; a quiet turn counts as `waiting`. A start ends what the last run left without a worker ("host restarted") and relaunches working Tickets with `recovery`, through the new `Engine::restart`. `run_code`'s mounts and scratch directory are configurable, with swarm runs' sandbox command pinned unchanged. `Plan::Swarm` reports `failed` until P5; background `run_code` jobs are P3e. |
 | P6 Watchdog | **Done.** `src/agent/watchdog.rs`: a pure `assess(snapshot, now, thresholds)` over what the Store already holds, with no model: a Ticket waiting for a person (1h), a working Assignment with no Report (30m), an Effect with 3 failed attempts, an `unavailable` Decision in the last hour, an account at 80% of its cap, and a pause file held for 1h. Each alert id hashes its kind, its subject (with the problem's start) and a 6h bucket. With a `watchdog` section in agent.yaml, `agent serve` runs it every minute, tells the operator's conversation each new alert once through its Channel, and records it in `watchdog_alerts` (schema v3), so a restart tells nothing new. `retry_stalled` retries a stalled Assignment once per Ticket through the runtime. `solos-swarm agent status` reports Tickets, Decisions, Effects, spend, the pause and the current alerts from a read-only Store. Judging with a model whether a worker drifts from its goal is later. |
-| P2 (rest), P3e, P5, P7, P9, P10 | Planned, below. |
+| P5 Swarm Tickets | **Done.** `src/agent/swarm_executor.rs`: a `Plan::Swarm` Ticket runs one governed swarm per Assignment through `swarm::run_goal_until` on the Pi workers' harness, provider and credential (`executor.swarm`). Its Goal is rendered from a YAML template (`src/agent/goal_template.rs`, minijinja, every placeholder an escaped YAML literal) with the Ticket's title, scope, agent count and remaining budget, checked with `Goal::validate` at config load and at launch. The Goal's budget is the Mandate budget minus what the Ticket's account committed, and the run's spend is charged on that account (`SqliteStore::charge`, once per run) before its Report. At most `max_runs` swarms run at once (default 1). A Stop cancels a run through the new cancel input of `run_goal_until`, which `solos-swarm run` does not use, and the agent's pause holds running swarms. Completed reports `ready` with the findings, the spend and the artifact; stopped reports `failed`; drained reports `waiting`. A restart relaunches an interrupted swarm in a new run directory and charges the old one from its `state.json`. The Router's prompt says when a swarm pays for itself, and `router_decide` takes `goal_template`. |
+| P2 (rest), P3e, P7, P9, P10 | Planned, below. |
 
 ## What "super-agent" means here
 
@@ -52,7 +53,7 @@ Agent mode uses the prototype's vocabulary, so its documents carry over:
 | Two-stage filter | `Policy::gate`, then `Effect::Assess` | The gate is code: allowlists, bot lists, accept mode. Only admitted batches cost a model call. |
 | Router | Router session + `Engine::decide` | Long-lived, light model, router-only tools, no `run_code`. Batches candidates per turn. |
 | Worker | `Plan::Session` Assignment | Own directory, full work tools, one Ticket. Never talks to people; reports. |
-| (new) Swarm worker | `Plan::Swarm { agents }` | The Ticket's scope becomes a Goal for today's swarm, under the Ticket's budget. |
+| (new) Swarm worker | `Plan::Swarm { agents, goal_template }` | The Ticket's scope becomes a Goal for today's swarm, rendered from a [Goal template](#goal-templates), under what the Ticket's budget has left. |
 | Mandate | `Mandate` | What an accept grants, including `budget_microusd`. Fixed at accept time. |
 | (new) Approval | `Approval` | Budgets above `auto_approve_microusd` wait for a person on the approver list. |
 | Report | `Report` | `progress`/`waiting` are quiet; `ready` sends the result; a question, `blocked` or `failed` asks a person. |
@@ -260,9 +261,42 @@ provider through the real broker. It runs on macOS too. Swarm mode is the first 
 - Later: a per-channel admission table, and operator DMs that carry status and pause.
 - `accept_mode: observe` (the Policy default) to start.
 
-**P5: SwarmExecutor.** `Plan::Swarm` Tickets run `swarm::run_goal` under the Ticket's envelope. The artifact
-becomes a `ready` Report with a summary and a link. The Router prompt says when a swarm pays for itself: wide
-research or tournaments, not a bug fix. Swarms above the threshold wait for approval (in the core already).
+**P5: SwarmExecutor.** Done; how to write a template in [Goal templates](#goal-templates).
+- Done: `executor: {kind: pi, ..., swarm: {templates, default_template, max_runs}}`. `PiExecutor`'s one dispatch
+  point sends `Plan::Swarm` Assignments to `SwarmExecutor`, which runs each as one `swarm::run_goal_until` on the
+  `PiHost` that serves the workers: `PiHarness`, the provider and the credential. At most `max_runs` swarms (default
+  1) run at once, apart from `max_workers`, since one swarm is many sessions; a launch past it waits for a slot.
+- Done: the Goal comes from the template the Plan names, or the default, filled with the Ticket's id, title, scope,
+  agent count and remaining budget. It must pass `Goal::validate`, and its budget and agent count must be the
+  Ticket's. Config load renders every template for one and two agents, so a bad template stops `agent serve` before
+  it starts; a Goal that still fails at launch is a `failed` Report, never a crash.
+- Done: the Goal's budget is the Mandate budget minus what the Ticket's account (`ticket:<id>`) committed, so a
+  Ticket never spends past its Mandate across its Assignments. The swarm's own broker holds and settles each call
+  against the Goal; when the run ends, its spend, with any hold still open at its hold, is charged on the Ticket's
+  account (`SqliteStore::charge`, once per `swarm:<run dir>`) before the Report, so the next Assignment and every
+  worker call see it. A stopped run is charged too.
+- Done: each run has its own directory, `<state>/tickets/<ticket>/swarm/<assignment>` (`-2`, `-3` when a launch
+  repeats), with the swarm's usual files: `config.yaml` (the rendered Goal), `manifest.json`, `events.jsonl`,
+  `state.json`, `artifacts/final.json`, `cleanup.json`, `runtime-report.json` and the transcripts. It stays as
+  evidence.
+- Done: Completed is a `ready` Report naming the filed findings, the spend and the artifact's path; Stopped is
+  `failed` with the reason; Drained is `waiting`. A failed or drained swarm also ends its Assignment, so the next
+  message from a person starts a new run. While it runs, a swarm sends a quiet `progress` Report with what it has
+  filed and spent, at half the Watchdog's `stalled` threshold and at least every 5 minutes, so P6 never takes a long
+  swarm for a stalled Assignment.
+- Done: a Stop Effect cancels a running swarm through `run_goal_until`'s cancel input (`swarm::Cancel::on`), which
+  takes the operator-cancel path (partial findings, the artifact of what was filed, every session stopped,
+  `cleanup.json`) and waits until it is done. `run_goal` keeps SIGTERM and Ctrl-C, so `solos-swarm run` is
+  unchanged; under `agent serve` the agent owns the signals and cancels its swarms as it shuts down. The agent's
+  pause gate holds running swarms through a `PAUSE` file in their run directories.
+- Done: after a restart, P3d's recovery relaunches an interrupted swarm Assignment with `recovery`, in a new run
+  directory; the old one stays as it was, and its spend is charged from its `state.json` before the new Goal's
+  budget is read. There is no `run --resume`.
+- Done: the Router's prompt says a session fits most work, a bug fix above all, and a swarm only work that splits
+  into many independent parts (wide research, many checks, a tournament); it lists the templates and says that a
+  swarm budget above the approval threshold waits for a person's approval. `router_decide` takes `goal_template`
+  and refuses a swarm where none runs or a template that does not exist.
+- Later: a running swarm takes no new Input; a follow-up on its Thread waits for the Ticket's next Assignment.
 
 **P6: Watchdog.** Done; setup in [Watchdog](#watchdog).
 - Done: `assess(snapshot, now, thresholds)` in `src/agent/watchdog.rs` is pure. It reads only what the Store holds
@@ -454,6 +488,62 @@ A schedule's `reply_to` can also be `{kind: slack, channel: C0123OPS}`, or a thr
 serves slack. Anyone who can comment on a listed repository reaches the Policy gate, which admits requests only from
 `policy.people`. The hidden marker in each comment holds the agent's message id and nothing else.
 
+## Goal templates
+
+A swarm Ticket runs the Goal its template renders. A template is a swarm Goal file, the YAML `solos-swarm run
+--config` reads, with minijinja placeholders for the Ticket: `ticket`, `title`, `scope`, `agents` and
+`budget_microusd`, which is what the Ticket has left to spend. Every placeholder prints a quoted, escaped YAML value,
+so a title or scope that came from a message cannot add a key or end a string. Use a placeholder as a whole value,
+and join text inside the braces with `~`.
+
+- Write `agent_count: {{ agents }}` and `budget_microusd: {{ budget_microusd }}`, with one task per agent: a
+  `{% for n in range(agents) %}` loop. A Goal with another budget or agent count does not launch.
+- The swarm's calls go through the workers' provider and credential. A Goal that names an `upstream` must name that
+  provider, and one that does not gets it, as `solos-swarm run --provider` does. Its `model` must be one that
+  provider admits, and its prices at least the admitted rates.
+- The rest is the swarm's own, as in swarm mode: `scope` on the deployment allowlist, `deadline_seconds`,
+  `max_calls_per_agent`, the request limits, the `grants` and the prompts. `worker_prompt` and `synthesis_prompt`
+  together stay within 8,192 bytes, so keep a long scope in the task inputs.
+
+`agent serve` renders each template for one and two agents as it loads the config, and refuses one that does not
+make a valid Goal. The example below is `tests/fixtures/goal-template.yaml`:
+
+```yaml
+schema_version: 1
+intent: {{ title }}
+worker_prompt: {{ "Claim your task, then file one record for your part. Ticket " ~ ticket ~ ": " ~ scope }}
+synthesis_prompt: Call read_findings, then submit_artifact with every record of every finding.
+scope: synthetic-fixtures-only
+model: deepseek-flash
+agent_count: {{ agents }}
+deadline_seconds: 600
+budget_microusd: {{ budget_microusd }}
+max_calls_per_agent: 16
+max_input_bytes: 262144
+max_output_tokens: 2048
+input_price_microusd_per_million: 300000
+output_price_microusd_per_million: 1200000
+grants: [claim_task, board_read, board_post, submit_finding, read_findings, submit_artifact]
+tasks:
+{% for n in range(agents) %}  - id: {{ "part-" ~ n }}
+    input: {part: {{ n }}, of: {{ agents }}, question: {{ scope }}}
+{% endfor %}seed: 1
+catalog_version: agent-swarm
+scorer_version: "1"
+```
+
+```yaml
+executor:
+  kind: pi
+  provider: deepseek
+  model: deepseek-flash
+  prices: {input_microusd_per_million: 300000, output_microusd_per_million: 1200000}
+  swarm:
+    templates: {research: goals/research.yaml}   # relative to this file
+    default_template: research                   # for a swarm plan that names none
+    # max_runs: 1                                # swarms at once
+```
+
 ## Watchdog
 
 The Watchdog writes to one conversation an operator reads, through a Channel the config already has.
@@ -487,7 +577,9 @@ post one alert twice. `solos-swarm agent status --state-dir DIR --config agent.y
   strength.
 - Only explicit strength stops work; bots and CI can at most make inferred candidates, and those start nothing
   outside `auto` mode with a matching enabled rule.
-- Workers stay keyless: the broker holds the model key, and P9 keeps tool credentials on the node.
+- Workers stay keyless: the broker holds the model key, and P9 keeps tool credentials on the node. A swarm's
+  agents are keyless too, behind the swarm's own broker, and the Goal they run is the operator's template: Trigger
+  text reaches it only as escaped values, and its budget is what the Ticket has left.
 - The event-driven surface is larger than a batch run's. Router and workers keep the `bwrap` sandbox, workers get
   no network except through broker tools, and the Router gets no `run_code`.
 - Open: the article's own caveat applies. A compromised control plane could drive every connected node. P9

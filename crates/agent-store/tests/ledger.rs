@@ -2,7 +2,7 @@ mod common;
 
 use common::TempDb;
 use solos_agent_store::{
-    HoldId, HoldRequest, Reservation, SpendState, SqliteStore, StoreError, Tokens,
+    Charge, HoldId, HoldRequest, Reservation, SpendState, SqliteStore, StoreError, Tokens,
 };
 
 const DAY: u64 = 86_400_000;
@@ -105,6 +105,57 @@ fn accounts_and_days_are_counted_apart() {
             .unwrap(),
         Reservation::Refused { committed: 400 }
     ));
+}
+
+#[test]
+fn a_charge_counts_once_per_request_id_against_its_accounts_cap() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let now = 20 * DAY;
+    let run = |cost, request_id| Charge {
+        account: "ticket:tk_1",
+        provider: "deepseek",
+        cost_microusd: cost,
+        request_id,
+        at_ms: now,
+    };
+    assert!(store.charge(&run(600, "swarm:as_1")).unwrap());
+    assert!(
+        !store.charge(&run(600, "swarm:as_1")).unwrap(),
+        "a repeat charges nothing"
+    );
+    assert!(store.charge(&run(0, "swarm:as_2")).unwrap());
+    assert_eq!(store.committed("ticket:tk_1", 0).unwrap(), 600);
+    assert_eq!(store.committed("ticket:tk_2", 0).unwrap(), 0);
+    let rows = store.spend("ticket:tk_1").unwrap();
+    let rows: Vec<_> = rows
+        .iter()
+        .map(|r| {
+            (
+                r.state,
+                r.cost_microusd,
+                r.request_id.as_deref(),
+                r.closed_ms,
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            (SpendState::Settled, 600, Some("swarm:as_1"), Some(now)),
+            (SpendState::Settled, 0, Some("swarm:as_2"), Some(now)),
+        ]
+    );
+    let after = request("ticket:tk_1", 1_000, 401, now);
+    assert_eq!(
+        store
+            .reserve(&HoldRequest {
+                since_ms: 0,
+                ..after
+            })
+            .unwrap(),
+        Reservation::Refused { committed: 600 },
+        "a worker cannot spend what the swarm spent"
+    );
 }
 
 #[test]
