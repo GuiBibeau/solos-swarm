@@ -1,7 +1,7 @@
 use crate::StoreError;
 use rusqlite::{Connection, TransactionBehavior};
 
-pub(crate) const LATEST: u32 = 2;
+pub(crate) const LATEST: u32 = 3;
 
 /// Aggregates are JSON in `body`; the other columns index the port's queries.
 const V1: &str = "
@@ -82,8 +82,26 @@ CREATE TRIGGER IF NOT EXISTS spend_no_delete BEFORE DELETE ON spend
 BEGIN SELECT RAISE(ABORT, 'spend is never deleted'); END;
 ";
 
+/// What the Watchdog told the operator, one row per alert id. Only the
+/// Watchdog writes it: a row is recorded before its message goes out and
+/// marked sent after, so a restart neither repeats an alert nor loses one.
+const V3: &str = "
+CREATE TABLE IF NOT EXISTS watchdog_alerts (
+    id TEXT PRIMARY KEY NOT NULL,
+    kind TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    ticket TEXT,
+    retry INTEGER NOT NULL DEFAULT 0,
+    raised_ms INTEGER NOT NULL,
+    message TEXT NOT NULL,
+    sent_ms INTEGER
+) STRICT;
+CREATE INDEX IF NOT EXISTS watchdog_unsent ON watchdog_alerts (raised_ms) WHERE sent_ms IS NULL;
+CREATE INDEX IF NOT EXISTS watchdog_retries ON watchdog_alerts (ticket) WHERE retry = 1;
+";
+
 /// Migration `n` is `MIGRATIONS[n - 1]`.
-const MIGRATIONS: [&str; LATEST as usize] = [V1, V2];
+const MIGRATIONS: [&str; LATEST as usize] = [V1, V2, V3];
 
 /// Applies the migrations the file lacks. The write lock makes a second
 /// process that opens the file at the same time wait, then find nothing to do.
@@ -120,7 +138,7 @@ pub(crate) fn version(conn: &Connection) -> Result<u32, StoreError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LATEST, V1, V2, migrate, version};
+    use super::{LATEST, V1, V2, V3, migrate, version};
     use rusqlite::Connection;
 
     #[test]
@@ -136,10 +154,11 @@ mod tests {
         // Each script itself is idempotent, not only gated by the version.
         conn.execute_batch(V1).unwrap();
         conn.execute_batch(V2).unwrap();
+        conn.execute_batch(V3).unwrap();
     }
 
     #[test]
-    fn a_v1_file_gains_the_spend_table_and_keeps_its_rows() {
+    fn a_v1_file_gains_the_later_tables_and_keeps_its_rows() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE schema_version (version INTEGER PRIMARY KEY NOT NULL) STRICT;",
@@ -151,7 +170,7 @@ mod tests {
         conn.execute("INSERT INTO triggers (id, body) VALUES ('t1', '{}')", [])
             .unwrap();
         migrate(&mut conn).unwrap();
-        assert_eq!(version(&conn).unwrap(), 2);
+        assert_eq!(version(&conn).unwrap(), LATEST);
         let kept: String = conn
             .query_row("SELECT body FROM triggers WHERE id = 't1'", [], |row| {
                 row.get(0)
@@ -162,6 +181,10 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM spend", [], |row| row.get(0))
             .unwrap();
         assert_eq!(spend, 0);
+        let alerts: u32 = conn
+            .query_row("SELECT COUNT(*) FROM watchdog_alerts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(alerts, 0);
     }
 
     #[test]

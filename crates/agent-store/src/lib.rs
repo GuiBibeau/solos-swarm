@@ -11,16 +11,18 @@ mod error;
 mod ledger;
 mod queue;
 mod schema;
+mod watchdog;
 
 pub use chain::Chain;
 pub use error::StoreError;
 pub use ledger::{Charge, HoldId, HoldRequest, Reservation, Spend, SpendState, Tokens};
 pub use queue::{EffectId, QueuedEffect};
+pub use watchdog::AlertRow;
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::de::DeserializeOwned;
 use solos_agent_core::model::{
-    ChangeSet, Decision, DecisionId, EvalId, Thread, ThreadKey, Ticket, TicketId, Trigger,
+    ChangeSet, Decision, DecisionId, EvalId, Ms, Thread, ThreadKey, Ticket, TicketId, Trigger,
     TriggerId,
 };
 use solos_agent_core::{Error, Repositories};
@@ -50,6 +52,28 @@ impl SqliteStore {
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.busy_timeout(Duration::from_secs(5))?;
         Self::start(conn)
+    }
+
+    /// Open an existing file to read only: no migration, no change of
+    /// journal mode, and SQLite refuses every write. A file of a newer
+    /// schema is refused, as by [`Self::open`].
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        let found = schema::version(&conn)?;
+        if found > schema::LATEST {
+            return Err(StoreError::Schema {
+                found,
+                known: schema::LATEST,
+            });
+        }
+        Ok(Self {
+            conn,
+            read_error: Cell::new(None),
+        })
     }
 
     pub fn open_in_memory() -> Result<Self, StoreError> {
@@ -86,6 +110,31 @@ impl SqliteStore {
     /// Every Decision, by id.
     pub fn decisions(&self) -> Result<Vec<Decision>, StoreError> {
         self.bodies("SELECT body FROM decisions ORDER BY id")
+    }
+
+    /// Decisions recorded at or after `since_ms`, newest first, at most
+    /// `limit`. Decisions are written once, in time order, so the read
+    /// stops at the first older one instead of reading them all.
+    pub fn recent_decisions(
+        &self,
+        since_ms: Ms,
+        limit: usize,
+    ) -> Result<Vec<Decision>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT body FROM decisions ORDER BY rowid DESC")?;
+        let mut rows = stmt.query([])?;
+        let mut found = Vec::new();
+        while found.len() < limit
+            && let Some(row) = rows.next()?
+        {
+            let decision: Decision = serde_json::from_str(&row.get::<_, String>(0)?)?;
+            if decision.at_ms < since_ms {
+                break;
+            }
+            found.push(decision);
+        }
+        Ok(found)
     }
 
     /// One Trigger. Unlike the port's read, a failed read is an error here.

@@ -22,8 +22,9 @@ and its MIT-licensed prototype `deepseek-ai/dsh-superagent-prototype` (docs 000-
 | P4 Slack | Done (#23). `src/agent/slack/`: `SlackSource` (Socket Mode: an outbound WebSocket, nothing exposed) and `SlackChannel` (Web API), configured as `kind: slack` and read from token files that are deleted once read. Events from the listed channels become Triggers (`slack:<channel>:<ts>`, Thread `slack:<channel>:<thread_ts>`); the bot's own messages, other channels, edits and other events are dropped, and every envelope is acknowledged. The Source reconnects with backoff after a `disconnect` or an error. Replies go in the Trigger's thread, escaped, with acknowledgements and questions cut to 500 characters and results to 3,000 with a marker. Each post carries its `MessageId` as metadata; a repeated Send looks for it in the thread first, so a crash between a post and its done mark does not post twice. A deleted or archived conversation is `Gone`; rate limits and 5xx retry, after `Retry-After`. An approval request carries Approve and Stop buttons; a click is a `Fact::Command` the runtime applies as `approve` or `stop_ticket` and answers in the thread. A budget above `auto_approve_microusd` is now accepted when a Slack channel and a `slack:` approver are configured. New dependency: `tokio-tungstenite` 0.29.0 on the existing rustls. Tests run against a fake Slack, including one `agent serve` end to end. |
 | P8 GitHub and schedules | **Done.** `src/agent/github/`: `GithubSource` polls each listed repository's issues and pull requests, issue and review comments `since` a cursor, and its latest workflow runs, over REST (nothing exposed); `GithubChannel` comments on the issue or pull request. Configured as `kind: github` with a personal access token file that is deleted once read. An issue or pull request is the Thread `github:<owner>/<repo>#<number>`; its opening, each comment (`github:<owner>/<repo>:comment:<id>`) and each failed workflow run on a pull request (a bot Trigger on that pull request's Thread) are Triggers. A mention of the agent's login addresses it, `[bot]` accounts are bots, and the agent's own comments are dropped. Listings are conditional (`ETag`), rate limits are waited out, and the read position is an atomic file in the state directory that a restart resumes from without sending a Trigger twice. Each comment ends with a hidden marker naming its `MessageId`, so a crash between a post and its done mark does not post twice. `src/agent/schedule.rs`: `ScheduleSource` (`kind: schedule`) fires named slots, `every` an interval or `daily_at` a UTC time, as System Triggers `schedule:<name>:<slot start>`: a restart cannot fire a slot twice, and missed slots fire once. A schedule may name a `reply_to`. No new dependencies. Tests run against a fake GitHub and a clock the test moves, including one `agent serve` end to end. |
 | P3d Pi workers | **Done.** `src/agent/pi_executor.rs`: `PiExecutor` runs each `Plan::Session` Assignment as a keyless Pi worker session in bwrap, in its Ticket's directory under the state dir, with an optional prepare command run once per Ticket and at most `max_workers` sessions at once (`executor: {kind: pi, ...}`). The agent broker admits each worker as a `Worker` principal on its Ticket's account, so the Mandate budget caps every Assignment of the Ticket together, and serves `worker_report`, `worker_handback`, `run_code` and `fetch_url` (`SWARM_TOOLSET=worker`). A worker is prompted with its Assignment, then with new Inputs between turns; a quiet turn counts as `waiting`. A start ends what the last run left without a worker ("host restarted") and relaunches working Tickets with `recovery`, through the new `Engine::restart`. `run_code`'s mounts and scratch directory are configurable, with swarm runs' sandbox command pinned unchanged. `Plan::Swarm` reports `failed` until P5; background `run_code` jobs are P3e. |
+| P6 Watchdog | **Done.** `src/agent/watchdog.rs`: a pure `assess(snapshot, now, thresholds)` over what the Store already holds, with no model: a Ticket waiting for a person (1h), a working Assignment with no Report (30m), an Effect with 3 failed attempts, an `unavailable` Decision in the last hour, an account at 80% of its cap, and a pause file held for 1h. Each alert id hashes its kind, its subject (with the problem's start) and a 6h bucket. With a `watchdog` section in agent.yaml, `agent serve` runs it every minute, tells the operator's conversation each new alert once through its Channel, and records it in `watchdog_alerts` (schema v3), so a restart tells nothing new. `retry_stalled` retries a stalled Assignment once per Ticket through the runtime. `solos-swarm agent status` reports Tickets, Decisions, Effects, spend, the pause and the current alerts from a read-only Store. Judging with a model whether a worker drifts from its goal is later. |
 | P5 Swarm Tickets | **Done.** `src/agent/swarm_executor.rs`: a `Plan::Swarm` Ticket runs one governed swarm per Assignment through `swarm::run_goal_until` on the Pi workers' harness, provider and credential (`executor.swarm`). Its Goal is rendered from a YAML template (`src/agent/goal_template.rs`, minijinja, every placeholder an escaped YAML literal) with the Ticket's title, scope, agent count and remaining budget, checked with `Goal::validate` at config load and at launch. The Goal's budget is the Mandate budget minus what the Ticket's account committed, and the run's spend is charged on that account (`SqliteStore::charge`, once per run) before its Report. At most `max_runs` swarms run at once (default 1). A Stop cancels a run through the new cancel input of `run_goal_until`, which `solos-swarm run` does not use, and the agent's pause holds running swarms. Completed reports `ready` with the findings, the spend and the artifact; stopped reports `failed`; drained reports `waiting`. A restart relaunches an interrupted swarm in a new run directory and charges the old one from its `state.json`. The Router's prompt says when a swarm pays for itself, and `router_decide` takes `goal_template`. |
-| P2 (rest), P3e, P6, P7, P9, P10 | Planned, below. |
+| P2 (rest), P3e, P7, P9, P10 | Planned, below. |
 
 ## What "super-agent" means here
 
@@ -56,7 +57,7 @@ Agent mode uses the prototype's vocabulary, so its documents carry over:
 | Mandate | `Mandate` | What an accept grants, including `budget_microusd`. Fixed at accept time. |
 | (new) Approval | `Approval` | Budgets above `auto_approve_microusd` wait for a person on the approver list. |
 | Report | `Report` | `progress`/`waiting` are quiet; `ready` sends the result; a question, `blocked` or `failed` asks a person. |
-| Watchdog | P6 | A separate control loop over progress, ledger and provider health. |
+| Watchdog | Watchdog (P6) | A separate control loop over the Store: waits, stalls, failing Effects, Router failures, spend and pauses. |
 | Compute/state/execution separation | P3, P9 | Store and effect queue; then remote execution nodes. |
 
 The flow:
@@ -181,7 +182,7 @@ Evals; the effect runner holds Effects. Swarm code is unchanged.
 
 Open in P0: a Ticket whose Trigger names no reply channel (a schedule, for example) asks nobody when it needs a
 person. P8 lets a schedule name its `reply_to`, a Slack channel or a GitHub issue. A schedule without one still asks
-nobody, until P6's Watchdog reports Tickets that wait for a person.
+nobody itself; since P6 the Watchdog tells the operator when such a Ticket waits for a person.
 
 **P1: the harness seam.** Add the `AgentHarness` port and move the Pi launch out of `main.rs` into `PiHarness`
 without changing behaviour. Add `ScriptedHarness`, which needs no Pi, node or bwrap and calls the real broker the way
@@ -295,11 +296,43 @@ provider through the real broker. It runs on macOS too. Swarm mode is the first 
   and refuses a swarm where none runs or a template that does not exist.
 - Later: a running swarm takes no new Input; a follow-up on its Thread waits for the Ticket's next Assignment.
 
-**P6: Watchdog.** A separate loop with its own small account.
-- Inputs: progress (budget %, calls, time since the last Report), the provider outage streak, Evals that keep
-  expiring, Effects that keep failing.
-- Actions: notify the operator channel, retry an Assignment, pause.
-- It answers "what is running and why" in operator DMs. It never widens a Mandate.
+**P6: Watchdog.** Done; setup in [Watchdog](#watchdog).
+- Done: `assess(snapshot, now, thresholds)` in `src/agent/watchdog.rs` is pure. It reads only what the Store holds
+  (open Tickets, recent Decisions, pending Effects with their attempt counts, the spend ledger) and the state
+  directory's pause gate. It calls no model, so it needs no account. Signals, with their default thresholds:
+  - a Ticket that has waited 1h for a person: an approval, an answer, or a look at blocked or failed work. A
+    Ticket whose request named no reply channel says that nobody else was asked;
+  - a working Assignment with no Report for 30m (stalled). A pause holds this signal, and the quiet time restarts
+    when the pause lifts, since workers cannot call a model while paused;
+  - an Effect with 3 failed attempts, such as a Send stuck on one conversation;
+  - 1 `unavailable` Decision in the last hour: the Router left an Eval undecided three times running;
+  - an account at 80% of its cap: the Router's daily cap (known from agent.yaml) and each open Ticket's budget;
+  - a pause that the state directory's `control.json` or `PAUSE` has held for 1h, timed from the file. A pause set
+    in agent.yaml, or the peak window, raises nothing.
+- Done: alert ids. An id is `wd_` and a hash of the kind, the subject and a bucket of `repeat` (6h). The subject
+  holds the problem's start where the Store has one: the launch or Report a stall counts from, the Report or step a
+  wait counts from, the call that crossed a cap, the pause file's time. Buckets count from when the threshold was
+  crossed. So a problem is told when it crosses its threshold and once every 6h while it lasts, and a problem that
+  comes back is a new alert. A failing Effect and `unavailable` Decisions have no start in the Store, so their
+  buckets are the clock's.
+- Done: the loop. With a `watchdog` section in agent.yaml, `agent serve` runs it beside the runtime every `every`
+  (1m), the first time one interval after the start, once the runtime has recovered what the last run left. Each
+  new alert becomes a row in the Store's `watchdog_alerts` table (schema v3), which only the Watchdog writes: the
+  row is written before the alert is sent and marked sent after. A known id is never told again, so a restart
+  tells nothing new; an unsent row goes out at the next tick. The alert goes to `watchdog.operator`, a reply
+  address on a source a configured Channel serves, as an attention message, during a pause too.
+- Done: one action, `retry_stalled`. The Watchdog asks the runtime to retry a stalled Assignment as `Fact::Retry`,
+  so the Engine keeps one writer. The runtime first checks that the Assignment is still the Ticket's working one,
+  with the Reports the Watchdog saw, then calls `Engine::retry`, which spends from the same Ticket budget. It acts
+  once per Ticket; a second stall of the same Ticket is only told. It never widens a Mandate or a budget.
+- Done: `solos-swarm agent status --state-dir DIR [--config agent.yaml] [--json]`, a report of what is running and
+  why: open Tickets with their stage, age, plan, spend against budget, the request that started them and their
+  latest Assignment; the latest Decisions; pending and failing Effects; the Router's spend today; the pause; and the
+  alerts `assess` would raise now. It opens the Store read-only (no migration, no write), so it is safe while the
+  agent serves. `--config` adds the Router's cap, the Watchdog's thresholds and a pause set in agent.yaml.
+- Later: judging with a model whether a worker is drifting from its goal, beyond silence; the provider outage
+  streak, and Evals that keep expiring before they turn `unavailable`; a pause as an action; and operator DMs that
+  answer "what is running and why" with the status report.
 
 **P7: more harnesses, both directions.**
 - *solos-swarm drives them.* `ClaudeCodeHarness` uses headless stream-json with `--mcp-config` and the broker as the
@@ -508,6 +541,30 @@ executor:
     default_template: research                   # for a swarm plan that names none
     # max_runs: 1                                # swarms at once
 ```
+
+## Watchdog
+
+The Watchdog writes to one conversation an operator reads, through a Channel the config already has.
+
+```yaml
+watchdog:
+  operator: {source: slack, address: {channel: D0123OPS}}  # a DM or channel the bot can post in
+  every: 1m                    # how often it looks
+  retry_stalled: true          # retry a stalled Assignment, once per Ticket
+  thresholds:                  # each optional; these are the defaults
+    waiting: 1h                # a Ticket waiting for a person
+    stalled: 30m               # a working Assignment with no Report
+    failed_attempts: 3         # an Effect's failed attempts
+    unavailable: 1             # unavailable Decisions...
+    unavailable_within: 1h     # ...within this window
+    spend_percent: 80          # of the Router's daily cap or a Ticket's budget
+    paused: 1h                 # a pause held by control.json or PAUSE
+    repeat: 6h                 # a problem that lasts is told again this often
+```
+
+On Slack, `address` takes `channel` and, for a thread, `thread_ts`; on GitHub, `repo` and `number` (an issue). A
+top-level Slack post cannot be searched for like a thread reply, so a crash between a post and its record there can
+post one alert twice. `solos-swarm agent status --state-dir DIR --config agent.yaml` shows what it would raise now.
 
 ## Security model
 
