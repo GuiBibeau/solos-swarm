@@ -84,6 +84,11 @@ impl GoalTemplates {
         self.default.as_deref()
     }
 
+    /// The provider every swarm's calls go to.
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
     /// The Goal `fill` gets from the template `name`, or the default one,
     /// with its upstream on this agent's provider. It is valid, its budget
     /// is the fill's and it has one Task per agent. The rendered YAML comes

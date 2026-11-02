@@ -1,8 +1,9 @@
 //! The swarm arm of the executor: each Assignment of a `Plan::Swarm` Ticket
 //! runs one governed swarm through `swarm::run_goal_until`, with a Goal
 //! rendered from a template under what the Ticket has left to spend. A run
-//! has its own directory under the Ticket's, which stays as evidence, and at
-//! most `max_runs` swarms run at once.
+//! has its own directory under the Ticket's, which stays as evidence, and its
+//! cost is charged on the Ticket's account once it ends. At most `max_runs`
+//! swarms run at once.
 
 use super::broker::{AgentBroker, clip};
 use super::goal_template::{Fill, GoalTemplates};
@@ -14,10 +15,10 @@ use crate::swarm::{self, Cancel, GoalOutcome, GoalRun, GoalStatus};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 use solos_agent_core::model::{AssignmentId, MicroUsd, Plan, ReportIn, ReportStatus, TicketId};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::os::unix::fs::DirBuilderExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::sync::{Semaphore, watch};
@@ -55,6 +56,8 @@ struct Inner<H> {
     parts: SwarmParts<H>,
     slots: Arc<Semaphore>,
     runs: Mutex<BTreeMap<AssignmentId, Run>>,
+    /// Run directories whose swarm has not been charged yet.
+    unbooked: Mutex<BTreeSet<PathBuf>>,
 }
 
 struct Run {
@@ -76,6 +79,7 @@ where
                 slots: Arc::new(Semaphore::new(parts.max_runs)),
                 parts,
                 runs: Mutex::new(BTreeMap::new()),
+                unbooked: Mutex::new(BTreeSet::new()),
             }),
         })
     }
@@ -149,6 +153,12 @@ where
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    fn unbooked(&self) -> MutexGuard<'_, BTreeSet<PathBuf>> {
+        self.unbooked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Start a swarm for `launch`, once per Assignment. The table stays
     /// locked until it holds the run, so a run that ends at once still
     /// finds itself there to remove.
@@ -209,7 +219,14 @@ where
             }
         };
         let run_dir = run.run_dir.clone();
+        self.unbooked().insert(run_dir.clone());
         let outcome = self.swarm(run, cancel.clone()).await;
+        let cost = match &outcome {
+            Ok(outcome) => outcome.spent_microusd.saturating_add(outcome.held_microusd),
+            Err(_) => run_cost(&run_dir).unwrap_or(0),
+        };
+        // Before any Report, so the next Assignment's budget counts it.
+        self.book(&launch.ticket, &run_dir, cost).await;
         if cancel.borrow().is_some() {
             // The Engine ended the Assignment already, or the process is ending.
             return Ok(());
@@ -219,13 +236,68 @@ where
             Err(err) => {
                 let (why, _) = clip(&format!("{err:#}"), REASON_CHARS);
                 let text = format!(
-                    "The swarm could not run: {why}. Its run is in {}.",
+                    "The swarm could not run: {why}. It spent {cost} microusd; its run is in {}.",
                     run_dir.display()
                 );
-                report(facts, launch, ReportStatus::Failed, text, 0).await?;
+                report(facts, launch, ReportStatus::Failed, text, cost).await?;
                 ended(facts, launch, format!("swarm failed: {why}")).await
             }
         }
+    }
+
+    /// Charge the Ticket's account what the run in `run_dir` cost. One that
+    /// fails is told here, and the Ticket's next launch charges it.
+    async fn book(&self, ticket: &TicketId, run_dir: &Path, cost: MicroUsd) {
+        if let Err(err) = self.charge(ticket, run_dir, cost).await {
+            eprintln!(
+                "agent: the {cost} microusd the swarm in {} spent are not charged yet: {err:#}",
+                run_dir.display()
+            );
+        }
+        self.unbooked().remove(run_dir);
+    }
+
+    /// Charge a run once, under its directory's name.
+    async fn charge(&self, ticket: &TicketId, run_dir: &Path, cost: MicroUsd) -> Result<bool> {
+        let name = run_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("a run directory has no name")?;
+        let provider = self.parts.templates.provider();
+        self.parts
+            .broker
+            .charge_ticket(ticket, provider, cost, format!("swarm:{name}"))
+            .await
+    }
+
+    /// Charge what earlier runs of `ticket` cost and were not charged, such
+    /// as a run a crash cut short.
+    async fn book_earlier(&self, ticket: &TicketId) -> Result<()> {
+        let base = self.swarm_dir(ticket);
+        let entries = match std::fs::read_dir(&base) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err).with_context(|| format!("cannot list {}", base.display())),
+        };
+        for entry in entries {
+            let dir = entry?.path();
+            if self.unbooked().contains(&dir) {
+                continue;
+            }
+            if let Some(cost) = run_cost(&dir)
+                && self.charge(ticket, &dir, cost).await?
+            {
+                eprintln!(
+                    "agent: charged {ticket} {cost} microusd for the swarm in {}, which was cut short",
+                    dir.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn swarm_dir(&self, ticket: &TicketId) -> PathBuf {
+        self.parts.tickets_dir.join(ticket.as_str()).join(SWARM_DIR)
     }
 
     /// The Goal for what the Ticket has left to spend, and a new run
@@ -239,6 +311,8 @@ where
             bail!("{} is not a swarm plan", launch.assignment);
         };
         let parts = &self.parts;
+        dir_name(launch.ticket.as_str())?;
+        self.book_earlier(&launch.ticket).await?;
         let committed = parts.broker.ticket_committed(&launch.ticket).await?;
         let remaining = launch.budget_microusd.saturating_sub(committed);
         ensure!(
@@ -272,11 +346,8 @@ where
     /// A directory no run has used: `<ticket>/swarm/<assignment>`, or with
     /// `-2`, `-3`, ... after it when a launch repeats.
     fn run_dir(&self, ticket: &TicketId, assignment: &AssignmentId) -> Result<PathBuf> {
-        let base = self
-            .parts
-            .tickets_dir
-            .join(dir_name(ticket.as_str())?)
-            .join(SWARM_DIR);
+        dir_name(ticket.as_str())?;
+        let base = self.swarm_dir(ticket);
         private_dir(&base)?;
         let name = dir_name(assignment.as_str())?;
         for n in 1..=RUN_DIRS {
@@ -320,6 +391,17 @@ where
             never = paused => match never {},
         }
     }
+}
+
+/// What a run's `state.json` says it committed: its spend, and the holds
+/// still open, at their hold, as the ledger charges a call a crash cut
+/// short. `None` before its first event, when it has spent nothing.
+fn run_cost(run_dir: &Path) -> Option<MicroUsd> {
+    let bytes = std::fs::read(run_dir.join("state.json")).ok()?;
+    let state: Value = serde_json::from_slice(&bytes).ok()?;
+    state["spent_microusd"]
+        .as_u64()?
+        .checked_add(state["held_microusd"].as_u64()?)
 }
 
 /// The outcome as the Ticket's Report. A swarm that did not complete also
@@ -540,6 +622,7 @@ mod tests {
 
     struct World<H> {
         executor: SwarmExecutor<H>,
+        broker: AgentBroker,
         facts: FactSink,
         inbound: mpsc::Receiver<Inbound>,
         dir: PathBuf,
@@ -584,7 +667,7 @@ mod tests {
             let executor = SwarmExecutor::new(SwarmParts {
                 harness: Arc::new(harness),
                 provider: Arc::new(Scripted),
-                broker,
+                broker: broker.clone(),
                 templates: GoalTemplates::load(&config, "deepseek").unwrap(),
                 tickets_dir: dir.join("state/tickets"),
                 state_dir: dir.join("state"),
@@ -595,6 +678,7 @@ mod tests {
             .unwrap();
             Self {
                 executor,
+                broker,
                 facts,
                 inbound,
                 dir,
@@ -635,6 +719,27 @@ mod tests {
                 Fact::Report { report, .. } => report,
                 other => panic!("not a report: {other:?}"),
             }
+        }
+        async fn committed(&self, ticket: &str) -> u64 {
+            self.broker
+                .ticket_committed(&TicketId::new(ticket))
+                .await
+                .unwrap()
+        }
+        /// Whether `run` of `ticket` was charged already: a charge again
+        /// would then charge nothing.
+        async fn charged(&self, ticket: &str, run: &str) -> bool {
+            let again = self
+                .broker
+                .charge_ticket(
+                    &TicketId::new(ticket),
+                    "deepseek",
+                    0,
+                    format!("swarm:{run}"),
+                )
+                .await
+                .unwrap();
+            !again
         }
         fn run_dir(&self, ticket: &str, assignment: &str) -> PathBuf {
             self.dir
@@ -717,6 +822,11 @@ mod tests {
             )
         );
         assert_eq!(report.spent_microusd, 270);
+        assert_eq!(
+            w.committed("tk_1").await,
+            270,
+            "the run is charged on the ticket"
+        );
         let artifact_json: Value =
             serde_json::from_slice(&std::fs::read(&artifact).unwrap()).unwrap();
         assert_eq!(artifact_json["papers"].as_array().map(Vec::len), Some(2));
@@ -763,7 +873,66 @@ mod tests {
             "its assignment ended: stopped by alice on slack"
         );
         assert!(!run.join("broker.sock").exists());
+        assert!(
+            w.charged("tk_1", "as_1").await,
+            "a stopped run is charged too"
+        );
         w.no_fact().await;
+    }
+
+    #[tokio::test]
+    async fn the_goal_gets_what_the_ticket_has_left_after_earlier_work_and_runs_cut_short() {
+        let mut w = World::new(filing(), 1, TEMPLATE);
+        let tk = TicketId::new("tk_1");
+        w.broker
+            .charge_ticket(&tk, "deepseek", 100_000, "a worker's calls".into())
+            .await
+            .unwrap();
+        let cut = w.run_dir("tk_1", "as_1");
+        std::fs::create_dir_all(&cut).unwrap();
+        let state = json!({"goal_status":"running","spent_microusd":20_000,"held_microusd":3_456});
+        std::fs::write(cut.join("state.json"), state.to_string()).unwrap();
+
+        w.launch(launch("tk_1", "as_2", 2)).await;
+        assert!(started(&w.fact().await, "as_2"));
+        assert_eq!(w.report().await.status, ReportStatus::Ready);
+        let config =
+            std::fs::read_to_string(w.run_dir("tk_1", "as_2").join("config.yaml")).unwrap();
+        assert!(
+            config.contains(&format!(
+                "budget_microusd: {}\n",
+                500_000 - 100_000 - 23_456
+            )),
+            "{config}"
+        );
+        assert_eq!(w.committed("tk_1").await, 100_000 + 23_456 + 270);
+        assert!(w.charged("tk_1", "as_1").await && w.charged("tk_1", "as_2").await);
+        assert!(cut.join("state.json").is_file(), "the run cut short stays");
+
+        w.launch(launch("tk_1", "as_3", 2)).await;
+        assert!(started(&w.fact().await, "as_3"));
+        assert_eq!(w.report().await.status, ReportStatus::Ready);
+        assert_eq!(
+            w.committed("tk_1").await,
+            100_000 + 23_456 + 270 + 270,
+            "each run is charged once"
+        );
+
+        w.broker
+            .charge_ticket(&tk, "deepseek", 500_000, "the rest".into())
+            .await
+            .unwrap();
+        w.launch(launch("tk_1", "as_4", 2)).await;
+        assert!(started(&w.fact().await, "as_4"));
+        let report = w.report().await;
+        assert_eq!(report.status, ReportStatus::Failed);
+        assert!(
+            report
+                .text
+                .ends_with("the ticket's budget of 500000 microusd is spent"),
+            "{}",
+            report.text
+        );
     }
 
     #[tokio::test]

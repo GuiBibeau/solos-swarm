@@ -23,7 +23,9 @@ use solos_agent_core::model::{
     Accept, Acknowledge, AssignmentId, EvalId, MicroUsd, Ms, Plan, ReportIn, ReportStatus,
     ThreadKey, Ticket, TicketId, Trigger, TriggerId, Verdict,
 };
-use solos_agent_store::{HoldId, HoldRequest, Reservation, SqliteStore, StoreError, Tokens};
+use solos_agent_store::{
+    Charge, HoldId, HoldRequest, Reservation, SqliteStore, StoreError, Tokens,
+};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -399,6 +401,28 @@ impl AgentBroker {
     pub async fn ticket_committed(&self, ticket: &TicketId) -> Result<MicroUsd> {
         let account = Account::ticket_key(ticket);
         self.store(move |store| store.committed(&account, 0)).await
+    }
+
+    /// Charge `ticket`'s account what a run its own broker settled cost,
+    /// once per `request_id`. Returns whether this call charged it.
+    pub async fn charge_ticket(
+        &self,
+        ticket: &TicketId,
+        provider: &str,
+        cost_microusd: MicroUsd,
+        request_id: String,
+    ) -> Result<bool> {
+        let (account, provider) = (Account::ticket_key(ticket), provider.to_owned());
+        self.store(move |store| {
+            store.charge(&Charge {
+                account: &account,
+                provider: &provider,
+                cost_microusd,
+                request_id: &request_id,
+                at_ms: now_ms(),
+            })
+        })
+        .await
     }
 
     /// The routes, for the grants admitted so far and any worker.

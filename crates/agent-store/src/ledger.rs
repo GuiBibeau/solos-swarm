@@ -30,6 +30,18 @@ pub struct HoldRequest<'a> {
     pub at_ms: Ms,
 }
 
+/// A cost paid outside this ledger's holds, such as a whole swarm run's,
+/// whose own broker held and settled each of its calls.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Charge<'a> {
+    pub account: &'a str,
+    pub provider: &'a str,
+    pub cost_microusd: MicroUsd,
+    /// What was paid for. An account is charged once per id.
+    pub request_id: &'a str,
+    pub at_ms: Ms,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reservation {
     Held(HoldId),
@@ -218,6 +230,39 @@ impl SqliteStore {
             return Err(StoreError::NotHeld(id));
         }
         Ok(())
+    }
+
+    /// Record `charge` as a settled row, unless its account has a row with
+    /// its request id already. Returns whether it was recorded, so a repeat
+    /// after a crash charges nothing twice.
+    pub fn charge(&mut self, charge: &Charge<'_>) -> Result<bool, StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let seen: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM spend WHERE account = ?1 AND request_id = ?2",
+                params![charge.account, charge.request_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if seen.is_some() {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO spend (account, provider, at_ms, state, hold_microusd, cost_microusd,
+                 request_id, closed_ms)
+             VALUES (?1, ?2, ?3, 'settled', ?4, ?4, ?5, ?3)",
+            params![
+                charge.account,
+                charge.provider,
+                charge.at_ms,
+                charge.cost_microusd,
+                charge.request_id
+            ],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Charge every hold still open at its hold, and return how many there
