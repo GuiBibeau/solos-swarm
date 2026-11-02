@@ -49,6 +49,10 @@ pub use solos_swarm::gateway::{
     Dialect, OpenAiCompatible, PriceTable, Provider, Upstream, effective_control, peak_retry_after,
     reasoning_model, upstream_profile, venice_model,
 };
+#[path = "broker_goal_text.rs"]
+mod goal_text;
+#[allow(unused_imports)]
+pub use goal_text::{FilingContract, Nudges, RecordFields};
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Goal {
@@ -94,6 +98,14 @@ pub struct Goal {
     pub seed: u64,
     pub catalog_version: String,
     pub scorer_version: String,
+    /// What the run tells an agent that has not filed. Absent,
+    /// [`Nudges::research`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nudges: Option<Nudges>,
+    /// Which Task input fields shape the record the host files for an agent
+    /// that never did. Absent, [`RecordFields::research`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_fields: Option<RecordFields>,
 }
 
 impl Goal {
@@ -212,7 +224,21 @@ impl Goal {
                 "Task input exceeds admitted limit"
             );
         }
+        if let Some(nudges) = &self.nudges {
+            nudges.validate().context("invalid Goal nudges")?;
+        }
+        if let Some(fields) = &self.record_fields {
+            fields.validate().context("invalid Goal record_fields")?;
+        }
         Ok(())
+    }
+    pub fn nudges(&self) -> &Nudges {
+        self.nudges.as_ref().unwrap_or(Nudges::research())
+    }
+    pub fn record_fields(&self) -> &RecordFields {
+        self.record_fields
+            .as_ref()
+            .unwrap_or(RecordFields::research())
     }
     /// The admitted upstream, resolving the legacy pair for a Goal frozen before
     /// `upstream` existed. Never fails on a validated Goal.
@@ -787,11 +813,12 @@ impl Store {
             notes: agent.map_or(&[][..], |a| &a.notes),
         };
         let text = progress::partial_text(&summary);
-        let mut record = deferred_record(task, reason, text.as_deref());
+        let fields = goal.record_fields();
+        let mut record = deferred_record(task, fields, reason, text.as_deref());
         if text.is_some() {
             record["evidence"] = json!(record["description"]);
         }
-        json!({ finding_key(task): [record] })
+        json!({ finding_key(task, fields): [record] })
     }
     /// Host-side filing for every claimed Task whose agent never filed. Used when
     /// the run ends (deadline, cancel, nudges exhausted); it does not need an
@@ -888,7 +915,7 @@ fn is_coordinator(task: &Task) -> bool {
 }
 
 /// The result key of a Task, derived only from the public Task input.
-fn finding_key(task: &Task) -> String {
+fn finding_key(task: &Task, fields: &RecordFields) -> String {
     task.input
         .get("output_contract")
         .and_then(|contract| contract.get("result_key"))
@@ -896,25 +923,32 @@ fn finding_key(task: &Task) -> String {
         .filter(|key| !key.is_empty())
         .map(str::to_owned)
         .or_else(|| {
-            (task.input.get("experiment").is_some() || task.input.get("artifact_fields").is_some())
-                .then(|| "experiments".to_owned())
+            fields
+                .marked_by
+                .iter()
+                .any(|field| task.input.get(field).is_some())
+                .then(|| fields.marked_result_key.clone())
         })
-        .unwrap_or_else(|| "inconsistencies".to_owned())
+        .unwrap_or_else(|| fields.result_key.clone())
 }
 
 /// A valid experiment-contract row for a Task that was never executed.
-fn deferred_record(task: &Task, reason: &str, partial: Option<&str>) -> Value {
+fn deferred_record(
+    task: &Task,
+    fields: &RecordFields,
+    reason: &str,
+    partial: Option<&str>,
+) -> Value {
     let input = &task.input;
     let title = input
         .get("title")
         .and_then(Value::as_str)
         .filter(|title| !title.is_empty())
         .unwrap_or(task.id.as_str());
-    let file = input
-        .get("seed_url")
-        .and_then(Value::as_str)
-        .or_else(|| input.get("paper_url").and_then(Value::as_str))
-        .or_else(|| input.get("artifact_file").and_then(Value::as_str))
+    let file = fields
+        .file_from
+        .iter()
+        .find_map(|field| input.get(field).and_then(Value::as_str))
         .unwrap_or_default();
     let mut record = json!({
         "id": task.id,
@@ -927,9 +961,9 @@ fn deferred_record(task: &Task, reason: &str, partial: Option<&str>) -> Value {
         "code": "",
         "output": format!("DEFERRED: {reason}"),
     });
-    for field in ["experiment", "component", "compute"] {
+    for field in &fields.copy {
         if let Some(value) = input.get(field) {
-            record[field] = value.clone();
+            record[field.as_str()] = value.clone();
         }
     }
     record
@@ -1711,6 +1745,155 @@ mod tests {
         let events = fs::read_to_string(dir.join("events.jsonl")).unwrap();
         assert!(events.contains("\"tool\":\"claim_task\""));
         assert!(events.contains("\"tool\":\"submit_finding\""));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `finding_key` and `deferred_record` as they were before a Goal could
+    /// name its record fields, copied unchanged.
+    fn finding_key_before(task: &Task) -> String {
+        task.input
+            .get("output_contract")
+            .and_then(|contract| contract.get("result_key"))
+            .and_then(Value::as_str)
+            .filter(|key| !key.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                (task.input.get("experiment").is_some()
+                    || task.input.get("artifact_fields").is_some())
+                .then(|| "experiments".to_owned())
+            })
+            .unwrap_or_else(|| "inconsistencies".to_owned())
+    }
+    fn deferred_record_before(task: &Task, reason: &str, partial: Option<&str>) -> Value {
+        let input = &task.input;
+        let title = input
+            .get("title")
+            .and_then(Value::as_str)
+            .filter(|title| !title.is_empty())
+            .unwrap_or(task.id.as_str());
+        let file = input
+            .get("seed_url")
+            .and_then(Value::as_str)
+            .or_else(|| input.get("paper_url").and_then(Value::as_str))
+            .or_else(|| input.get("artifact_file").and_then(Value::as_str))
+            .unwrap_or_default();
+        let mut record = json!({
+            "id": task.id,
+            "title": title,
+            "file": file,
+            "description": partial.map_or_else(|| format!(
+                "Deferred before execution: {reason}. No code was run; this record preserves the Task contract for a later retry."
+            ), str::to_owned),
+            "severity": "defer",
+            "code": "",
+            "output": format!("DEFERRED: {reason}"),
+        });
+        for field in ["experiment", "component", "compute"] {
+            if let Some(value) = input.get(field) {
+                record[field] = value.clone();
+            }
+        }
+        record
+    }
+
+    #[test]
+    fn a_goal_without_record_fields_files_the_same_bytes_as_before() {
+        let (goal, _, dir) = setup();
+        assert!(goal.nudges.is_none() && goal.record_fields.is_none());
+        assert_eq!(goal.nudges(), &Nudges::default());
+        assert_eq!(goal.record_fields(), &RecordFields::default());
+        for input in [
+            json!({}),
+            json!({"title": "A", "seed_url": "https://example.test/a", "experiment": "E1",
+                   "component": "component-a", "compute": {"cpus": 4}}),
+            json!({"title": "", "seed_url": 7, "paper_url": "https://example.test/p.pdf",
+                   "artifact_file": "out/t.csv"}),
+            json!({"artifact_file": "out/t.csv", "artifact_fields": ["a"]}),
+            json!({"output_contract": {"result_key": "papers"}, "experiment": "E2"}),
+            json!({"output_contract": {"result_key": ""}, "paper_url": "https://example.test/q"}),
+            json!({"compute": null}),
+            json!("not an object"),
+        ] {
+            let task: Task =
+                serde_json::from_value(json!({"id": "t-1", "input": input.clone()})).unwrap();
+            assert_eq!(
+                finding_key(&task, goal.record_fields()),
+                finding_key_before(&task),
+                "{input}"
+            );
+            for partial in [None, Some("Partial: three Board posts.")] {
+                let now = deferred_record(&task, goal.record_fields(), "deadline", partial);
+                let before = deferred_record_before(&task, "deadline", partial);
+                assert_eq!(
+                    serde_json::to_vec(&now).unwrap(),
+                    serde_json::to_vec(&before).unwrap(),
+                    "{input}"
+                );
+            }
+        }
+        let value = serde_json::to_value(&goal).unwrap();
+        assert!(
+            value.get("nudges").is_none() && value.get("record_fields").is_none(),
+            "a Goal without them serializes as it did"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_goal_with_record_fields_files_its_own_record() {
+        let (mut goal, mut store, dir) = setup();
+        goal.record_fields = Some(
+            serde_json::from_value(json!({
+                "file_from": ["path"],
+                "copy": ["section"],
+                "result_key": "notes",
+                "marked_by": [],
+            }))
+            .unwrap(),
+        );
+        goal.validate().unwrap();
+        let input = json!({"title": "A", "path": "src/lib.rs", "seed_url": "https://example.test/a",
+                           "section": "3.1", "experiment": "E1"});
+        goal.tasks[0].input = input.clone();
+        store.tasks[0].input = input;
+        store
+            .tool(&goal, "agent-00", "claim_task", json!({}))
+            .unwrap();
+        assert_eq!(store.file_partial_findings(&goal, "deadline").unwrap(), 1);
+        let result = &store.findings[0].result;
+        assert_eq!(result.as_object().unwrap().len(), 1);
+        let record = &result["notes"][0];
+        assert_eq!(record["file"], "src/lib.rs");
+        assert_eq!(record["section"], "3.1");
+        assert!(record.get("experiment").is_none());
+        assert_eq!(record["output"], "DEFERRED: deadline");
+        let value = serde_json::to_value(&goal).unwrap();
+        assert_eq!(value["record_fields"]["result_key"], "notes");
+        assert!(value.get("nudges").is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn goal_validate_refuses_a_malformed_nudge_or_record_field() {
+        let (mut goal, _, dir) = setup();
+        goal.nudges = Some(serde_json::from_value(json!({"explore": "You are {agent}."})).unwrap());
+        let err = format!("{:#}", goal.validate().unwrap_err());
+        assert!(
+            err.contains("invalid Goal nudges: nudges.explore: {agent} is not a placeholder"),
+            "{err}"
+        );
+        goal.nudges =
+            Some(serde_json::from_value(json!({"explore": "You are {agent_id}."})).unwrap());
+        goal.validate().unwrap();
+        goal.record_fields = Some(serde_json::from_value(json!({"copy": ["severity"]})).unwrap());
+        let err = format!("{:#}", goal.validate().unwrap_err());
+        assert!(err.contains("invalid Goal record_fields"), "{err}");
+        let mut file = serde_json::to_value(&goal).unwrap();
+        file["nudges"]["explore_harder"] = json!("x");
+        assert!(
+            serde_json::from_value::<Goal>(file).is_err(),
+            "an unknown nudge stage"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

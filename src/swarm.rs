@@ -4,7 +4,8 @@
 //! `run_goal`.
 use crate::{
     broker::{
-        self, Broker, Goal, Provider, Store, Upstream, file_digest, now_ms, router, write_json,
+        self, Broker, FilingContract, Goal, Nudges, Provider, Store, Upstream, file_digest, now_ms,
+        router, write_json,
     },
     code::CodeExecutor,
     harness::{AgentHarness, Observation, Role, Session, SessionEvent, SessionSpec},
@@ -353,7 +354,7 @@ const NUDGE_MANDATORY_AT: usize = 32;
 
 /// The exact filing call this Task admits. Built from the Task's own
 /// `output_contract`, never from a guessed shape or a fabricated record.
-fn filing_contract(task: Option<&broker::Task>) -> Option<(String, String, String)> {
+fn filing_contract(task: Option<&broker::Task>) -> Option<FilingContract> {
     let task = task?;
     let contract = task.input.get("output_contract")?;
     let key = contract.get("result_key").and_then(Value::as_str)?;
@@ -371,53 +372,27 @@ fn filing_contract(task: Option<&broker::Task>) -> Option<(String, String, Strin
         .filter_map(Value::as_str)
         .collect::<Vec<_>>()
         .join(" | ");
-    Some((
-        task.id.clone(),
-        key.to_owned(),
-        format!("{required}; severity one of {severities}"),
-    ))
+    Some(FilingContract {
+        task_id: task.id.clone(),
+        result_key: key.to_owned(),
+        required_fields: required,
+        severities,
+    })
 }
 
-/// The escalating instruction sent to a worker that has not filed. Earlier
-/// rounds still allow exploration; later rounds make the tool call mandatory and
-/// name the exact call, because the most common failure is a worker that keeps
-/// researching and never submits.
-fn nudge(round: usize, id: &str, task: Option<&broker::Task>) -> String {
+/// The escalating instruction sent to a worker that has not filed, in the
+/// Goal's words. Earlier rounds still allow exploration; later rounds make the
+/// tool call mandatory and name the exact call, because the most common
+/// failure is a worker that keeps researching and never submits.
+fn nudge(nudges: &Nudges, round: usize, id: &str, task: Option<&broker::Task>) -> Result<String> {
     if round < NUDGE_FILING_AT {
-        format!(
-            "You are {id}. Keep researching. Use fetch_url to read the actual sources in your \
-             assigned block: the manuscript map, the paper README, and the LaTeX sections under \
-             build/sections/. Read several papers before you decide. Post useful intermediates to \
-             the Board. Do not file yet unless you have already covered your block and have at \
-             least three well-evidenced records. Keep going."
-        )
+        nudges.explore(id)
     } else if round < NUDGE_MANDATORY_AT {
-        format!(
-            "You are {id}. You have enough evidence to begin assembling your records. Post your \
-             top candidates to the Board now, then prepare one submit_finding call. Filing becomes \
-             mandatory in a few turns; do not open a new line of inquiry."
-        )
+        nudges.assemble(id)
     } else {
         match filing_contract(task) {
-            Some((task_id, key, fields)) => format!(
-                "You are {id}. Filing is now the ONLY remaining action. Call submit_finding exactly \
-                 once, now:\n\
-                 submit_finding({{\"task_id\":\"{task_id}\",\"result\":{{\"{key}\":[]}}}})\n\
-                 Replace the empty list with one object per paper you have already read in this \
-                 conversation. Each object needs {fields}. Every file must be one of your seed \
-                 URLs. Never invent a paper and never copy this instruction into a record. If you \
-                 have no defensible record, submit the empty list: an empty finding is \
-                 recoverable, a missing one blocks the whole Goal. Do not call fetch_url again. \
-                 After submit_finding returns accepted, call board_post once and end the turn."
-            ),
-            None => format!(
-                "You are {id}. Filing is now the ONLY remaining action. Call claim_task if you \
-                 have not already, then call submit_finding exactly once with your claimed task_id \
-                 and the result object your worker prompt defines, built from evidence already in \
-                 this conversation. A filing with no records is better than no filing; never invent \
-                 a record. Do not call fetch_url again. After submit_finding returns accepted, end \
-                 the turn."
-            ),
+            Some(contract) => nudges.file(id, &contract),
+            None => nudges.file_without_contract(id),
         }
     }
 }
@@ -523,7 +498,7 @@ async fn work(
             continue;
         }
         *count += 1;
-        let prompt = nudge(*count, &who, task.as_ref());
+        let prompt = nudge(goal.nudges(), *count, &who, task.as_ref())?;
         let worker = workers
             .iter_mut()
             .find(|worker| worker.id() == who)
@@ -698,10 +673,14 @@ mod tests {
         .unwrap()
     }
 
+    fn research(round: usize, id: &str, task: Option<&broker::Task>) -> String {
+        nudge(Nudges::research(), round, id, task).unwrap()
+    }
+
     #[test]
     fn the_mandatory_nudge_names_the_goal_contract_call_without_inventing_rows() {
         let task = task();
-        let text = nudge(NUDGE_MANDATORY_AT, "agent-07", Some(&task));
+        let text = research(NUDGE_MANDATORY_AT, "agent-07", Some(&task));
         assert!(
             text.contains(r#"submit_finding({"task_id":"lens-04","result":{"papers":[]}})"#),
             "the exact call must be literal: {text}"
@@ -717,11 +696,141 @@ mod tests {
     #[test]
     fn early_nudges_still_allow_research_and_an_unclaimed_worker_gets_no_fake_task() {
         let task = task();
-        assert!(nudge(1, "agent-07", Some(&task)).contains("Keep researching"));
-        assert!(!nudge(1, "agent-07", Some(&task)).contains("submit_finding({"));
-        let unclaimed = nudge(NUDGE_MANDATORY_AT, "agent-07", None);
+        assert!(research(1, "agent-07", Some(&task)).contains("Keep researching"));
+        assert!(!research(1, "agent-07", Some(&task)).contains("submit_finding({"));
+        let unclaimed = research(NUDGE_MANDATORY_AT, "agent-07", None);
         assert!(unclaimed.contains("submit_finding exactly once"));
         assert!(!unclaimed.contains("lens-04"));
+    }
+
+    /// `filing_contract` and `nudge` as they were before a Goal could name
+    /// its nudges, copied unchanged.
+    fn filing_contract_before(task: Option<&broker::Task>) -> Option<(String, String, String)> {
+        let task = task?;
+        let contract = task.input.get("output_contract")?;
+        let key = contract.get("result_key").and_then(Value::as_str)?;
+        let required = contract
+            .get("required_fields")
+            .and_then(Value::as_array)?
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let severities = contract
+            .get("severities")
+            .and_then(Value::as_array)?
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        Some((
+            task.id.clone(),
+            key.to_owned(),
+            format!("{required}; severity one of {severities}"),
+        ))
+    }
+    fn nudge_before(round: usize, id: &str, task: Option<&broker::Task>) -> String {
+        if round < NUDGE_FILING_AT {
+            format!(
+                "You are {id}. Keep researching. Use fetch_url to read the actual sources in your \
+                 assigned block: the manuscript map, the paper README, and the LaTeX sections under \
+                 build/sections/. Read several papers before you decide. Post useful intermediates to \
+                 the Board. Do not file yet unless you have already covered your block and have at \
+                 least three well-evidenced records. Keep going."
+            )
+        } else if round < NUDGE_MANDATORY_AT {
+            format!(
+                "You are {id}. You have enough evidence to begin assembling your records. Post your \
+                 top candidates to the Board now, then prepare one submit_finding call. Filing becomes \
+                 mandatory in a few turns; do not open a new line of inquiry."
+            )
+        } else {
+            match filing_contract_before(task) {
+                Some((task_id, key, fields)) => format!(
+                    "You are {id}. Filing is now the ONLY remaining action. Call submit_finding exactly \
+                     once, now:\n\
+                     submit_finding({{\"task_id\":\"{task_id}\",\"result\":{{\"{key}\":[]}}}})\n\
+                     Replace the empty list with one object per paper you have already read in this \
+                     conversation. Each object needs {fields}. Every file must be one of your seed \
+                     URLs. Never invent a paper and never copy this instruction into a record. If you \
+                     have no defensible record, submit the empty list: an empty finding is \
+                     recoverable, a missing one blocks the whole Goal. Do not call fetch_url again. \
+                     After submit_finding returns accepted, call board_post once and end the turn."
+                ),
+                None => format!(
+                    "You are {id}. Filing is now the ONLY remaining action. Call claim_task if you \
+                     have not already, then call submit_finding exactly once with your claimed task_id \
+                     and the result object your worker prompt defines, built from evidence already in \
+                     this conversation. A filing with no records is better than no filing; never invent \
+                     a record. Do not call fetch_url again. After submit_finding returns accepted, end \
+                     the turn."
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn a_goal_without_nudges_sends_the_same_bytes_as_before() {
+        let full = task();
+        let mut partial = task();
+        partial.input["output_contract"]
+            .as_object_mut()
+            .unwrap()
+            .remove("severities");
+        let mut bare = task();
+        bare.input = json!({"title": "No contract"});
+        for task in [Some(&full), Some(&partial), Some(&bare), None] {
+            for round in 1..=NUDGE_MANDATORY_AT + 8 {
+                for id in ["agent-00", "agent-07", "agent-29"] {
+                    assert_eq!(
+                        research(round, id, task),
+                        nudge_before(round, id, task),
+                        "round {round}, {id}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            research(NUDGE_MANDATORY_AT, "agent-07", Some(&full)),
+            "You are agent-07. Filing is now the ONLY remaining action. Call submit_finding \
+             exactly once, now:\nsubmit_finding({\"task_id\":\"lens-04\",\"result\":{\"papers\":\
+             []}})\nReplace the empty list with one object per paper you have already read in \
+             this conversation. Each object needs id, title, file, description, severity; \
+             severity one of breakthrough | useful | background. Every file must be one of your \
+             seed URLs. Never invent a paper and never copy this instruction into a record. If \
+             you have no defensible record, submit the empty list: an empty finding is \
+             recoverable, a missing one blocks the whole Goal. Do not call fetch_url again. \
+             After submit_finding returns accepted, call board_post once and end the turn."
+        );
+    }
+
+    #[test]
+    fn a_goal_with_its_own_nudges_says_its_own_words() {
+        let own: Nudges = serde_json::from_value(json!({
+            "explore": "{agent_id}: read the repository.",
+            "assemble": "{agent_id}: list the changes you would make.",
+            "file": "{agent_id}: {call} with {required_fields} ({severities}) for {task_id}/{result_key}.",
+            "file_without_contract": "{agent_id}: claim a task and file it.",
+        }))
+        .unwrap();
+        own.validate().unwrap();
+        let task = task();
+        let at = |round, task| nudge(&own, round, "agent-03", task).unwrap();
+        assert_eq!(at(1, Some(&task)), "agent-03: read the repository.");
+        assert_eq!(
+            at(NUDGE_FILING_AT, Some(&task)),
+            "agent-03: list the changes you would make."
+        );
+        assert_eq!(
+            at(NUDGE_MANDATORY_AT, Some(&task)),
+            "agent-03: submit_finding({\"task_id\":\"lens-04\",\"result\":{\"papers\":[]}}) with \
+             id, title, file, description, severity (breakthrough | useful | background) for \
+             lens-04/papers."
+        );
+        assert_eq!(
+            at(NUDGE_MANDATORY_AT, None),
+            "agent-03: claim a task and file it."
+        );
     }
 
     // Broker socket placement (main #5).
