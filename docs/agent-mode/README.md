@@ -21,7 +21,8 @@ and its MIT-licensed prototype `deepseek-ai/dsh-superagent-prototype` (docs 000-
 | P3c Pi Router | **Done.** The Router is a long-lived Pi session behind the same `Router` port (`src/agent/pi_router.rs`): each Candidate becomes a compact card, the cards queued between turns go into one prompt, and a session that dies restarts while the core's Eval expiry brings back what it left undecided. It runs keyless in bwrap and calls the agent broker (`src/agent/broker.rs`), which speaks the swarm broker's wire on a socket in the state dir, holds and settles each model call against the Router's daily cap in the store's new spend ledger (schema v2), refuses calls while the state dir is paused, and serves the Router's two tools, `router_decide` (the Engine's answer, or its refusal, goes back to the model) and `router_read`. The pricing, request contract, providers and pause gate both brokers use moved to `src/gateway/`, with swarm mode unchanged. |
 | P4 Slack | Done (#23). `src/agent/slack/`: `SlackSource` (Socket Mode: an outbound WebSocket, nothing exposed) and `SlackChannel` (Web API), configured as `kind: slack` and read from token files that are deleted once read. Events from the listed channels become Triggers (`slack:<channel>:<ts>`, Thread `slack:<channel>:<thread_ts>`); the bot's own messages, other channels, edits and other events are dropped, and every envelope is acknowledged. The Source reconnects with backoff after a `disconnect` or an error. Replies go in the Trigger's thread, escaped, with acknowledgements and questions cut to 500 characters and results to 3,000 with a marker. Each post carries its `MessageId` as metadata; a repeated Send looks for it in the thread first, so a crash between a post and its done mark does not post twice. A deleted or archived conversation is `Gone`; rate limits and 5xx retry, after `Retry-After`. An approval request carries Approve and Stop buttons; a click is a `Fact::Command` the runtime applies as `approve` or `stop_ticket` and answers in the thread. A budget above `auto_approve_microusd` is now accepted when a Slack channel and a `slack:` approver are configured. New dependency: `tokio-tungstenite` 0.29.0 on the existing rustls. Tests run against a fake Slack, including one `agent serve` end to end. |
 | P8 GitHub and schedules | **Done.** `src/agent/github/`: `GithubSource` polls each listed repository's issues and pull requests, issue and review comments `since` a cursor, and its latest workflow runs, over REST (nothing exposed); `GithubChannel` comments on the issue or pull request. Configured as `kind: github` with a personal access token file that is deleted once read. An issue or pull request is the Thread `github:<owner>/<repo>#<number>`; its opening, each comment (`github:<owner>/<repo>:comment:<id>`) and each failed workflow run on a pull request (a bot Trigger on that pull request's Thread) are Triggers. A mention of the agent's login addresses it, `[bot]` accounts are bots, and the agent's own comments are dropped. Listings are conditional (`ETag`), rate limits are waited out, and the read position is an atomic file in the state directory that a restart resumes from without sending a Trigger twice. Each comment ends with a hidden marker naming its `MessageId`, so a crash between a post and its done mark does not post twice. `src/agent/schedule.rs`: `ScheduleSource` (`kind: schedule`) fires named slots, `every` an interval or `daily_at` a UTC time, as System Triggers `schedule:<name>:<slot start>`: a restart cannot fire a slot twice, and missed slots fire once. A schedule may name a `reply_to`. No new dependencies. Tests run against a fake GitHub and a clock the test moves, including one `agent serve` end to end. |
-| P2 (rest), P3d, P5-P7, P9, P10 | Planned, below. |
+| P3d Pi workers | **Done.** `src/agent/pi_executor.rs`: `PiExecutor` runs each `Plan::Session` Assignment as a keyless Pi worker session in bwrap, in its Ticket's directory under the state dir, with an optional prepare command run once per Ticket and at most `max_workers` sessions at once (`executor: {kind: pi, ...}`). The agent broker admits each worker as a `Worker` principal on its Ticket's account, so the Mandate budget caps every Assignment of the Ticket together, and serves `worker_report`, `worker_handback`, `run_code` and `fetch_url` (`SWARM_TOOLSET=worker`). A worker is prompted with its Assignment, then with new Inputs between turns; a quiet turn counts as `waiting`. A start ends what the last run left without a worker ("host restarted") and relaunches working Tickets with `recovery`, through the new `Engine::restart`. `run_code`'s mounts and scratch directory are configurable, with swarm runs' sandbox command pinned unchanged. `Plan::Swarm` reports `failed` until P5; background `run_code` jobs are P3e. |
+| P2 (rest), P3e, P5-P7, P9, P10 | Planned, below. |
 
 ## What "super-agent" means here
 
@@ -207,8 +208,8 @@ provider through the real broker. It runs on macOS too. Swarm mode is the first 
     upstream body, the providers (`provider_for`) and the pause gate moved to `src/gateway/`; swarm mode calls them
     and its broker tests, smoke and golden launch are unchanged.
   - The agent broker (`src/agent/broker.rs`) maps each bearer token to a `Grant`: a principal (the Router; a
-    Worker per Assignment in P3d), an account and model terms. Accounts are `router` (capped per UTC day by
-    `budgets.router_daily_microusd`) and `ticket:<id>` (capped for life by the Mandate budget, for P3d). Holds and
+    Worker per Assignment since P3d), an account and model terms. Accounts are `router` (capped per UTC day by
+    `budgets.router_daily_microusd`) and `ticket:<id>` (capped for life by the Mandate budget). Holds and
     settlements are rows in the store's `spend` table, so a restart keeps every cap; a closed row is final.
   - Router tools: `router_decide` (one flat object: eval, decision, reason, and the accept or stop fields; an accept
     above the approval threshold stands only when Slack can take the approval, through a Slack channel and a
@@ -216,13 +217,33 @@ provider through the real broker. It runs on macOS too. Swarm mode is the first 
     Trigger, Thread or Ticket with its neighbours' ids). No `run_code`, no `fetch_url`. The Pi extension picks the
     set with `SWARM_TOOLSET=router` and takes the Router's system prompt from the broker.
   - `router_note` and an outage pause in the agent broker are not built yet.
-- P3d: `SessionExecutor`, behind the same `Executor` port: one worker per Ticket in its own directory or git
-  worktree, with worker tools `worker_report` and `worker_handback`. Async `run_code`: `job_start`, `job_wait` and
-  `job_stop`, and auto-background after 5 s, so a worker can take new Inputs mid-command.
+- P3d (done): `PiExecutor` (`src/agent/pi_executor.rs`), behind the same `Executor` port, runs each Assignment of a
+  `Plan::Session` Ticket as one worker session on `PiHarness`. `Plan::Swarm` goes through the same dispatch point
+  and reports `failed` until P5.
+  - A worker has its Ticket's directory, `<state>/tickets/<ticket>/`, whose `work/` is `run_code`'s `/work`; an
+    optional `prepare` command (a `git worktree add`, say) runs there once per Ticket. At most `max_workers`
+    sessions live at once; a launch past it waits for a slot.
+  - The worker is a `Worker` principal in the agent broker on the account `ticket:<id>`, which every Assignment of
+    the Ticket shares, so a retry spends from the same budget and a call past it is refused, while the Router's
+    account is untouched. Its tools: `worker_report` (status, text, question; the spend comes from the ledger),
+    `worker_handback` (a follow-up that is not the Ticket's goes to the Router, once), `run_code` (the shared
+    `CodeExecutor`, now with configurable mounts and a caller-owned scratch directory; swarm runs keep their exact
+    sandbox command) and `fetch_url` (`broker::fetch`, swarm mode's limits). `SWARM_TOOLSET=worker` selects them.
+  - It is prompted with its Assignment (title, scope, matched rules, every Input so far, how to report, and with
+    `recovery` a note to check `/work` before repeating outside actions), then with each later batch of Inputs
+    between turns. A turn that ends with no Report, or with `progress` only, counts as `waiting`. A session that
+    dies reports `failed` and ends its Assignment, so the next reply starts a new one.
+  - At start, an Assignment the last run left running, or pending with its Launch performed, ends with "host
+    restarted", oldest Ticket first. One that was working starts again with `recovery` through
+    `Engine::restart` (the end and the new launch in one transaction); one that waited for input, an answer or a
+    person starts again with the Input that wakes it.
+- P3e: background `run_code` jobs: `job_start`, `job_wait` and `job_stop`, and auto-background after a few seconds,
+  so a worker can take new Inputs mid-command. Not built yet.
 - Design change (P3b): agent mode keeps its own accounts, one per Ticket plus the Router's, in the agent Store. It
   shares the swarm code that really is common (pricing, the provider call, the pause gate, `fetch`, `run_code`)
   instead of generalizing swarm mode's Goal-shaped broker `Store`. P2b and P2c shrink to extracting those pieces
-  when P3c and P3d need them; P3c extracted pricing, the provider call and the pause gate.
+  when P3c and P3d need them; P3c extracted pricing, the provider call and the pause gate, and P3d `run_code`'s
+  mounts and scratch directory.
 - Exit: the article's flow end to end on a laptop, with scripted Triggers.
 
 **P4: Slack.** Done; setup in [Slack app setup](#slack-app-setup).
