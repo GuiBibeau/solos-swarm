@@ -450,10 +450,11 @@ impl Job {
             } => shared.executor.stop(ticket, assignment, reason).await,
             Job::Send(message) => {
                 let source = message.channel.source.clone();
-                let channel = shared
-                    .channels
-                    .get(&source)
-                    .with_context(|| format!("no channel serves source {source}"))?;
+                // No channel will ever serve this source, so retrying cannot help.
+                let Some(channel) = shared.channels.get(&source) else {
+                    eprintln!("agent: no channel serves {source}; its message was dropped");
+                    return Ok(());
+                };
                 if channel.send(message).await? == SendOutcome::Gone {
                     eprintln!("agent: a {source} conversation is gone; its message was dropped");
                 }

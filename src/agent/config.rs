@@ -98,6 +98,11 @@ impl AgentConfig {
             self.budgets.session_microusd > 0,
             "budgets.session_microusd must be above zero"
         );
+        ensure!(
+            self.budgets.session_microusd <= self.policy.auto_approve_microusd,
+            "budgets.session_microusd is above policy.auto_approve_microusd, so every Ticket \
+             would wait for an approval that agent serve cannot take yet"
+        );
         Ok(())
     }
 }
@@ -210,10 +215,12 @@ budgets: {session_microusd: 500000}
             "channels:\n  - {kind: jsonl, source: slack, path: other.jsonl}\n",
         );
         let free = VALID.replace("session_microusd: 500000", "session_microusd: 0");
+        let gated = VALID.replace("session_microusd: 500000", "session_microusd: 50000000");
         for (case, yaml) in [
             ("no source", no_source),
             ("one source twice", twice),
             ("zero budget", free),
+            ("budget above the approval threshold", gated),
         ] {
             assert_ne!(yaml, VALID, "{case}: the case did not change the config");
             assert!(parse(&yaml).is_err(), "{case}: accepted");

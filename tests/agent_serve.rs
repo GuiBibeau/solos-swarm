@@ -583,3 +583,21 @@ async fn a_bot_message_on_the_requests_thread_reaches_the_worker_as_context() {
     assert_eq!(judged[0].kind, DecisionKind::Ignore);
     assert_settled(&store);
 }
+
+#[tokio::test]
+async fn a_reply_to_a_source_with_no_channel_is_dropped_and_the_runtime_still_goes_idle() {
+    let scratch = Scratch::new("no-channel");
+    let mut asked = request("t-github", "T9", "Summarise the incident report");
+    for address in &mut asked.reply_to {
+        address.source = "github".into();
+    }
+    scratch.append(&[asked]);
+
+    let summary = scratch.serve(false).await;
+
+    assert_eq!(summary.effects_pending, 0, "nothing retries forever");
+    assert!(scratch.sent().is_empty(), "no channel serves github");
+    let store = scratch.store();
+    let ended = store.tickets().unwrap()[0].ended.clone();
+    assert!(ended.is_some(), "the work itself still completed");
+}
