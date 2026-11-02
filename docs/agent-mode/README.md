@@ -16,6 +16,7 @@ and its MIT-licensed prototype `deepseek-ai/dsh-superagent-prototype` (docs 000-
 | P0 Core and plan | Done (#18). `crates/agent-core`: domain, ports, Engine, in-memory store, allowlist Policy, 91 tests and a seeded fuzzer. Most tests are regressions from the adversarial review and the swarm review of PR #18. Swarm mode untouched. |
 | P1 Harness seam | Done (#19). `src/harness.rs`: the `AgentHarness` port, `PiHarness` (the Pi launch moved out of `main.rs`, argv and env pinned by a golden test) and `harness::scripted::ScriptedHarness`. `run`, `work()`, `settled` and `rpc` use the port. A new end-to-end test runs `work()` with three scripted agents through the real broker, with no Pi, node or bwrap. Swarm runs unchanged. |
 | P2a `run_goal` | Done (#20). `src/swarm.rs`: `swarm::run_goal(GoalRun, harness, provider) -> GoalOutcome` holds the run machinery that was in `main.rs` (spawn loop, `work`, nudges, deadline, broker socket, shutdown, `cleanup.json` and `runtime-report.json`), moved unchanged. `run` keeps the CLI part: flags, credential, Goal file, upstream, validation, the Linux and deadline checks, `PiHarness` and the provider, the stdout line and the exit code. The end-to-end test now drives `run_goal` with `ScriptedHarness`, so it also covers the spawn loop, shutdown and the run's files. Swarm runs unchanged. |
+| P2b One bwrap builder, Goal words | **Done.** `src/bwrap.rs`: `Bwrap` has one typed method per bwrap flag the run path uses and `exec(program, args)`, and builds the Pi launch (`PiHarness::command`: swarm agents, agent mode's Router and workers), `run_code`'s sandbox (background jobs too) and `doctor`'s probe. The golden tests of the Pi launch and the swarm `run_code` command pass unedited, and a new one pins `doctor`'s probe. The frozen `mvp` sandboxes (`sandbox.rs`, `wasi_worker.rs`) keep their own lines. The research text of the nudges and the Task fields of a host-filed record are now optional Goal fields, `nudges` (one template per stage) and `record_fields`, whose defaults are the old values byte for byte; `Goal::validate` checks them and a Goal template can set them. This closes P2: P3b's design change settled the rest of its list. Swarm runs unchanged. |
 | P3a SQLite Store | Done (#21). `crates/agent-store` (`solos-agent-store`): `SqliteStore` implements `Repositories` on one SQLite file (`rusqlite` 0.41.1 with bundled SQLite, WAL, `synchronous=FULL`, a versioned schema). Aggregates are JSON rows with index columns for active Threads, `thread_of_eval` and open Tickets. Each commit writes state, Effects and events in one transaction. The Effect queue lists due Effects oldest first and records done, or failed with an attempt count and a retry time; Sends to one Channel address keep commit order, and Launch, Deliver and Stop keep it per Ticket; every call is safe to repeat after a crash. The event log is hash-chained like `events.jsonl`, with `verify_chain()`. A seeded differential walk checks it against `MemoryRepositories` after every Engine command. |
 | P3b `agent serve` | Done (#22). `src/agent/`: the async shell ports `Source`, `Channel`, `Router` and `Executor`, a runtime with one task that owns the Engine on the SQLite Store, and `solos-swarm agent serve --config agent.yaml --state-dir DIR [--until-idle]`. The runtime stores Source Triggers, starts due Evals, hands each due Effect to its adapter, and marks it done or failed with exponential backoff. It applies adapter facts as `decide`, `assignment_started` and `report`, and holds every Effect while the Policy is paused. First adapters: `JsonlSource`, `JsonlChannel` (once per `MessageId`, safe after a crash), `ScriptedRouter` and `ScriptedExecutor`, so it runs with no model, Slack or sandbox. Tests cover a full run, a crash between a Launch and its done mark, a restart, retries, a pause and Thread context reaching the worker. |
 | P3c Pi Router | **Done.** The Router is a long-lived Pi session behind the same `Router` port (`src/agent/pi_router.rs`): each Candidate becomes a compact card, the cards queued between turns go into one prompt, and a session that dies restarts while the core's Eval expiry brings back what it left undecided. It runs keyless in bwrap and calls the agent broker (`src/agent/broker.rs`), which speaks the swarm broker's wire on a socket in the state dir, holds and settles each model call against the Router's daily cap in the store's new spend ledger (schema v2), refuses calls while the state dir is paused, and serves the Router's two tools, `router_decide` (the Engine's answer, or its refusal, goes back to the model) and `router_read`. The pricing, request contract, providers and pause gate both brokers use moved to `src/gateway/`, with swarm mode unchanged. |
@@ -25,7 +26,7 @@ and its MIT-licensed prototype `deepseek-ai/dsh-superagent-prototype` (docs 000-
 | P6 Watchdog | **Done.** `src/agent/watchdog.rs`: a pure `assess(snapshot, now, thresholds)` over what the Store already holds, with no model: a Ticket waiting for a person (1h), a working Assignment with no Report (30m), an Effect with 3 failed attempts, an `unavailable` Decision in the last hour, an account at 80% of its cap, and a pause file held for 1h. Each alert id hashes its kind, its subject (with the problem's start) and a 6h bucket. With a `watchdog` section in agent.yaml, `agent serve` runs it every minute, tells the operator's conversation each new alert once through its Channel, and records it in `watchdog_alerts` (schema v3), so a restart tells nothing new. `retry_stalled` retries a stalled Assignment once per Ticket through the runtime. `solos-swarm agent status` reports Tickets, Decisions, Effects, spend, the pause and the current alerts from a read-only Store. Judging with a model whether a worker drifts from its goal is later. |
 | P3e Background jobs | **Done.** `src/agent/jobs.rs`: a worker with `run_code` also gets `job_start {code, timeout_s?}`, `job_wait {job, wait_s?}` and `job_stop {job}`. A job runs in its Ticket's `/work` under `run_code`'s sandbox and limits, returns its id at once and belongs to its Assignment: a stop, the Ticket's end, a dead session or a shutdown kills it, and a kill reaches every process of its sandbox, even in bwrap's first milliseconds. A `run_code` still running after `background_after_secs` (5) becomes a job when the Ticket has room; a short one returns exactly as before, and swarm runs keep their synchronous `run_code`. A job's end reaches the worker once: in a turn only its `job_wait` or `job_stop` takes it, and an end the turn left, or one that comes between turns, becomes a Note on the Ticket (`Fact::Note`, applied as `Engine::note`) that wakes the worker. No core change. |
 | P5 Swarm Tickets | Done (#28). `src/agent/swarm_executor.rs`: a `Plan::Swarm` Ticket runs one governed swarm per Assignment through `swarm::run_goal_until` on the Pi workers' harness, provider and credential (`executor.swarm`). Its Goal is rendered from a YAML template (`src/agent/goal_template.rs`, minijinja, every placeholder an escaped YAML literal) with the Ticket's title, scope, agent count and remaining budget, checked with `Goal::validate` at config load and at launch. The Goal's budget is the Mandate budget minus what the Ticket's account committed, and the run's spend is charged on that account (`SqliteStore::charge`, once per run) before its Report. At most `max_runs` swarms run at once (default 1). A Stop cancels a run through the new cancel input of `run_goal_until`, which `solos-swarm run` does not use, and the agent's pause holds running swarms. Completed reports `ready` with the findings, the spend and the artifact; stopped reports `failed`; drained reports `waiting`. A restart relaunches an interrupted swarm in a new run directory and charges the old one from its `state.json`. The Router's prompt says when a swarm pays for itself, and `router_decide` takes `goal_template`. |
-| P2 (rest), P7, P9, P10 | Planned, below. |
+| P7, P9, P10 | Planned, below. |
 
 ## What "super-agent" means here
 
@@ -123,8 +124,9 @@ flowchart TB
 - `crates/agent-core` imports nothing but `serde`, `serde_json` and `sha2`, and does no I/O. `tests/boundary.rs`
   checks the dependency list and every `std::` path in `src/` (grouped imports too) against an allowlist of pure
   modules. It is a source scan, not a proof.
-- The swarm core reaches the same rule in P2: the pure parts of `broker.rs` (claims, envelopes, progress,
-  artifact union) move out of the HTTP and file code.
+- The swarm core does not follow that rule: the pure parts of `broker.rs` (claims, envelopes, progress,
+  artifact union) still sit beside its HTTP and file code. P3b's design change shares pieces of it instead of
+  splitting it (see P3), so P2 closed without that move.
 - `crates/agent-store` is a driven adapter: it depends on agent-core and `rusqlite`; agent-core never depends on it.
 - Adapters depend on ports, never on each other. Composition roots (`run`, `agent serve`) are the only places that
   name concrete adapters.
@@ -141,7 +143,7 @@ and external work leaves as `Effect`s. The shell ports are async and live in the
 | `AgentHarness` | `start(SessionSpec, events) -> Session`; `Session::{prompt, stop, join}`; events `TurnEnded`, `Rejected`, and an `Err` when a session's stream ends | `PiHarness`, `ScriptedHarness` | `src/harness.rs` (P1) |
 | `ModelGateway` | One broker, many accounts: `reserve(account, request)`, `settle(intent, usage)`; pause and peak gates | today's broker; the agent broker (P3c) | `broker.rs` `Store::reserve`/`settle`/`envelope`, `Intent`; shared since P3c in `src/gateway/`: `PriceTable` (was `Goal::cost`/`settled_cost`), `Receipt`, `admit_request`/`upstream_body`, `effective_control` |
 | `ModelUpstream` | `dispatch(body) -> receipt` | `OpenAiCompatible` | `broker::Provider` (1012); merged with `provider::Provider` (mvp) for llama.cpp |
-| `ExecutionEnvironment` | `run(code) -> receipt`; `start(code) -> job`, `wait(job)`, `stop(job)` | local `bwrap` | `code.rs` `CodeExecutor`, plus the five hand-built `bwrap` command lines (`harness.rs:106` in `PiHarness::command`, `main.rs:280` in `doctor`, `code.rs:313`, `sandbox.rs:315` in `prepare_process`, `wasi_worker.rs:316`) |
+| `ExecutionEnvironment` | `run(code) -> receipt`; `start(code) -> job`, `wait(job)`, `stop(job)` | local `bwrap` | `code.rs` `CodeExecutor`. Since P2b the run path's `bwrap` lines (`PiHarness::command`, `run_code`, `doctor`) come from `src/bwrap.rs`; the frozen mvp's two (`sandbox.rs` in `prepare_process`, `wasi_worker.rs`) stay hand-built |
 | `EventLog` | `append(kind, data) -> seq`; `verify()` | `events.jsonl` hash chain | `Store::record` (452), `broker_control::read_chain`/`load_image` |
 | `Source` | `run(sink, facts)`, with people's commands (Slack buttons) as `Fact::Command`; later `context(trigger, part)` for bounded recall | `JsonlSource` (P3b), `SlackSource` (P4), `GithubSource` and `ScheduleSource` (P8) | new |
 | `Channel` | `send(OutboundMessage, SendOptions { repeat, approval }) -> Sent \| Gone`; shapes text per medium (short chat, PRs structured) | `JsonlChannel` (P3b), `SlackChannel` (P4), `GithubChannel` (P8) | `src/agent/jsonl.rs`, `src/agent/slack/`, `src/agent/github/` |
@@ -190,15 +192,46 @@ without changing behaviour. Add `ScriptedHarness`, which needs no Pi, node or bw
 the Pi extension does, and the end-to-end test `run`/`work()` lacked: three scripted agents and the `smoke::Scripted`
 provider through the real broker. It runs on macOS too. Swarm mode is the first consumer. Done.
 
-**P2: the shared kernel.**
-- One `bwrap` builder.
-- `EventLog` split from `Store`, which stops rewriting `state.json` on every event.
-- A ledger with accounts (Goal, Task, Ticket, Router).
-- Broker auth by principal (account, role, grants) instead of `agent-NN`.
-- One `ModelUpstream` trait.
+**P2: the shared kernel.** Done; swarm runs are unchanged by each step.
 - P2a, done: `swarm::run_goal(GoalRun, harness, provider) -> GoalOutcome` as a library function in `src/swarm.rs`;
   the `run` CLI is a thin wrapper.
-- The domain text in `nudge()` (now in `src/swarm.rs`) and `deferred_record` moves into Goal data.
+- P2b, done: one `bwrap` builder, `src/bwrap.rs`.
+  - `Bwrap` adds one flag per call, in call order: `unshare_all`, `die_with_parent`, `new_session`, `ro_bind`,
+    `ro_bind_try`, `bind`, `dev`, `proc`, `tmpfs`, `tmpfs_sized` (`--size` and the tmpfs it sizes, as one call),
+    `dir`, `symlink`, `clearenv`, `setenv` and `chdir`. `exec(program, args)` ends the line and returns the
+    argument vector, without bwrap itself, so a caller still chooses the binary (`bwrap` on `PATH`, or `run_code`'s
+    configured one behind `prlimit`), the host environment and the stdio. It has no `Debug`, since a `setenv` value
+    can be a bearer token.
+  - `PiHarness::command`, `CodeExecutor`'s sandbox (`run_code` and background jobs) and `doctor`'s probe build their
+    lines with it, with the same arguments in the same order: the golden tests of the Pi launch and the swarm
+    `run_code` command pass unedited, and a new test pins `doctor`'s probe to the line it had.
+  - The frozen `mvp` path keeps its own hand-built lines, in `sandbox.rs` (`prepare_process`) and `wasi_worker.rs`.
+    They are out of scope while it is frozen.
+- P2b, done: the domain words of the swarm runtime are Goal data (`src/broker_goal_text.rs`).
+  - `nudges: {explore, assemble, file, file_without_contract}` is what `run_goal` tells an agent whose turn ended
+    before it filed: `explore` from the first nudge, `assemble` from the 16th, and from the 32nd `file` for an
+    agent whose claimed Task has a whole `output_contract` (result key, required fields, severities) and
+    `file_without_contract` otherwise. Each is a template: `{agent_id}` in every stage, and in `file` also
+    `{task_id}`, `{result_key}`, `{required_fields}` (joined with `, `), `{severities}` (joined with ` | `) and
+    `{call}`, the exact `submit_finding` call. A template has no other brace.
+  - `record_fields: {file_from, copy, result_key, marked_result_key, marked_by}` shapes the record the host files
+    for an agent that never did (`defer_task`, `file_partial_findings`): its `file` is the first string among the
+    Task input's `file_from` fields, and the `copy` fields are copied as they are. A Task whose contract names no
+    `result_key` files under `marked_result_key` when its input has any of `marked_by`, and under `result_key`
+    otherwise.
+  - A Goal that leaves a field out gets today's value: the research texts for the nudges, and `file_from: [seed_url,
+    paper_url, artifact_file]`, `copy: [experiment, component, compute]`, `result_key: inconsistencies`,
+    `marked_result_key: experiments`, `marked_by: [experiment, artifact_fields]`. Tests compare the nudges of every
+    stage, and the records and result keys for a spread of Task inputs, against copies of the code before the move.
+    A Goal without the fields serializes without them, so `smoke`'s `config.yaml` keeps its bytes.
+  - `Goal::validate` renders every stage once, so a template with an unknown or misplaced placeholder, an unclosed
+    or stray brace, a blank stage or one over 4,096 bytes is refused at admission rather than mid-run. It also
+    refuses a blank field name, a list of more than 32, and a `copy` field the record sets itself (`id`, `title`,
+    `file`, `description`, `severity`, `code`, `output`, `evidence`).
+- Settled by P3b's design change rather than built: `EventLog` split from `Store`, a ledger with accounts (Goal,
+  Task, Ticket, Router), broker auth by principal instead of `agent-NN`, and one `ModelUpstream` trait. Agent mode
+  keeps its own accounts, principals and hash-chained event log in the agent Store, and both brokers share the
+  providers, pricing and pause gate in `src/gateway/`; swarm mode's broker `Store` stays as it is.
 
 **P3: local agent shell.**
 - P3a (done): the SQLite Store, `crates/agent-store`, with the durable Effect queue and the event log.
@@ -528,6 +561,17 @@ and join text inside the braces with `~`.
 - The rest is the swarm's own, as in swarm mode: `scope` on the deployment allowlist, `deadline_seconds`,
   `max_calls_per_agent`, the request limits, the `grants` and the prompts. `worker_prompt` and `synthesis_prompt`
   together stay within 8,192 bytes, so keep a long scope in the task inputs.
+- A template that is not research can say its own words with `nudges` and `record_fields` (see P2b); each field it
+  leaves out keeps the research swarm's. A nudge's placeholders are single braces, such as `{agent_id}`, which
+  minijinja leaves alone, and one inside a `{{ }}` string comes out the same. Keep `title` and `scope` out of a
+  nudge: a brace in a message would make the Goal invalid.
+
+  ```yaml
+  nudges:
+    explore: {{ "You are {agent_id}. Keep reading the code for " ~ ticket ~ "." }}
+    file: "You are {agent_id}. File now, exactly: {call}"
+  record_fields: {file_from: [path], copy: [part], result_key: changes}
+  ```
 
 `agent serve` renders each template for one and two agents as it loads the config, and refuses one that does not
 make a valid Goal. The example below is `tests/fixtures/goal-template.yaml`:
