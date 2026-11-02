@@ -713,6 +713,11 @@ mod tests {
             outcome.status
         );
         let run_dir = outcome.run_dir.clone();
+        assert_eq!(run_dir, dir.join("run").canonicalize().unwrap());
+        assert!(outcome.runtime_pass);
+        assert_eq!(outcome.remaining_workers, 0);
+        assert_eq!(outcome.artifact, Some(run_dir.join("artifacts/final.json")));
+        assert_eq!(outcome.findings, 3);
         let read = |name: &str| -> Value {
             serde_json::from_slice(&fs::read(run_dir.join(name)).unwrap()).unwrap()
         };
@@ -751,6 +756,45 @@ mod tests {
             .sum();
         assert!(settled > 0);
         assert_eq!(state["spent_microusd"], settled);
+        assert_eq!(outcome.spent_microusd, settled);
+        assert_eq!(state["goal_status"], "completed");
+        let agents = state["agents"].as_object().unwrap();
+        assert_eq!(agents.keys().collect::<Vec<_>>(), ids);
+        assert!(agents.values().all(|agent| agent["status"] == "stopped"));
+
+        let config = dir.join("goal.yaml");
+        assert_eq!(
+            fs::read(run_dir.join("config.yaml")).unwrap(),
+            fs::read(&config).unwrap()
+        );
+        let config_sha256 = broker::file_digest(&config).unwrap();
+        let manifest = read("manifest.json");
+        assert_eq!(manifest["live"], true);
+        assert_eq!(manifest["provider"], "deepseek");
+        assert_eq!(
+            manifest["model_revision"],
+            "deepseek/deepseek-flash (API alias, weights unavailable)"
+        );
+        assert_eq!(manifest["artifacts"]["config.yaml"], config_sha256);
+        assert_eq!(
+            manifest["extension_sha256"],
+            broker::file_digest(&dir.join("pi/extensions/broker.ts")).unwrap()
+        );
+        assert_eq!(manifest["deadline_seconds"], 60);
+        assert!(manifest.get("upstream_provider").is_none());
+        assert_eq!(
+            read("pi-settings.json"),
+            json!({"retry":{"enabled":false},"compaction":{"enabled":true,"reserveTokens":65_536},"quietStartup":true})
+        );
+        let cleanup = read("cleanup.json");
+        assert_eq!(cleanup["verdict"], "PASS");
+        assert_eq!(cleanup["remaining_workers"], 0);
+        let report = read("runtime-report.json");
+        assert_eq!(report["runtime_verdict"], "PASS");
+        assert_eq!(report["reason"], Value::Null);
+        assert_eq!(report["idle_probe"], false);
+        assert!(!run_dir.join("resume.json").exists());
+        assert!(!run_dir.join("broker.sock").exists());
 
         // resume_plan re-verifies every event's sequence and hash, and that
         // state.json was written at the last event.
@@ -764,6 +808,32 @@ mod tests {
         assert_eq!(plan.last_seq, events.len() as u64);
         assert_eq!(plan.held_microusd, 0);
         assert_eq!(plan.finished_agents, ids);
+
+        // Every agent is admitted before any is prompted. Shutdown records the
+        // stop, then each agent, then the cleanup, last.
+        let entries: Vec<Value> = events
+            .iter()
+            .map(|event| json!([event["kind"], event["data"]]))
+            .collect();
+        assert_eq!(
+            entries[..4],
+            [
+                json!(["goal_registered",{"intent":"scripted end to end","config_sha256":config_sha256}]),
+                json!(["agent_started",{"agent_id":"agent-00"}]),
+                json!(["agent_started",{"agent_id":"agent-01"}]),
+                json!(["agent_started",{"agent_id":"agent-02"}]),
+            ]
+        );
+        assert_eq!(
+            entries[entries.len() - 5..],
+            [
+                json!(["goal_stopped",{"reason":"completed"}]),
+                json!(["agent_stopped",{"agent_id":"agent-00"}]),
+                json!(["agent_stopped",{"agent_id":"agent-01"}]),
+                json!(["agent_stopped",{"agent_id":"agent-02"}]),
+                json!(["cleanup_completed",{"remaining_workers":0}]),
+            ]
+        );
 
         // Sessions run concurrently, so order is checked per agent, plus the
         // one cross-agent rule: synthesis is prompted after every filing.
@@ -833,6 +903,65 @@ mod tests {
             .position(|event| event["data"]["message"] == "submit the exact union")
             .unwrap();
         assert!(last_filing < synthesis_prompt);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_idle_run_stops_at_its_deadline_and_still_writes_its_files() {
+        use solos_swarm::harness::scripted::ScriptedHarness;
+        let (dir, run) = scripted_run(1, true);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            swarm::run_goal(
+                run,
+                &ScriptedHarness::new(BTreeMap::new()),
+                Arc::new(smoke::Scripted),
+            ),
+        )
+        .await
+        .expect("run_goal did not finish")
+        .unwrap();
+        let GoalStatus::Stopped(error) = &outcome.status else {
+            panic!("{:?}", outcome.status);
+        };
+        assert_eq!(error.to_string(), "host-side Goal deadline expired");
+        assert!(!outcome.runtime_pass);
+        assert_eq!(outcome.remaining_workers, 0);
+        assert_eq!(outcome.artifact, None);
+        assert_eq!((outcome.findings, outcome.spent_microusd), (0, 0));
+        let read = |name: &str| -> Value {
+            serde_json::from_slice(&fs::read(outcome.run_dir.join(name)).unwrap()).unwrap()
+        };
+        assert_eq!(read("manifest.json")["live"], false);
+        assert_eq!(read("state.json")["goal_status"], "stopped");
+        assert_eq!(read("state.json")["held_microusd"], 0);
+        assert_eq!(read("cleanup.json")["verdict"], "PASS");
+        let report = read("runtime-report.json");
+        assert_eq!(report["runtime_verdict"], "FAIL");
+        assert_eq!(report["reason"], "host-side Goal deadline expired");
+        assert_eq!(report["idle_probe"], true);
+        let kinds: Vec<String> = fs::read_to_string(outcome.run_dir.join("events.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let event: Value = serde_json::from_str(line).unwrap();
+                event["kind"].as_str().unwrap().to_owned()
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "goal_registered",
+                "agent_started",
+                "agent_started",
+                "agent_started",
+                "goal_stopped",
+                "agent_stopped",
+                "agent_stopped",
+                "agent_stopped",
+                "cleanup_completed",
+            ]
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 }
