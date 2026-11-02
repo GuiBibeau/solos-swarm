@@ -15,6 +15,9 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
+// Through the crate's name, not `crate::`: the broker's HTTP tests compile
+// this file as a module of their own.
+use solos_swarm::bwrap::Bwrap;
 use std::{
     ffi::OsString,
     fs::{self, OpenOptions},
@@ -481,145 +484,71 @@ impl CodeExecutor {
     /// The bwrap argument vector is separated from the process launch so the
     /// isolation contract can be asserted without a Linux host.
     fn bwrap_args(&self, scratch: &Path, code: &str) -> Vec<OsString> {
-        let mut args: Vec<OsString> = [
-            "--unshare-all",
-            "--die-with-parent",
-            "--new-session",
-            "--ro-bind",
-            "/usr",
-            "/usr",
-            "--ro-bind-try",
-            "/etc",
-            "/etc",
-            "--ro-bind-try",
-            "/lib",
-            "/lib",
-            "--ro-bind-try",
-            "/lib64",
-            "/lib64",
-            "--symlink",
-            "usr/bin",
-            "/bin",
-            "--symlink",
-            "usr/sbin",
-            "/sbin",
-            "--proc",
-            "/proc",
-            "--dev",
-            "/dev",
-            "--size",
-        ]
-        .into_iter()
-        .map(OsString::from)
-        .collect();
-        args.push(OsString::from(TMPFS_BYTES.to_string()));
-        args.extend(
-            ["--tmpfs", "/tmp", "--dir", "/work", "--bind"]
-                .into_iter()
-                .map(OsString::from),
-        );
-        args.push(scratch.into());
-        args.push("/work".into());
+        let mut sandbox = Bwrap::new()
+            .unshare_all()
+            .die_with_parent()
+            .new_session()
+            .ro_bind("/usr", "/usr")
+            .ro_bind_try("/etc", "/etc")
+            .ro_bind_try("/lib", "/lib")
+            .ro_bind_try("/lib64", "/lib64")
+            .symlink("usr/bin", "/bin")
+            .symlink("usr/sbin", "/sbin")
+            .proc("/proc")
+            .dev("/dev")
+            .tmpfs_sized(TMPFS_BYTES, "/tmp")
+            .dir("/work")
+            .bind(scratch, "/work");
         for mount in &self.config.mounts {
-            bound_alias(&mut args, &mount.target, &mount.source);
+            sandbox = sandbox
+                .dir(&mount.target)
+                .ro_bind(&mount.source, &mount.target);
         }
         if let Some(root) = &self.config.uv_root {
             // The venv's interpreter is an absolute symlink into uv's Python
             // store. Bind the whole store at its real path so that link resolves.
-            create_parent_dirs(&mut args, root);
-            args.push("--ro-bind".into());
-            args.push(root.into());
-            args.push(root.into());
+            sandbox = parent_dirs(sandbox, root).ro_bind(root, root);
         }
-        args.extend(
-            [
-                "--chdir",
-                "/work",
-                "--clearenv",
-                "--setenv",
-                "PATH",
-                "/venv/bin:/usr/local/bin:/usr/bin:/bin",
-                "--setenv",
-                "HOME",
-                "/work",
-                "--setenv",
-                "TMPDIR",
-                "/tmp",
-                "--setenv",
-                "LANG",
-                "C.UTF-8",
-                "--setenv",
-                "LC_ALL",
-                "C.UTF-8",
-                "--setenv",
-                "PYTHONNOUSERSITE",
-                "1",
-                "--setenv",
-                "PYTHONDONTWRITEBYTECODE",
-                "1",
-                "--setenv",
-                "PYTHONUNBUFFERED",
-                "1",
-                "--setenv",
-                "PYTHONPATH",
-                "/regimes/src:/regimes",
-                "--setenv",
-                "MPLBACKEND",
-                "Agg",
-                // Bound BLAS thread fan-out: the box has 128 cores, but four
-                // concurrent sandboxes each starting 128 OpenBLAS threads
-                // exhausts the per-process address-space cap before the user
-                // code allocates anything.
-                "--setenv",
-                "OPENBLAS_NUM_THREADS",
-                "4",
-                "--setenv",
-                "OMP_NUM_THREADS",
-                "4",
-                "--setenv",
-                "MKL_NUM_THREADS",
-                "4",
-                "--setenv",
-                "NUMEXPR_NUM_THREADS",
-                "4",
-                "--setenv",
-                "VECLIB_MAXIMUM_THREADS",
-                "4",
-                "--setenv",
-                "RAYON_NUM_THREADS",
-                "4",
-                // CPU-only deployment: even if a library probes for a device,
-                // this sandbox never exposes one.
-                "--setenv",
-                "CUDA_VISIBLE_DEVICES",
-                "",
-                "/usr/bin/bash",
-                "-c",
-            ]
-            .into_iter()
-            .map(OsString::from),
-        );
-        args.push(code.into());
-        args
+        sandbox
+            .chdir("/work")
+            .clearenv()
+            .setenv("PATH", "/venv/bin:/usr/local/bin:/usr/bin:/bin")
+            .setenv("HOME", "/work")
+            .setenv("TMPDIR", "/tmp")
+            .setenv("LANG", "C.UTF-8")
+            .setenv("LC_ALL", "C.UTF-8")
+            .setenv("PYTHONNOUSERSITE", "1")
+            .setenv("PYTHONDONTWRITEBYTECODE", "1")
+            .setenv("PYTHONUNBUFFERED", "1")
+            .setenv("PYTHONPATH", "/regimes/src:/regimes")
+            .setenv("MPLBACKEND", "Agg")
+            // Bound BLAS thread fan-out: the box has 128 cores, but four
+            // concurrent sandboxes each starting 128 OpenBLAS threads
+            // exhausts the per-process address-space cap before the user
+            // code allocates anything.
+            .setenv("OPENBLAS_NUM_THREADS", "4")
+            .setenv("OMP_NUM_THREADS", "4")
+            .setenv("MKL_NUM_THREADS", "4")
+            .setenv("NUMEXPR_NUM_THREADS", "4")
+            .setenv("VECLIB_MAXIMUM_THREADS", "4")
+            .setenv("RAYON_NUM_THREADS", "4")
+            // CPU-only deployment: even if a library probes for a device,
+            // this sandbox never exposes one.
+            .setenv("CUDA_VISIBLE_DEVICES", "")
+            .exec("/usr/bin/bash", ["-c", code])
     }
 }
-fn bound_alias(args: &mut Vec<OsString>, alias: &Path, source: &Path) {
-    args.push("--dir".into());
-    args.push(alias.into());
-    args.push("--ro-bind".into());
-    args.push(source.into());
-    args.push(alias.into());
-}
-fn create_parent_dirs(args: &mut Vec<OsString>, path: &Path) {
+/// `--dir` for each directory above `path` but the root, outermost first.
+fn parent_dirs(mut sandbox: Bwrap, path: &Path) -> Bwrap {
     let mut parents: Vec<&Path> = path.ancestors().skip(1).collect();
     parents.reverse();
     for parent in parents {
         if parent == Path::new("/") {
             continue;
         }
-        args.push("--dir".into());
-        args.push(parent.into());
+        sandbox = sandbox.dir(parent);
     }
+    sandbox
 }
 fn write_files(scratch: &Path, files: &[(String, String)]) -> Result<()> {
     for (name, content) in files {

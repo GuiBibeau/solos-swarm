@@ -1,7 +1,7 @@
 //! The agent harness port: how a mode starts an agent session, prompts it and
 //! stops it, whichever program runs the session. `PiHarness` is the adapter
 //! swarm runs launch.
-use crate::broker::now_ms;
+use crate::{broker::now_ms, bwrap::Bwrap};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -133,97 +133,54 @@ impl PiHarness {
     /// distinct mount or identity.
     pub fn command(spec: &SessionSpec) -> Command {
         let node = spec.node.as_path();
-        let mut cmd = Command::new("bwrap");
-        cmd.env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .args([
-                "--unshare-all",
-                "--die-with-parent",
-                "--new-session",
-                "--ro-bind",
-                "/usr",
-                "/usr",
-                // Name resolution and CA material are a read-only binding rather than
-                // a borrowing from the host environment, so a clearenv worker still
-                // resolves and verifies a live target.
-                "--ro-bind-try",
-                "/etc",
-                "/etc",
-                // The loader directories are bound rather than symlinked: on a usr-merged
-                // host /lib is itself a symlink, so replacing it with one would hide the
-                // real libraries from a dynamically linked node and fail as ENOENT.
-                "--ro-bind-try",
-                "/lib",
-                "/lib",
-                "--ro-bind-try",
-                "/lib64",
-                "/lib64",
-                "--proc",
-                "/proc",
-                "--dev",
-                "/dev",
-                "--tmpfs",
-                "/tmp",
-                "--tmpfs",
-                "/work",
-                "--dir",
-                "/work/config",
-                "--dir",
-                "/runtime",
-            ])
+        let mut sandbox = Bwrap::new()
+            .unshare_all()
+            .die_with_parent()
+            .new_session()
+            .ro_bind("/usr", "/usr")
+            // Name resolution and CA material are a read-only binding rather than
+            // a borrowing from the host environment, so a clearenv worker still
+            // resolves and verifies a live target.
+            .ro_bind_try("/etc", "/etc")
+            // The loader directories are bound rather than symlinked: on a usr-merged
+            // host /lib is itself a symlink, so replacing it with one would hide the
+            // real libraries from a dynamically linked node and fail as ENOENT.
+            .ro_bind_try("/lib", "/lib")
+            .ro_bind_try("/lib64", "/lib64")
+            .proc("/proc")
+            .dev("/dev")
+            .tmpfs("/tmp")
+            .tmpfs("/work")
+            .dir("/work/config")
+            .dir("/runtime")
             // `node` is the binary path; its install root is what gets bound, so the
             // worker can exec an absolute binary path and still resolve node_modules
             // beside it under the same /runtime/node prefix.
-            .arg("--ro-bind")
-            .arg(node.parent().and_then(Path::parent).unwrap_or(node))
-            .arg("/runtime/node")
-            .arg("--ro-bind")
-            .arg(spec.pi_root.join("node_modules"))
-            .arg("/runtime/node_modules")
-            .arg("--ro-bind")
-            .arg(spec.pi_root.join("extensions"))
-            .arg("/runtime/extensions")
-            .arg("--ro-bind")
-            .arg(&spec.broker_socket)
-            .arg("/broker.sock")
-            .arg("--ro-bind")
-            .arg(&spec.pi_settings)
-            .arg("/work/config/settings.json")
-            .args([
-                "--clearenv",
-                "--setenv",
-                "PATH",
-                "/usr/bin",
-                "--setenv",
-                "HOME",
-                "/work",
-                "--setenv",
-                "PI_CODING_AGENT_DIR",
-                "/work/config",
-                "--setenv",
-                "SWARM_SOCKET",
-                "/broker.sock",
-                "--setenv",
-                "SWARM_TOKEN",
-            ])
-            .arg(&spec.token)
-            .args(["--setenv", "SWARM_ROLE"])
-            .arg(spec.role.as_str())
-            .args(["--setenv", "SWARM_GRANTS"])
-            .arg(spec.grants.join(","))
-            .args(
-                spec.role
-                    .toolset()
-                    .into_iter()
-                    .flat_map(|toolset| ["--setenv", "SWARM_TOOLSET", toolset]),
+            .ro_bind(
+                node.parent().and_then(Path::parent).unwrap_or(node),
+                "/runtime/node",
             )
-            .args([
-                "--chdir",
-                "/work",
-                // The explicit binary path, not the directory: a directory exec needs
-                // the kernel to resolve the name through PATH inside the mount
-                // namespace, which fails EACCES on some host/container kernels.
-                "/runtime/node/bin/node",
+            .ro_bind(spec.pi_root.join("node_modules"), "/runtime/node_modules")
+            .ro_bind(spec.pi_root.join("extensions"), "/runtime/extensions")
+            .ro_bind(&spec.broker_socket, "/broker.sock")
+            .ro_bind(&spec.pi_settings, "/work/config/settings.json")
+            .clearenv()
+            .setenv("PATH", "/usr/bin")
+            .setenv("HOME", "/work")
+            .setenv("PI_CODING_AGENT_DIR", "/work/config")
+            .setenv("SWARM_SOCKET", "/broker.sock")
+            .setenv("SWARM_TOKEN", &spec.token)
+            .setenv("SWARM_ROLE", spec.role.as_str())
+            .setenv("SWARM_GRANTS", spec.grants.join(","));
+        if let Some(toolset) = spec.role.toolset() {
+            sandbox = sandbox.setenv("SWARM_TOOLSET", toolset);
+        }
+        let args = sandbox.chdir("/work").exec(
+            // The explicit binary path, not the directory: a directory exec needs
+            // the kernel to resolve the name through PATH inside the mount
+            // namespace, which fails EACCES on some host/container kernels.
+            "/runtime/node/bin/node",
+            [
                 "/runtime/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
                 "--offline",
                 "--mode",
@@ -231,9 +188,7 @@ impl PiHarness {
                 "--provider",
                 "swarm",
                 "--model",
-            ])
-            .arg(&spec.model)
-            .args([
+                spec.model.as_str(),
                 "--thinking",
                 "off",
                 "--no-session",
@@ -247,7 +202,12 @@ impl PiHarness {
                 "--no-approve",
                 "--extension",
                 "/runtime/extensions/broker.ts",
-            ])
+            ],
+        );
+        let mut cmd = Command::new("bwrap");
+        cmd.env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

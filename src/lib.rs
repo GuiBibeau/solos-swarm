@@ -5,6 +5,7 @@ pub mod agent;
 pub mod artifacts;
 pub mod audit;
 pub mod broker;
+pub mod bwrap;
 pub mod cluster;
 pub mod code;
 pub mod context;
