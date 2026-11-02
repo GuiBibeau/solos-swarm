@@ -1,7 +1,14 @@
 mod mvp;
 mod smoke;
 
-use solos_swarm::{broker, code::CodeExecutor};
+use solos_swarm::{
+    broker,
+    code::CodeExecutor,
+    harness::{
+        AgentHarness, Observation, PiHarness, Role, Session, SessionEvent, SessionSpec,
+        bounded_line,
+    },
+};
 
 use anyhow::{Context, Result, ensure};
 use broker::{
@@ -14,14 +21,13 @@ use std::{
     fs,
     os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::{Path, PathBuf},
-    process::Stdio,
     sync::Arc,
     time::Duration,
 };
 use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncReadExt, AsyncWriteExt, BufReader},
     net::UnixListener,
-    process::{Child, ChildStdin, Command},
+    process::Command,
     sync::{Mutex, Semaphore, mpsc},
 };
 use zeroize::Zeroizing;
@@ -100,188 +106,12 @@ enum Action {
     },
 }
 
-// Eight arguments are deliberate: this is the single documented worker
-// isolation boundary, and every one is a distinct mount or identity input.
-#[allow(clippy::too_many_arguments)]
-fn sandbox(
-    node: &Path,
-    root: &Path,
-    socket: &Path,
-    settings: &Path,
-    grants: &str,
-    token: &str,
-    id: &str,
-    model: &str,
-) -> Command {
-    let mut cmd = Command::new("bwrap");
-    cmd.env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .args([
-            "--unshare-all",
-            "--die-with-parent",
-            "--new-session",
-            "--ro-bind",
-            "/usr",
-            "/usr",
-            // Name resolution and CA material are a read-only binding rather than
-            // a borrowing from the host environment, so a clearenv worker still
-            // resolves and verifies a live target.
-            "--ro-bind-try",
-            "/etc",
-            "/etc",
-            // The loader directories are bound rather than symlinked: on a usr-merged
-            // host /lib is itself a symlink, so replacing it with one would hide the
-            // real libraries from a dynamically linked node and fail as ENOENT.
-            "--ro-bind-try",
-            "/lib",
-            "/lib",
-            "--ro-bind-try",
-            "/lib64",
-            "/lib64",
-            "--proc",
-            "/proc",
-            "--dev",
-            "/dev",
-            "--tmpfs",
-            "/tmp",
-            "--tmpfs",
-            "/work",
-            "--dir",
-            "/work/config",
-            "--dir",
-            "/runtime",
-        ])
-        // `node` is the binary path; its install root is what gets bound, so the
-        // worker can exec an absolute binary path and still resolve node_modules
-        // beside it under the same /runtime/node prefix.
-        .arg("--ro-bind")
-        .arg(node.parent().and_then(Path::parent).unwrap_or(node))
-        .arg("/runtime/node")
-        .arg("--ro-bind")
-        .arg(root.join("node_modules"))
-        .arg("/runtime/node_modules")
-        .arg("--ro-bind")
-        .arg(root.join("extensions"))
-        .arg("/runtime/extensions")
-        .arg("--ro-bind")
-        .arg(socket)
-        .arg("/broker.sock")
-        .arg("--ro-bind")
-        .arg(settings)
-        .arg("/work/config/settings.json")
-        .args([
-            "--clearenv",
-            "--setenv",
-            "PATH",
-            "/usr/bin",
-            "--setenv",
-            "HOME",
-            "/work",
-            "--setenv",
-            "PI_CODING_AGENT_DIR",
-            "/work/config",
-            "--setenv",
-            "SWARM_SOCKET",
-            "/broker.sock",
-            "--setenv",
-            "SWARM_TOKEN",
-        ])
-        .arg(token)
-        .args(["--setenv", "SWARM_ROLE"])
-        .arg(if id == "agent-00" {
-            "coordinator"
-        } else {
-            "worker"
-        })
-        .args(["--setenv", "SWARM_GRANTS"])
-        .arg(grants)
-        .args([
-            "--chdir",
-            "/work",
-            // The explicit binary path, not the directory: a directory exec needs
-            // the kernel to resolve the name through PATH inside the mount
-            // namespace, which fails EACCES on some host/container kernels.
-            "/runtime/node/bin/node",
-            "/runtime/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
-            "--offline",
-            "--mode",
-            "rpc",
-            "--provider",
-            "swarm",
-            "--model",
-        ])
-        .arg(model)
-        .args([
-            "--thinking",
-            "off",
-            "--no-session",
-            "--no-builtin-tools",
-            "--no-extensions",
-            "--no-mcp",
-            "--no-skills",
-            "--no-prompt-templates",
-            "--no-themes",
-            "--no-context-files",
-            "--no-approve",
-            "--extension",
-            "/runtime/extensions/broker.ts",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    cmd
-}
-
-async fn bounded_line(
-    reader: &mut (impl AsyncBufRead + Unpin),
-    limit: usize,
-) -> Result<Option<Vec<u8>>> {
-    let mut result = Vec::new();
-    loop {
-        let buf = reader.fill_buf().await?;
-        if buf.is_empty() {
-            return Ok(if result.is_empty() {
-                None
-            } else {
-                Some(result)
-            });
-        }
-        let n = buf
-            .iter()
-            .position(|c| *c == b'\n')
-            .map_or(buf.len(), |p| p + 1);
-        ensure!(
-            result.len() + n <= limit,
-            "Pi protocol line exceeds byte limit"
-        );
-        let finished = buf[n - 1] == b'\n';
-        result.extend_from_slice(&buf[..n]);
-        reader.consume(n);
-        if finished {
-            return Ok(Some(result));
-        }
-    }
-}
-
-struct Worker {
-    id: String,
-    child: Child,
-    stdin: ChildStdin,
-}
-async fn rpc(worker: &mut Worker, store: &Arc<Mutex<Store>>, prompt: &str) -> Result<()> {
+async fn rpc(worker: &mut impl Session, store: &Arc<Mutex<Store>>, prompt: &str) -> Result<()> {
     store.lock().await.record(
         "agent_prompt",
-        json!({"agent_id":worker.id,"message":prompt}),
+        json!({"agent_id":worker.id(),"message":prompt}),
     )?;
-    let message = json!({"id":format!("prompt-{}",now_ms()),"type":"prompt","message":prompt});
-    worker
-        .stdin
-        .write_all(&serde_json::to_vec(&message)?)
-        .await?;
-    worker.stdin.write_all(b"\n").await?;
-    worker.stdin.flush().await?;
-    Ok(())
+    worker.prompt(prompt).await
 }
 
 /// Two escalation points, counted PER AGENT. A cohort-wide round counter let a
@@ -362,31 +192,31 @@ fn nudge(round: usize, id: &str, task: Option<&broker::Task>) -> String {
         }
     }
 }
-async fn settled(
-    rx: &mut mpsc::Receiver<(String, Result<Value>)>,
-    required: &BTreeSet<String>,
-) -> Result<()> {
+async fn settled(rx: &mut mpsc::Receiver<Observation>, required: &BTreeSet<String>) -> Result<()> {
     let mut done = BTreeSet::new();
     while done.len() < required.len() {
         let (id, event) = rx
             .recv()
             .await
             .context("worker observation channel closed")?;
-        let event = event.with_context(|| format!("{id} RPC failed"))?;
-        if event["type"] == "response" && event["success"] == false {
-            anyhow::bail!("{id} RPC rejected command: {}", event["error"]);
-        }
-        if event["type"] == "agent_settled" && required.contains(&id) {
-            done.insert(id);
+        match event.with_context(|| format!("{id} RPC failed"))? {
+            SessionEvent::Rejected(error) => {
+                anyhow::bail!("{id} RPC rejected command: {error}")
+            }
+            SessionEvent::TurnEnded => {
+                if required.contains(&id) {
+                    done.insert(id);
+                }
+            }
         }
     }
     Ok(())
 }
 
 async fn work(
-    workers: &mut [Worker],
+    workers: &mut [impl Session],
     store: &Arc<Mutex<Store>>,
-    rx: &mut mpsc::Receiver<(String, Result<Value>)>,
+    rx: &mut mpsc::Receiver<Observation>,
     goal: &Goal,
     idle: bool,
 ) -> Result<()> {
@@ -396,11 +226,13 @@ async fn work(
     for worker in workers.iter_mut() {
         let prompt = format!(
             "You are {} in one cooperative swarm. Goal: {}\n{}",
-            worker.id, goal.intent, goal.worker_prompt
+            worker.id(),
+            goal.intent,
+            goal.worker_prompt
         );
         rpc(worker, store, &prompt).await?;
     }
-    let ids: BTreeSet<String> = workers.iter().map(|w| w.id.clone()).collect();
+    let ids: BTreeSet<String> = workers.iter().map(|w| w.id().to_owned()).collect();
     // Nudge rounds recover a turn that ended without the required tool call. The
     // count is per worker and the events are consumed as they arrive: a worker
     // that has already used many turns must be steered to file even while the
@@ -414,11 +246,13 @@ async fn work(
             .recv()
             .await
             .context("worker observation channel closed")?;
-        let event = event.with_context(|| format!("{who} RPC failed"))?;
-        if event["type"] == "response" && event["success"] == false {
-            anyhow::bail!("{who} RPC rejected command: {}", event["error"]);
+        match event.with_context(|| format!("{who} RPC failed"))? {
+            SessionEvent::Rejected(error) => {
+                anyhow::bail!("{who} RPC rejected command: {error}")
+            }
+            SessionEvent::TurnEnded => {}
         }
-        if event["type"] != "agent_settled" || !pending.contains(&who) {
+        if !pending.contains(&who) {
             continue;
         }
         let (filed, task, terminal) = {
@@ -463,7 +297,7 @@ async fn work(
         let prompt = nudge(*count, &who, task.as_ref());
         let worker = workers
             .iter_mut()
-            .find(|worker| worker.id == who)
+            .find(|worker| worker.id() == who)
             .context("settled worker has no process")?;
         rpc(worker, store, &prompt).await?;
     }
@@ -670,88 +504,36 @@ async fn run(options: RunOptions) -> Result<()> {
     )?;
     let (tx, mut rx) = mpsc::channel(256);
     let mut workers = Vec::new();
-    let mut readers = Vec::new();
     let mut startup_error = None;
     for n in 0..goal.agent_count {
         let id = format!("agent-{n:02}");
         let token = store.lock().await.admit(&id)?;
-        // The worker's Pi model id is the provider's wire model, because the
-        // broker transcript echoes whichever id Pi asks for.
-        let mut child = match sandbox(
-            &node,
-            &root,
-            &broker_socket.path,
-            &settings,
-            &goal.grants.join(","),
-            &token,
-            &id,
-            &upstream.model,
-        )
-        .spawn()
-        {
-            Ok(child) => child,
+        let spec = SessionSpec {
+            // The broker grants the coordinator tools to agent-00 only.
+            role: if n == 0 {
+                Role::Coordinator
+            } else {
+                Role::Worker
+            },
+            id,
+            grants: goal.grants.clone(),
+            token,
+            // The worker's Pi model id is the provider's wire model, because the
+            // broker transcript echoes whichever id Pi asks for.
+            model: upstream.model.clone(),
+            run_dir: run_dir.clone(),
+            broker_socket: broker_socket.path.clone(),
+            pi_settings: settings.clone(),
+            node: node.clone(),
+            pi_root: root.clone(),
+        };
+        match PiHarness.start(&spec, tx.clone()).await {
+            Ok(worker) => workers.push(worker),
             Err(error) => {
-                startup_error = Some(anyhow::Error::new(error));
+                startup_error = Some(error);
                 break;
             }
-        };
-        let stdout = child.stdout.take().context("missing Pi stdout")?;
-        let stderr = child.stderr.take().context("missing Pi stderr")?;
-        let stdin = child.stdin.take().context("missing Pi stdin")?;
-        let send = tx.clone();
-        let who = id.clone();
-        let dir = run_dir.clone();
-        readers.push(tokio::spawn(async move {
-            let result = async {
-                let mut file =
-                    tokio::fs::File::create(dir.join(format!("{who}.rpc.jsonl"))).await?;
-                let mut reader = BufReader::new(stdout);
-                while let Some(line) = bounded_line(&mut reader, 16_777_216).await? {
-                    file.write_all(&line).await?;
-                    // A line that is not JSON is tolerated rather than fatal: a
-                    // crash-truncated or interleaved write must not cost the whole
-                    // worker its transcript, which is also the evidence.
-                    let Ok(value) = serde_json::from_slice::<Value>(&line) else {
-                        continue;
-                    };
-                    if value["type"] == "agent_settled" || value["type"] == "response" {
-                        send.send((who.clone(), Ok(value))).await.ok();
-                    }
-                }
-                file.sync_all().await?;
-                Ok::<(), anyhow::Error>(())
-            }
-            .await;
-            match result {
-                Ok(()) => {
-                    send.send((who, Err(anyhow::anyhow!("Pi process exited"))))
-                        .await
-                        .ok();
-                    Ok(())
-                }
-                Err(error) => {
-                    send.send((who, Err(anyhow::anyhow!(error.to_string()))))
-                        .await
-                        .ok();
-                    Err(error)
-                }
-            }
-        }));
-        let who = id.clone();
-        let dir = run_dir.clone();
-        readers.push(tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr);
-            let mut file = tokio::fs::File::create(dir.join(format!("{who}.stderr"))).await?;
-            let mut total = 0;
-            while let Some(line) = bounded_line(&mut reader, 65_536).await? {
-                total += line.len();
-                ensure!(total <= 1_048_576, "Pi stderr limit");
-                file.write_all(&line).await?;
-            }
-            file.sync_all().await?;
-            Ok::<(), anyhow::Error>(())
-        }));
-        workers.push(Worker { id, child, stdin });
+        }
     }
     drop(tx);
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -789,37 +571,7 @@ async fn run(options: RunOptions) -> Result<()> {
         .into();
         state.record("goal_stopped",json!({"reason":result.as_ref().err().map(|e|e.to_string()).unwrap_or_else(||"completed".into())}))?;
     }
-    let mut remaining = 0;
-    for worker in &mut workers {
-        if worker.child.try_wait()?.is_none() {
-            worker.child.start_kill()?;
-        }
-        if !matches!(
-            tokio::time::timeout(Duration::from_secs(5), worker.child.wait()).await,
-            Ok(Ok(_))
-        ) {
-            remaining += 1;
-        }
-        let mut state = store.lock().await;
-        if let Some(agent) = state.agents.get_mut(&worker.id) {
-            agent.stopped_ms = Some(now_ms());
-            agent.status = "stopped".into();
-        }
-        state.record("agent_stopped", json!({"agent_id":worker.id}))?;
-    }
-    for mut reader in readers {
-        match tokio::time::timeout(Duration::from_secs(2), &mut reader).await {
-            Ok(Ok(Ok(()))) => (),
-            Err(_) => {
-                remaining += 1;
-                reader.abort();
-                let _ = reader.await;
-            }
-            _ => {
-                remaining += 1;
-            }
-        }
-    }
+    let remaining = stop_sessions(workers, &store).await?;
     server.abort();
     let _ = server.await;
     broker_socket.cleanup();
@@ -850,6 +602,28 @@ async fn run(options: RunOptions) -> Result<()> {
         json!({"runtime_verdict":if runtime_pass {"PASS"}else{"FAIL"},"run_dir":run_dir,"cleanup_verdict":if remaining==0 {"PASS"}else{"INCONCLUSIVE"}})
     );
     if drained { Ok(()) } else { result }
+}
+
+/// Stop every session, then join their readers, and count what did not end
+/// cleanly: a session still alive after its wait, or a reader that failed or
+/// timed out.
+async fn stop_sessions(mut workers: Vec<impl Session>, store: &Arc<Mutex<Store>>) -> Result<usize> {
+    let mut remaining = 0;
+    for worker in &mut workers {
+        if !worker.stop().await? {
+            remaining += 1;
+        }
+        let mut state = store.lock().await;
+        if let Some(agent) = state.agents.get_mut(worker.id()) {
+            agent.stopped_ms = Some(now_ms());
+            agent.status = "stopped".into();
+        }
+        state.record("agent_stopped", json!({"agent_id":worker.id()}))?;
+    }
+    for worker in workers {
+        remaining += worker.join().await;
+    }
+    Ok(remaining)
 }
 
 /// `sockaddr_un.sun_path` is 108 bytes and must also store a trailing NUL.
@@ -1098,16 +872,28 @@ async fn fetch_probe(root: &Path, node: &Path, url: &str) -> Result<()> {
             .with_state(client);
         axum::serve(listener, app).await
     });
-    let mut child = sandbox(
-        &node,
-        &root,
-        &socket,
-        &settings,
-        "claim_task,board_read,board_post,submit_finding,read_findings,submit_artifact,fetch_url",
-        "probe-token",
-        "agent-00",
-        "probe-m1",
-    )
+    let mut child = PiHarness::command(&SessionSpec {
+        id: "agent-00".into(),
+        role: Role::Coordinator,
+        grants: [
+            "claim_task",
+            "board_read",
+            "board_post",
+            "submit_finding",
+            "read_findings",
+            "submit_artifact",
+            "fetch_url",
+        ]
+        .map(String::from)
+        .to_vec(),
+        token: "probe-token".into(),
+        model: "probe-m1".into(),
+        run_dir: work.clone(),
+        broker_socket: socket,
+        pi_settings: settings,
+        node,
+        pi_root: root,
+    })
     .spawn()?;
     let mut stdin = child.stdin.take().context("missing Pi stdin")?;
     let stdout = child.stdout.take().context("missing Pi stdout")?;
@@ -1351,17 +1137,25 @@ mod tests {
 
     #[test]
     fn the_pi_launch_keeps_its_exact_program_argv_and_env() {
-        for (id, role) in [("agent-00", "coordinator"), ("agent-03", "worker")] {
-            let command = sandbox(
-                Path::new("/opt/node-v24/bin/node"),
-                Path::new("/srv/pi"),
-                Path::new("/runs/r1/broker.sock"),
-                Path::new("/runs/r1/pi-settings.json"),
-                "claim_task,board_read,board_post,submit_finding,read_findings,submit_artifact,fetch_url",
-                "token-0f3a",
-                id,
-                "deepseek-flash",
-            );
+        for (id, spec_role, role) in [
+            ("agent-00", Role::Coordinator, "coordinator"),
+            ("agent-03", Role::Worker, "worker"),
+        ] {
+            let command = PiHarness::command(&SessionSpec {
+                id: id.into(),
+                role: spec_role,
+                grants: "claim_task,board_read,board_post,submit_finding,read_findings,submit_artifact,fetch_url"
+                    .split(',')
+                    .map(String::from)
+                    .collect(),
+                token: "token-0f3a".into(),
+                model: "deepseek-flash".into(),
+                run_dir: PathBuf::from("/runs/r1"),
+                broker_socket: PathBuf::from("/runs/r1/broker.sock"),
+                pi_settings: PathBuf::from("/runs/r1/pi-settings.json"),
+                node: PathBuf::from("/opt/node-v24/bin/node"),
+                pi_root: PathBuf::from("/srv/pi"),
+            });
             let command = command.as_std();
             assert_eq!(command.get_program(), "bwrap");
             let args: Vec<&str> = command
