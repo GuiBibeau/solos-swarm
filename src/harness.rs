@@ -36,6 +36,8 @@ pub type Observation = (String, Result<SessionEvent>);
 pub enum Role {
     Coordinator,
     Worker,
+    /// Agent mode's Router: the extension gives it the Router tool set.
+    Router,
 }
 
 impl Role {
@@ -43,6 +45,16 @@ impl Role {
         match self {
             Role::Coordinator => "coordinator",
             Role::Worker => "worker",
+            Role::Router => "router",
+        }
+    }
+
+    /// The extension's `SWARM_TOOLSET`. Swarm roles set none, so their
+    /// launch is unchanged.
+    fn toolset(self) -> Option<&'static str> {
+        match self {
+            Role::Coordinator | Role::Worker => None,
+            Role::Router => Some("router"),
         }
     }
 }
@@ -181,6 +193,12 @@ impl PiHarness {
             .arg(spec.role.as_str())
             .args(["--setenv", "SWARM_GRANTS"])
             .arg(spec.grants.join(","))
+            .args(
+                spec.role
+                    .toolset()
+                    .into_iter()
+                    .flat_map(|toolset| ["--setenv", "SWARM_TOOLSET", toolset]),
+            )
             .args([
                 "--chdir",
                 "/work",
@@ -403,6 +421,49 @@ pub async fn bounded_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_router_role_adds_a_toolset_to_the_launch() {
+        let spec = |role| SessionSpec {
+            id: "s".into(),
+            role,
+            grants: vec!["router_decide".into(), "router_read".into()],
+            token: "t".into(),
+            model: "deepseek-flash".into(),
+            run_dir: PathBuf::from("/state/router"),
+            broker_socket: PathBuf::from("/state/broker.sock"),
+            pi_settings: PathBuf::from("/state/router/pi-settings.json"),
+            node: PathBuf::from("/opt/node/bin/node"),
+            pi_root: PathBuf::from("/srv/pi"),
+        };
+        let args = |role| -> Vec<String> {
+            PiHarness::command(&spec(role))
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect()
+        };
+        let router = args(Role::Router);
+        let worker = args(Role::Worker);
+        let at = router
+            .iter()
+            .position(|arg| arg == "SWARM_TOOLSET")
+            .unwrap();
+        assert_eq!(
+            router[at - 1..=at + 1],
+            ["--setenv", "SWARM_TOOLSET", "router"]
+        );
+        assert_eq!(
+            router[at - 3..at - 1],
+            ["SWARM_GRANTS", "router_decide,router_read"]
+        );
+        let mut without = router.clone();
+        without.drain(at - 1..=at + 1);
+        let role = worker.iter().position(|arg| arg == "worker").unwrap();
+        without[role] = "worker".into();
+        assert_eq!(without, worker, "the toolset is the only other difference");
+        assert!(!worker.iter().any(|arg| arg == "SWARM_TOOLSET"));
+    }
 
     #[test]
     fn only_a_settled_agent_and_a_refused_command_become_events() {

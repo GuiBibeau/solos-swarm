@@ -120,7 +120,26 @@ enum AgentCommand {
         /// and exit. For tests and dry runs.
         #[arg(long)]
         until_idle: bool,
+        /// A Pi Router: the checkout that holds `node_modules` and `extensions`.
+        #[arg(long)]
+        pi_root: Option<PathBuf>,
+        /// A Pi Router: the node binary.
+        #[arg(long)]
+        node: Option<PathBuf>,
+        /// A Pi Router: the model key. Read once and deleted; it stays in
+        /// this process and never enters the sandbox.
+        #[arg(long)]
+        credential_file: Option<PathBuf>,
     },
+}
+
+/// Read a one-use credential file and delete it, whether or not the read
+/// worked, so no later error can leave the key on disk.
+fn consume_credential(path: &Path) -> Result<Zeroizing<String>> {
+    let result = fs::read_to_string(path);
+    let _ = fs::remove_file(path);
+    let raw = Zeroizing::new(result.context("cannot read broker credential")?);
+    Ok(Zeroizing::new(raw.trim().to_owned()))
 }
 
 /// One legacy preview run: a frozen Goal, the pinned Pi tree and one credential.
@@ -148,10 +167,7 @@ async fn run(options: RunOptions) -> Result<()> {
     } = options;
     // Consume the one-use credential before any launch or config error can retain it.
     let key = if let Some(path) = credential_file {
-        let result = fs::read_to_string(&path);
-        let _ = fs::remove_file(&path);
-        let raw = Zeroizing::new(result.context("cannot read broker credential")?);
-        Zeroizing::new(raw.trim().to_owned())
+        consume_credential(&path)?
     } else {
         Zeroizing::new(String::new())
     };
@@ -235,9 +251,23 @@ async fn execute(command: Action) -> Result<()> {
                     config,
                     state_dir,
                     until_idle,
+                    pi_root,
+                    node,
+                    credential_file,
                 },
         } => {
-            let summary = solos_swarm::agent::serve(&config, &state_dir, until_idle).await?;
+            // Before the config is read, so no config error can leave the key on disk.
+            let credential = credential_file
+                .as_deref()
+                .map(consume_credential)
+                .transpose()?;
+            let options = solos_swarm::agent::ServeOptions {
+                until_idle,
+                pi_root,
+                node,
+                credential,
+            };
+            let summary = solos_swarm::agent::serve(&config, &state_dir, options).await?;
             println!("{}", json!(summary));
             Ok(())
         }
