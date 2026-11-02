@@ -281,7 +281,9 @@ provider through the real broker. It runs on macOS too. Swarm mode is the first 
   evidence.
 - Done: Completed is a `ready` Report naming the filed findings, the spend and the artifact's path; Stopped is
   `failed` with the reason; Drained is `waiting`. A failed or drained swarm also ends its Assignment, so the next
-  message from a person starts a new run.
+  message from a person starts a new run. While it runs, a swarm sends a quiet `progress` Report with what it has
+  filed and spent, at half the Watchdog's `stalled` threshold and at least every 5 minutes, so P6 never takes a long
+  swarm for a stalled Assignment.
 - Done: a Stop Effect cancels a running swarm through `run_goal_until`'s cancel input (`swarm::Cancel::on`), which
   takes the operator-cancel path (partial findings, the artifact of what was filed, every session stopped,
   `cleanup.json`) and waits until it is done. `run_goal` keeps SIGTERM and Ctrl-C, so `solos-swarm run` is

@@ -14,7 +14,7 @@ use crate::harness::AgentHarness;
 use crate::swarm::{self, Cancel, GoalOutcome, GoalRun, GoalStatus};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
-use solos_agent_core::model::{AssignmentId, MicroUsd, Plan, ReportIn, ReportStatus, TicketId};
+use solos_agent_core::model::{AssignmentId, MicroUsd, Ms, Plan, ReportIn, ReportStatus, TicketId};
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::os::unix::fs::DirBuilderExt;
@@ -29,6 +29,7 @@ pub const SWARM_DIR: &str = "swarm";
 const REASON_CHARS: usize = 400;
 const NAMED_FINDINGS: usize = 10;
 const PAUSE_TICK: Duration = Duration::from_secs(1);
+const MOST_PROGRESS_EVERY: Duration = Duration::from_secs(300);
 /// How many directories one Assignment's repeated launches may take.
 const RUN_DIRS: usize = 100;
 
@@ -46,6 +47,16 @@ pub struct SwarmParts<H> {
     pub node: PathBuf,
     pub pi_root: PathBuf,
     pub max_runs: usize,
+    /// How often a running swarm sends a quiet `progress` Report.
+    pub progress_every: Duration,
+}
+
+/// Often enough that the Watchdog, which takes an Assignment with no
+/// Report for `stalled_ms` for stalled, never takes a running swarm for one.
+pub fn progress_every(stalled_ms: Option<Ms>) -> Duration {
+    stalled_ms.map_or(MOST_PROGRESS_EVERY, |ms| {
+        Duration::from_millis(ms / 2).clamp(Duration::from_secs(1), MOST_PROGRESS_EVERY)
+    })
 }
 
 pub struct SwarmExecutor<H> {
@@ -220,7 +231,7 @@ where
         };
         let run_dir = run.run_dir.clone();
         self.unbooked().insert(run_dir.clone());
-        let outcome = self.swarm(run, cancel.clone()).await;
+        let outcome = self.swarm(run, cancel.clone(), launch, facts).await;
         let cost = match &outcome {
             Ok(outcome) => outcome.spent_microusd.saturating_add(outcome.held_microusd),
             Err(_) => run_cost(&run_dir).unwrap_or(0),
@@ -367,12 +378,14 @@ where
         bail!("{assignment} has used {RUN_DIRS} run directories");
     }
 
-    /// The swarm itself, held while the agent is paused, until it ends or
-    /// `cancel` is set.
+    /// The swarm itself, held while the agent is paused and reporting its
+    /// progress, until it ends or `cancel` is set.
     async fn swarm(
         &self,
         run: GoalRun,
         mut cancel: watch::Receiver<Option<String>>,
+        launch: &Launch,
+        facts: &FactSink,
     ) -> Result<GoalOutcome> {
         let request = async move {
             match cancel.wait_for(Option::is_some).await {
@@ -381,6 +394,12 @@ where
             }
         };
         let paused = mirror_pause(self.parts.state_dir.clone(), run.run_dir.clone());
+        let alive = heartbeat(
+            facts.clone(),
+            launch.clone(),
+            run.run_dir.clone(),
+            self.parts.progress_every,
+        );
         tokio::select! {
             outcome = swarm::run_goal_until(
                 run,
@@ -389,6 +408,7 @@ where
                 Cancel::on(request),
             ) => outcome,
             never = paused => match never {},
+            never = alive => match never {},
         }
     }
 }
@@ -397,11 +417,36 @@ where
 /// still open, at their hold, as the ledger charges a call a crash cut
 /// short. `None` before its first event, when it has spent nothing.
 fn run_cost(run_dir: &Path) -> Option<MicroUsd> {
-    let bytes = std::fs::read(run_dir.join("state.json")).ok()?;
-    let state: Value = serde_json::from_slice(&bytes).ok()?;
+    let state = run_state(run_dir)?;
     state["spent_microusd"]
         .as_u64()?
         .checked_add(state["held_microusd"].as_u64()?)
+}
+
+fn run_state(run_dir: &Path) -> Option<Value> {
+    let bytes = std::fs::read(run_dir.join("state.json")).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// A quiet `progress` Report every `every`, with what the run has filed and
+/// spent so far. A Report the runtime does not take changes nothing.
+async fn heartbeat(
+    facts: FactSink,
+    launch: Launch,
+    run_dir: PathBuf,
+    every: Duration,
+) -> Infallible {
+    loop {
+        tokio::time::sleep(every).await;
+        let filed = run_state(&run_dir)
+            .and_then(|state| state["findings"].as_array().map(Vec::len))
+            .unwrap_or(0);
+        let spent = run_cost(&run_dir).unwrap_or(0);
+        let text = format!(
+            "The swarm is running; it has filed {filed} of its findings and spent {spent} microusd."
+        );
+        let _ = report(&facts, &launch, ReportStatus::Progress, text, spent).await;
+    }
 }
 
 /// The outcome as the Ticket's Report. A swarm that did not complete also
@@ -444,9 +489,7 @@ fn filed(outcome: &GoalOutcome) -> String {
         1 => "filed 1 finding".to_owned(),
         n => format!("filed {n} findings"),
     };
-    let tasks: Vec<String> = std::fs::read(outcome.run_dir.join("state.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    let tasks: Vec<String> = run_state(&outcome.run_dir)
         .and_then(|state| {
             let findings = state["findings"].as_array()?;
             Some(
@@ -535,7 +578,7 @@ async fn mirror_pause(state_dir: PathBuf, run_dir: PathBuf) -> Infallible {
 
 #[cfg(test)]
 mod tests {
-    use super::{SWARM_DIR, SwarmExecutor, SwarmParts, mirror_pause};
+    use super::{SWARM_DIR, SwarmExecutor, SwarmParts, mirror_pause, progress_every};
     use crate::agent::broker::{AgentBroker, BrokerParts, DecideTerms};
     use crate::agent::config::SwarmConfig;
     use crate::agent::goal_template::GoalTemplates;
@@ -644,6 +687,9 @@ mod tests {
         H::Session: Send + 'static,
     {
         fn new(harness: H, max_runs: usize, template: &str) -> Self {
+            Self::with_progress(harness, max_runs, template, Duration::from_secs(3_600))
+        }
+        fn with_progress(harness: H, max_runs: usize, template: &str, every: Duration) -> Self {
             let dir = dir();
             std::fs::write(dir.join("goal.yaml"), template).unwrap();
             let config = SwarmConfig {
@@ -675,6 +721,7 @@ mod tests {
                 node: dir.join("node"),
                 pi_root: dir.join("pi"),
                 max_runs,
+                progress_every: every,
             })
             .unwrap();
             Self {
@@ -980,6 +1027,26 @@ mod tests {
             ReportStatus::Ready,
             "the executor still runs swarms"
         );
+    }
+
+    #[tokio::test]
+    async fn a_running_swarm_reports_progress_quietly_so_it_is_not_taken_for_stalled() {
+        let idle = Idle::default();
+        let mut w = World::with_progress(idle, 1, TEMPLATE, Duration::from_millis(200));
+        w.launch(launch("tk_1", "as_1", 2)).await;
+        assert!(started(&w.fact().await, "as_1"));
+        let progress = w.report().await;
+        assert_eq!(progress.status, ReportStatus::Progress);
+        assert_eq!(
+            progress.text,
+            "The swarm is running; it has filed 0 of its findings and spent 0 microusd."
+        );
+        w.stop("tk_1", "as_1").await;
+        let minute = 60_000;
+        assert_eq!(progress_every(None), Duration::from_secs(300));
+        assert_eq!(progress_every(Some(30 * minute)), Duration::from_secs(300));
+        assert_eq!(progress_every(Some(4 * minute)), Duration::from_secs(120));
+        assert_eq!(progress_every(Some(10)), Duration::from_secs(1));
     }
 
     #[tokio::test]

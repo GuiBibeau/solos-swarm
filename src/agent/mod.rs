@@ -280,6 +280,12 @@ where
                 node: node.clone(),
                 pi_root: pi_root.clone(),
                 max_runs: swarm.max_runs,
+                progress_every: swarm_executor::progress_every(
+                    config
+                        .watchdog
+                        .as_ref()
+                        .map(|watchdog| watchdog.thresholds().stalled_ms),
+                ),
             })?),
             _ => None,
         };
