@@ -22,13 +22,16 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Component, Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
-    sync::Semaphore,
+    sync::{Semaphore, watch},
     task::JoinHandle,
 };
 
@@ -356,6 +359,63 @@ impl CodeExecutor {
         let request = CodeRequest::parse(args)?;
         let scratch = self.owned_scratch(scratch)?;
         self.execute(&scratch, request).await
+    }
+    /// [`run_in`](Self::run_in) on its own task: it returns at once, and
+    /// the request ends with the same receipt or error.
+    pub fn start_in(self: &Arc<Self>, scratch: &Path, args: &Value) -> Result<Started> {
+        let request = CodeRequest::parse(args)?;
+        let scratch = self.owned_scratch(scratch)?;
+        Ok(self.start(scratch, request, OutputBounds::RUN_CODE))
+    }
+    /// One bash command with `scratch` as `/work` on its own task, with its
+    /// own wall-clock `timeout` and output `bounds`, and no files or stdin.
+    pub fn start_job_in(
+        self: &Arc<Self>,
+        scratch: &Path,
+        code: &str,
+        timeout: Duration,
+        bounds: OutputBounds,
+    ) -> Result<Started> {
+        ensure!(!code.trim().is_empty(), "run_code code is empty");
+        ensure!(
+            code.len() <= MAX_CODE_BYTES,
+            "run_code code exceeds {MAX_CODE_BYTES} bytes"
+        );
+        let scratch = self.owned_scratch(scratch)?;
+        let request = CodeRequest {
+            code: code.to_owned(),
+            files: Vec::new(),
+            timeout,
+            stdin: None,
+        };
+        Ok(self.start(scratch, request, bounds))
+    }
+    fn start(
+        self: &Arc<Self>,
+        scratch: PathBuf,
+        request: CodeRequest,
+        bounds: OutputBounds,
+    ) -> Started {
+        let progress = Arc::new(Progress {
+            stdout: Mutex::new(Captured::new(bounds.stdout_bytes)),
+            stderr: Mutex::new(Captured::new(bounds.stderr_bytes)),
+            running: AtomicBool::new(false),
+        });
+        let (stop, stopping) = watch::channel(false);
+        let (ended, end) = watch::channel(None);
+        tokio::spawn(supervise(
+            self.clone(),
+            scratch,
+            request,
+            progress.clone(),
+            stopping,
+            ended,
+        ));
+        Started {
+            progress,
+            stop,
+            end,
+        }
     }
     /// `scratch` itself, not a link, and inside the scratch root once every
     /// link and `..` above it is resolved.
@@ -715,6 +775,369 @@ async fn read_bounded<R: AsyncRead + Unpin>(
     Ok((String::from_utf8_lossy(&kept).into_owned(), truncated))
 }
 
+/// What a started request keeps of each stream until it is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutputBounds {
+    pub stdout_bytes: usize,
+    pub stderr_bytes: usize,
+}
+
+impl OutputBounds {
+    /// `run_code`'s, so a request nobody reads early keeps what its receipt
+    /// always kept.
+    pub const RUN_CODE: Self = Self {
+        stdout_bytes: STDOUT_LIMIT,
+        stderr_bytes: STDERR_LIMIT,
+    };
+}
+
+/// How a started request ended.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Ended {
+    /// `receipt` is `run_code`'s, with the output nobody read before. A
+    /// request stopped before it had a sandbox slot never ran.
+    Ran { receipt: Value, stopped: bool },
+    /// The sandbox could not run; `run_code` returns this as its error.
+    Failed(String),
+}
+
+/// Output printed since the last read.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Unread {
+    pub stdout: String,
+    pub stderr: String,
+    /// Some output was dropped because nobody read it in time.
+    pub truncated: bool,
+}
+
+/// A request running on its own task in the same sandbox, under the same
+/// limits, as [`CodeExecutor::run_in`]. Its output can be read while it
+/// runs, its end awaited, and it can be stopped. Dropping it stops it.
+pub struct Started {
+    progress: Arc<Progress>,
+    stop: watch::Sender<bool>,
+    end: watch::Receiver<Option<Ended>>,
+}
+
+impl Started {
+    /// It holds a sandbox slot; until then it waits for one.
+    pub fn running(&self) -> bool {
+        self.progress.running.load(Ordering::SeqCst)
+    }
+    pub fn ended(&self) -> Option<Ended> {
+        self.end.borrow().clone()
+    }
+    /// Its end, if it comes within `limit`.
+    pub async fn wait(&self, limit: Duration) -> Option<Ended> {
+        tokio::time::timeout(limit, self.end()).await.ok()
+    }
+    /// Its end, whenever it comes.
+    pub fn end(&self) -> impl Future<Output = Ended> + Send + 'static {
+        let mut end = self.end.clone();
+        async move {
+            let ended = match end.wait_for(Option::is_some).await {
+                Ok(ended) => ended.clone(),
+                Err(_) => None,
+            };
+            ended.unwrap_or_else(|| {
+                Ended::Failed("the run_code task ended without a receipt".into())
+            })
+        }
+    }
+    /// Kill it, or keep it from starting. Its end follows.
+    pub fn stop(&self) {
+        self.stop.send_replace(true);
+    }
+    /// What it printed since the last read. While it runs, a character the
+    /// stream has not finished waits for its last bytes.
+    pub fn read(&self) -> Unread {
+        let (stdout, out_dropped) = self.progress.stdout().drain(false);
+        let (stderr, err_dropped) = self.progress.stderr().drain(false);
+        Unread {
+            stdout,
+            stderr,
+            truncated: out_dropped || err_dropped,
+        }
+    }
+}
+
+impl Drop for Started {
+    fn drop(&mut self) {
+        self.stop.send_replace(true);
+    }
+}
+
+struct Progress {
+    stdout: Mutex<Captured>,
+    stderr: Mutex<Captured>,
+    running: AtomicBool,
+}
+
+impl Progress {
+    fn stdout(&self) -> MutexGuard<'_, Captured> {
+        self.stdout.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    fn stderr(&self) -> MutexGuard<'_, Captured> {
+        self.stderr.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// One stream's unread output, at most `limit` bytes. Output past it is
+/// dropped until a read makes room, as [`read_bounded`] drops it.
+struct Captured {
+    unread: Vec<u8>,
+    limit: usize,
+    dropped: bool,
+}
+
+impl Captured {
+    fn new(limit: usize) -> Self {
+        Self {
+            unread: Vec::new(),
+            limit,
+            dropped: false,
+        }
+    }
+    fn push(&mut self, bytes: &[u8]) {
+        let room = self.limit.saturating_sub(self.unread.len());
+        let take = room.min(bytes.len());
+        self.unread.extend_from_slice(&bytes[..take]);
+        if take < bytes.len() {
+            self.dropped = true;
+        }
+    }
+    /// The unread text, and whether output was dropped since the last read.
+    fn drain(&mut self, whole: bool) -> (String, bool) {
+        let cut = if whole {
+            self.unread.len()
+        } else {
+            complete_prefix(&self.unread)
+        };
+        let text = String::from_utf8_lossy(&self.unread[..cut]).into_owned();
+        self.unread.drain(..cut);
+        (text, std::mem::take(&mut self.dropped))
+    }
+    /// What [`finish_reader`] reports for a reader that failed or hung.
+    fn lost(&mut self) -> (String, bool) {
+        self.unread.clear();
+        self.dropped = false;
+        (String::new(), true)
+    }
+}
+
+/// `bytes` up to a character the stream has not finished.
+fn complete_prefix(bytes: &[u8]) -> usize {
+    // A UTF-8 character is at most four bytes, so only the last three can
+    // start one that is not finished.
+    for back in 1..=bytes.len().min(3) {
+        let at = bytes.len() - back;
+        let byte = bytes[at];
+        if byte & 0xC0 == 0x80 {
+            continue;
+        }
+        let length = match byte {
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF7 => 4,
+            _ => 1,
+        };
+        return if back < length { at } else { bytes.len() };
+    }
+    bytes.len()
+}
+
+#[derive(Clone, Copy)]
+enum Stream {
+    Stdout,
+    Stderr,
+}
+
+async fn supervise(
+    executor: Arc<CodeExecutor>,
+    scratch: PathBuf,
+    request: CodeRequest,
+    progress: Arc<Progress>,
+    mut stop: watch::Receiver<bool>,
+    end: watch::Sender<Option<Ended>>,
+) {
+    let ended = attend(&executor, &scratch, request, &progress, &mut stop)
+        .await
+        .unwrap_or_else(|err| Ended::Failed(format!("{err:#}")));
+    end.send_replace(Some(ended));
+}
+
+/// [`CodeExecutor::execute`] for a started request: a stop while it waits
+/// for a slot ends it unrun, and a stop while it runs kills it.
+async fn attend(
+    executor: &CodeExecutor,
+    scratch: &Path,
+    request: CodeRequest,
+    progress: &Arc<Progress>,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<Ended> {
+    let queued = Instant::now();
+    let permit = tokio::select! {
+        permit = executor.permits.clone().acquire_owned() => {
+            permit.context("run_code scheduler closed")?
+        }
+        () = stopped(stop) => {
+            let receipt = json!({
+                "exit_code": -1,
+                "stdout": "",
+                "stderr": "",
+                "timed_out": false,
+                "duration_ms": 0,
+                "truncated": false,
+                "queue_wait_ms": queued.elapsed().as_millis() as u64,
+            });
+            return Ok(Ended::Ran { receipt, stopped: true });
+        }
+    };
+    let queue_wait_ms = queued.elapsed().as_millis() as u64;
+    progress.running.store(true, Ordering::SeqCst);
+    write_files(scratch, &request.files)?;
+    let command = executor.command(scratch, &request.code);
+    let (mut receipt, was_stopped) =
+        execute_watched(command, request.stdin, request.timeout, progress, stop).await?;
+    receipt["queue_wait_ms"] = json!(queue_wait_ms);
+    drop(permit);
+    Ok(Ended::Ran {
+        receipt,
+        stopped: was_stopped,
+    })
+}
+
+/// A stop was asked for, or every handle on the request is gone.
+async fn stopped(stop: &mut watch::Receiver<bool>) {
+    let _ = stop.wait_for(|stop| *stop).await;
+}
+
+/// [`execute`] with output anyone may read as it comes, and a stop that
+/// kills the sandbox like a timeout does. The receipt is the same.
+async fn execute_watched(
+    mut command: Command,
+    stdin: Option<String>,
+    timeout: Duration,
+    progress: &Arc<Progress>,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<(Value, bool)> {
+    command
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let started = Instant::now();
+    let mut child = command.spawn().context("run_code sandbox launch failed")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("run_code sandbox stdout missing")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("run_code sandbox stderr missing")?;
+    let stdout_task = tokio::spawn(capture(stdout, progress.clone(), Stream::Stdout));
+    let stderr_task = tokio::spawn(capture(stderr, progress.clone(), Stream::Stderr));
+    let stdin_task = match stdin {
+        None => None,
+        Some(text) => {
+            let mut pipe = child
+                .stdin
+                .take()
+                .context("run_code sandbox stdin missing")?;
+            Some(tokio::spawn(async move {
+                pipe.write_all(text.as_bytes()).await?;
+                pipe.shutdown().await
+            }))
+        }
+    };
+    let (mut timed_out, mut was_stopped) = (false, false);
+    let status = tokio::select! {
+        status = child.wait() => Some(status?),
+        () = tokio::time::sleep(timeout) => {
+            timed_out = true;
+            None
+        }
+        () = stopped(stop) => {
+            was_stopped = true;
+            None
+        }
+    };
+    if status.is_none() {
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    }
+    let (stdout, stdout_truncated) = finish_capture(stdout_task, progress, Stream::Stdout).await;
+    let (stderr, stderr_truncated) = finish_capture(stderr_task, progress, Stream::Stderr).await;
+    if let Some(task) = stdin_task {
+        let abort = task.abort_handle();
+        if tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .is_err()
+        {
+            abort.abort();
+        }
+    }
+    let receipt = json!({
+        "exit_code": status.and_then(|status| status.code()).unwrap_or(-1),
+        "stdout": stdout,
+        "stderr": stderr,
+        "timed_out": timed_out,
+        "duration_ms": started.elapsed().as_millis() as u64,
+        "truncated": stdout_truncated || stderr_truncated,
+    });
+    Ok((receipt, was_stopped))
+}
+
+async fn capture<R: AsyncRead + Unpin>(
+    mut reader: R,
+    progress: Arc<Progress>,
+    stream: Stream,
+) -> io::Result<()> {
+    let mut buffer = [0u8; 8_192];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok(());
+        }
+        let mut captured = match stream {
+            Stream::Stdout => progress.stdout(),
+            Stream::Stderr => progress.stderr(),
+        };
+        captured.push(&buffer[..read]);
+    }
+}
+
+/// [`finish_reader`] for a captured stream: what nobody read yet.
+async fn finish_capture(
+    mut task: JoinHandle<io::Result<()>>,
+    progress: &Progress,
+    stream: Stream,
+) -> (String, bool) {
+    let abort = task.abort_handle();
+    let finished = match tokio::time::timeout(Duration::from_secs(5), &mut task).await {
+        Ok(Ok(Ok(()))) => true,
+        Ok(Ok(Err(_))) | Ok(Err(_)) => false,
+        Err(_) => {
+            abort.abort();
+            false
+        }
+    };
+    let mut captured = match stream {
+        Stream::Stdout => progress.stdout(),
+        Stream::Stderr => progress.stderr(),
+    };
+    if finished {
+        captured.drain(true)
+    } else {
+        captured.lost()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1047,6 +1470,70 @@ mod tests {
         let (text, truncated) = read_bounded(&input[..], 20).await.unwrap();
         assert_eq!(text.len(), 10);
         assert!(!truncated);
+    }
+    #[test]
+    fn captured_output_keeps_unread_bytes_up_to_its_limit_and_whole_characters() {
+        let mut captured = Captured::new(4);
+        captured.push(b"abcdef");
+        assert_eq!(captured.drain(false), ("abcd".into(), true));
+        assert_eq!(captured.drain(false), (String::new(), false));
+        captured.push("é".as_bytes());
+        captured.push(&"ü".as_bytes()[..1]);
+        assert_eq!(captured.drain(false), ("é".into(), false), "ü waits");
+        captured.push(&"ü".as_bytes()[1..]);
+        assert_eq!(captured.drain(false), ("ü".into(), false));
+        captured.push(&"€".as_bytes()[..2]);
+        assert_eq!(captured.drain(true), ("\u{fffd}".into(), false));
+        assert_eq!(complete_prefix(&[b'a', 0xFF, 0xFE]), 3);
+        assert_eq!(complete_prefix(&[0xF0, 0x9F, 0x98]), 0);
+    }
+    /// A started request that nobody reads early ends with `run_in`'s
+    /// receipt, whatever its output and outcome.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_a_started_request_ends_with_the_receipt_run_in_gives() {
+        if !Path::new("/usr/bin/bwrap").is_file() || !Path::new("/usr/bin/prlimit").is_file() {
+            return;
+        }
+        let dir = scratch_dir();
+        let work = dir.join("tk_1/work");
+        fs::create_dir_all(&work).unwrap();
+        let worker = Arc::new(executor(worker_config(&dir)));
+        for args in [
+            json!({"code": "cat in.txt; printf 'é%.0s' $(seq 40000); echo oops >&2; exit 3", "files": {"in.txt": "x"}}),
+            json!({"code": "read line; echo \"got $line\"", "stdin": "hello\n"}),
+            json!({"code": "sleep 5", "timeout_seconds": 1}),
+        ] {
+            let mut ran = worker.run_in(&work, &args).await.unwrap();
+            let started = worker.start_in(&work, &args).unwrap();
+            let Ended::Ran {
+                receipt: mut kept,
+                stopped: false,
+            } = started.end().await
+            else {
+                panic!("{args} did not run")
+            };
+            for receipt in [&mut ran, &mut kept] {
+                receipt["duration_ms"] = json!(0);
+                receipt["queue_wait_ms"] = json!(0);
+            }
+            assert_eq!(kept, ran, "{args}");
+        }
+        let started = worker
+            .start_in(&work, &json!({"code": "sleep 30"}))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        started.stop();
+        let Some(Ended::Ran { receipt, stopped }) = started.wait(Duration::from_secs(10)).await
+        else {
+            panic!("the stop did not end it")
+        };
+        assert!(stopped);
+        assert_eq!(
+            (receipt["exit_code"].clone(), receipt["timed_out"].clone()),
+            (json!(-1), json!(false))
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
     #[cfg(target_os = "linux")]
     #[tokio::test]
