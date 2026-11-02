@@ -10,6 +10,7 @@ pub mod pi_router;
 pub mod ports;
 pub mod runtime;
 pub mod scripted;
+pub mod slack;
 
 pub use config::AgentConfig;
 pub use runtime::{Adapters, RunOptions, Runtime, Summary};
@@ -25,6 +26,7 @@ use pi_router::PiRouter;
 use ports::{Channel, Executor, Router, Source};
 use scripted::{ScriptedExecutor, ScriptedRouter};
 use serde_json::json;
+use slack::{SlackApi, SlackChannel, SlackSource, Token};
 use solos_agent_store::SqliteStore;
 use std::collections::BTreeMap;
 use std::os::unix::fs::DirBuilderExt;
@@ -70,6 +72,8 @@ pub async fn serve(config: &Path, state_dir: &Path, options: ServeOptions) -> Re
         node,
         credential,
     } = options;
+    // First, so the token files are consumed before anything else can fail.
+    let io = Io::open(&config, !until_idle)?;
     let host = match &config.router {
         RouterConfig::Scripted {} => None,
         RouterConfig::Pi {
@@ -92,7 +96,7 @@ pub async fn serve(config: &Path, state_dir: &Path, options: ServeOptions) -> Re
             })
         }
     };
-    serve_with(config, state_dir, until_idle, host).await
+    serve_io(config, state_dir, until_idle, io, host).await
 }
 
 /// [`serve`] with the Router's harness and provider given, so tests can
@@ -101,6 +105,21 @@ pub async fn serve_with<H>(
     config: AgentConfig,
     state_dir: &Path,
     until_idle: bool,
+    host: Option<RouterHost<H>>,
+) -> Result<Summary>
+where
+    H: AgentHarness + Send + Sync + 'static,
+    H::Session: Send + 'static,
+{
+    let io = Io::open(&config, !until_idle)?;
+    serve_io(config, state_dir, until_idle, io, host).await
+}
+
+async fn serve_io<H>(
+    config: AgentConfig,
+    state_dir: &Path,
+    until_idle: bool,
+    io: Io,
     host: Option<RouterHost<H>>,
 ) -> Result<Summary>
 where
@@ -128,7 +147,7 @@ where
     let runtime = Runtime::new(
         store,
         config.policy.clone(),
-        adapters(&config, !until_idle, router)?,
+        io.adapters(&config, router),
         runtime_options,
     )
     .with_control_dir(state_dir);
@@ -278,34 +297,66 @@ impl Served {
     }
 }
 
-/// The Sources, Channels and Executor the config names, around `router`.
-/// `follow`: Sources keep reading what arrives later.
-pub fn adapters(config: &AgentConfig, follow: bool, router: Arc<dyn Router>) -> Result<Adapters> {
-    let sources = config
-        .sources
-        .iter()
-        .map(|source| -> Box<dyn Source> {
+/// The Sources and Channels the config names, opened before anything else
+/// can fail, since opening them reads and deletes the Slack token files.
+struct Io {
+    sources: Vec<Box<dyn Source>>,
+    channels: BTreeMap<String, Arc<dyn Channel>>,
+}
+
+impl Io {
+    /// `follow`: Sources keep reading what arrives later.
+    fn open(config: &AgentConfig, follow: bool) -> Result<Self> {
+        let mut sources: Vec<Box<dyn Source>> = Vec::new();
+        let mut slack_api = None;
+        for source in &config.sources {
             match source {
-                SourceConfig::Jsonl { path } => Box::new(JsonlSource::new(path, follow)),
+                SourceConfig::Jsonl { path } => {
+                    sources.push(Box::new(JsonlSource::new(path, follow)));
+                }
+                SourceConfig::Slack {
+                    channels,
+                    app_token_file,
+                    bot_token_file,
+                    api_base,
+                } => {
+                    let app = Token::take(app_token_file, "xapp-");
+                    let bot = Token::take(bot_token_file, "xoxb-");
+                    let api = Arc::new(SlackApi::new(api_base, bot?)?);
+                    let slack = SlackSource::new(api.clone(), app?, channels.clone(), follow);
+                    sources.push(Box::new(slack));
+                    slack_api = Some(api);
+                }
             }
-        })
-        .collect();
-    let mut channels: BTreeMap<String, Arc<dyn Channel>> = BTreeMap::new();
-    for channel in &config.channels {
-        let adapter: Arc<dyn Channel> = match channel {
-            ChannelConfig::Jsonl { path, .. } => Arc::new(JsonlChannel::open(path)?),
-        };
-        channels.insert(channel.source().to_owned(), adapter);
+        }
+        let mut channels: BTreeMap<String, Arc<dyn Channel>> = BTreeMap::new();
+        for channel in &config.channels {
+            let adapter: Arc<dyn Channel> = match channel {
+                ChannelConfig::Jsonl { path, .. } => Arc::new(JsonlChannel::open(path)?),
+                ChannelConfig::Slack {} => Arc::new(SlackChannel::new(
+                    slack_api
+                        .clone()
+                        .context("the slack channel needs a slack source")?,
+                )),
+            };
+            channels.insert(channel.source().to_owned(), adapter);
+        }
+        Ok(Self { sources, channels })
     }
-    let executor: Arc<dyn Executor> = match config.executor {
-        ExecutorConfig::Scripted {} => Arc::new(ScriptedExecutor),
-    };
-    Ok(Adapters {
-        sources,
-        channels,
-        router,
-        executor,
-    })
+
+    /// The runtime's adapters: these, the Executor the config names, and
+    /// `router`.
+    fn adapters(self, config: &AgentConfig, router: Arc<dyn Router>) -> Adapters {
+        let executor: Arc<dyn Executor> = match config.executor {
+            ExecutorConfig::Scripted {} => Arc::new(ScriptedExecutor),
+        };
+        Adapters {
+            sources: self.sources,
+            channels: self.channels,
+            router,
+            executor,
+        }
+    }
 }
 
 async fn shutdown() {

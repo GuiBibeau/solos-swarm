@@ -2,15 +2,17 @@
 //! Adapters run concurrently and send facts and Effect outcomes back to it.
 
 use super::ports::{
-    Answer, Channel, Delivered, Delivery, Executor, Fact, FactSink, Inbound, Launch, Router,
-    SendOutcome, Source,
+    Answer, Channel, Command, Delivered, Delivery, Executor, Fact, FactSink, Failure, Inbound,
+    Launch, Order, Router, SendOptions, SendOutcome, Source,
 };
 use crate::broker::now_ms;
 use crate::gateway;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
+use solos_agent_core::ids::key;
 use solos_agent_core::model::{
-    AssignmentId, Candidate, Effect, InputBody, Ms, OutboundMessage, Stage, TicketId, Trigger,
+    Actor, Approval, AssignmentId, Candidate, Effect, InputBody, MessageId, MessageKind, Ms,
+    OutboundMessage, Stage, TicketId, Trigger,
 };
 use solos_agent_core::{AllowlistPolicy, Engine, Error, Intake, Policy, Repositories};
 use solos_agent_store::{EffectId, QueuedEffect, SqliteStore};
@@ -94,6 +96,13 @@ pub struct Runtime {
     /// The Policy's own `paused`, which the directory's gate adds to.
     configured_pause: bool,
     gate_checked: Option<Instant>,
+    /// The last Effect committed before this run. A crash may have cut any
+    /// of them short after its adapter acted, so a Send among them is a
+    /// possible repeat.
+    recovered: Option<EffectId>,
+    /// Answers to commands, waiting to go out. They are not Effects: a crash
+    /// loses an unsent one, never the command's own outcome.
+    replies: Vec<OutboundMessage>,
 }
 
 impl Runtime {
@@ -122,6 +131,8 @@ impl Runtime {
             inbound: Some(inbound),
             control_dir: None,
             gate_checked: None,
+            recovered: None,
+            replies: Vec::new(),
         }
     }
 
@@ -141,12 +152,13 @@ impl Runtime {
     /// a crash would; every Effect not marked done runs again on the next
     /// start.
     pub async fn run(mut self, stop: impl Future<Output = ()>) -> Result<Summary> {
+        self.recovered = self.engine.repos().effects()?.last().map(|q| q.id);
         let facts = self.facts.clone();
         let mut inbound = self.inbound.take().context("a runtime runs once")?;
         let (trigger_tx, mut triggers) = mpsc::channel::<Vec<Trigger>>(16);
         let mut sources = JoinSet::new();
         for source in std::mem::take(&mut self.sources) {
-            sources.spawn(source.run(trigger_tx.clone()));
+            sources.spawn(source.run(trigger_tx.clone(), facts.clone()));
         }
         drop(trigger_tx);
         let mut sources_open = true;
@@ -158,7 +170,8 @@ impl Runtime {
             self.gate();
             self.evaluate()?;
             self.dispatch(&mut work, &facts)?;
-            let drained = !sources_open && sources.is_empty() && inbound.is_empty();
+            let drained =
+                !sources_open && sources.is_empty() && inbound.is_empty() && work.is_empty();
             if self.options.until_idle && drained && self.idle()? {
                 break;
             }
@@ -262,6 +275,7 @@ impl Runtime {
                     .report(&ticket, &assignment, report)
                     .map(|()| None),
             ),
+            Fact::Command(command) => return self.command(command).map(|()| Ok(None)),
         };
         match result {
             Ok(decision) => Ok(Ok(decision.and_then(|id| self.engine.repos().decision(&id)))),
@@ -273,9 +287,70 @@ impl Runtime {
         }
     }
 
+    /// Apply a person's command and answer in the thread it came from.
+    fn command(&mut self, command: Command) -> Result<()> {
+        let Command {
+            id,
+            order,
+            ticket,
+            source,
+            by,
+            reply_to,
+        } = command;
+        let who = by.name.clone().unwrap_or_else(|| by.id.clone());
+        let policy = self.engine.policy();
+        let outcome = match order {
+            Order::Approve if !policy.may_approve(&source, &by) => {
+                Err(format!("{who} is not allowed to approve budgets."))
+            }
+            Order::Stop if !may_stop(policy, &source, &by) => {
+                Err(format!("{who} is not allowed to stop this work."))
+            }
+            Order::Approve => told(
+                self.engine.approve(&ticket, &source, by.clone()),
+                format!("Approved by {who}. The work starts now."),
+            )?,
+            Order::Stop => told(
+                self.engine
+                    .stop_ticket(&ticket, &format!("stopped by {who} on {source}")),
+                format!("Stopped by {who}."),
+            )?,
+        };
+        let text = outcome.unwrap_or_else(|refused| {
+            eprintln!(
+                "agent: {order:?} of {ticket} by {source}:{} refused: {refused}",
+                by.id
+            );
+            refused
+        });
+        self.replies.push(OutboundMessage {
+            id: MessageId(key("rp", &[&id])),
+            channel: reply_to,
+            kind: MessageKind::Acknowledgement,
+            text,
+            ticket: Some(ticket),
+        });
+        Ok(())
+    }
+
     /// Hand due Effects to their adapters. A pause holds every Effect, per
     /// the core's rule; `evaluate_due` starts no Evals meanwhile.
     fn dispatch(&mut self, work: &mut JoinSet<()>, facts: &FactSink) -> Result<()> {
+        // A person's command was applied even under a pause, so its answer goes too.
+        for reply in std::mem::take(&mut self.replies) {
+            let Some(channel) = self.shared.channels.get(&reply.channel.source).cloned() else {
+                eprintln!(
+                    "agent: no channel serves {}; a command's answer was dropped",
+                    reply.channel.source
+                );
+                continue;
+            };
+            work.spawn(async move {
+                if let Err(err) = channel.send(reply, SendOptions::default()).await {
+                    eprintln!("agent: a command's answer was not sent: {err:#}");
+                }
+            });
+        }
         let room = MAX_IN_FLIGHT.saturating_sub(self.in_flight.len());
         if self.engine.policy().paused() || room == 0 {
             return Ok(());
@@ -295,10 +370,11 @@ impl Runtime {
             if self.in_flight.contains(&id) {
                 continue;
             }
-            let job = match self.job(effect) {
+            let repeat = attempts > 0 || self.recovered.is_some_and(|last| id <= last);
+            let job = match self.job(effect, repeat) {
                 Ok(job) => job,
                 Err(err) => {
-                    self.failed(id, attempts, &format!("{err:#}"))?;
+                    self.failed(id, attempts, &Failure::from(err))?;
                     continue;
                 }
             };
@@ -307,7 +383,7 @@ impl Runtime {
                 let result = job
                     .perform(shared, facts.clone())
                     .await
-                    .map_err(|err| format!("{err:#}"));
+                    .map_err(Failure::from);
                 let outcome = Inbound::Outcome {
                     id,
                     attempts,
@@ -322,7 +398,8 @@ impl Runtime {
     }
 
     /// What the adapter needs beyond the Effect, read from the store now.
-    fn job(&self, effect: Effect) -> Result<Job> {
+    /// `repeat`: an earlier attempt may have performed it.
+    fn job(&self, effect: Effect, repeat: bool) -> Result<Job> {
         let store = self.engine.repos();
         Ok(match effect {
             Effect::Assess(candidate) => Job::Assess(candidate),
@@ -385,7 +462,19 @@ impl Runtime {
                 assignment,
                 reason,
             },
-            Effect::Send(message) => Job::Send(message),
+            Effect::Send(message) => {
+                // The Engine keeps the approval question as the Ticket's attention.
+                let approval = message.kind == MessageKind::Attention
+                    && message
+                        .ticket
+                        .as_ref()
+                        .and_then(|id| store.ticket(id))
+                        .is_some_and(|t| {
+                            t.approval == Approval::Waiting
+                                && t.attention.as_deref() == Some(message.text.as_str())
+                        });
+                Job::Send(message, SendOptions { repeat, approval })
+            }
         })
     }
 
@@ -416,7 +505,7 @@ impl Runtime {
                         self.summary.effects_done += 1;
                         Ok(())
                     }
-                    Err(why) => self.failed(id, attempts, &why),
+                    Err(failure) => self.failed(id, attempts, &failure),
                 }
             }
         }
@@ -438,11 +527,16 @@ impl Runtime {
         if !self.in_flight.remove(&id) {
             return Ok(());
         }
-        self.failed(id, attempts, &format!("the adapter task failed: {err}"))
+        let failure = Failure {
+            why: format!("the adapter task failed: {err}"),
+            retry_after: None,
+        };
+        self.failed(id, attempts, &failure)
     }
 
-    fn failed(&mut self, id: EffectId, attempts: u32, why: &str) -> Result<()> {
-        let wait = backoff(&self.options, attempts);
+    fn failed(&mut self, id: EffectId, attempts: u32, failure: &Failure) -> Result<()> {
+        let wait = backoff(&self.options, attempts).max(failure.retry_after.unwrap_or_default());
+        let why = &failure.why;
         eprintln!(
             "agent: effect {id} failed (attempt {}): {why}; retry in {wait:?}",
             attempts + 1
@@ -494,6 +588,27 @@ fn settle(what: &str, result: Result<(), Error>) -> Result<()> {
     }
 }
 
+/// What a person is told about their command: `done`, or why nothing
+/// changed. A Store error stops the runtime.
+fn told(result: Result<(), Error>, done: String) -> Result<Result<String, String>> {
+    match result {
+        Ok(()) => Ok(Ok(done)),
+        Err(Error::Store(why)) => bail!("a command: {why}"),
+        Err(Error::Refused(why) | Error::Invalid(why)) => {
+            Ok(Err(format!("Nothing changed: {why}.")))
+        }
+        Err(other) => Ok(Err(format!("Nothing changed: {other}."))),
+    }
+}
+
+/// The core lets any command stop a Ticket, so the shell decides who may:
+/// an approver, or a person allowed to ask for work.
+fn may_stop(policy: &AllowlistPolicy, source: &str, by: &Actor) -> bool {
+    by.is_person()
+        && (policy.may_approve(source, by)
+            || policy.people.contains(&format!("{source}:{}", by.id)))
+}
+
 fn backoff(options: &RunOptions, attempts: u32) -> Duration {
     options
         .retry_base
@@ -510,7 +625,7 @@ enum Job {
         assignment: AssignmentId,
         reason: String,
     },
-    Send(OutboundMessage),
+    Send(OutboundMessage, SendOptions),
 }
 
 impl Job {
@@ -524,14 +639,14 @@ impl Job {
                 assignment,
                 reason,
             } => shared.executor.stop(ticket, assignment, reason).await,
-            Job::Send(message) => {
+            Job::Send(message, options) => {
                 let source = message.channel.source.clone();
                 // No channel will ever serve this source, so retrying cannot help.
                 let Some(channel) = shared.channels.get(&source) else {
                     eprintln!("agent: no channel serves {source}; its message was dropped");
                     return Ok(());
                 };
-                if channel.send(message).await? == SendOutcome::Gone {
+                if channel.send(message, options).await? == SendOutcome::Gone {
                     eprintln!("agent: a {source} conversation is gone; its message was dropped");
                 }
                 Ok(())

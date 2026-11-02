@@ -1,7 +1,7 @@
 //! File adapters for tests and dry runs: Triggers in, messages out, one JSON
 //! value per line.
 
-use super::ports::{BoxFuture, Channel, SendOutcome, Source, TriggerSink};
+use super::ports::{BoxFuture, Channel, FactSink, SendOptions, SendOutcome, Source, TriggerSink};
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use solos_agent_core::model::{MessageId, OutboundMessage, Trigger};
@@ -33,7 +33,7 @@ impl JsonlSource {
 }
 
 impl Source for JsonlSource {
-    fn run(self: Box<Self>, sink: TriggerSink) -> BoxFuture<'static, Result<()>> {
+    fn run(self: Box<Self>, sink: TriggerSink, _: FactSink) -> BoxFuture<'static, Result<()>> {
         Box::pin(async move {
             let mut cursor = Cursor::default();
             loop {
@@ -176,8 +176,9 @@ impl Outbox {
     }
 }
 
+/// The outbox already sends each id once, so a repeat needs no check.
 impl Channel for JsonlChannel {
-    fn send(&self, message: OutboundMessage) -> BoxFuture<'_, Result<SendOutcome>> {
+    fn send(&self, message: OutboundMessage, _: SendOptions) -> BoxFuture<'_, Result<SendOutcome>> {
         let outbox = self.outbox.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
@@ -195,7 +196,7 @@ impl Channel for JsonlChannel {
 #[cfg(test)]
 mod tests {
     use super::{JsonlChannel, JsonlSource};
-    use crate::agent::ports::{Channel, Source};
+    use crate::agent::ports::{Channel, FactSink, SendOptions, Source};
     use solos_agent_core::model::{
         Actor, Addressed, ChannelRef, MessageId, MessageKind, OutboundMessage, ThreadKey, Trigger,
         TriggerId,
@@ -244,13 +245,24 @@ mod tests {
         batch.iter().map(|t| t.id.as_str()).collect()
     }
 
+    fn facts() -> FactSink {
+        FactSink(mpsc::channel(1).0)
+    }
+
+    async fn send(channel: &JsonlChannel, id: &str) {
+        channel
+            .send(message(id), SendOptions::default())
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn a_reopened_outbox_sends_each_message_once_and_drops_a_torn_line() {
         let dir = scratch("outbox");
         let path = dir.join("outbox.jsonl");
         let channel = JsonlChannel::open(&path).unwrap();
-        channel.send(message("ms_1")).await.unwrap();
-        channel.send(message("ms_1")).await.unwrap();
+        send(&channel, "ms_1").await;
+        send(&channel, "ms_1").await;
         drop(channel);
         let mut file = std::fs::OpenOptions::new()
             .append(true)
@@ -259,8 +271,8 @@ mod tests {
         file.write_all(br#"{"id":"ms_2","chan"#).unwrap();
 
         let reopened = JsonlChannel::open(&path).unwrap();
-        reopened.send(message("ms_1")).await.unwrap();
-        reopened.send(message("ms_2")).await.unwrap();
+        send(&reopened, "ms_1").await;
+        send(&reopened, "ms_2").await;
 
         let text = std::fs::read_to_string(&path).unwrap();
         let sent: Vec<OutboundMessage> = text
@@ -279,7 +291,7 @@ mod tests {
         std::fs::write(&path, &text).unwrap();
         let (sink, mut batches) = mpsc::channel(4);
         Box::new(JsonlSource::new(&path, false))
-            .run(sink)
+            .run(sink, facts())
             .await
             .unwrap();
         assert_eq!(ids(&batches.recv().await.unwrap()), ["t1", "t2"]);
@@ -289,7 +301,7 @@ mod tests {
         );
 
         let (sink, mut batches) = mpsc::channel(4);
-        let follow = tokio::spawn(Box::new(JsonlSource::new(&path, true)).run(sink));
+        let follow = tokio::spawn(Box::new(JsonlSource::new(&path, true)).run(sink, facts()));
         assert_eq!(
             ids(&batches.recv().await.unwrap()),
             ["t1"],

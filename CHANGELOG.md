@@ -27,6 +27,10 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   `Source`, `Channel`, `Router` and `Executor` ports, a single-writer runtime over the Engine and the SQLite Store
   (Effects retried with exponential backoff, all held while paused), and the jsonl and scripted adapters, so the
   agent runs with no model, Slack or sandbox.
+- Agent mode, P4: Slack (`src/agent/slack/`, `kind: slack` source and channel). A Socket Mode Source (outbound
+  WebSocket, every envelope acknowledged, reconnect with backoff) and a Web API Channel that replies in the thread,
+  never posts a message twice after a crash, and offers Approve and Stop buttons that the runtime applies as
+  `approve` and `stop_ticket`; `tokio-tungstenite` 0.29.0 on the existing rustls.
 - Agent mode, P3c: a Pi Router. `router: {kind: pi, ...}` in `agent.yaml` and `agent serve --pi-root --node
   --credential-file` run the Router as one long-lived, keyless, bwrap-sandboxed Pi session that judges batched
   Candidate cards through `router_decide` and `router_read` on a new agent broker (`src/agent/broker.rs`). The
