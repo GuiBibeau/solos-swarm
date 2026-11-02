@@ -57,6 +57,11 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   `watchdog_alerts` table (agent store schema v3) so a restart repeats none; `retry_stalled` retries a stalled
   Assignment once per Ticket through the runtime. `solos-swarm agent status` reports what is running and why from a
   read-only Store, as text or `--json`.
+- Agent mode, P7a: `solos-swarm mcp`, a hand-written stdio MCP server. `--socket --token-file` offers one principal's
+  broker tools (the broker's new `GET /tools`, from a Rust tool registry the Pi extension's schemas are tested
+  against), with refusals as `isError` results and pauses waited out; `--state-dir --operator` offers `agent_status`,
+  `agent_request` (a Trigger from `mcp:<operator>` through the new `kind: mcp` Source) and `agent_replies` (the
+  `kind: mcp` Channel's outbox).
 - `collect` leaves the per-run `code/` scratch directory on the host and writes `collect-manifest.json`; `--include-code` opts back in.
 - Docs: pause mode, self-update operations, dashboard tunnel, tournament runbook, replay status.
 
