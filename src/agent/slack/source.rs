@@ -2,7 +2,9 @@
 //! agent opened with the app-level token, and the agent acknowledges every
 //! envelope by its id.
 
-use super::{APPROVE_ACTION, Answer, SOURCE, STOP_ACTION, SlackApi, Token, TokenRefused};
+use super::{
+    APPROVE_ACTION, Answer, SOURCE, STOP_ACTION, SlackApi, Token, TokenRefused, reply_to, thread,
+};
 use crate::agent::ports::{
     BoxFuture, Command, Fact, FactSink, Order, RetryAfter, Source, TriggerSink,
 };
@@ -11,10 +13,8 @@ use anyhow::{Context, Result, bail};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use solos_agent_core::model::{
-    Actor, ActorKind, Addressed, ChannelRef, Ms, ThreadKey, TicketId, Trigger, TriggerId,
-};
-use std::collections::{BTreeMap, BTreeSet};
+use solos_agent_core::model::{Actor, ActorKind, Addressed, Ms, TicketId, Trigger, TriggerId};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::MissedTickBehavior;
@@ -336,8 +336,8 @@ impl SlackSource {
             actor,
             addressed,
             text,
-            threads: vec![ThreadKey::new(format!("{SOURCE}:{channel}:{root}"))],
-            reply_to: vec![reply_to(&channel, &root)],
+            threads: vec![thread(&channel, &root)],
+            reply_to: vec![reply_to(&channel, Some(&root))],
             meta: Value::Object(meta),
         })
     }
@@ -394,20 +394,10 @@ impl SlackSource {
                     ticket: TicketId::new(action["value"].as_str()?),
                     source: SOURCE.into(),
                     by: by.clone(),
-                    reply_to: reply_to(&channel, &root),
+                    reply_to: reply_to(&channel, Some(&root)),
                 })
             })
             .collect()
-    }
-}
-
-fn reply_to(channel: &str, thread: &str) -> ChannelRef {
-    ChannelRef {
-        source: SOURCE.into(),
-        address: BTreeMap::from([
-            ("channel".to_owned(), channel.to_owned()),
-            ("thread_ts".to_owned(), thread.to_owned()),
-        ]),
     }
 }
 

@@ -20,7 +20,8 @@ and its MIT-licensed prototype `deepseek-ai/dsh-superagent-prototype` (docs 000-
 | P3b `agent serve` | Done (#22). `src/agent/`: the async shell ports `Source`, `Channel`, `Router` and `Executor`, a runtime with one task that owns the Engine on the SQLite Store, and `solos-swarm agent serve --config agent.yaml --state-dir DIR [--until-idle]`. The runtime stores Source Triggers, starts due Evals, hands each due Effect to its adapter, and marks it done or failed with exponential backoff. It applies adapter facts as `decide`, `assignment_started` and `report`, and holds every Effect while the Policy is paused. First adapters: `JsonlSource`, `JsonlChannel` (once per `MessageId`, safe after a crash), `ScriptedRouter` and `ScriptedExecutor`, so it runs with no model, Slack or sandbox. Tests cover a full run, a crash between a Launch and its done mark, a restart, retries, a pause and Thread context reaching the worker. |
 | P3c Pi Router | **Done.** The Router is a long-lived Pi session behind the same `Router` port (`src/agent/pi_router.rs`): each Candidate becomes a compact card, the cards queued between turns go into one prompt, and a session that dies restarts while the core's Eval expiry brings back what it left undecided. It runs keyless in bwrap and calls the agent broker (`src/agent/broker.rs`), which speaks the swarm broker's wire on a socket in the state dir, holds and settles each model call against the Router's daily cap in the store's new spend ledger (schema v2), refuses calls while the state dir is paused, and serves the Router's two tools, `router_decide` (the Engine's answer, or its refusal, goes back to the model) and `router_read`. The pricing, request contract, providers and pause gate both brokers use moved to `src/gateway/`, with swarm mode unchanged. |
 | P4 Slack | Done (#23). `src/agent/slack/`: `SlackSource` (Socket Mode: an outbound WebSocket, nothing exposed) and `SlackChannel` (Web API), configured as `kind: slack` and read from token files that are deleted once read. Events from the listed channels become Triggers (`slack:<channel>:<ts>`, Thread `slack:<channel>:<thread_ts>`); the bot's own messages, other channels, edits and other events are dropped, and every envelope is acknowledged. The Source reconnects with backoff after a `disconnect` or an error. Replies go in the Trigger's thread, escaped, with acknowledgements and questions cut to 500 characters and results to 3,000 with a marker. Each post carries its `MessageId` as metadata; a repeated Send looks for it in the thread first, so a crash between a post and its done mark does not post twice. A deleted or archived conversation is `Gone`; rate limits and 5xx retry, after `Retry-After`. An approval request carries Approve and Stop buttons; a click is a `Fact::Command` the runtime applies as `approve` or `stop_ticket` and answers in the thread. A budget above `auto_approve_microusd` is now accepted when a Slack channel and a `slack:` approver are configured. New dependency: `tokio-tungstenite` 0.29.0 on the existing rustls. Tests run against a fake Slack, including one `agent serve` end to end. |
-| P2 (rest), P3d, P5-P10 | Planned, below. |
+| P8 GitHub and schedules | **Done.** `src/agent/github/`: `GithubSource` polls each listed repository's issues and pull requests, issue and review comments `since` a cursor, and its latest workflow runs, over REST (nothing exposed); `GithubChannel` comments on the issue or pull request. Configured as `kind: github` with a personal access token file that is deleted once read. An issue or pull request is the Thread `github:<owner>/<repo>#<number>`; its opening, each comment (`github:<owner>/<repo>:comment:<id>`) and each failed workflow run on a pull request (a bot Trigger on that pull request's Thread) are Triggers. A mention of the agent's login addresses it, `[bot]` accounts are bots, and the agent's own comments are dropped. Listings are conditional (`ETag`), rate limits are waited out, and the read position is an atomic file in the state directory that a restart resumes from without sending a Trigger twice. Each comment ends with a hidden marker naming its `MessageId`, so a crash between a post and its done mark does not post twice. `src/agent/schedule.rs`: `ScheduleSource` (`kind: schedule`) fires named slots, `every` an interval or `daily_at` a UTC time, as System Triggers `schedule:<name>:<slot start>`: a restart cannot fire a slot twice, and missed slots fire once. A schedule may name a `reply_to`. No new dependencies. Tests run against a fake GitHub and a clock the test moves, including one `agent serve` end to end. |
+| P2 (rest), P3d, P5-P7, P9, P10 | Planned, below. |
 
 ## What "super-agent" means here
 
@@ -138,8 +139,8 @@ and external work leaves as `Effect`s. The shell ports are async and live in the
 | `ModelUpstream` | `dispatch(body) -> receipt` | `OpenAiCompatible` | `broker::Provider` (1012); merged with `provider::Provider` (mvp) for llama.cpp |
 | `ExecutionEnvironment` | `run(code) -> receipt`; `start(code) -> job`, `wait(job)`, `stop(job)` | local `bwrap` | `code.rs` `CodeExecutor`, plus the five hand-built `bwrap` command lines (`harness.rs:106` in `PiHarness::command`, `main.rs:280` in `doctor`, `code.rs:313`, `sandbox.rs:315` in `prepare_process`, `wasi_worker.rs:316`) |
 | `EventLog` | `append(kind, data) -> seq`; `verify()` | `events.jsonl` hash chain | `Store::record` (452), `broker_control::read_chain`/`load_image` |
-| `Source` | `run(sink, facts)`, with people's commands (Slack buttons) as `Fact::Command`; later `context(trigger, part)` for bounded recall | `JsonlSource` (P3b), `SlackSource` (P4) | new |
-| `Channel` | `send(OutboundMessage, SendOptions { repeat, approval }) -> Sent \| Gone`; shapes text per medium (short chat, PRs structured) | `JsonlChannel` (P3b), `SlackChannel` (P4) | `src/agent/jsonl.rs`, `src/agent/slack/` |
+| `Source` | `run(sink, facts)`, with people's commands (Slack buttons) as `Fact::Command`; later `context(trigger, part)` for bounded recall | `JsonlSource` (P3b), `SlackSource` (P4), `GithubSource` and `ScheduleSource` (P8) | new |
+| `Channel` | `send(OutboundMessage, SendOptions { repeat, approval }) -> Sent \| Gone`; shapes text per medium (short chat, PRs structured) | `JsonlChannel` (P3b), `SlackChannel` (P4), `GithubChannel` (P8) | `src/agent/jsonl.rs`, `src/agent/slack/`, `src/agent/github/` |
 | `Store` | agent-core `Repositories` plus the effect queue | in-memory (P0), SQLite `crates/agent-store` (P3a) | new |
 | `ToolSurface` | How a session calls tools: `/model` and `/tool/{name}` on the broker | Pi extension (`extensions/broker.ts`) | add an MCP facade, so any MCP harness gets the same tools |
 
@@ -177,7 +178,8 @@ A handed-back Trigger is judged once, on its primary Thread, however many Ticket
 Evals; the effect runner holds Effects. Swarm code is unchanged.
 
 Open in P0: a Ticket whose Trigger names no reply channel (a schedule, for example) asks nobody when it needs a
-person. P4 gives every Source an operator channel, and P6's Watchdog reports Tickets that wait for a person.
+person. P8 lets a schedule name its `reply_to`, a Slack channel or a GitHub issue. A schedule without one still asks
+nobody, until P6's Watchdog reports Tickets that wait for a person.
 
 **P1: the harness seam.** Add the `AgentHarness` port and move the Pi launch out of `main.rs` into `PiHarness`
 without changing behaviour. Add `ScriptedHarness`, which needs no Pi, node or bwrap and calls the real broker the way
@@ -253,8 +255,41 @@ research or tournaments, not a bug fix. Swarms above the threshold wait for appr
 - *They host solos-swarm.* An MCP server (`solos-swarm mcp`) exposes `swarm_run`, `ticket_*` and the ledger as tools,
   so another harness's session can be the Router or call a governed swarm.
 
-**P8: GitHub and schedules.** Poll notifications; Issue and pull-request Threads; CI results as bot Triggers; a
-pull request bound to its Ticket. Structured PR comments. A cron Source for proactive sweeps.
+**P8: GitHub and schedules.** Done; setup in [GitHub token](#github-token).
+- Done: a polling Source (`kind: github`) for the listed repositories, not the notifications API, which only works
+  with classic tokens and folds a conversation's comments into one notification. Each poll reads issues and pull
+  requests, issue comments and review comments oldest first `since` a cursor, and the latest completed workflow runs.
+  An issue or pull request is the Thread `github:<owner>/<repo>#<number>`. Triggers: its opening
+  (`github:<owner>/<repo>#<number>`), each comment (`github:<owner>/<repo>:comment:<id>`; a review comment is
+  `...:review_comment:<id>`, since GitHub numbers the two apart), and CI below. A mention of the agent's login
+  (`@login`, any case, not inside a word or an email address) is `Addressed::Mention`; an account of type Bot or one
+  ending in `[bot]` is a bot. The agent's own comments are dropped; it learns its login from `GET /user`.
+- Done: CI results as bot Triggers. A failed, timed-out or never-started workflow run on a pull request
+  (`github:<owner>/<repo>:run:<id>:<attempt>`, actor `github-actions[bot]`) joins that pull request's Thread. A run
+  from a fork names no pull request, so its head commit is matched against the open ones. A token without Actions
+  access turns CI Triggers off for that repository and says so once.
+- Done: the read position is `github-cursor.json` in the state directory, replaced atomically. For each repository
+  and listing it holds the latest `updated_at` read and the Trigger ids sent that a listing can still return. Each read
+  goes back 10 minutes behind it, for items GitHub lists late and for clock skew, and skips what it sent. It is saved a
+  poll after its batch went out, once the runtime has taken every batch, so a crash cannot move it past Triggers that
+  were not stored. A first start reads the last 10 minutes.
+- Done: rate limits and conditional requests. A 403 or 429 waits `Retry-After`, or until `X-RateLimit-Reset` when
+  nothing remains, or a minute; a response that spent the last request holds the next one back. The Source and the
+  Channel share that hold. A listing read whole carries its `ETag`, so a quiet repository costs 304s, which GitHub does
+  not count; a listing longer than a page is read whole each time, since new items land on its last page.
+- Done: a Channel (`kind: github`) that comments on the issue or pull request. Acknowledgements and questions are cut to
+  2,000 characters, results to 16,000 (GitHub allows 65,536), with a note; a code block left open is closed, and
+  `@mentions` outside code go in backticks, so a worker cannot notify anyone. Each comment ends with a hidden
+  `<!-- solos-swarm message <id> -->` marker; a repeated Send looks for it among the agent's comments, newest pages
+  first, before posting. A missing issue or repository (404, 410) or a locked issue is `Gone`; 5xx, a refused
+  permission and rate limits are retried.
+- Done: a schedule Source (`kind: schedule`): named slots `every` an interval (slots start at whole multiples of it
+  since the Unix epoch) or `daily_at` a UTC time. Each firing is a System Trigger `schedule:<name>:<slot start>` on the
+  Thread `schedule:<name>`, so a restart in the same slot repeats an id the Engine holds, and a start after a gap fires
+  the latest slot once, the first start included. A schedule may name its `reply_to`: a Slack channel or thread, or a
+  GitHub issue, whose Thread joins the Trigger's so an answer there reaches the Ticket.
+- Later: a pull request bound to its Ticket (with P3d's workers), pull request reviews themselves, check runs of other
+  CI apps and commit statuses, and webhooks for lower latency.
 
 **P9: separate execution.** `solos-swarm node` is a daemon on a user's machine (BYOM) or a cloud box. It runs
 commands and holds no session state, and connects over the `mvp` QUIC mTLS transport (`cluster.rs`) with SPIFFE
@@ -312,6 +347,58 @@ budgets: {session_microusd: 500000}
 
 Message metadata (`solos_swarm_message`, holding the agent's message id) is visible to members of the workspace;
 it carries nothing else.
+
+## GitHub token
+
+The agent polls GitHub with a token of its own account, so it can tell its comments from everyone else's
+(`GET /user`). Use a dedicated machine account, not a person's.
+
+1. Give the account access to each repository it should read. On a private repository the Read role is enough: it can
+   open and comment on issues and pull requests.
+2. Create a fine-grained personal access token (Settings, Developer settings, Personal access tokens, Fine-grained
+   tokens). Resource owner: the organization, whose owners may have to approve it. Repository access: only the
+   listed repositories. Repository permissions:
+   - Metadata: Read (every token has it);
+   - Issues: Read and write, to list issues and their comments and to post replies;
+   - Pull requests: Read and write, to list pull requests and review comments and to reply on pull requests;
+   - Actions: Read, for the workflow runs behind CI Triggers. Without it CI Triggers are off.
+
+   Set an expiry and replace the token file before it.
+3. A classic token works too, with the `repo` scope (or `public_repo` for public repositories only). GitHub App
+   installation tokens (`ghs_`) are refused: they expire within the hour and `GET /user` cannot name their account.
+4. Write the token to a file readable only by the agent's user. Each start reads it and deletes it, so provide a fresh
+   file for every start.
+
+```yaml
+policy:
+  people: [github:alice]                # GitHub logins who may ask for work
+  bots: ["github:github-actions[bot]"]  # CI failures become inferred candidates
+sources:
+  - kind: github
+    repos: [acme/widgets]
+    token_file: secrets/github-token    # ghp_... or github_pat_..., relative to this file
+    # poll_secs: 60                     # each poll costs at most four requests per repository
+    # api_base: https://api.github.com/ # the default; GitHub Enterprise Server is https://HOST/api/v3/
+  - kind: schedule
+    schedules:
+      - name: triage
+        every: 6h                       # 00:00, 06:00, 12:00 and 18:00 UTC
+        text: Triage the issues opened since the last sweep.
+        reply_to: {kind: github, repo: acme/widgets, number: 1}
+      - name: standup
+        daily_at: "09:00"               # UTC
+        text: Summarise yesterday's merged pull requests.
+        reply_to: {kind: github, repo: acme/widgets, number: 2}
+channels:
+  - kind: github                        # comments with the github source's token
+router: {kind: scripted}
+executor: {kind: scripted}
+budgets: {session_microusd: 500000}
+```
+
+A schedule's `reply_to` can also be `{kind: slack, channel: C0123OPS}`, or a thread with `thread_ts`, when a channel
+serves slack. Anyone who can comment on a listed repository reaches the Policy gate, which admits requests only from
+`policy.people`. The hidden marker in each comment holds the agent's message id and nothing else.
 
 ## Security model
 

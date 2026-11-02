@@ -5,13 +5,16 @@
 
 pub mod broker;
 pub mod config;
+pub mod github;
 pub mod jsonl;
 pub mod pi_executor;
 pub mod pi_router;
 pub mod ports;
 pub mod runtime;
+pub mod schedule;
 pub mod scripted;
 pub mod slack;
+pub mod utc;
 
 pub use config::AgentConfig;
 pub use runtime::{Adapters, RunOptions, Runtime, Summary};
@@ -22,9 +25,11 @@ use crate::harness::{AgentHarness, PiHarness, Role, SessionSpec};
 use anyhow::{Context, Result, bail, ensure};
 use broker::{AgentBroker, BrokerParts, DecideTerms, Grant, ModelTerms, Principal, ROUTER_TOOLS};
 use config::{ChannelConfig, ExecutorConfig, RouterConfig, SourceConfig};
+use github::{GithubApi, GithubChannel, GithubSource};
 use jsonl::{JsonlChannel, JsonlSource};
 use pi_router::PiRouter;
 use ports::{Channel, Executor, Router, Source};
+use schedule::ScheduleSource;
 use scripted::{ScriptedExecutor, ScriptedRouter};
 use serde_json::json;
 use slack::{SlackApi, SlackChannel, SlackSource, Token};
@@ -33,6 +38,7 @@ use std::collections::BTreeMap;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use zeroize::Zeroizing;
 
 /// The Store's file in the state directory.
@@ -74,7 +80,7 @@ pub async fn serve(config: &Path, state_dir: &Path, options: ServeOptions) -> Re
         credential,
     } = options;
     // First, so the token files are consumed before anything else can fail.
-    let io = Io::open(&config, !until_idle)?;
+    let io = Io::open(&config, state_dir, !until_idle)?;
     let host = match &config.router {
         RouterConfig::Scripted {} => None,
         RouterConfig::Pi {
@@ -112,7 +118,7 @@ where
     H: AgentHarness + Send + Sync + 'static,
     H::Session: Send + 'static,
 {
-    let io = Io::open(&config, !until_idle)?;
+    let io = Io::open(&config, state_dir, !until_idle)?;
     serve_io(config, state_dir, until_idle, io, host).await
 }
 
@@ -297,17 +303,20 @@ impl Served {
 }
 
 /// The Sources and Channels the config names, opened before anything else
-/// can fail, since opening them reads and deletes the Slack token files.
+/// can fail, since opening them reads and deletes the Slack and GitHub token
+/// files.
 struct Io {
     sources: Vec<Box<dyn Source>>,
     channels: BTreeMap<String, Arc<dyn Channel>>,
 }
 
 impl Io {
-    /// `follow`: Sources keep reading what arrives later.
-    fn open(config: &AgentConfig, follow: bool) -> Result<Self> {
+    /// `follow`: Sources keep reading what arrives later. Sources keep their
+    /// read positions in `state_dir`.
+    fn open(config: &AgentConfig, state_dir: &Path, follow: bool) -> Result<Self> {
         let mut sources: Vec<Box<dyn Source>> = Vec::new();
         let mut slack_api = None;
+        let mut github_api = None;
         for source in &config.sources {
             match source {
                 SourceConfig::Jsonl { path } => {
@@ -326,6 +335,27 @@ impl Io {
                     sources.push(Box::new(slack));
                     slack_api = Some(api);
                 }
+                SourceConfig::Github {
+                    repos,
+                    token_file,
+                    api_base,
+                    poll_secs,
+                } => {
+                    let token = github::Token::take(token_file)?;
+                    let api = Arc::new(GithubApi::new(api_base, token)?);
+                    let cursor = state_dir.join(github::CURSOR_FILE);
+                    let source = GithubSource::new(api.clone(), repos.clone(), cursor, follow)
+                        .with_poll(Duration::from_secs(*poll_secs));
+                    sources.push(Box::new(source));
+                    github_api = Some(api);
+                }
+                SourceConfig::Schedule { schedules } => {
+                    let schedules = schedules
+                        .iter()
+                        .map(config::ScheduleConfig::schedule)
+                        .collect::<Result<_>>()?;
+                    sources.push(Box::new(ScheduleSource::new(schedules, follow)));
+                }
             }
         }
         let mut channels: BTreeMap<String, Arc<dyn Channel>> = BTreeMap::new();
@@ -336,6 +366,11 @@ impl Io {
                     slack_api
                         .clone()
                         .context("the slack channel needs a slack source")?,
+                )),
+                ChannelConfig::Github {} => Arc::new(GithubChannel::new(
+                    github_api
+                        .clone()
+                        .context("the github channel needs a github source")?,
                 )),
             };
             channels.insert(channel.source().to_owned(), adapter);
