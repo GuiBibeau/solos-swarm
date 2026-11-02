@@ -2,8 +2,8 @@
 //! Adapters run concurrently and send facts and Effect outcomes back to it.
 
 use super::ports::{
-    Answer, Channel, Command, Delivered, Delivery, Executor, Fact, FactSink, Failure, Inbound,
-    Launch, Order, Router, SendOptions, SendOutcome, Source,
+    Answer, Applied, Channel, Command, Delivered, Delivery, Executor, Fact, FactSink, Failure,
+    Inbound, Launch, Order, Router, SendOptions, SendOutcome, Source,
 };
 use crate::broker::now_ms;
 use crate::gateway;
@@ -254,16 +254,22 @@ impl Runtime {
     /// Apply a fact as its Engine command. The outer error is a Store
     /// failure, which stops the runtime; the answer says what the Engine did.
     fn apply(&mut self, fact: Fact) -> Result<Answer> {
+        let done = |()| Applied::Done;
         let (what, result) = match fact {
-            Fact::Verdict { eval, verdict } => (
-                format!("verdict on {eval}"),
-                self.engine.decide(&eval, verdict).map(Some),
-            ),
+            Fact::Verdict { eval, verdict } => {
+                let decided = self.engine.decide(&eval, verdict).map(|id| {
+                    self.engine
+                        .repos()
+                        .decision(&id)
+                        .map_or(Applied::Done, Applied::Decision)
+                });
+                (format!("verdict on {eval}"), decided)
+            }
             Fact::Started { ticket, assignment } => (
                 format!("start of {assignment} on {ticket}"),
                 self.engine
                     .assignment_started(&ticket, &assignment)
-                    .map(|()| None),
+                    .map(done),
             ),
             Fact::Report {
                 ticket,
@@ -271,14 +277,32 @@ impl Runtime {
                 report,
             } => (
                 format!("report on {assignment} of {ticket}"),
-                self.engine
-                    .report(&ticket, &assignment, report)
-                    .map(|()| None),
+                self.engine.report(&ticket, &assignment, report).map(done),
             ),
-            Fact::Command(command) => return self.command(command).map(|()| Ok(None)),
+            Fact::Ended {
+                ticket,
+                assignment,
+                reason,
+            } => (
+                format!("end of {assignment} on {ticket}"),
+                self.engine
+                    .assignment_ended(&ticket, &assignment, &reason)
+                    .map(done),
+            ),
+            Fact::Handback {
+                ticket,
+                trigger,
+                reason,
+            } => (
+                format!("handback of {trigger} by {ticket}"),
+                self.engine
+                    .handback(&ticket, &trigger, &reason)
+                    .map(|queued| Applied::HandedBack { queued }),
+            ),
+            Fact::Command(command) => return self.command(command).map(|()| Ok(Applied::Done)),
         };
         match result {
-            Ok(decision) => Ok(Ok(decision.and_then(|id| self.engine.repos().decision(&id)))),
+            Ok(applied) => Ok(Ok(applied)),
             Err(Error::Store(why)) => bail!("{what}: {why}"),
             Err(err) => {
                 eprintln!("agent: {what}: {err}");

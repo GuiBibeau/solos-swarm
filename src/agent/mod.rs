@@ -261,6 +261,7 @@ impl PiParts {
             provider: self.provider,
             facts,
             decide: self.decide,
+            workers: None,
         })?;
         broker.admit(self.token, self.grant)?;
         let (listener, socket) = broker::bind(state_dir)?;

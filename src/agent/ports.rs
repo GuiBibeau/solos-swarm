@@ -6,7 +6,7 @@
 use anyhow::{Result, anyhow};
 use solos_agent_core::model::{
     Actor, AssignmentId, Candidate, ChannelRef, Decision, EvalId, Input, MicroUsd, OutboundMessage,
-    Plan, ReportIn, TicketId, Trigger, Verdict,
+    Plan, ReportIn, TicketId, Trigger, TriggerId, Verdict,
 };
 use solos_agent_store::EffectId;
 use std::time::Duration;
@@ -136,6 +136,19 @@ pub enum Fact {
         assignment: AssignmentId,
         report: ReportIn,
     },
+    /// The worker is gone without a final Report; the Ticket stays open.
+    Ended {
+        ticket: TicketId,
+        assignment: AssignmentId,
+        reason: String,
+    },
+    /// A worker gives back a Trigger that reached its Ticket but is not its
+    /// to handle, so the Router judges it.
+    Handback {
+        ticket: TicketId,
+        trigger: TriggerId,
+        reason: String,
+    },
     Command(Command),
 }
 
@@ -163,9 +176,21 @@ pub enum Order {
     Stop,
 }
 
-/// The Engine's answer to an asked fact: the Decision a Verdict recorded,
-/// or why the Engine refused the fact.
-pub type Answer = std::result::Result<Option<Decision>, String>;
+/// What the Engine did with an asked fact.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Applied {
+    /// The Decision a Verdict recorded.
+    Decision(Decision),
+    /// A handback: whether its Trigger now waits for an Eval. It does not
+    /// when it was handed back before or already went to its own Eval.
+    HandedBack {
+        queued: bool,
+    },
+    Done,
+}
+
+/// The Engine's answer to an asked fact, or why it refused the fact.
+pub type Answer = std::result::Result<Applied, String>;
 
 /// Facts and Effect outcomes share one queue, so the facts an adapter sends
 /// before its call returns are applied before the Effect is marked done.

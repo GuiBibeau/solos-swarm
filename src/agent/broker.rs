@@ -6,8 +6,9 @@
 //! settled against the principal's account in the agent Store.
 
 use super::AgentConfig;
-use super::ports::{Fact, FactSink};
-use crate::broker::now_ms;
+use super::ports::{Applied, Fact, FactSink};
+use crate::broker::{FETCH_TOTAL_BYTES, fetch, now_ms};
+use crate::code::CodeExecutor;
 use crate::gateway::{self, PriceTable, Provider, Receipt, Upstream};
 use anyhow::{Context, Result, anyhow, ensure};
 use axum::{
@@ -19,13 +20,13 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use solos_agent_core::model::{
-    Accept, Acknowledge, EvalId, MicroUsd, Ms, Plan, ThreadKey, Ticket, TicketId, Trigger,
-    TriggerId, Verdict,
+    Accept, Acknowledge, AssignmentId, EvalId, MicroUsd, Ms, Plan, ReportIn, ReportStatus,
+    ThreadKey, Ticket, TicketId, Trigger, TriggerId, Verdict,
 };
 use solos_agent_store::{HoldId, HoldRequest, Reservation, SqliteStore, StoreError, Tokens};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::net::UnixListener;
 
@@ -33,6 +34,8 @@ use tokio::net::UnixListener;
 pub const SOCKET_FILE: &str = "broker.sock";
 /// What the Router's sessions may call. No `run_code`, no `fetch_url`.
 pub const ROUTER_TOOLS: [&str; 2] = ["router_decide", "router_read"];
+/// What a worker's sessions may call. `run_code` needs the host to offer it.
+pub const WORKER_TOOLS: [&str; 4] = ["worker_report", "worker_handback", "run_code", "fetch_url"];
 const DAY_MS: Ms = 86_400_000;
 /// `sockaddr_un.sun_path` is 108 bytes, with a trailing NUL.
 const SUN_PATH_LIMIT: usize = 108;
@@ -40,17 +43,86 @@ const READ_TEXT_CHARS: usize = 2_000;
 const READ_REPORT_CHARS: usize = 1_000;
 const READ_REASON_CHARS: usize = 300;
 const READ_RECENT: usize = 20;
+const REPORT_TEXT_CHARS: usize = 8_000;
+const QUESTION_CHARS: usize = 1_000;
 
 /// Who a session is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum Principal {
     Router,
+    /// The worker of one Assignment.
+    Worker(Arc<WorkerSeat>),
 }
 
 impl Principal {
-    pub fn tools(self) -> &'static [&'static str] {
+    pub fn tools(&self) -> &'static [&'static str] {
         match self {
             Self::Router => &ROUTER_TOOLS,
+            Self::Worker(_) => &WORKER_TOOLS,
+        }
+    }
+}
+
+/// One Assignment's worker as the broker knows it. The executor that
+/// started the worker holds it too, to tell whether a turn reported.
+#[derive(Debug)]
+pub struct WorkerSeat {
+    pub ticket: TicketId,
+    pub assignment: AssignmentId,
+    /// `run_code`'s `/work`.
+    pub work_dir: PathBuf,
+    /// The Ticket's whole budget, which every Assignment of it shares.
+    pub budget_microusd: MicroUsd,
+    /// The Ticket account's spend from this time on is this Assignment's.
+    pub since_ms: Ms,
+    /// The latest status the Engine took in the current turn.
+    turn: Mutex<Option<ReportStatus>>,
+    fetched_bytes: AtomicU64,
+}
+
+impl WorkerSeat {
+    pub fn new(
+        ticket: TicketId,
+        assignment: AssignmentId,
+        work_dir: PathBuf,
+        budget_microusd: MicroUsd,
+    ) -> Self {
+        Self {
+            ticket,
+            assignment,
+            work_dir,
+            budget_microusd,
+            since_ms: now_ms(),
+            turn: Mutex::new(None),
+            fetched_bytes: AtomicU64::new(0),
+        }
+    }
+
+    pub fn account(&self) -> Account {
+        Account::Ticket {
+            id: self.ticket.clone(),
+            budget_microusd: self.budget_microusd,
+        }
+    }
+
+    /// A prompt went out: what the worker reports from now on is this turn's.
+    pub fn begin_turn(&self) {
+        if let Ok(mut turn) = self.turn.lock() {
+            *turn = None;
+        }
+    }
+
+    /// The turn left the Ticket as if still working: it reported nothing,
+    /// or only progress.
+    pub fn quiet_turn(&self) -> bool {
+        self.turn.lock().map_or(true, |turn| {
+            matches!(*turn, None | Some(ReportStatus::Progress))
+        })
+    }
+
+    fn reported(&self, status: ReportStatus) {
+        if let Ok(mut turn) = self.turn.lock() {
+            *turn = Some(status);
         }
     }
 }
@@ -150,9 +222,18 @@ pub struct BrokerParts {
     /// for reads. The runtime keeps the Engine's.
     pub store: SqliteStore,
     pub provider: Arc<dyn Provider>,
-    /// Where `router_decide` sends its Verdicts.
+    /// Where the Router's Verdicts and the workers' Reports and handbacks go.
     pub facts: FactSink,
     pub decide: DecideTerms,
+    /// What workers are admitted on; `None` admits none.
+    pub workers: Option<WorkerParts>,
+}
+
+/// Every worker's model and its `run_code`.
+pub struct WorkerParts {
+    pub terms: ModelTerms,
+    /// `None`: this host offers workers no `run_code`.
+    pub code: Option<Arc<CodeExecutor>>,
 }
 
 #[derive(Clone)]
@@ -166,6 +247,9 @@ struct Inner {
     provider: Arc<dyn Provider>,
     facts: FactSink,
     decide: DecideTerms,
+    workers: Option<WorkerParts>,
+    /// `fetch_url`'s egress, apart from the provider's transport.
+    client: reqwest::Client,
     grants: RwLock<BTreeMap<String, Arc<Grant>>>,
     /// A settlement above its hold means the ledger no longer bounds spend,
     /// so every later model call is refused.
@@ -223,6 +307,7 @@ impl AgentBroker {
             provider,
             facts,
             decide,
+            workers,
         } = parts;
         let orphans = store.close_open_holds(now_ms())?;
         if orphans > 0 {
@@ -237,6 +322,8 @@ impl AgentBroker {
                 provider,
                 facts,
                 decide,
+                workers,
+                client: crate::swarm::http_client()?,
                 grants: RwLock::new(BTreeMap::new()),
                 overrun: AtomicBool::new(false),
             }),
@@ -252,8 +339,64 @@ impl AgentBroker {
         Ok(())
     }
 
-    /// The routes, for the grants admitted so far.
+    /// Admit one Assignment's worker on its Ticket's account, with the
+    /// workers' model terms and `system_prompt` at `/session`.
+    pub fn admit_worker(
+        &self,
+        token: String,
+        seat: WorkerSeat,
+        system_prompt: String,
+    ) -> Result<Arc<WorkerSeat>> {
+        let parts = self
+            .inner
+            .workers
+            .as_ref()
+            .context("this broker admits no workers")?;
+        let seat = Arc::new(seat);
+        let grant = Grant {
+            principal: Principal::Worker(seat.clone()),
+            account: seat.account(),
+            terms: parts.terms.clone(),
+            system_prompt: Some(system_prompt),
+        };
+        self.admit(token, grant)?;
+        Ok(seat)
+    }
+
+    /// Whether this broker offers workers `run_code`.
+    pub fn offers_run_code(&self) -> bool {
+        self.inner
+            .workers
+            .as_ref()
+            .is_some_and(|parts| parts.code.is_some())
+    }
+
+    /// Refuse `token` from now on. A call already admitted finishes.
+    pub fn revoke(&self, token: &str) {
+        match self.inner.grants.write() {
+            Ok(mut grants) => {
+                grants.remove(token);
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().remove(token);
+            }
+        }
+    }
+
+    /// What `seat`'s Assignment has committed so far on its Ticket's account.
+    pub async fn spent(&self, seat: &WorkerSeat) -> Result<MicroUsd> {
+        let (account, since) = (seat.account().key(), seat.since_ms);
+        self.store(move |store| store.committed(&account, since))
+            .await
+    }
+
+    /// The routes, for the grants admitted so far and any worker.
     pub fn router(&self) -> Result<axum::Router> {
+        let workers = self
+            .inner
+            .workers
+            .as_ref()
+            .map(|parts| parts.terms.max_input_bytes);
         let largest = self
             .inner
             .grants
@@ -261,6 +404,7 @@ impl AgentBroker {
             .map_err(|_| anyhow!("the grant table lock is poisoned"))?
             .values()
             .map(|grant| grant.terms.max_input_bytes)
+            .chain(workers)
             .max()
             .unwrap_or(0);
         Ok(axum::Router::new()
@@ -433,9 +577,13 @@ async fn tool(
     if !grant.principal.tools().contains(&name.as_str()) {
         return Err(forbidden("tool outside admitted grants"));
     }
-    match name.as_str() {
-        "router_decide" => decide(&broker, args).await,
-        "router_read" => read(&broker, args).await,
+    match (&grant.principal, name.as_str()) {
+        (Principal::Router, "router_decide") => decide(&broker, args).await,
+        (Principal::Router, "router_read") => read(&broker, args).await,
+        (Principal::Worker(seat), "worker_report") => report(&broker, seat, args).await,
+        (Principal::Worker(seat), "worker_handback") => handback(&broker, seat, args).await,
+        (Principal::Worker(seat), "run_code") => run_code(&broker, seat, args).await,
+        (Principal::Worker(seat), "fetch_url") => fetch_url(&broker, seat, args).await,
         _ => Err(forbidden("unknown tool")),
     }
 }
@@ -560,16 +708,165 @@ async fn decide(broker: &AgentBroker, args: Value) -> Reply {
         .await
         .map_err(failed)?;
     match answer {
-        Ok(Some(decision)) => Ok(Json(json!({
+        Ok(Applied::Decision(decision)) => Ok(Json(json!({
             "decision": decision.id,
             "kind": decision.kind,
             "ticket": decision.ticket,
             "would_accept": decision.would_accept,
             "reason": decision.reason,
         }))),
-        Ok(None) => Ok(Json(json!({"applied": true}))),
+        Ok(_) => Ok(Json(json!({"applied": true}))),
         Err(why) => Err(refuse(StatusCode::CONFLICT, why)),
     }
+}
+
+/// `worker_report`'s arguments. The spend comes from the ledger, never
+/// from the model.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReportArgs {
+    status: ReportStatus,
+    text: String,
+    #[serde(default)]
+    question: Option<String>,
+}
+
+/// What the worker does after a Report the Engine took.
+fn after(status: ReportStatus) -> &'static str {
+    match status {
+        ReportStatus::Progress => "Recorded; nobody was told. Keep working.",
+        ReportStatus::Waiting => "Recorded. End your turn; new input continues the ticket.",
+        ReportStatus::Ready => "Sent to whoever asked; the ticket has ended. Stop here.",
+        ReportStatus::Dropped => "The ticket has ended. Stop here.",
+        ReportStatus::Blocked | ReportStatus::Failed => {
+            "A person has been asked. End your turn; their answer continues the ticket."
+        }
+    }
+}
+
+/// `worker_report`: the Report goes to the Engine with the Assignment's
+/// spend so far. Long text is shortened rather than refused, so the model
+/// is not left retrying a rejected call.
+async fn report(broker: &AgentBroker, seat: &Arc<WorkerSeat>, args: Value) -> Reply {
+    let ReportArgs {
+        status,
+        text,
+        question,
+    } = arguments(args)?;
+    let (text, text_cut) = clip(text.trim(), REPORT_TEXT_CHARS);
+    if text.is_empty() {
+        return Err(refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a report needs a text",
+        ));
+    }
+    let question = question
+        .as_deref()
+        .map(str::trim)
+        .filter(|question| !question.is_empty())
+        .map(|question| clip(question, QUESTION_CHARS));
+    let question_cut = question.as_ref().is_some_and(|(_, cut)| *cut);
+    let spent = broker.spent(seat).await.map_err(failed)?;
+    let fact = Fact::Report {
+        ticket: seat.ticket.clone(),
+        assignment: seat.assignment.clone(),
+        report: ReportIn {
+            status,
+            text,
+            question: question.map(|(question, _)| question),
+            spent_microusd: spent,
+        },
+    };
+    match broker.inner.facts.ask(fact).await.map_err(failed)? {
+        Ok(_) => {
+            seat.reported(status);
+            let mut reply = json!({
+                "recorded": true,
+                "status": status,
+                "spent_microusd": spent,
+                "budget_microusd": seat.budget_microusd,
+                "next": after(status),
+            });
+            if text_cut || question_cut {
+                reply["shortened"] = json!(format!(
+                    "The text is kept to {REPORT_TEXT_CHARS} characters and a question to \
+                     {QUESTION_CHARS}; the rest was cut."
+                ));
+            }
+            Ok(Json(reply))
+        }
+        Err(why) => Err(refuse(StatusCode::CONFLICT, why)),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HandbackArgs {
+    trigger: TriggerId,
+    reason: String,
+}
+
+/// `worker_handback`: a follow-up that is not this Ticket's goes to the
+/// Router, once.
+async fn handback(broker: &AgentBroker, seat: &Arc<WorkerSeat>, args: Value) -> Reply {
+    let HandbackArgs { trigger, reason } = arguments(args)?;
+    let reason = reason.trim().to_owned();
+    if reason.is_empty() {
+        return Err(refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a handback needs a reason",
+        ));
+    }
+    let fact = Fact::Handback {
+        ticket: seat.ticket.clone(),
+        trigger,
+        reason,
+    };
+    match broker.inner.facts.ask(fact).await.map_err(failed)? {
+        Ok(Applied::HandedBack { queued }) => Ok(Json(json!({
+            "handed_back": true,
+            "queued": queued,
+            "next": if queued {
+                "The Router will judge it. Do not act on it yourself."
+            } else {
+                "It was handed back before or was already judged on its own. Do not act on it yourself."
+            },
+        }))),
+        Ok(_) => Ok(Json(json!({"handed_back": true}))),
+        Err(why) => Err(refuse(StatusCode::CONFLICT, why)),
+    }
+}
+
+/// `run_code` in the Ticket's directory. Its receipt goes back as is; a
+/// non-zero exit is a result, not an error.
+async fn run_code(broker: &AgentBroker, seat: &Arc<WorkerSeat>, args: Value) -> Reply {
+    let code = broker
+        .inner
+        .workers
+        .as_ref()
+        .and_then(|parts| parts.code.clone())
+        .ok_or_else(|| forbidden("run_code is not available on this host"))?;
+    code.run_in(&seat.work_dir, &args)
+        .await
+        .map(Json)
+        .map_err(|err| refuse(StatusCode::UNPROCESSABLE_ENTITY, format!("{err:#}")))
+}
+
+/// `fetch_url` with swarm mode's limits: each call's bounds in `fetch`, and
+/// a read budget across the Assignment's calls.
+async fn fetch_url(broker: &AgentBroker, seat: &Arc<WorkerSeat>, args: Value) -> Reply {
+    if seat.fetched_bytes.load(Ordering::SeqCst) >= FETCH_TOTAL_BYTES {
+        return Err(forbidden(format!(
+            "read budget exhausted after {} MiB; stop fetching and report what you have with worker_report",
+            FETCH_TOTAL_BYTES / (1024 * 1024)
+        )));
+    }
+    let response = fetch(&broker.inner.client, &args)
+        .await
+        .map_err(|err| refuse(StatusCode::BAD_GATEWAY, format!("{err:#}")))?;
+    let bytes = response["body_bytes"].as_u64().unwrap_or(0);
+    seat.fetched_bytes.fetch_add(bytes, Ordering::SeqCst);
+    Ok(Json(response))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
