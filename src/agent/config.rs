@@ -1,7 +1,11 @@
 //! `agent.yaml`. Unknown fields are errors, like a swarm Goal's, so a typo
 //! cannot silently fall back to a default.
 
-use super::slack;
+mod sources;
+
+pub use sources::{Interval, ReplyTo, ScheduleConfig, TimeOfDay};
+
+use super::{github, slack};
 use crate::gateway::{PriceTable, upstream_profile};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
@@ -38,10 +42,34 @@ pub enum SourceConfig {
         #[serde(default = "slack_api_base")]
         api_base: String,
     },
+    /// GitHub over REST polling; its Triggers name source `github`. Only
+    /// the listed repositories are read. The token file is read once and
+    /// deleted.
+    Github {
+        /// `owner/name`.
+        repos: BTreeSet<String>,
+        /// A personal access token of the agent's own account, which the
+        /// `github` channel uses too.
+        token_file: PathBuf,
+        #[serde(default = "github_api_base")]
+        api_base: String,
+        #[serde(default = "github_poll_secs")]
+        poll_secs: u64,
+    },
+    /// Named schedules that fire as System Triggers of source `schedule`.
+    Schedule { schedules: Vec<ScheduleConfig> },
 }
 
 fn slack_api_base() -> String {
     slack::DEFAULT_API_BASE.to_owned()
+}
+
+fn github_api_base() -> String {
+    github::DEFAULT_API_BASE.to_owned()
+}
+
+fn github_poll_secs() -> u64 {
+    60
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -53,6 +81,9 @@ pub enum ChannelConfig {
     /// Posts in Slack threads with the bot token and API base of the
     /// `slack` Source. Serves replies to source `slack`.
     Slack {},
+    /// Comments on issues and pull requests with the token and API base of
+    /// the `github` Source. Serves replies to source `github`.
+    Github {},
 }
 
 impl ChannelConfig {
@@ -60,6 +91,7 @@ impl ChannelConfig {
         match self {
             Self::Jsonl { source, .. } => source,
             Self::Slack {} => slack::SOURCE,
+            Self::Github {} => github::SOURCE,
         }
     }
 }
@@ -135,12 +167,14 @@ impl AgentConfig {
                     *app_token_file = base.join(&*app_token_file);
                     *bot_token_file = base.join(&*bot_token_file);
                 }
+                SourceConfig::Github { token_file, .. } => *token_file = base.join(&*token_file),
+                SourceConfig::Schedule { .. } => {}
             }
         }
         for channel in &mut config.channels {
             match channel {
                 ChannelConfig::Jsonl { path, .. } => *path = base.join(&*path),
-                ChannelConfig::Slack {} => {}
+                ChannelConfig::Slack {} | ChannelConfig::Github {} => {}
             }
         }
         Ok(config)
@@ -175,6 +209,8 @@ impl AgentConfig {
             !slack_channel || slack_sources == 1,
             "the slack channel needs the slack source's bot token"
         );
+        self.validate_github()?;
+        self.validate_schedules(&served)?;
         ensure!(
             self.budgets.session_microusd > 0,
             "budgets.session_microusd must be above zero"

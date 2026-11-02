@@ -14,6 +14,8 @@ use anyhow::{Context, Result, ensure};
 use reqwest::header::RETRY_AFTER;
 use reqwest::{RequestBuilder, StatusCode};
 use serde_json::Value;
+use solos_agent_core::model::{ChannelRef, ThreadKey};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,6 +34,24 @@ pub const METADATA_EVENT: &str = "solos_swarm_message";
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RETRY_AFTER: u64 = 3_600;
+
+/// The Thread of a message and its replies.
+pub fn thread(channel: &str, thread_ts: &str) -> ThreadKey {
+    ThreadKey::new(format!("{SOURCE}:{channel}:{thread_ts}"))
+}
+
+/// Where a reply goes: a thread, or with no `thread_ts` a new message in
+/// the channel.
+pub fn reply_to(channel: &str, thread_ts: Option<&str>) -> ChannelRef {
+    let mut address = BTreeMap::from([("channel".to_owned(), channel.to_owned())]);
+    if let Some(thread_ts) = thread_ts {
+        address.insert("thread_ts".to_owned(), thread_ts.to_owned());
+    }
+    ChannelRef {
+        source: SOURCE.into(),
+        address,
+    }
+}
 
 /// A Slack token, held in memory only. Its `Debug` never shows it.
 #[derive(Clone)]
