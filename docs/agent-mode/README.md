@@ -17,8 +17,9 @@ and its MIT-licensed prototype `deepseek-ai/dsh-superagent-prototype` (docs 000-
 | P1 Harness seam | Done (#19). `src/harness.rs`: the `AgentHarness` port, `PiHarness` (the Pi launch moved out of `main.rs`, argv and env pinned by a golden test) and `harness::scripted::ScriptedHarness`. `run`, `work()`, `settled` and `rpc` use the port. A new end-to-end test runs `work()` with three scripted agents through the real broker, with no Pi, node or bwrap. Swarm runs unchanged. |
 | P2a `run_goal` | Done (#20). `src/swarm.rs`: `swarm::run_goal(GoalRun, harness, provider) -> GoalOutcome` holds the run machinery that was in `main.rs` (spawn loop, `work`, nudges, deadline, broker socket, shutdown, `cleanup.json` and `runtime-report.json`), moved unchanged. `run` keeps the CLI part: flags, credential, Goal file, upstream, validation, the Linux and deadline checks, `PiHarness` and the provider, the stdout line and the exit code. The end-to-end test now drives `run_goal` with `ScriptedHarness`, so it also covers the spawn loop, shutdown and the run's files. Swarm runs unchanged. |
 | P3a SQLite Store | Done (#21). `crates/agent-store` (`solos-agent-store`): `SqliteStore` implements `Repositories` on one SQLite file (`rusqlite` 0.41.1 with bundled SQLite, WAL, `synchronous=FULL`, a versioned schema). Aggregates are JSON rows with index columns for active Threads, `thread_of_eval` and open Tickets. Each commit writes state, Effects and events in one transaction. The Effect queue lists due Effects oldest first and records done, or failed with an attempt count and a retry time; Sends to one Channel address keep commit order, and Launch, Deliver and Stop keep it per Ticket; every call is safe to repeat after a crash. The event log is hash-chained like `events.jsonl`, with `verify_chain()`. A seeded differential walk checks it against `MemoryRepositories` after every Engine command. |
-| P3b `agent serve` | **Done.** `src/agent/`: the async shell ports `Source`, `Channel`, `Router` and `Executor`, a runtime with one task that owns the Engine on the SQLite Store, and `solos-swarm agent serve --config agent.yaml --state-dir DIR [--until-idle]`. The runtime stores Source Triggers, starts due Evals, hands each due Effect to its adapter, and marks it done or failed with exponential backoff. It applies adapter facts as `decide`, `assignment_started` and `report`, and holds every Effect while the Policy is paused. First adapters: `JsonlSource`, `JsonlChannel` (once per `MessageId`, safe after a crash), `ScriptedRouter` and `ScriptedExecutor`, so it runs with no model, Slack or sandbox. Tests cover a full run, a crash between a Launch and its done mark, a restart, retries, a pause and Thread context reaching the worker. |
-| P2 (rest), P3c-P10 | Planned, below. |
+| P3b `agent serve` | Done (#22). `src/agent/`: the async shell ports `Source`, `Channel`, `Router` and `Executor`, a runtime with one task that owns the Engine on the SQLite Store, and `solos-swarm agent serve --config agent.yaml --state-dir DIR [--until-idle]`. The runtime stores Source Triggers, starts due Evals, hands each due Effect to its adapter, and marks it done or failed with exponential backoff. It applies adapter facts as `decide`, `assignment_started` and `report`, and holds every Effect while the Policy is paused. First adapters: `JsonlSource`, `JsonlChannel` (once per `MessageId`, safe after a crash), `ScriptedRouter` and `ScriptedExecutor`, so it runs with no model, Slack or sandbox. Tests cover a full run, a crash between a Launch and its done mark, a restart, retries, a pause and Thread context reaching the worker. |
+| P4 Slack | **Done.** `src/agent/slack/`: `SlackSource` (Socket Mode: an outbound WebSocket, nothing exposed) and `SlackChannel` (Web API), configured as `kind: slack` and read from token files that are deleted once read. Events from the listed channels become Triggers (`slack:<channel>:<ts>`, Thread `slack:<channel>:<thread_ts>`); the bot's own messages, other channels, edits and other events are dropped, and every envelope is acknowledged. The Source reconnects with backoff after a `disconnect` or an error. Replies go in the Trigger's thread, escaped, with acknowledgements and questions cut to 500 characters and results to 3,000 with a marker. Each post carries its `MessageId` as metadata; a repeated Send looks for it in the thread first, so a crash between a post and its done mark does not post twice. A deleted or archived conversation is `Gone`; rate limits and 5xx retry, after `Retry-After`. An approval request carries Approve and Stop buttons; a click is a `Fact::Command` the runtime applies as `approve` or `stop_ticket` and answers in the thread. A budget above `auto_approve_microusd` is now accepted when a Slack channel and a `slack:` approver are configured. New dependency: `tokio-tungstenite` 0.29.0 on the existing rustls. Tests run against a fake Slack, including one `agent serve` end to end. |
+| P2 (rest), P3c, P3d, P5-P10 | Planned, below. |
 
 ## What "super-agent" means here
 
@@ -136,8 +137,8 @@ and external work leaves as `Effect`s. The shell ports are async and live in the
 | `ModelUpstream` | `dispatch(body) -> receipt` | `OpenAiCompatible` | `broker::Provider` (1012); merged with `provider::Provider` (mvp) for llama.cpp |
 | `ExecutionEnvironment` | `run(code) -> receipt`; `start(code) -> job`, `wait(job)`, `stop(job)` | local `bwrap` | `code.rs` `CodeExecutor`, plus the five hand-built `bwrap` command lines (`harness.rs:106` in `PiHarness::command`, `main.rs:280` in `doctor`, `code.rs:313`, `sandbox.rs:315` in `prepare_process`, `wasi_worker.rs:316`) |
 | `EventLog` | `append(kind, data) -> seq`; `verify()` | `events.jsonl` hash chain | `Store::record` (452), `broker_control::read_chain`/`load_image` |
-| `Source` | `run(sink, cancel)`; `context(trigger, part)` for bounded recall | CLI/jsonl, then Slack | new |
-| `Channel` | `send(OutboundMessage) -> Sent \| Gone`; shapes text per medium (chat at most 100 words, PRs structured) | `JsonlChannel` (P3b), then Slack | `src/agent/jsonl.rs` |
+| `Source` | `run(sink, facts)`, with people's commands (Slack buttons) as `Fact::Command`; later `context(trigger, part)` for bounded recall | `JsonlSource` (P3b), `SlackSource` (P4) | new |
+| `Channel` | `send(OutboundMessage, SendOptions { repeat, approval }) -> Sent \| Gone`; shapes text per medium (short chat, PRs structured) | `JsonlChannel` (P3b), `SlackChannel` (P4) | `src/agent/jsonl.rs`, `src/agent/slack/` |
 | `Store` | agent-core `Repositories` plus the effect queue | in-memory (P0), SQLite `crates/agent-store` (P3a) | new |
 | `ToolSurface` | How a session calls tools: `/model` and `/tool/{name}` on the broker | Pi extension (`extensions/broker.ts`) | add an MCP facade, so any MCP harness gets the same tools |
 
@@ -209,12 +210,18 @@ provider through the real broker. It runs on macOS too. Swarm mode is the first 
   when P3c and P3d need them.
 - Exit: the article's flow end to end on a laptop, with scripted Triggers.
 
-**P4: Slack.**
-- A Socket Mode Source, so no public endpoint is needed (the dashboard already binds only to `127.0.0.1`).
-- A Web API Channel: threaded replies, at most 100 words in chat.
-- Block Kit buttons for Approve and Stop, which call `approve` and `stop_ticket` as commands, never as text.
-- A per-channel admission table. Operator DMs carry status and pause.
-- `accept_mode: observe` to start.
+**P4: Slack.** Done; setup in [Slack app setup](#slack-app-setup).
+- Done: a Socket Mode Source, so no public endpoint is needed (the dashboard already binds only to `127.0.0.1`).
+  It listens to the configured channel ids only and drops the bot's own messages.
+- Done: a Web API Channel with threaded replies. Acknowledgements and questions are cut to 500 characters, results
+  to 3,000 with a marker, and all text is escaped so a worker cannot ping `<!channel>`. Each post carries its
+  `MessageId` as message metadata, and a repeated Send searches the thread for it first, since Slack does not
+  deduplicate.
+- Done: Block Kit buttons for Approve and Stop, which reach the runtime as `Fact::Command` and call `approve` and
+  `stop_ticket` as commands, never as text. The Policy's `approvers` may approve; approvers and `people` may stop.
+  The outcome is answered in the thread, best effort: a crash can lose that answer, never the command.
+- Later: a per-channel admission table, and operator DMs that carry status and pause.
+- `accept_mode: observe` (the Policy default) to start.
 
 **P5: SwarmExecutor.** `Plan::Swarm` Tickets run `swarm::run_goal` under the Ticket's envelope. The artifact
 becomes a `ready` Report with a summary and a link. The Router prompt says when a swarm pays for itself: wide
@@ -249,11 +256,57 @@ Credentials stay on the node and tools use them through scoped identities (`tool
 - Metrics: completion p50/p95, Router decisions, cache-read tokens, dollars.
 - Target: within the article's shape (p50 about 12 min, p95 about 16 min on its workload), at a budget we report.
 
+## Slack app setup
+
+The agent connects out over Socket Mode, so the app needs no request URL and the host exposes nothing.
+
+1. Create an app at <https://api.slack.com/apps> ("From scratch") in your workspace.
+2. **Socket Mode:** turn it on. Slack offers to create an app-level token; give it the `connections:write` scope.
+   This is the `xapp-` token.
+3. **OAuth & Permissions**, bot token scopes:
+   - `app_mentions:read` for mentions;
+   - `chat:write` to reply;
+   - `channels:history` for public channels, `groups:history` for private ones, and `im:history` for direct
+     messages. These carry the message events and let a repeated reply search its thread (`conversations.replies`).
+4. **Event Subscriptions:** turn them on and subscribe to the bot events `app_mention`, `message.channels`, and as
+   needed `message.groups` and `message.im`. A mention arrives as both `app_mention` and `message`; both map to the
+   same Trigger id, so it is stored once.
+5. **Interactivity & Shortcuts:** turn it on. Under Socket Mode no request URL is needed; the Approve and Stop
+   clicks arrive on the socket.
+6. Install the app to the workspace and copy the bot token (`xoxb-`). Invite the bot to each channel it should
+   listen to (`/invite @your-app`), and note each channel's id (channel details, at the bottom: `C...`). A direct
+   message with the bot has a `D...` id that can be listed too.
+7. Write each token to its own file, readable only by the agent's user. Each start reads both files and deletes
+   them, so the tokens live only in the process; provide fresh files for every start.
+
+```yaml
+policy:
+  people: [slack:U012ALICE]            # who may ask for work
+  approvers: [slack:U012ALICE]         # who may approve a budget above the threshold
+  auto_approve_microusd: 2000000
+sources:
+  - kind: slack
+    channels: [C0123OPS]
+    app_token_file: secrets/slack-app-token   # xapp-..., relative to this file
+    bot_token_file: secrets/slack-bot-token   # xoxb-...
+    # api_base: https://slack.com/api/        # the default; tests point it at a fake
+channels:
+  - kind: slack                        # replies with the slack source's bot token
+router: {kind: scripted}
+executor: {kind: scripted}
+budgets: {session_microusd: 500000}
+```
+
+Message metadata (`solos_swarm_message`, holding the agent's message id) is visible to members of the workspace;
+it carries nothing else.
+
 ## Security model
 
 - Trigger text is data. It cannot change a permission, a budget or the Policy (the core has no path for it).
-  An approval is an adapter command, authenticated by the adapter, never text. A stop is either an adapter
-  command (`stop_ticket`) or a Router `Verdict::Stop` on an Eval of explicit strength.
+  An approval is an adapter command, authenticated by the adapter, never text: a Slack button click arrives on
+  the socket the agent opened with its app token, and Slack names the user. A stop is either an adapter
+  command (`stop_ticket`, open to approvers and allowed people) or a Router `Verdict::Stop` on an Eval of explicit
+  strength.
 - Only explicit strength stops work; bots and CI can at most make inferred candidates, and those start nothing
   outside `auto` mode with a matching enabled rule.
 - Workers stay keyless: the broker holds the model key, and P9 keeps tool credentials on the node.
@@ -268,7 +321,7 @@ Credentials stay on the node and tools use them through scoped identities (`tool
    not scale to months of Triggers.
 2. **Router model:** the cheapest model that judges reliably (the article uses a lighter model for the Router).
    This will be measured in P3.
-3. **Slack app mode:** Socket Mode is recommended over the Events API, so there is no public endpoint.
+3. **Slack app mode:** decided: Socket Mode, built in P4, so there is no public endpoint.
 4. **The `mvp` stack:** it is frozen and harvested as adapters (P7, P9). Deleting it is a separate decision.
 
 ## Non-goals
