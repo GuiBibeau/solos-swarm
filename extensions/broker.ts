@@ -33,6 +33,35 @@ const ROUTER_TOOLS = [
   },
 ];
 
+const FETCH_URL = { name: "fetch_url", description: "Fetch one live http(s) URL through the broker; returns status, headers and bounded body. Your only network egress.", parameters: Type.Object({ url: Type.String({ minLength: 1, maxLength: 2048 }), method: Type.Optional(Type.String()), headers: Type.Optional(Type.Object({}, { additionalProperties: true })), body: Type.Optional(Type.String()), max_bytes: Type.Optional(Type.Number()) }) };
+
+// Agent mode's worker: one Ticket. It reports instead of talking to people; SWARM_GRANTS narrows the set.
+const WORKER_TOOLS = [
+  {
+    name: "worker_report",
+    description: "Report on your ticket. progress: still working, nobody is told. waiting: your turn is over and nothing is outstanding. ready: the result, sent to whoever asked; it ends the ticket. blocked or failed: you need a person; say why. dropped: nothing to do; ends the ticket silently. A refused report comes back as an error that says why.",
+    parameters: Type.Object({
+      status: StringEnum(["progress", "waiting", "ready", "blocked", "failed", "dropped"] as const),
+      text: Type.String({ minLength: 1, description: "For ready, the complete result for the person who asked; otherwise what happened, briefly." }),
+      question: Type.Optional(Type.String({ description: "One concrete question for a person, when only a person can answer it." })),
+    }),
+  },
+  {
+    name: "worker_handback",
+    description: "Hand back a new message that reached your ticket but is not yours to handle: a request beyond your scope, other work, or a stop. The Router judges it; do not act on it yourself.",
+    parameters: Type.Object({
+      trigger: Type.String({ minLength: 1, description: "The trigger id of the message." }),
+      reason: Type.String({ minLength: 1, description: "One sentence: why it is not yours." }),
+    }),
+  },
+  { name: "run_code", description: "Run one bash command in an isolated, offline Linux sandbox. /work is your ticket's directory: the only writable path, kept between calls. Other paths the operator mounted are read-only. No network, broker socket, host home or credentials. Files are written into /work before the command. Returns bounded {exit_code,stdout,stderr,timed_out,duration_ms,truncated}. timeout_seconds is 1-300 (default 120).", parameters: Type.Object({ code: Type.String({ minLength: 1 }), files: Type.Optional(Type.Object({}, { additionalProperties: Type.String() })), timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 300 })), stdin: Type.Optional(Type.String()) }) },
+  FETCH_URL,
+];
+
+function granted(name: string): boolean {
+  return !process.env.SWARM_GRANTS || process.env.SWARM_GRANTS.split(",").map((grant) => grant.trim()).filter(Boolean).includes(name);
+}
+
 async function broker(path: string, payload: unknown, signal?: AbortSignal): Promise<Response> {
   const socketPath = process.env.SWARM_SOCKET;
   const token = process.env.SWARM_TOKEN;
@@ -65,7 +94,7 @@ async function broker(path: string, payload: unknown, signal?: AbortSignal): Pro
 export default function swarmBroker(pi: ExtensionAPI) {
   // Unset is a swarm agent. Anything but a known set is refused, so a typo cannot widen the tools.
   const toolset = process.env.SWARM_TOOLSET;
-  if (toolset !== undefined && toolset !== "router") throw new Error(`Unknown SWARM_TOOLSET: ${toolset}`);
+  if (toolset !== undefined && toolset !== "router" && toolset !== "worker") throw new Error(`Unknown SWARM_TOOLSET: ${toolset}`);
   pi.registerProvider("swarm", {
     baseUrl: "http://swarm.invalid/v1", api: "swarm-broker", apiKey: "$SWARM_TOKEN",
     models: [{
@@ -127,7 +156,7 @@ export default function swarmBroker(pi: ExtensionAPI) {
     },
   });
 
-  const tools = toolset === "router" ? ROUTER_TOOLS : [
+  const tools = toolset === "router" ? ROUTER_TOOLS : toolset === "worker" ? WORKER_TOOLS.filter((tool) => granted(tool.name)) : [
     { name: "claim_task", description: "Claim your assigned task. Returns its ID and input payload. Claim exactly once before any other tool.", parameters: Type.Object({}) },
     { name: "board_read", description: "Read shared progress messages for this Goal.", parameters: Type.Object({}) },
     // Deliberately no maxLength here: a schema rejection is a tool error the
@@ -137,10 +166,10 @@ export default function swarmBroker(pi: ExtensionAPI) {
     { name: "submit_finding", description: "Submit your claimed task's structured result exactly as the Goal's worker prompt defines it. Immutable once accepted.", parameters: Type.Object({ task_id: Type.String(), result: Type.Object({}, { additionalProperties: true }) }) },
     { name: "read_findings", description: "Coordinator only: read completed findings from every worker.", parameters: Type.Object({}) },
     { name: "submit_artifact", description: "Coordinator only: submit the combined artifact exactly as the Goal's synthesis prompt defines it.", parameters: Type.Object({ artifact: Type.Object({}, { additionalProperties: true }) }) },
-    { name: "fetch_url", description: "Fetch one live http(s) URL through the broker; returns status, headers and bounded body. Your only network egress.", parameters: Type.Object({ url: Type.String({ minLength: 1, maxLength: 2048 }), method: Type.Optional(Type.String()), headers: Type.Optional(Type.Object({}, { additionalProperties: true })), body: Type.Optional(Type.String()), max_bytes: Type.Optional(Type.Number()) }) },
+    FETCH_URL,
     { name: "run_code", description: "Run one bash command in an isolated, CPU-only, offline Linux sandbox. The working directory and only writable path is /work. Read-only: /dataset (decoded Parquet), /regimes (source checkout), /venv (Python environment; use /venv/bin/python). No network, broker socket, host home, GPU, or credentials. Files are written into /work before the command. Returns bounded {exit_code,stdout,stderr,timed_out,duration_ms,truncated}. timeout_seconds is 1-300 (default 120).", parameters: Type.Object({ code: Type.String({ minLength: 1 }), files: Type.Optional(Type.Object({}, { additionalProperties: Type.String() })), timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 300 })), stdin: Type.Optional(Type.String()) }) },
   ].filter((tool) => (process.env.SWARM_ROLE === "coordinator" || !["read_findings", "submit_artifact"].includes(tool.name))
-    && (!process.env.SWARM_GRANTS || process.env.SWARM_GRANTS.split(",").map((grant) => grant.trim()).filter(Boolean).includes(tool.name)));
+    && granted(tool.name));
   for (const tool of tools) pi.registerTool({
     ...tool, label: tool.name,
     async execute(_id, params, signal) {
@@ -152,8 +181,8 @@ export default function swarmBroker(pi: ExtensionAPI) {
         notice = `Message shortened to the ${BOARD_MESSAGE_LIMIT}-character Board limit; continue.`;
       }
       const response = await broker(`/tool/${tool.name}`, payload, signal);
-      if (!response.ok && toolset === "router") {
-        // The Router corrects a refused decision from the Engine's reason, so the reason is the tool error.
+      if (!response.ok && toolset !== undefined) {
+        // An agent session corrects a refused call from the Engine's reason, so the reason is the tool error.
         const refusal = await response.json().catch(() => ({}));
         throw new Error(`Broker refused ${tool.name}: ${refusal.error ?? `HTTP ${response.status}`}`);
       }
@@ -164,8 +193,8 @@ export default function swarmBroker(pi: ExtensionAPI) {
     },
   });
   pi.on("session_start", () => pi.setActiveTools(tools.map((tool) => tool.name)));
-  if (toolset === "router") {
-    // The host writes the Router's instructions; the session fetches them from its broker once.
+  if (toolset !== undefined) {
+    // The host writes an agent session's instructions; the session fetches them from its broker once.
     let systemPrompt: string | undefined;
     pi.on("before_agent_start", async () => {
       if (systemPrompt === undefined) {
