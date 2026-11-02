@@ -7,6 +7,7 @@ pub mod broker;
 pub mod config;
 pub mod github;
 pub mod jsonl;
+pub mod mcp;
 pub mod pi_executor;
 pub mod pi_router;
 pub mod ports;
@@ -471,6 +472,10 @@ impl Io {
                         .collect::<Result<_>>()?;
                     sources.push(Box::new(ScheduleSource::new(schedules, follow)));
                 }
+                SourceConfig::Mcp {} => {
+                    let inbox = mcp::open_inbox(state_dir)?;
+                    sources.push(Box::new(JsonlSource::new(inbox, follow)));
+                }
             }
         }
         let mut channels: BTreeMap<String, Arc<dyn Channel>> = BTreeMap::new();
@@ -487,6 +492,10 @@ impl Io {
                         .clone()
                         .context("the github channel needs a github source")?,
                 )),
+                ChannelConfig::Mcp {} => {
+                    mcp::open_dir(state_dir)?;
+                    Arc::new(JsonlChannel::open(mcp::outbox(state_dir))?)
+                }
             };
             channels.insert(channel.source().to_owned(), adapter);
         }
