@@ -13,10 +13,15 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   files, caps, messages, Store events and shutdown accounting. `harness::scripted::ScriptedHarness` plays scripted
   tool calls against the real broker, and a new end-to-end test runs `work()` with three scripted agents and
   `smoke::Scripted`.
+- Agent mode, P2a: `swarm::run_goal(GoalRun, harness, provider) -> GoalOutcome` in `src/swarm.rs`, so agent mode can
+  run a swarm as a library call. The run machinery moved out of `main.rs` unchanged (spawn loop, `work`, nudges,
+  deadline, broker socket, shutdown); `solos-swarm run` is a thin wrapper with the same run-dir files, Store events,
+  stdout line and exit code. The end-to-end test drives `run_goal` with `ScriptedHarness` and also checks the spawn
+  loop, shutdown, `cleanup.json`, `runtime-report.json` and a deadline stop.
 - Agent mode, P3a: workspace crate `crates/agent-store` (`solos-agent-store`), the SQLite Store for agent-core
   (`rusqlite` 0.41.1, bundled SQLite, WAL). It implements `Repositories` with one transaction per commit, and adds a
   durable Effect queue (due oldest first, done, failed with an attempt count and a retry time, Sends kept in commit
-  order per Channel address, every call safe to repeat after a crash) and an event log hash-chained like
+  order per Channel address and Launch, Deliver and Stop per Ticket, every call safe to repeat after a crash) and an event log hash-chained like
   `events.jsonl`, with `verify_chain()`. A seeded differential walk checks it against `MemoryRepositories`.
 - `collect` leaves the per-run `code/` scratch directory on the host and writes `collect-manifest.json`; `--include-code` opts back in.
 - Docs: pause mode, self-update operations, dashboard tunnel, tournament runbook, replay status.

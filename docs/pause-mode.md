@@ -2,7 +2,7 @@
 
 Pause mode lets a run hold its model calls without ending. It exists so a run can span the provider's
 peak-price windows, or wait while an operator looks at something, and lose neither work nor deadline.
-Source: `effective_control` in `src/broker.rs`, `unpaused_deadline` in `src/main.rs`, `extensions/broker.ts`.
+Source: `effective_control` in `src/broker.rs`, `unpaused_deadline` in `src/swarm.rs`, `extensions/broker.ts`.
 
 ## One answer, four inputs
 
