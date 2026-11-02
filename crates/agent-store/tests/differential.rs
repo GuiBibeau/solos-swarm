@@ -464,7 +464,10 @@ struct Walk {
 fn lane(effect: &Effect) -> Option<String> {
     match effect {
         Effect::Send(m) => Some(format!("{:?}", m.channel)),
-        _ => None,
+        Effect::Launch { ticket, .. }
+        | Effect::Deliver { ticket, .. }
+        | Effect::Stop { ticket, .. } => Some(format!("ticket:{ticket}")),
+        Effect::Assess(_) => None,
     }
 }
 
