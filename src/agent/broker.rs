@@ -5,6 +5,8 @@
 //! either. Each token names a principal, and every model call is held and
 //! settled against the principal's account in the agent Store.
 
+pub mod registry;
+
 use super::AgentConfig;
 use super::ports::{Applied, Fact, FactSink};
 use crate::broker::{FETCH_TOTAL_BYTES, fetch, now_ms};
@@ -15,8 +17,9 @@ use axum::{
     Json,
     extract::{DefaultBodyLimit, Path as RoutePath, State},
     http::{HeaderMap, StatusCode},
-    routing::post,
+    routing::{get, post},
 };
+use registry::PrincipalKind;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use solos_agent_core::model::{
@@ -59,6 +62,13 @@ impl Principal {
         match self {
             Self::Router => &ROUTER_TOOLS,
             Self::Worker(_) => &WORKER_TOOLS,
+        }
+    }
+
+    pub fn kind(&self) -> PrincipalKind {
+        match self {
+            Self::Router => PrincipalKind::Router,
+            Self::Worker(_) => PrincipalKind::Worker,
         }
     }
 }
@@ -410,6 +420,7 @@ impl AgentBroker {
         Ok(axum::Router::new()
             .route("/model", post(model))
             .route("/tool/{name}", post(tool))
+            .route("/tools", get(tools))
             .route("/session", post(session))
             // Above the admitted input on purpose, as in swarm mode: a
             // session replays its whole conversation, so the wire body may
@@ -456,6 +467,19 @@ async fn session(State(broker): State<AgentBroker>, headers: HeaderMap) -> Reply
         Some(prompt) => Ok(Json(json!({"system_prompt": prompt}))),
         None => Err(refuse(StatusCode::NOT_FOUND, "no system prompt")),
     }
+}
+
+/// The calling principal's tools from the registry, without `run_code` where
+/// this host offers none, so an MCP host lists only what it can call.
+async fn tools(State(broker): State<AgentBroker>, headers: HeaderMap) -> Reply {
+    let grant = broker.authenticate(&headers)?;
+    let kind = grant.principal.kind();
+    let offered: Vec<_> = registry::tools(kind)
+        .into_iter()
+        .filter(|tool| grant.principal.tools().contains(&tool.name))
+        .filter(|tool| tool.name != "run_code" || broker.offers_run_code())
+        .collect();
+    Ok(Json(json!({"principal": kind, "tools": offered})))
 }
 
 async fn model(

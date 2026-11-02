@@ -1,0 +1,223 @@
+{
+  "router": [
+    {
+      "name": "router_decide",
+      "description": "Decide one candidate by its eval id: accept it as work, ignore it, or stop one of the Tickets on its thread. Call it once per candidate. A refused decision comes back as an error that says why; correct the call and try again.",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "eval",
+          "decision",
+          "reason"
+        ],
+        "properties": {
+          "eval": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The eval id on the candidate's first line."
+          },
+          "decision": {
+            "type": "string",
+            "enum": [
+              "accept",
+              "ignore",
+              "stop"
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "description": "One sentence: why."
+          },
+          "title": {
+            "type": "string",
+            "description": "accept: a short title for the work."
+          },
+          "scope": {
+            "type": "string",
+            "description": "accept: what the worker must do, in your words and complete on its own."
+          },
+          "plan": {
+            "type": "string",
+            "enum": [
+              "session",
+              "swarm"
+            ],
+            "description": "accept: session (one worker, the default) or swarm (wide research and tournaments only)."
+          },
+          "agents": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 30,
+            "description": "accept with plan swarm: how many agents."
+          },
+          "budget_microusd": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "accept: the Ticket's whole budget in microusd. Omit it for the default."
+          },
+          "acknowledge": {
+            "type": "string",
+            "description": "accept: the first reply, instead of the standard one. An empty string sends none."
+          },
+          "rules": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "accept of inferred work: the proactive rules it matches."
+          },
+          "ticket": {
+            "type": "string",
+            "description": "stop: the id of the Ticket to stop."
+          }
+        }
+      }
+    },
+    {
+      "name": "router_read",
+      "description": "Read one trigger, thread or ticket by id. The answer names its neighbours by id; follow them one hop at a time when a candidate needs more context.",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "trigger",
+              "thread",
+              "ticket"
+            ],
+            "description": "Which kind of id it is, when it could be more than one."
+          }
+        }
+      }
+    }
+  ],
+  "worker": [
+    {
+      "name": "worker_report",
+      "description": "Report on your ticket. progress: still working, nobody is told. waiting: your turn is over and nothing is outstanding. ready: the result, sent to whoever asked; it ends the ticket. blocked or failed: you need a person; say why. dropped: nothing to do; ends the ticket silently. A refused report comes back as an error that says why.",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "status",
+          "text"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "progress",
+              "waiting",
+              "ready",
+              "blocked",
+              "failed",
+              "dropped"
+            ]
+          },
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "description": "For ready, the complete result for the person who asked; otherwise what happened, briefly."
+          },
+          "question": {
+            "type": "string",
+            "description": "One concrete question for a person, when only a person can answer it."
+          }
+        }
+      }
+    },
+    {
+      "name": "worker_handback",
+      "description": "Hand back a new message that reached your ticket but is not yours to handle: a request beyond your scope, other work, or a stop. The Router judges it; do not act on it yourself.",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "trigger",
+          "reason"
+        ],
+        "properties": {
+          "trigger": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The trigger id of the message."
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "description": "One sentence: why it is not yours."
+          }
+        }
+      }
+    },
+    {
+      "name": "run_code",
+      "description": "Run one bash command in an isolated, offline Linux sandbox. /work is your ticket's directory: the only writable path, kept between calls. Other paths the operator mounted are read-only. No network, broker socket, host home or credentials. Files are written into /work before the command. Returns bounded {exit_code,stdout,stderr,timed_out,duration_ms,truncated}. timeout_seconds is 1-300 (default 120).",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "minLength": 1
+          },
+          "files": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "timeout_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 300
+          },
+          "stdin": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "fetch_url",
+      "description": "Fetch one live http(s) URL through the broker; returns status, headers and bounded body. Your only network egress.",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "url": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          },
+          "method": {
+            "type": "string"
+          },
+          "headers": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": true
+          },
+          "body": {
+            "type": "string"
+          },
+          "max_bytes": {
+            "type": "number"
+          }
+        }
+      }
+    }
+  ]
+}
