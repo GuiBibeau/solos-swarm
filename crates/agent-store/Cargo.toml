@@ -1,0 +1,18 @@
+[package]
+name = "solos-agent-store"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "SQLite Store for solos-swarm agent mode: agent-core state, a durable Effect queue and a hash-chained event log."
+license = "Apache-2.0"
+repository = "https://github.com/GuiBibeau/solos-swarm"
+
+[dependencies]
+solos-agent-core = { path = "../agent-core" }
+rusqlite = { version = "=0.41.1", default-features = false, features = ["bundled", "cache", "fallible_uint"] }
+serde = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "=0.10.9"
+
+[lints]
+workspace = true

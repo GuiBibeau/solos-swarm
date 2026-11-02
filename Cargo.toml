@@ -1,6 +1,6 @@
 [workspace]
-members = ["crates/agent-core"]
-default-members = [".", "crates/agent-core"]
+members = ["crates/agent-core", "crates/agent-store"]
+default-members = [".", "crates/agent-core", "crates/agent-store"]
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

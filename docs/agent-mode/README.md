@@ -13,10 +13,11 @@ and its MIT-licensed prototype `deepseek-ai/dsh-superagent-prototype` (docs 000-
 
 | Phase | State |
 |---|---|
-| P0 Core and plan | **This PR.** `crates/agent-core`: domain, ports, Engine, in-memory store, allowlist Policy, 91 tests and a seeded fuzzer. Most tests are regressions from the adversarial review and the swarm review of PR #18. Swarm mode untouched. |
-| P1 Harness seam | **Done.** `src/harness.rs`: the `AgentHarness` port, `PiHarness` (the Pi launch moved out of `main.rs`, argv and env pinned by a golden test) and `harness::scripted::ScriptedHarness`. `run`, `work()`, `settled` and `rpc` use the port. A new end-to-end test runs `work()` with three scripted agents through the real broker, with no Pi, node or bwrap. Swarm runs unchanged. |
-| P2a `run_goal` | **Done.** `src/swarm.rs`: `swarm::run_goal(GoalRun, harness, provider) -> GoalOutcome` holds the run machinery that was in `main.rs` (spawn loop, `work`, nudges, deadline, broker socket, shutdown, `cleanup.json` and `runtime-report.json`), moved unchanged. `run` keeps the CLI part: flags, credential, Goal file, upstream, validation, the Linux and deadline checks, `PiHarness` and the provider, the stdout line and the exit code. The end-to-end test now drives `run_goal` with `ScriptedHarness`, so it also covers the spawn loop, shutdown and the run's files. Swarm runs unchanged. |
-| P2 (rest), P3-P10 | Planned, below. |
+| P0 Core and plan | Done (#18). `crates/agent-core`: domain, ports, Engine, in-memory store, allowlist Policy, 91 tests and a seeded fuzzer. Most tests are regressions from the adversarial review and the swarm review of PR #18. Swarm mode untouched. |
+| P1 Harness seam | Done (#19). `src/harness.rs`: the `AgentHarness` port, `PiHarness` (the Pi launch moved out of `main.rs`, argv and env pinned by a golden test) and `harness::scripted::ScriptedHarness`. `run`, `work()`, `settled` and `rpc` use the port. A new end-to-end test runs `work()` with three scripted agents through the real broker, with no Pi, node or bwrap. Swarm runs unchanged. |
+| P2a `run_goal` | Done (#20). `src/swarm.rs`: `swarm::run_goal(GoalRun, harness, provider) -> GoalOutcome` holds the run machinery that was in `main.rs` (spawn loop, `work`, nudges, deadline, broker socket, shutdown, `cleanup.json` and `runtime-report.json`), moved unchanged. `run` keeps the CLI part: flags, credential, Goal file, upstream, validation, the Linux and deadline checks, `PiHarness` and the provider, the stdout line and the exit code. The end-to-end test now drives `run_goal` with `ScriptedHarness`, so it also covers the spawn loop, shutdown and the run's files. Swarm runs unchanged. |
+| P3a SQLite Store | **Done.** `crates/agent-store` (`solos-agent-store`): `SqliteStore` implements `Repositories` on one SQLite file (`rusqlite` 0.41.1 with bundled SQLite, WAL, `synchronous=FULL`, a versioned schema). Aggregates are JSON rows with index columns for active Threads, `thread_of_eval` and open Tickets. Each commit writes state, Effects and events in one transaction. The Effect queue lists due Effects oldest first and records done, or failed with an attempt count and a retry time; Sends to one Channel address keep commit order, and Launch, Deliver and Stop keep it per Ticket; every call is safe to repeat after a crash. The event log is hash-chained like `events.jsonl`, with `verify_chain()`. A seeded differential walk checks it against `MemoryRepositories` after every Engine command. |
+| P2 (rest), P3b-P10 | Planned, below. |
 
 ## What "super-agent" means here
 
@@ -116,6 +117,7 @@ flowchart TB
   modules. It is a source scan, not a proof.
 - The swarm core reaches the same rule in P2: the pure parts of `broker.rs` (claims, envelopes, progress,
   artifact union) move out of the HTTP and file code.
+- `crates/agent-store` is a driven adapter: it depends on agent-core and `rusqlite`; agent-core never depends on it.
 - Adapters depend on ports, never on each other. Composition roots (`run`, `agent serve`) are the only places that
   name concrete adapters.
 - One writer per state: the Engine writes Triggers, Threads, Decisions and Tickets; a Source writes only its read
@@ -135,7 +137,7 @@ and external work leaves as `Effect`s. The shell ports are async and live in the
 | `EventLog` | `append(kind, data) -> seq`; `verify()` | `events.jsonl` hash chain | `Store::record` (452), `broker_control::read_chain`/`load_image` |
 | `Source` | `run(sink, cancel)`; `context(trigger, part)` for bounded recall | CLI/jsonl, then Slack | new |
 | `Channel` | `send(OutboundMessage) -> Sent \| Gone`; shapes text per medium (chat at most 100 words, PRs structured) | stdout, then Slack | new |
-| `Store` | agent-core `Repositories` plus the effect queue | in-memory (this PR), then SQLite | new |
+| `Store` | agent-core `Repositories` plus the effect queue | in-memory (P0), SQLite `crates/agent-store` (P3a) | new |
 | `ToolSurface` | How a session calls tools: `/model` and `/tool/{name}` on the broker | Pi extension (`extensions/broker.ts`) | add an MCP facade, so any MCP harness gets the same tools |
 
 `SessionSpec` names a role (`router`, `worker`, `swarm-agent`, `coordinator`), grants, model, working directory,
@@ -190,7 +192,8 @@ provider through the real broker. It runs on macOS too. Swarm mode is the first 
 - The domain text in `nudge()` (now in `src/swarm.rs`) and `deferred_record` moves into Goal data.
 
 **P3: local agent shell.**
-- `solos-swarm agent serve --config agent.yaml`, built on the SQLite Store and an effect runner (retry with backoff,
+- P3a (done): the SQLite Store, `crates/agent-store`, with the durable Effect queue and the event log.
+- `solos-swarm agent serve --config agent.yaml`, built on that Store and an effect runner (retry with backoff,
   ordered per Channel).
 - A CLI/jsonl Source and a stdout Channel.
 - The Router session on `PiHarness`, with router tools on the broker (`router_decide`, `router_note`, `router_read`
@@ -256,8 +259,8 @@ Credentials stay on the node and tools use them through scoped identities (`tool
 
 ## Open decisions
 
-1. **Agent-mode store:** SQLite (`rusqlite`, bundled) is recommended for long-lived state; a JSON image like
-   `state.json` does not scale to months of Triggers.
+1. **Agent-mode store:** decided: SQLite (`rusqlite`, bundled), built in P3a. A JSON image like `state.json` does
+   not scale to months of Triggers.
 2. **Router model:** the cheapest model that judges reliably (the article uses a lighter model for the Router).
    This will be measured in P3.
 3. **Slack app mode:** Socket Mode is recommended over the Events API, so there is no public endpoint.
