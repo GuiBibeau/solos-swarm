@@ -18,6 +18,10 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   durable Effect queue (due oldest first, done, failed with an attempt count and a retry time, Sends kept in commit
   order per Channel address, every call safe to repeat after a crash) and an event log hash-chained like
   `events.jsonl`, with `verify_chain()`. A seeded differential walk checks it against `MemoryRepositories`.
+- Agent mode, P3b: `solos-swarm agent serve --config agent.yaml --state-dir DIR [--until-idle]` (`src/agent/`): the
+  `Source`, `Channel`, `Router` and `Executor` ports, a single-writer runtime over the Engine and the SQLite Store
+  (Effects retried with exponential backoff, all held while paused), and the jsonl and scripted adapters, so the
+  agent runs with no model, Slack or sandbox.
 - `collect` leaves the per-run `code/` scratch directory on the host and writes `collect-manifest.json`; `--include-code` opts back in.
 - Docs: pause mode, self-update operations, dashboard tunnel, tournament runbook, replay status.
 
