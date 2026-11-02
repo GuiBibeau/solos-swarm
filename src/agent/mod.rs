@@ -396,7 +396,7 @@ fn router_session(
             instructions.as_deref(),
             &config.policy,
             rules,
-            DecideTerms::for_config(config),
+            &DecideTerms::for_config(config),
         )),
     };
     Ok((spec, grant))

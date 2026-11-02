@@ -660,6 +660,7 @@ mod tests {
                 decide: DecideTerms {
                     default_budget_microusd: 1,
                     max_budget_microusd: None,
+                    swarm: None,
                 },
                 workers: None,
             })
