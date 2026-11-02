@@ -7,6 +7,7 @@
 //! launch past that waits for a slot.
 
 use super::broker::{self, AgentBroker, WorkerSeat, clip};
+use super::jobs::JOB_TOOLS;
 use super::ports::{BoxFuture, Delivered, Delivery, Executor, Fact, FactSink, Launch};
 use crate::broker::write_json;
 use crate::harness::{
@@ -60,8 +61,11 @@ stop, hand it back with worker_handback and its trigger id instead of acting on 
 pub fn system_prompt(budget_microusd: MicroUsd, run_code: bool) -> String {
     let tools = if run_code {
         "run_code runs one bash command in an offline sandbox whose working directory, /work, is this \
-         ticket's own directory and keeps what you write between calls; fetch_url is your only network \
-         access."
+         ticket's own directory and keeps what you write between calls. A command still running after a \
+         few seconds moves to the background as a job; job_start starts one there at once. job_wait \
+         waits a short while for a job, job_stop stops one, and a job that ends after your turn comes \
+         back to you as new input, so you can end your turn instead of waiting. fetch_url is your only \
+         network access."
     } else {
         "fetch_url is your only network access; this host offers no run_code."
     };
@@ -107,7 +111,7 @@ fn input_lines(out: &mut String, delivered: &Delivered) {
             let _ = write!(out, "\n- trigger {trigger} (its text is not available)");
         }
         (InputBody::Note { text }, _) => {
-            out.push_str("\n- a note from the Router");
+            out.push_str("\n- a note from the agent");
             quoted(out, text);
         }
         (InputBody::Approved { by }, _) => {
@@ -279,6 +283,7 @@ where
             .to_vec();
         if parts.broker.offers_run_code() {
             grants.push("run_code".into());
+            grants.extend(JOB_TOOLS.map(String::from));
         }
         private_dir(&parts.tickets_dir)?;
         Ok(Self {
@@ -468,6 +473,7 @@ where
             .play(&mut session, &mut events, inbox, stop, run)
             .await;
         close(session).await;
+        seat.stop_jobs().await;
         outcome
     }
 
@@ -551,6 +557,8 @@ impl Turns<'_> {
     /// Report started, prompt the assignment, and keep prompting until the
     /// worker is stopped or gone. Inputs that come during a turn wait for
     /// the next one; an Input the session already has is not sent again.
+    /// A turn's end turns the job ends it did not take into Notes, which
+    /// come back as Inputs.
     async fn play(
         &self,
         session: &mut impl Session,
@@ -592,15 +600,25 @@ impl Turns<'_> {
             tokio::select! {
                 _ = stop.changed() => return Ok(None),
                 batch = inbox.recv() => match batch {
-                    Some(batch) => queued.extend(
-                        batch.into_iter().filter(|d| seen.insert(d.input.id.clone())),
-                    ),
+                    Some(batch) => {
+                        queued.extend(
+                            batch.into_iter().filter(|d| seen.insert(d.input.id.clone())),
+                        );
+                        if in_turn && !queued.is_empty() {
+                            seat.input_waiting();
+                        }
+                    }
                     None => return Ok(None),
                 },
                 event = events.recv() => match event {
                     Some((_, Ok(SessionEvent::TurnEnded))) => {
                         in_turn = false;
-                        if queued.is_empty() && seat.quiet_turn() {
+                        let notes = seat.end_turn();
+                        let woken = !notes.is_empty();
+                        for note in notes {
+                            self.facts.send(note).await?;
+                        }
+                        if queued.is_empty() && !woken && !seat.jobs_running() && seat.quiet_turn() {
                             self.quiet().await?;
                         }
                     }
@@ -614,8 +632,8 @@ impl Turns<'_> {
         }
     }
 
-    /// A turn left the Ticket as if working and nothing waits to be
-    /// prompted, so it counts as `waiting`.
+    /// A turn left the Ticket as if working, nothing waits to be prompted
+    /// and no job runs, so it counts as `waiting`.
     async fn quiet(&self) -> Result<()> {
         let spent = self.broker.spent(self.seat).await?;
         let report = ReportIn {
