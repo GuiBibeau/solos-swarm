@@ -1,0 +1,568 @@
+//! The agent broker over HTTP on its Unix socket, with a scripted provider:
+//! the Router account's holds and settlements, its daily cap across a
+//! restart, the pause gate, identities, and the two Router tools against a
+//! running runtime.
+
+use anyhow::Result;
+use serde_json::{Value, json};
+use solos_agent_core::AllowlistPolicy;
+use solos_agent_core::model::{
+    Actor, Addressed, Candidate, ChannelRef, DecisionKind, MessageKind, OutboundMessage, ThreadKey,
+    Trigger, TriggerId,
+};
+use solos_agent_store::{SpendState, SqliteStore};
+use solos_swarm::agent::broker::{
+    self, Account, AgentBroker, BrokerParts, DecideTerms, Grant, ModelTerms, Principal,
+};
+use solos_swarm::agent::jsonl::{JsonlChannel, JsonlSource};
+use solos_swarm::agent::ports::{BoxFuture, Channel, FactSink, Router};
+use solos_swarm::agent::scripted::{ScriptedExecutor, ScriptedRouter};
+use solos_swarm::agent::{Adapters, RunOptions, Runtime, STORE_FILE};
+use solos_swarm::gateway::{Dispatch, PriceTable, Provider, Upstream, upstream_body};
+use std::collections::BTreeMap;
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::{Notify, oneshot};
+
+const TOKEN: &str = "router-token";
+const MAX_OUTPUT: u64 = 2_048;
+const PRICES: PriceTable = PriceTable {
+    input_microusd_per_million: 300_000,
+    output_microusd_per_million: 1_200_000,
+    cache_hit_microusd_per_million: Some(6_000),
+};
+/// 100 prompt tokens and 50 completion tokens at `PRICES`.
+const COST: u64 = 90;
+const LIMIT: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Behaviour {
+    Answer,
+    Fail,
+    NoReceipt,
+}
+
+/// Answers every call with a fixed completion, and keeps what it was sent.
+struct Scripted {
+    behaviour: Mutex<Behaviour>,
+    bodies: Mutex<Vec<Value>>,
+}
+
+impl Scripted {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            behaviour: Mutex::new(Behaviour::Answer),
+            bodies: Mutex::new(Vec::new()),
+        })
+    }
+    fn set(&self, behaviour: Behaviour) {
+        *self.behaviour.lock().unwrap() = behaviour;
+    }
+    fn calls(&self) -> usize {
+        self.bodies.lock().unwrap().len()
+    }
+}
+
+impl Provider for Scripted {
+    fn dispatch(&self, body: Value) -> Dispatch {
+        self.bodies.lock().unwrap().push(body);
+        let behaviour = *self.behaviour.lock().unwrap();
+        Box::pin(async move {
+            let usage =
+                json!({"prompt_tokens":100,"prompt_cache_hit_tokens":0,"completion_tokens":50});
+            match behaviour {
+                Behaviour::Answer => Ok(
+                    json!({"id":"receipt-1","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":usage}),
+                ),
+                Behaviour::Fail => Err(anyhow::anyhow!(
+                    "provider transport failure; outcome unknown"
+                )),
+                Behaviour::NoReceipt => Ok(json!({"choices":[],"usage":usage})),
+            }
+        })
+    }
+}
+
+/// Keeps each Candidate for the test to decide over HTTP.
+#[derive(Default)]
+struct Holding {
+    candidates: Mutex<Vec<Candidate>>,
+    arrived: Notify,
+}
+
+impl Router for Holding {
+    fn assess(&self, candidate: Candidate, _: FactSink) -> BoxFuture<'_, Result<()>> {
+        self.candidates.lock().unwrap().push(candidate);
+        self.arrived.notify_one();
+        Box::pin(async { Ok(()) })
+    }
+}
+
+struct Scratch {
+    root: PathBuf,
+}
+
+impl Scratch {
+    fn new(name: &str) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "agent-broker-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("state")).unwrap();
+        Self { root }
+    }
+    fn state(&self) -> PathBuf {
+        self.root.join("state")
+    }
+    fn store(&self) -> SqliteStore {
+        SqliteStore::open(self.state().join(STORE_FILE)).unwrap()
+    }
+    fn triggers(&self) -> PathBuf {
+        self.root.join("triggers.jsonl")
+    }
+    fn append(&self, trigger: &Trigger) {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.triggers())
+            .unwrap();
+        writeln!(file, "{}", serde_json::to_string(trigger).unwrap()).unwrap();
+    }
+    fn sent(&self) -> Vec<OutboundMessage> {
+        std::fs::read_to_string(self.root.join("outbox.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+    fn runtime(&self, router: Arc<dyn Router>, until_idle: bool) -> Runtime {
+        let channel: Arc<dyn Channel> =
+            Arc::new(JsonlChannel::open(self.root.join("outbox.jsonl")).unwrap());
+        let adapters = Adapters {
+            sources: vec![Box::new(JsonlSource::new(self.triggers(), false))],
+            channels: BTreeMap::from([("slack".to_owned(), channel)]),
+            router,
+            executor: Arc::new(ScriptedExecutor),
+        };
+        let options = RunOptions {
+            until_idle,
+            tick: Duration::from_millis(10),
+            ..RunOptions::default()
+        };
+        let policy = AllowlistPolicy {
+            people: ["slack:alice".to_owned()].into(),
+            ..AllowlistPolicy::default()
+        };
+        Runtime::new(self.store(), policy, adapters, options).with_control_dir(self.state())
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn request(id: &str, thread: &str, text: &str) -> Trigger {
+    Trigger {
+        id: TriggerId::new(id),
+        source: "slack".into(),
+        at_ms: 1_000,
+        actor: Actor::person("alice"),
+        addressed: Addressed::Mention,
+        text: text.into(),
+        threads: vec![ThreadKey::new(thread)],
+        reply_to: vec![ChannelRef {
+            source: "slack".into(),
+            address: BTreeMap::from([("thread_ts".to_owned(), thread.to_owned())]),
+        }],
+        meta: json!({}),
+    }
+}
+
+fn grant(daily_microusd: u64) -> Grant {
+    Grant {
+        principal: Principal::Router,
+        account: Account::Router { daily_microusd },
+        terms: ModelTerms {
+            upstream: Upstream::deepseek("deepseek-flash"),
+            prices: PRICES,
+            max_input_bytes: 65_536,
+            max_output_tokens: MAX_OUTPUT,
+        },
+        system_prompt: Some("You are the Router.".into()),
+    }
+}
+
+/// A broker serving on the state directory's socket, and a client for it.
+struct Served {
+    server: tokio::task::JoinHandle<()>,
+    client: reqwest::Client,
+}
+
+impl Served {
+    async fn post(&self, path: &str, token: Option<&str>, body: Value) -> (u16, Value) {
+        let mut request = self
+            .client
+            .post(format!("http://broker/{path}"))
+            .json(&body);
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.unwrap();
+        let status = response.status().as_u16();
+        (status, response.json().await.unwrap_or(Value::Null))
+    }
+    async fn model(&self, text: &str) -> (u16, Value) {
+        self.post("model", Some(TOKEN), model_request(text)).await
+    }
+    /// Stop serving and close the socket, as a process exit would.
+    async fn stop(mut self) {
+        self.server.abort();
+        let _ = (&mut self.server).await;
+    }
+}
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+fn model_request(text: &str) -> Value {
+    json!({"model":"deepseek-flash","messages":[{"role":"user","content":text}],
+           "tools":[{"type":"function","function":{"name":"router_decide","parameters":{"type":"object"}}}]})
+}
+
+fn serve(scratch: &Scratch, provider: Arc<Scripted>, facts: FactSink, daily: u64) -> Served {
+    let broker = AgentBroker::new(BrokerParts {
+        dir: scratch.state(),
+        store: scratch.store(),
+        provider,
+        facts,
+        decide: DecideTerms {
+            default_budget_microusd: 500_000,
+            max_budget_microusd: 2_000_000,
+        },
+    })
+    .unwrap();
+    broker.admit(TOKEN.into(), grant(daily)).unwrap();
+    let (listener, socket) = broker::bind(&scratch.state()).unwrap();
+    let app = broker.router().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = reqwest::Client::builder()
+        .unix_socket(socket)
+        .build()
+        .unwrap();
+    Served { server, client }
+}
+
+/// A broker whose runtime never runs: enough for model calls.
+fn model_only(scratch: &Scratch, provider: Arc<Scripted>, daily: u64) -> (Runtime, Served) {
+    let runtime = scratch.runtime(Arc::new(Holding::default()), true);
+    let served = serve(scratch, provider, runtime.facts(), daily);
+    (runtime, served)
+}
+
+fn hold_for(text: &str) -> u64 {
+    let bytes = serde_json::to_vec(&model_request(text)).unwrap().len();
+    PRICES.request_hold(bytes, MAX_OUTPUT)
+}
+
+#[tokio::test]
+async fn a_router_call_is_held_then_settled_against_the_router_account() {
+    let scratch = Scratch::new("settle");
+    let provider = Scripted::new();
+    let (_runtime, served) = model_only(&scratch, provider.clone(), 1_000_000);
+
+    let (status, reply) = served.model("judge eval ev_1").await;
+
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["swarm_cost_microusd"], COST);
+    assert_eq!(reply["id"], "receipt-1");
+    let sent = provider.bodies.lock().unwrap().clone();
+    assert_eq!(
+        sent,
+        [upstream_body(
+            "deepseek-flash",
+            &model_request("judge eval ev_1"),
+            MAX_OUTPUT
+        )]
+    );
+    let rows = scratch.store().spend("router").unwrap();
+    let [row] = &rows[..] else { panic!("{rows:?}") };
+    assert_eq!(row.state, SpendState::Settled);
+    assert_eq!(row.hold_microusd, hold_for("judge eval ev_1"));
+    assert_eq!(row.cost_microusd, COST);
+    assert_eq!(row.provider, "deepseek");
+    assert_eq!(row.request_id.as_deref(), Some("receipt-1"));
+    assert_eq!(
+        row.tokens.map(|t| (t.input, t.cached_input, t.output)),
+        Some((100, 0, 50))
+    );
+}
+
+#[tokio::test]
+async fn the_daily_cap_refuses_and_still_refuses_after_a_restart() {
+    let scratch = Scratch::new("cap");
+    let provider = Scripted::new();
+    // One call fits; a second hold on top of the first call's cost does not.
+    let cap = hold_for("judge") + COST - 1;
+    {
+        let (_runtime, served) = model_only(&scratch, provider.clone(), cap);
+        assert_eq!(served.model("judge").await.0, 200);
+        let (status, reply) = served.model("judge").await;
+        assert_eq!(status, 403);
+        let why = reply["error"].as_str().unwrap();
+        assert!(why.contains("daily spend cap"), "{why}");
+        assert!(why.contains(&format!("{COST} of {cap}")), "{why}");
+        served.stop().await;
+    }
+
+    let (_runtime, restarted) = model_only(&scratch, provider.clone(), cap);
+    let (status, reply) = restarted.model("judge").await;
+
+    assert_eq!(status, 403, "{reply}");
+    assert_eq!(provider.calls(), 1, "no refused call reached the provider");
+    let rows = scratch.store().spend("router").unwrap();
+    assert_eq!(rows.len(), 1, "a refusal holds nothing");
+    assert_eq!(scratch.store().committed("router", 0).unwrap(), COST);
+}
+
+#[tokio::test]
+async fn a_pause_in_the_state_dir_refuses_model_calls_with_the_swarm_reply() {
+    let scratch = Scratch::new("pause");
+    let provider = Scripted::new();
+    let (_runtime, served) = model_only(&scratch, provider.clone(), 1_000_000);
+
+    std::fs::write(scratch.state().join("PAUSE"), "").unwrap();
+    let (status, reply) = served.model("judge").await;
+    assert_eq!(status, 503);
+    assert_eq!(
+        reply,
+        json!({"paused":true,"retry_after_s":60,"reason":"model calls are paused (operator pause or peak window)"})
+    );
+    std::fs::remove_file(scratch.state().join("PAUSE")).unwrap();
+    std::fs::write(
+        scratch.state().join("control.json"),
+        r#"{"mode":"pause","reason":"test"}"#,
+    )
+    .unwrap();
+    let (status, reply) = served.model("judge").await;
+    assert_eq!((status, reply["retry_after_s"].clone()), (503, json!(30)));
+    assert_eq!(provider.calls(), 0);
+    assert!(scratch.store().spend("router").unwrap().is_empty());
+
+    std::fs::remove_file(scratch.state().join("control.json")).unwrap();
+    assert_eq!(served.model("judge").await.0, 200);
+}
+
+#[tokio::test]
+async fn an_unknown_or_missing_token_is_refused_everywhere() {
+    let scratch = Scratch::new("tokens");
+    let provider = Scripted::new();
+    let (_runtime, served) = model_only(&scratch, provider.clone(), 1_000_000);
+    let read = json!({"id":"t1"});
+    for (path, body) in [
+        ("model", model_request("judge")),
+        ("tool/router_read", read.clone()),
+        ("session", json!({})),
+    ] {
+        for token in [None, Some("forged-token")] {
+            let (status, reply) = served.post(path, token, body.clone()).await;
+            assert_eq!(status, 403, "{path} {token:?}: {reply}");
+        }
+    }
+    assert_eq!(provider.calls(), 0);
+    let (status, reply) = served.post("session", Some(TOKEN), json!({})).await;
+    assert_eq!(
+        (status, reply),
+        (200, json!({"system_prompt":"You are the Router."}))
+    );
+}
+
+#[tokio::test]
+async fn the_router_may_offer_and_call_only_its_two_tools() {
+    let scratch = Scratch::new("grants");
+    let provider = Scripted::new();
+    let (_runtime, served) = model_only(&scratch, provider.clone(), 1_000_000);
+    for tool in ["run_code", "fetch_url", "claim_task"] {
+        let (status, _) = served
+            .post(&format!("tool/{tool}"), Some(TOKEN), json!({}))
+            .await;
+        assert_eq!(status, 403, "{tool}");
+        let mut offered = model_request("judge");
+        offered["tools"][0]["function"]["name"] = json!(tool);
+        let (status, reply) = served.post("model", Some(TOKEN), offered).await;
+        assert_eq!(status, 403, "{tool}");
+        assert_eq!(reply["error"], "unadmitted provider tool");
+    }
+    let mut wrong = model_request("judge");
+    wrong["model"] = json!("deepseek-pro");
+    assert_eq!(served.post("model", Some(TOKEN), wrong).await.0, 403);
+    assert_eq!(provider.calls(), 0);
+}
+
+#[tokio::test]
+async fn a_failed_call_releases_its_hold_and_an_unreadable_receipt_is_charged_at_it() {
+    let scratch = Scratch::new("failures");
+    let provider = Scripted::new();
+    let (_runtime, served) = model_only(&scratch, provider.clone(), 1_000_000);
+    provider.set(Behaviour::Fail);
+    assert_eq!(served.model("judge").await.0, 403);
+    provider.set(Behaviour::NoReceipt);
+    assert_eq!(served.model("judge").await.0, 403);
+
+    let rows = scratch.store().spend("router").unwrap();
+    let closed: Vec<_> = rows.iter().map(|r| (r.state, r.cost_microusd)).collect();
+    assert_eq!(
+        closed,
+        [
+            (SpendState::Released, 0),
+            (SpendState::Unknown, hold_for("judge"))
+        ]
+    );
+}
+
+/// Run `body` against a live runtime, then stop it.
+async fn with_runtime<F: Future<Output = ()>>(runtime: Runtime, body: F) {
+    let (stop, stopped) = oneshot::channel::<()>();
+    let run = runtime.run(async {
+        let _ = stopped.await;
+    });
+    let test = async {
+        body.await;
+        let _ = stop.send(());
+    };
+    let (summary, ()) = tokio::time::timeout(LIMIT, async { tokio::join!(run, test) })
+        .await
+        .expect("the test did not finish");
+    summary.unwrap();
+}
+
+#[tokio::test]
+async fn router_decide_becomes_the_engines_decision_and_a_refused_one_is_a_tool_error() {
+    let scratch = Scratch::new("decide");
+    scratch.append(&request("t-ask", "T1", "Summarise the incident report"));
+    let router = Arc::new(Holding::default());
+    let runtime = scratch.runtime(router.clone(), false);
+    let served = serve(&scratch, Scripted::new(), runtime.facts(), 1_000_000);
+
+    with_runtime(runtime, async {
+        router.arrived.notified().await;
+        let eval = router.candidates.lock().unwrap()[0].eval.clone();
+        let accept = json!({"eval":eval,"decision":"accept","reason":"alice asked",
+                            "title":"Summarise the incident","scope":"Summarise the incident report"});
+
+        let (status, answer) = served.post("tool/router_decide", Some(TOKEN), accept.clone()).await;
+
+        assert_eq!(status, 200, "{answer}");
+        assert_eq!(answer["kind"], "accept");
+        let ticket = answer["ticket"].as_str().unwrap().to_owned();
+        assert!(ticket.starts_with("tk"), "{answer}");
+
+        let (status, refused) = served.post("tool/router_decide", Some(TOKEN), accept).await;
+        assert_eq!(status, 409, "{refused}");
+        let why = refused["error"].as_str().unwrap();
+        assert!(why.contains(eval.as_str()), "{why}");
+
+        let too_big = json!({"eval":eval,"decision":"accept","reason":"r","title":"T","scope":"S","budget_microusd":2_000_001});
+        let (status, refused) = served.post("tool/router_decide", Some(TOKEN), too_big).await;
+        assert_eq!(status, 422);
+        assert!(refused["error"].as_str().unwrap().contains("approval"));
+
+        // The accept launched work; wait until the scripted worker's result went out.
+        for _ in 0..500 {
+            if scratch.sent().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let kinds: Vec<_> = scratch.sent().iter().map(|m| m.kind).collect();
+        assert_eq!(kinds, [MessageKind::Acknowledgement, MessageKind::Result]);
+    })
+    .await;
+
+    let store = scratch.store();
+    let decisions = store.decisions().unwrap();
+    let [decision] = &decisions[..] else {
+        panic!("{decisions:?}")
+    };
+    assert_eq!(decision.kind, DecisionKind::Accept);
+    assert_eq!(decision.reason, "alice asked");
+    assert_eq!(store.tickets().unwrap()[0].title, "Summarise the incident");
+}
+
+#[tokio::test]
+async fn router_read_follows_ids_from_a_trigger_to_its_thread_and_ticket() {
+    let scratch = Scratch::new("read");
+    scratch.append(&request(
+        "t-ask",
+        "T1",
+        &"Fix the flaky retry test. ".repeat(200),
+    ));
+    // The scripted Router accepts at once, so the Ticket exists to be read.
+    let runtime = scratch.runtime(Arc::new(ScriptedRouter::new(500_000)), true);
+    let facts = runtime.facts();
+    runtime.run(std::future::pending()).await.unwrap();
+    let served = serve(&scratch, Scripted::new(), facts, 1_000_000);
+    let read = |args: Value| served.post("tool/router_read", Some(TOKEN), args);
+
+    let (status, trigger) = read(json!({"id":"t-ask"})).await;
+    assert_eq!(status, 200, "{trigger}");
+    assert_eq!(trigger["kind"], "trigger");
+    assert_eq!(trigger["actor"]["id"], "alice");
+    assert_eq!(trigger["text_clipped"], true);
+    assert!(trigger["text"].as_str().unwrap().chars().count() <= 2_003);
+    assert_eq!(trigger["threads"], json!(["T1"]));
+    let ticket_id = trigger["tickets"][0].as_str().unwrap().to_owned();
+
+    let (_, thread) = read(json!({"id":"T1"})).await;
+    assert_eq!(thread["kind"], "thread");
+    assert_eq!(thread["triggers"], json!(["t-ask"]));
+    assert_eq!(thread["tickets"], json!([ticket_id]));
+    assert_eq!(thread["decisions"][0]["kind"], "accept");
+    assert_eq!(thread["decisions"][0]["ticket"], json!(ticket_id));
+
+    let (_, ticket) = read(json!({"id":ticket_id})).await;
+    assert_eq!(ticket["kind"], "ticket");
+    assert_eq!(ticket["origin"], "t-ask");
+    assert_eq!(ticket["threads"], json!(["T1"]));
+    assert_eq!(ticket["stage"], "ended");
+    assert_eq!(ticket["latest_report"]["status"], "ready");
+
+    let (status, _) = read(json!({"id":"t-ask","kind":"thread"})).await;
+    assert_eq!(status, 404, "the kind narrows the lookup");
+    let (status, missing) = read(json!({"id":"nothing-here"})).await;
+    assert_eq!(status, 404);
+    assert!(missing["error"].as_str().unwrap().contains("nothing-here"));
+    assert_eq!(read(json!({"ids":["t-ask"]})).await.0, 422);
+}
+
+#[tokio::test]
+async fn a_pause_file_in_the_state_dir_starts_no_eval_until_it_lifts() {
+    let scratch = Scratch::new("runtime-pause");
+    scratch.append(&request("t-ask", "T1", "Rotate the staging keys"));
+    std::fs::write(scratch.state().join("PAUSE"), "").unwrap();
+    let router = || Arc::new(ScriptedRouter::new(500_000));
+
+    let paused = scratch.runtime(router(), true).run(std::future::pending());
+    let summary = tokio::time::timeout(LIMIT, paused).await.unwrap().unwrap();
+    assert_eq!((summary.triggers_received, summary.effects_done), (1, 0));
+    assert!(scratch.store().decisions().unwrap().is_empty());
+    assert!(scratch.sent().is_empty());
+
+    std::fs::remove_file(scratch.state().join("PAUSE")).unwrap();
+    let lifted = scratch.runtime(router(), true).run(std::future::pending());
+    tokio::time::timeout(LIMIT, lifted).await.unwrap().unwrap();
+    let kinds: Vec<_> = scratch.sent().iter().map(|m| m.kind).collect();
+    assert_eq!(kinds, [MessageKind::Acknowledgement, MessageKind::Result]);
+}

@@ -5,12 +5,12 @@
 
 use anyhow::{Result, anyhow};
 use solos_agent_core::model::{
-    AssignmentId, Candidate, EvalId, Input, MicroUsd, OutboundMessage, Plan, ReportIn, TicketId,
-    Trigger, Verdict,
+    AssignmentId, Candidate, Decision, EvalId, Input, MicroUsd, OutboundMessage, Plan, ReportIn,
+    TicketId, Trigger, Verdict,
 };
 use solos_agent_store::EffectId;
 use std::{future::Future, pin::Pin};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -108,10 +108,16 @@ pub enum Fact {
     },
 }
 
+/// The Engine's answer to an asked fact: the Decision a Verdict recorded,
+/// or why the Engine refused the fact.
+pub type Answer = std::result::Result<Option<Decision>, String>;
+
 /// Facts and Effect outcomes share one queue, so the facts an adapter sends
 /// before its call returns are applied before the Effect is marked done.
 pub(crate) enum Inbound {
     Fact(Fact),
+    /// A fact whose sender waits for the Engine's answer.
+    Ask(Fact, oneshot::Sender<Answer>),
     Outcome {
         id: EffectId,
         attempts: u32,
@@ -124,10 +130,27 @@ pub(crate) enum Inbound {
 pub struct FactSink(pub(crate) mpsc::Sender<Inbound>);
 
 impl FactSink {
+    pub(crate) fn channel() -> (Self, mpsc::Receiver<Inbound>) {
+        let (sender, receiver) = mpsc::channel(256);
+        (Self(sender), receiver)
+    }
+
     pub async fn send(&self, fact: Fact) -> Result<()> {
         self.0
             .send(Inbound::Fact(fact))
             .await
             .map_err(|_| anyhow!("the agent runtime has stopped"))
+    }
+
+    /// Send a fact and wait until the runtime has applied it.
+    pub async fn ask(&self, fact: Fact) -> Result<Answer> {
+        let (reply, answer) = oneshot::channel();
+        self.0
+            .send(Inbound::Ask(fact, reply))
+            .await
+            .map_err(|_| anyhow!("the agent runtime has stopped"))?;
+        answer
+            .await
+            .map_err(|_| anyhow!("the agent runtime stopped before it answered"))
     }
 }

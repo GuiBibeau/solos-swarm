@@ -2,10 +2,11 @@
 //! Adapters run concurrently and send facts and Effect outcomes back to it.
 
 use super::ports::{
-    Channel, Delivered, Delivery, Executor, Fact, FactSink, Inbound, Launch, Router, SendOutcome,
-    Source,
+    Answer, Channel, Delivered, Delivery, Executor, Fact, FactSink, Inbound, Launch, Router,
+    SendOutcome, Source,
 };
 use crate::broker::now_ms;
+use crate::gateway;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use solos_agent_core::model::{
@@ -15,8 +16,9 @@ use solos_agent_core::{AllowlistPolicy, Engine, Error, Intake, Policy, Repositor
 use solos_agent_store::{EffectId, QueuedEffect, SqliteStore};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::{self, JoinError, JoinSet};
 use tokio::time::MissedTickBehavior;
@@ -84,6 +86,14 @@ pub struct Runtime {
     in_flight: BTreeSet<EffectId>,
     /// Which Effect each running adapter task performs, so a panic fails it.
     tasks: HashMap<task::Id, (EffectId, u32)>,
+    facts: FactSink,
+    inbound: Option<mpsc::Receiver<Inbound>>,
+    /// A directory whose pause gate (`control.json`, `PAUSE`) pauses the
+    /// agent as the Policy's own `paused` does.
+    control_dir: Option<PathBuf>,
+    /// The Policy's own `paused`, which the directory's gate adds to.
+    configured_pause: bool,
+    gate_checked: Option<Instant>,
 }
 
 impl Runtime {
@@ -94,7 +104,9 @@ impl Runtime {
         options: RunOptions,
     ) -> Self {
         let clock: fn() -> Ms = now_ms;
+        let (facts, inbound) = FactSink::channel();
         Self {
+            configured_pause: policy.paused,
             engine: Engine::new(store, policy, clock),
             sources: adapters.sources,
             shared: Shared {
@@ -106,7 +118,22 @@ impl Runtime {
             summary: Summary::default(),
             in_flight: BTreeSet::new(),
             tasks: HashMap::new(),
+            facts,
+            inbound: Some(inbound),
+            control_dir: None,
+            gate_checked: None,
         }
+    }
+
+    /// Pause while `dir`'s pause gate is shut, as a broker does.
+    pub fn with_control_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.control_dir = Some(dir.into());
+        self
+    }
+
+    /// Where facts for this runtime go, before and while it runs.
+    pub fn facts(&self) -> FactSink {
+        self.facts.clone()
     }
 
     /// Serve until `stop` resolves, or with `until_idle` until there is
@@ -114,8 +141,8 @@ impl Runtime {
     /// a crash would; every Effect not marked done runs again on the next
     /// start.
     pub async fn run(mut self, stop: impl Future<Output = ()>) -> Result<Summary> {
-        let (inbound_tx, mut inbound) = mpsc::channel(256);
-        let facts = FactSink(inbound_tx);
+        let facts = self.facts.clone();
+        let mut inbound = self.inbound.take().context("a runtime runs once")?;
         let (trigger_tx, mut triggers) = mpsc::channel::<Vec<Trigger>>(16);
         let mut sources = JoinSet::new();
         for source in std::mem::take(&mut self.sources) {
@@ -128,6 +155,7 @@ impl Runtime {
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         tokio::pin!(stop);
         loop {
+            self.gate();
             self.evaluate()?;
             self.dispatch(&mut work, &facts)?;
             let drained = !sources_open && sources.is_empty() && inbound.is_empty();
@@ -162,6 +190,31 @@ impl Runtime {
         Ok(self.summary)
     }
 
+    /// Follow the control directory's pause gate, reading it at most once a
+    /// tick. Pausing does not change the Policy version, so running Evals
+    /// stay valid.
+    fn gate(&mut self) {
+        let Some(dir) = &self.control_dir else {
+            return;
+        };
+        if self
+            .gate_checked
+            .is_some_and(|at| at.elapsed() < self.options.tick)
+        {
+            return;
+        }
+        self.gate_checked = Some(Instant::now());
+        let paused = self.configured_pause
+            || gateway::effective_control(dir, gateway::unix_secs()).is_some();
+        if paused != self.engine.policy().paused() {
+            let mut policy = self.engine.policy().clone();
+            policy.paused = paused;
+            self.engine.set_policy(policy);
+            let what = if paused { "paused" } else { "unpaused" };
+            eprintln!("agent: {what} by {}", dir.display());
+        }
+    }
+
     fn evaluate(&mut self) -> Result<()> {
         if self.engine.repos().active_threads().is_empty() {
             return Ok(());
@@ -185,15 +238,19 @@ impl Runtime {
         Ok(())
     }
 
-    fn apply(&mut self, fact: Fact) -> Result<()> {
+    /// Apply a fact as its Engine command. The outer error is a Store
+    /// failure, which stops the runtime; the answer says what the Engine did.
+    fn apply(&mut self, fact: Fact) -> Result<Answer> {
         let (what, result) = match fact {
             Fact::Verdict { eval, verdict } => (
                 format!("verdict on {eval}"),
-                self.engine.decide(&eval, verdict).map(drop),
+                self.engine.decide(&eval, verdict).map(Some),
             ),
             Fact::Started { ticket, assignment } => (
                 format!("start of {assignment} on {ticket}"),
-                self.engine.assignment_started(&ticket, &assignment),
+                self.engine
+                    .assignment_started(&ticket, &assignment)
+                    .map(|()| None),
             ),
             Fact::Report {
                 ticket,
@@ -201,10 +258,19 @@ impl Runtime {
                 report,
             } => (
                 format!("report on {assignment} of {ticket}"),
-                self.engine.report(&ticket, &assignment, report),
+                self.engine
+                    .report(&ticket, &assignment, report)
+                    .map(|()| None),
             ),
         };
-        settle(&what, result)
+        match result {
+            Ok(decision) => Ok(Ok(decision.and_then(|id| self.engine.repos().decision(&id)))),
+            Err(Error::Store(why)) => bail!("{what}: {why}"),
+            Err(err) => {
+                eprintln!("agent: {what}: {err}");
+                Ok(Err(err.to_string()))
+            }
+        }
     }
 
     /// Hand due Effects to their adapters. A pause holds every Effect, per
@@ -325,7 +391,17 @@ impl Runtime {
 
     fn inbound(&mut self, message: Inbound) -> Result<()> {
         match message {
-            Inbound::Fact(fact) => self.apply(fact),
+            Inbound::Fact(fact) => self.apply(fact).map(drop),
+            Inbound::Ask(fact, reply) => {
+                let applied = self.apply(fact);
+                let answer = match &applied {
+                    Ok(answer) => answer.clone(),
+                    Err(err) => Err(format!("{err:#}")),
+                };
+                // The asker may have gone; the fact is applied either way.
+                let _ = reply.send(answer);
+                applied.map(drop)
+            }
             Inbound::Outcome {
                 id,
                 attempts,

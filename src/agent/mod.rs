@@ -3,6 +3,7 @@
 //! [`serve`] is the composition root, the one place that names concrete
 //! adapters.
 
+pub mod broker;
 pub mod config;
 pub mod jsonl;
 pub mod ports;
