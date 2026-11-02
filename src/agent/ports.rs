@@ -5,10 +5,11 @@
 
 use anyhow::{Result, anyhow};
 use solos_agent_core::model::{
-    AssignmentId, Candidate, EvalId, Input, MicroUsd, OutboundMessage, Plan, ReportIn, TicketId,
-    Trigger, Verdict,
+    Actor, AssignmentId, Candidate, ChannelRef, EvalId, Input, MicroUsd, OutboundMessage, Plan,
+    ReportIn, TicketId, Trigger, Verdict,
 };
 use solos_agent_store::EffectId;
+use std::time::Duration;
 use std::{future::Future, pin::Pin};
 use tokio::sync::mpsc;
 
@@ -21,8 +22,9 @@ pub type TriggerSink = mpsc::Sender<Vec<Trigger>>;
 /// the Engine stores each id once.
 pub trait Source: Send {
     /// Send batches to `sink`, oldest first, until the Source ends or the sink
-    /// closes.
-    fn run(self: Box<Self>, sink: TriggerSink) -> BoxFuture<'static, Result<()>>;
+    /// closes. Commands people give through the Source's own controls go to
+    /// `facts` as [`Fact::Command`].
+    fn run(self: Box<Self>, sink: TriggerSink, facts: FactSink) -> BoxFuture<'static, Result<()>>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,11 +34,39 @@ pub enum SendOutcome {
     Gone,
 }
 
+/// What the runtime knows about a message beyond its content.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SendOptions {
+    /// An earlier attempt may have sent it: one failed, or a crash ended the
+    /// last run before the message was marked sent.
+    pub repeat: bool,
+    /// It asks a person to approve its Ticket's budget, so a Channel with
+    /// buttons offers Approve and Stop.
+    pub approval: bool,
+}
+
 pub trait Channel: Send + Sync {
     /// Send at most once per `message.id`: a repeat reports `Sent` and sends
     /// nothing.
-    fn send(&self, message: OutboundMessage) -> BoxFuture<'_, Result<SendOutcome>>;
+    fn send(
+        &self,
+        message: OutboundMessage,
+        options: SendOptions,
+    ) -> BoxFuture<'_, Result<SendOutcome>>;
 }
+
+/// An adapter error that says when to try again, such as an HTTP 429's
+/// `Retry-After`. The runtime waits at least this long before the retry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetryAfter(pub Duration);
+
+impl std::fmt::Display for RetryAfter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "rate limited; retry after {}s", self.0.as_secs())
+    }
+}
+
+impl std::error::Error for RetryAfter {}
 
 pub trait Router: Send + Sync {
     /// Take a Candidate. Its Verdict arrives on `facts` as [`Fact::Verdict`],
@@ -106,6 +136,31 @@ pub enum Fact {
         assignment: AssignmentId,
         report: ReportIn,
     },
+    Command(Command),
+}
+
+/// A person's command through a Source's own controls, such as a Slack
+/// button, never through message text. The Source vouches for who gave it;
+/// the Policy decides whether they may.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Command {
+    /// Stable for one click, so a redelivered click names the same reply.
+    pub id: String,
+    pub order: Order,
+    pub ticket: TicketId,
+    /// The Source it came through, such as `slack`.
+    pub source: String,
+    pub by: Actor,
+    /// Where the outcome is told.
+    pub reply_to: ChannelRef,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Order {
+    /// Approve the Ticket's budget, so its work launches.
+    Approve,
+    /// Stop the Ticket for good.
+    Stop,
 }
 
 /// Facts and Effect outcomes share one queue, so the facts an adapter sends
@@ -115,8 +170,26 @@ pub(crate) enum Inbound {
     Outcome {
         id: EffectId,
         attempts: u32,
-        result: Result<(), String>,
+        result: Result<(), Failure>,
     },
+}
+
+pub(crate) struct Failure {
+    pub(crate) why: String,
+    pub(crate) retry_after: Option<Duration>,
+}
+
+impl From<anyhow::Error> for Failure {
+    fn from(err: anyhow::Error) -> Self {
+        let retry_after = err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<RetryAfter>())
+            .map(|after| after.0);
+        Self {
+            why: format!("{err:#}"),
+            retry_after,
+        }
+    }
 }
 
 /// Where adapters send facts. It outlives the call it came with.

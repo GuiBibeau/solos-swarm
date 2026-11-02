@@ -12,7 +12,7 @@ use solos_agent_core::model::{
 use solos_agent_store::SqliteStore;
 use solos_swarm::agent::jsonl::{JsonlChannel, JsonlSource};
 use solos_swarm::agent::ports::{
-    BoxFuture, Channel, Delivery, Executor, FactSink, Launch, SendOutcome,
+    BoxFuture, Channel, Delivery, Executor, FactSink, Launch, SendOptions, SendOutcome,
 };
 use solos_swarm::agent::scripted::{ScriptedExecutor, ScriptedRouter};
 use solos_swarm::agent::{Adapters, RunOptions, Runtime, STORE_FILE, Summary, serve};
@@ -297,9 +297,13 @@ struct Observed {
 }
 
 impl Channel for Observed {
-    fn send(&self, message: OutboundMessage) -> BoxFuture<'_, Result<SendOutcome>> {
+    fn send(
+        &self,
+        message: OutboundMessage,
+        options: SendOptions,
+    ) -> BoxFuture<'_, Result<SendOutcome>> {
         Box::pin(async move {
-            let outcome = self.inner.send(message).await?;
+            let outcome = self.inner.send(message, options).await?;
             self.sent.notify_one();
             Ok(outcome)
         })
@@ -461,7 +465,11 @@ struct Flaky {
 }
 
 impl Channel for Flaky {
-    fn send(&self, message: OutboundMessage) -> BoxFuture<'_, Result<SendOutcome>> {
+    fn send(
+        &self,
+        message: OutboundMessage,
+        options: SendOptions,
+    ) -> BoxFuture<'_, Result<SendOutcome>> {
         self.calls.lock().unwrap().push(Instant::now());
         let refuse = self
             .failures
@@ -471,7 +479,7 @@ impl Channel for Flaky {
             if refuse {
                 return Err(anyhow!("rate limited"));
             }
-            self.inner.send(message).await
+            self.inner.send(message, options).await
         })
     }
 }
