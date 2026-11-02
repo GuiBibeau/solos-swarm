@@ -144,6 +144,7 @@ impl World {
             decide: DecideTerms {
                 default_budget_microusd: 500_000,
                 max_budget_microusd: None,
+                swarm: None,
             },
             workers: Some(WorkerParts {
                 terms: terms(),

@@ -9,6 +9,7 @@
 use super::broker::{self, AgentBroker, WorkerSeat, clip};
 use super::jobs::JOB_TOOLS;
 use super::ports::{BoxFuture, Delivered, Delivery, Executor, Fact, FactSink, Launch};
+use super::swarm_executor::SwarmExecutor;
 use crate::broker::write_json;
 use crate::harness::{
     AgentHarness, JOIN_WAIT, Observation, Role, STOP_WAIT, Session, SessionEvent, SessionSpec,
@@ -176,9 +177,10 @@ pub fn delivery_text(ticket: &TicketId, inputs: &[Delivered]) -> String {
     text
 }
 
-/// What runs a Plan. Every launch goes through here; P5 adds the swarm.
+/// What runs a Plan. Every launch goes through here.
 enum Runner {
     Session,
+    Swarm,
     Unavailable(String),
 }
 
@@ -191,9 +193,7 @@ fn runner(plan: &Plan) -> Runner {
         Plan::Session {
             harness: Some(name),
         } => Runner::Unavailable(format!("the {name} harness is not available here")),
-        Plan::Swarm { agents, .. } => Runner::Unavailable(format!(
-            "this agent does not run swarm plans yet, so the swarm of {agents} agents did not start"
-        )),
+        Plan::Swarm { .. } => Runner::Swarm,
     }
 }
 
@@ -212,6 +212,8 @@ pub struct PiExecutorParts<H> {
     /// A shell command run once per Ticket in its directory before its
     /// first worker, with `SOLOS_TICKET` and `SOLOS_WORK_DIR` set.
     pub prepare: Option<String>,
+    /// Runs `Plan::Swarm` Assignments; without it they fail.
+    pub swarm: Option<SwarmExecutor<H>>,
 }
 
 pub struct PiExecutor<H> {
@@ -250,12 +252,25 @@ impl Drop for Revoke<'_> {
     }
 }
 
-fn private_dir(dir: &Path) -> Result<()> {
+pub(super) fn private_dir(dir: &Path) -> Result<()> {
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(dir)
         .with_context(|| format!("cannot create {}", dir.display()))
+}
+
+/// `name`, when it can name a directory: a Ticket or Assignment id.
+pub(super) fn dir_name(name: &str) -> Result<&str> {
+    ensure!(
+        !name.is_empty()
+            && name.len() <= 64
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+        "id {name} cannot name a directory"
+    );
+    Ok(name)
 }
 
 async fn close(mut session: impl Session) {
@@ -307,6 +322,9 @@ where
         for worker in workers.into_values() {
             finish(worker.task).await;
         }
+        if let Some(swarm) = &self.inner.parts.swarm {
+            swarm.shutdown().await;
+        }
     }
 }
 
@@ -317,36 +335,59 @@ where
 {
     fn launch(&self, launch: Launch, facts: FactSink) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
-            match runner(&launch.plan) {
-                Runner::Session => {
+            match (runner(&launch.plan), &self.inner.parts.swarm) {
+                (Runner::Session, _) => {
                     self.inner.start(launch, facts);
                     Ok(())
                 }
-                Runner::Unavailable(why) => failed(&facts, &launch, false, &why, 0).await,
+                (Runner::Swarm, Some(swarm)) => swarm.launch(launch, facts).await,
+                (Runner::Swarm, None) => {
+                    let agents = match &launch.plan {
+                        Plan::Swarm { agents, .. } => *agents,
+                        Plan::Session { .. } => 0,
+                    };
+                    let why = format!(
+                        "this agent has no executor.swarm, so the swarm of {agents} agents did \
+                         not start"
+                    );
+                    failed(&facts, &launch, false, &why, 0).await
+                }
+                (Runner::Unavailable(why), _) => failed(&facts, &launch, false, &why, 0).await,
             }
         })
     }
 
-    fn deliver(&self, delivery: Delivery, _: FactSink) -> BoxFuture<'_, Result<()>> {
-        match self.inner.workers().get(&delivery.assignment) {
-            Some(worker) => {
-                // A worker that ended meanwhile drops them; the next Assignment's launch carries every Input.
-                let _ = worker.inputs.send(delivery.inputs);
-            }
-            None => eprintln!(
-                "agent: no worker runs {} of {}; its inputs wait for the next one",
-                delivery.assignment, delivery.ticket
-            ),
+    fn deliver(&self, delivery: Delivery, facts: FactSink) -> BoxFuture<'_, Result<()>> {
+        if let Some(worker) = self.inner.workers().get(&delivery.assignment) {
+            // A worker that ended meanwhile drops them; the next Assignment's launch carries every Input.
+            let _ = worker.inputs.send(delivery.inputs);
+            return Box::pin(async { Ok(()) });
         }
+        if let Some(swarm) = &self.inner.parts.swarm
+            && swarm.has(&delivery.assignment)
+        {
+            return swarm.deliver(delivery, facts);
+        }
+        eprintln!(
+            "agent: no worker runs {} of {}; its inputs wait for the next one",
+            delivery.assignment, delivery.ticket
+        );
         Box::pin(async { Ok(()) })
     }
 
-    fn stop(&self, _: TicketId, assignment: AssignmentId, _: String) -> BoxFuture<'_, Result<()>> {
+    fn stop(
+        &self,
+        ticket: TicketId,
+        assignment: AssignmentId,
+        reason: String,
+    ) -> BoxFuture<'_, Result<()>> {
         let worker = self.inner.workers().remove(&assignment);
         Box::pin(async move {
             if let Some(worker) = worker {
                 let _ = worker.stop.send(true);
                 finish(worker.task).await;
+            } else if let Some(swarm) = &self.inner.parts.swarm {
+                swarm.stop(ticket, assignment, reason).await?;
             }
             Ok(())
         })
@@ -480,16 +521,7 @@ where
 
     /// The Ticket's directory, with its empty `work` and Pi settings.
     fn ticket_dir(&self, ticket: &TicketId) -> Result<PathBuf> {
-        let name = ticket.as_str();
-        ensure!(
-            !name.is_empty()
-                && name.len() <= 64
-                && name
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
-            "ticket id {name} cannot name a directory"
-        );
-        let dir = self.parts.tickets_dir.join(name);
+        let dir = self.parts.tickets_dir.join(dir_name(ticket.as_str())?);
         private_dir(&dir.join(WORK_DIR))?;
         let settings = dir.join("pi-settings.json");
         if !settings.exists() {
@@ -846,6 +878,7 @@ mod tests {
                 decide: DecideTerms {
                     default_budget_microusd: 1,
                     max_budget_microusd: None,
+                    swarm: None,
                 },
                 workers: Some(WorkerParts { terms, code: None }),
             })
@@ -861,6 +894,7 @@ mod tests {
                 model: "deepseek-flash".into(),
                 max_workers,
                 prepare: prepare.map(String::from),
+                swarm: None,
             })
             .unwrap();
             Self {

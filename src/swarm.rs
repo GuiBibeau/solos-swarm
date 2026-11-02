@@ -14,13 +14,16 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    future::Future,
     os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::{Path, PathBuf},
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
 use tokio::{
     net::UnixListener,
+    signal::unix::{Signal, SignalKind, signal},
     sync::{Mutex, Semaphore, mpsc},
 };
 
@@ -63,7 +66,38 @@ pub struct GoalOutcome {
     /// `artifacts/final.json`, when the run has an artifact.
     pub artifact: Option<PathBuf>,
     pub spent_microusd: u64,
+    /// Holds still open when the run ended: calls whose cost is unknown.
+    pub held_microusd: u64,
     pub findings: usize,
+}
+
+/// What cancels a run before its end, as an operator's cancel does: the
+/// unfiled Tasks get partial findings, what was filed becomes the artifact,
+/// and every session stops.
+pub struct Cancel {
+    /// SIGTERM and Ctrl-C to this process.
+    signals: bool,
+    /// Resolves with the reason the host cancels the run.
+    request: Option<Pin<Box<dyn Future<Output = String> + Send>>>,
+}
+
+impl Cancel {
+    /// SIGTERM or Ctrl-C to this process, as `solos-swarm run` has.
+    pub fn signals() -> Self {
+        Self {
+            signals: true,
+            request: None,
+        }
+    }
+
+    /// `request` resolving, with its reason. The process's signals are left
+    /// to the host, which owns them and cancels its runs itself.
+    pub fn on(request: impl Future<Output = String> + Send + 'static) -> Self {
+        Self {
+            signals: false,
+            request: Some(Box::pin(request)),
+        }
+    }
 }
 
 /// The client the model transport and the broker's `fetch_url` both use.
@@ -77,12 +111,23 @@ pub fn http_client() -> Result<reqwest::Client> {
 
 /// Run `run.goal` to its end. An `Err` means the run could not start or its
 /// evidence could not be written; a run that started and stopped reports
-/// `GoalStatus::Stopped`.
+/// `GoalStatus::Stopped`. SIGTERM and Ctrl-C cancel it.
 pub async fn run_goal<H: AgentHarness>(
     run: GoalRun,
     harness: &H,
     provider: Arc<dyn Provider>,
 ) -> Result<GoalOutcome> {
+    run_goal_until(run, harness, provider, Cancel::signals()).await
+}
+
+/// [`run_goal`], cancelled by `cancel`.
+pub async fn run_goal_until<H: AgentHarness>(
+    run: GoalRun,
+    harness: &H,
+    provider: Arc<dyn Provider>,
+    cancel: Cancel,
+) -> Result<GoalOutcome> {
+    let Cancel { signals, request } = cancel;
     let GoalRun {
         goal,
         config,
@@ -187,7 +232,11 @@ pub async fn run_goal<H: AgentHarness>(
         }
     }
     drop(tx);
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut term = if signals {
+        Some(signal(SignalKind::terminate())?)
+    } else {
+        None
+    };
     let result = if let Some(error) = startup_error {
         Err(error)
     } else {
@@ -195,8 +244,9 @@ pub async fn run_goal<H: AgentHarness>(
             result=work(&mut workers,&store,&mut rx,&goal,idle) => result,
             _=unpaused_deadline(deadline, run_dir.clone()) => Err(anyhow::anyhow!("host-side Goal deadline expired")),
             _=broker::control_watch(store.clone(),run_dir.clone()) => Err(anyhow::Error::new(broker::Drained)),
-            _=term.recv() => Err(anyhow::anyhow!("operator cancelled run")),
-            _=tokio::signal::ctrl_c() => Err(anyhow::anyhow!("operator interrupted run")),
+            () = terminated(term.as_mut()) => Err(anyhow::anyhow!("operator cancelled run")),
+            _=tokio::signal::ctrl_c(), if signals => Err(anyhow::anyhow!("operator interrupted run")),
+            reason = requested(request) => Err(anyhow::anyhow!(reason)),
         }
     };
     let drained = matches!(&result, Err(error) if error.is::<broker::Drained>());
@@ -262,9 +312,27 @@ pub async fn run_goal<H: AgentHarness>(
             .is_some()
             .then(|| run_dir.join("artifacts/final.json")),
         spent_microusd: state.spent_microusd,
+        held_microusd: state.held_microusd,
         findings: state.findings.len(),
         run_dir,
     })
+}
+
+/// SIGTERM, when the run listens for it.
+async fn terminated(term: Option<&mut Signal>) {
+    match term {
+        Some(term) => {
+            term.recv().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+async fn requested(request: Option<Pin<Box<dyn Future<Output = String> + Send>>>) -> String {
+    match request {
+        Some(request) => request.await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn rpc(worker: &mut impl Session, store: &Arc<Mutex<Store>>, prompt: &str) -> Result<()> {
