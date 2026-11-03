@@ -27,7 +27,7 @@ A Rust control plane, scheduler, and capability broker for governed agent swarms
 - **Replay-scored policy loop** for the tournament self-review. [replay/README.md](replay/README.md)
 - **Tournament runbook** from the first live run. [docs/running-a-tournament.md](docs/running-a-tournament.md)
 - The original `mvp` cluster path (Raft over QUIC, witness, evaluator), documented in `docs/ARCHITECTURE.md`.
-- **Agent mode (in progress)**: a long-lived agent for Slack, GitHub and schedules that runs each request on one
+- **Agent mode (in progress)**: a long-lived agent for Slack, Discord, GitHub and schedules that runs each request on one
   worker or on a governed swarm, sharing this broker, ledger, harness and sandbox. The pure domain is
   `crates/agent-core`. Plan: [docs/agent-mode/README.md](docs/agent-mode/README.md).
 
