@@ -72,6 +72,11 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   their own lines). The research words in the swarm runtime are now optional Goal fields: `nudges`, one template
   per escalation stage, and `record_fields`, the Task fields a host-filed record reads. `Goal::validate` checks
   them, a Goal template can set them, and a Goal without them runs exactly as before.
+- Agent mode, P10: `solos-swarm agent bench` reproduces the super-agent article's ablation on a seeded stream of chat
+  and CI Triggers with work requests (`agent workload` writes one), simulated work (`executor: {kind: simulated}`)
+  and three designs (`super-agent`, `no-pass-through` through the new `pass_through: false` and
+  `Engine::set_pass_through`, and `serial`), writing `report.json` and `report.md`; `--router pi` refuses to start
+  without `--max-spend-usd` and caps each run's Router account.
 - `collect` leaves the per-run `code/` scratch directory on the host and writes `collect-manifest.json`; `--include-code` opts back in.
 - Docs: pause mode, self-update operations, dashboard tunnel, tournament runbook, replay status.
 
