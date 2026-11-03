@@ -12,19 +12,20 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use solos_agent_core::model::{
     Actor, ActorKind, Addressed, Approval, Ask, AssignmentId, ChannelRef, Effect, EndedBy,
-    MessageId, MessageKind, OutboundMessage, ThreadKey, TicketId, TicketOutcome, Trigger,
-    TriggerId,
+    InputBody, MessageId, MessageKind, OutboundMessage, SecretGrant, SecretId, ThreadKey, TicketId,
+    TicketOutcome, Trigger, TriggerId,
 };
 use solos_agent_core::{AllowlistPolicy, Repositories};
 use solos_agent_store::SqliteStore;
 use solos_swarm::agent::jsonl::JsonlSource;
 use solos_swarm::agent::ports::{
-    BoxFuture, Channel, Delivery, Executor, FactSink, Launch, RetryAfter, SendOptions, SendOutcome,
-    Source,
+    Answer, Applied, BoxFuture, Channel, Delivered, Delivery, Executor, Fact, FactSink, Launch,
+    RetryAfter, SendOptions, SendOutcome, Source,
 };
 use solos_swarm::agent::scripted::{ScriptedExecutor, ScriptedRouter};
 use solos_swarm::agent::slack::{
-    APPROVE_ACTION, METADATA_EVENT, STOP_ACTION, SlackApi, SlackChannel, SlackSource, Token,
+    ALLOW_SECRET_ACTION, APPROVE_ACTION, DENY_SECRET_ACTION, METADATA_EVENT, STOP_ACTION, SlackApi,
+    SlackChannel, SlackSource, Token,
 };
 use solos_swarm::agent::{Adapters, RunOptions, Runtime, STORE_FILE, ServeOptions, Summary, serve};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -1198,6 +1199,464 @@ async fn a_click_from_someone_the_policy_does_not_allow_changes_nothing() {
     assert_eq!(found.approval, Approval::Waiting);
     assert!(found.ended.is_none());
     assert!(!launched(&store));
+}
+
+const REQUEST: &str = "Triage my notifications";
+const LABEL: &str = "sign in to https://github.com as gui";
+const THREAD: &str = "700.000001";
+
+fn secret() -> SecretId {
+    SecretId::try_from("local/github-gui".to_owned()).unwrap()
+}
+
+struct AsksForAKeyTwice {
+    answerable_by: Vec<String>,
+    answers: Mutex<Vec<Answer>>,
+    delivered: Mutex<Vec<Delivered>>,
+}
+
+impl AsksForAKeyTwice {
+    fn new(answerable_by: &[&str]) -> Arc<Self> {
+        Arc::new(Self {
+            answerable_by: answerable_by.iter().map(|s| (*s).to_owned()).collect(),
+            answers: Mutex::default(),
+            delivered: Mutex::default(),
+        })
+    }
+
+    fn answers(&self) -> Vec<Answer> {
+        self.answers.lock().unwrap().clone()
+    }
+
+    fn verdicts(&self) -> Vec<(bool, String)> {
+        let handed = self.delivered.lock().unwrap();
+        handed
+            .iter()
+            .filter_map(|d| match &d.input.body {
+                InputBody::Secret {
+                    secret: s,
+                    granted,
+                    by,
+                } if *s == secret() => Some((*granted, by.id.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn typed(&self) -> Vec<String> {
+        let handed = self.delivered.lock().unwrap();
+        handed
+            .iter()
+            .filter_map(|d| d.trigger.as_ref().map(|t| t.text.clone()))
+            .collect()
+    }
+}
+
+impl Executor for AsksForAKeyTwice {
+    fn launch(&self, launch: Launch, facts: FactSink) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            let started = Fact::Started {
+                ticket: launch.ticket.clone(),
+                assignment: launch.assignment,
+            };
+            facts.send(started).await?;
+            for _ in 0..2 {
+                let ask = Fact::SecretAsk {
+                    ticket: launch.ticket.clone(),
+                    secret: secret(),
+                    label: LABEL.into(),
+                    answerable_by: self.answerable_by.clone(),
+                };
+                let answer = facts.ask(ask).await?;
+                self.answers.lock().unwrap().push(answer);
+            }
+            Ok(())
+        })
+    }
+    fn deliver(&self, delivery: Delivery, _: FactSink) -> BoxFuture<'_, Result<()>> {
+        self.delivered.lock().unwrap().extend(delivery.inputs);
+        Box::pin(async { Ok(()) })
+    }
+    fn stop(&self, _: TicketId, _: AssignmentId, _: String) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+async fn until_some<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + LIMIT;
+    loop {
+        if let Some(found) = check() {
+            return found;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn keyed<'a>(fake: &Fake, scratch: &'a Scratch, executor: &Arc<AsksForAKeyTwice>) -> Agent<'a> {
+    Agent {
+        scratch,
+        source: fake.source(true),
+        channel: Some(fake.channel()),
+        executor: executor.clone(),
+        budget: BUDGET,
+        until_idle: false,
+    }
+}
+
+async fn click_on(conn: &Conn, ask: &Value, allow: bool, who: (&str, &str), envelope: &str) {
+    let buttons = &ask["blocks"][1]["elements"];
+    let button = &buttons[usize::from(!allow)];
+    conn.send(click(
+        envelope,
+        button["action_id"].as_str().unwrap(),
+        button["value"].as_str().unwrap(),
+        who,
+        THREAD,
+    ));
+}
+
+fn grant(scratch: &Scratch) -> Option<SecretGrant> {
+    scratch.store().tickets().unwrap()[0]
+        .secrets
+        .get(&secret())
+        .cloned()
+}
+
+async fn flow<T>(
+    fake: &Fake,
+    scratch: &Scratch,
+    executor: &Arc<AsksForAKeyTwice>,
+    then: impl AsyncFnOnce(&Conn, Value) -> T,
+) -> T {
+    let driver = async {
+        let conn = fake.connection().await;
+        conn.send(event("e1", mention(THREAD, "UALICE", REQUEST)));
+        let ask = fake.until_text(&format!("{REQUEST} wants to")).await;
+        until_some("two answers to the ask", || {
+            (executor.answers().len() == 2).then_some(())
+        })
+        .await;
+        until_some("every message sent", || {
+            let pending = scratch.store().pending_effects().unwrap();
+            pending
+                .iter()
+                .all(|q| !matches!(q.effect, Effect::Send(_)))
+                .then_some(())
+        })
+        .await;
+        then(&conn, ask).await
+    };
+    drive(keyed(fake, scratch, executor).runtime(), driver)
+        .await
+        .1
+}
+
+#[tokio::test]
+async fn one_ask_posts_one_message_with_allow_and_deny_and_a_repeated_send_posts_nothing() {
+    let fake = Fake::start().await;
+    let scratch = Scratch::new("secret-ask");
+    let executor = AsksForAKeyTwice::new(&["slack:UALICE"]);
+
+    let (ask, outcome) = flow(&fake, &scratch, &executor, async |_, ask| {
+        let store = scratch.store();
+        let sent = store
+            .effects()
+            .unwrap()
+            .into_iter()
+            .find_map(|q| match q.effect {
+                Effect::Send(m) if m.ask.is_some() => Some(m),
+                _ => None,
+            })
+            .expect("the ask was committed");
+        let again = SendOptions {
+            repeat: true,
+            ask: sent.ask.clone(),
+        };
+        let outcome = fake.channel().send(sent, again).await.unwrap();
+        (ask, outcome)
+    })
+    .await;
+
+    let ticket = scratch.store().tickets().unwrap()[0].id.to_string();
+    assert_eq!(
+        (&ask["channel"], &ask["thread_ts"]),
+        (&json!("C1"), &json!(THREAD))
+    );
+    assert_eq!(
+        ask["text"],
+        format!("{REQUEST} wants to {LABEL} for the first time.")
+    );
+    assert_eq!(ask["blocks"][0]["text"]["text"], ask["text"]);
+    let buttons = ask["blocks"][1]["elements"].as_array().unwrap();
+    let shown: Vec<(&str, &str, &str)> = buttons
+        .iter()
+        .map(|b| {
+            (
+                b["action_id"].as_str().unwrap(),
+                b["text"]["text"].as_str().unwrap(),
+                b["style"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            (ALLOW_SECRET_ACTION, "Allow for this ticket", "primary"),
+            (DENY_SECRET_ACTION, "Deny", "danger"),
+        ]
+    );
+    for button in buttons {
+        let value: Value = serde_json::from_str(button["value"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            value,
+            json!({ "ticket": ticket, "secret": "local/github-gui" })
+        );
+    }
+
+    let answers = executor.answers();
+    let [first, second] = &answers[..] else {
+        panic!("{answers:?}")
+    };
+    let Ok(Applied::Secret(SecretGrant::Waiting {
+        label,
+        answerable_by,
+        ..
+    })) = first
+    else {
+        panic!("the first ask waits: {first:?}")
+    };
+    assert_eq!(label, LABEL);
+    assert_eq!(answerable_by, &["slack:UALICE"]);
+    assert_eq!(second, first, "the second ask finds the first");
+    assert_eq!(outcome, SendOutcome::Sent);
+    assert!(
+        fake.slack().replies_calls >= 1,
+        "the repeat looked in the thread"
+    );
+    let posts = fake.slack().posts.len();
+    assert_eq!(posts, 2, "the acknowledgement and one ask, nothing more");
+    let asks = scratch
+        .store()
+        .effects()
+        .unwrap()
+        .into_iter()
+        .filter(|q| matches!(&q.effect, Effect::Send(m) if m.ask.is_some()))
+        .count();
+    assert_eq!(asks, 1, "the Engine committed one ask");
+}
+
+#[tokio::test]
+async fn allow_by_a_person_on_the_items_list_grants_it_and_tells_the_worker() {
+    let fake = Fake::start().await;
+    let scratch = Scratch::new("secret-allow");
+    let executor = AsksForAKeyTwice::new(&["slack:UALICE"]);
+
+    let reply = flow(&fake, &scratch, &executor, async |conn, ask| {
+        click_on(conn, &ask, true, ALICE, "e2").await;
+        let reply = fake.until_text("Allowed by alice").await;
+        until_some("the verdict handed to the worker", || {
+            (!executor.verdicts().is_empty()).then_some(())
+        })
+        .await;
+        reply
+    })
+    .await;
+
+    assert_eq!(
+        reply["text"],
+        "Allowed by alice: local/github-gui for this ticket."
+    );
+    assert_eq!(
+        (&reply["channel"], &reply["thread_ts"]),
+        (&json!("C1"), &json!(THREAD))
+    );
+    let Some(SecretGrant::Granted { by, .. }) = grant(&scratch) else {
+        panic!("{:?}", grant(&scratch))
+    };
+    assert_eq!(
+        (by.id.as_str(), by.name.as_deref()),
+        ("UALICE", Some("alice"))
+    );
+    assert_eq!(executor.verdicts(), [(true, "UALICE".to_owned())]);
+}
+
+#[tokio::test]
+async fn deny_records_denied_and_tells_the_worker() {
+    let fake = Fake::start().await;
+    let scratch = Scratch::new("secret-deny");
+    let executor = AsksForAKeyTwice::new(&["slack:UALICE"]);
+
+    let reply = flow(&fake, &scratch, &executor, async |conn, ask| {
+        click_on(conn, &ask, false, ALICE, "e2").await;
+        let reply = fake.until_text("Denied by alice").await;
+        until_some("the verdict handed to the worker", || {
+            (!executor.verdicts().is_empty()).then_some(())
+        })
+        .await;
+        reply
+    })
+    .await;
+
+    assert_eq!(
+        reply["text"],
+        "Denied by alice: local/github-gui for this ticket."
+    );
+    assert!(matches!(grant(&scratch), Some(SecretGrant::Denied { .. })));
+    assert_eq!(executor.verdicts(), [(false, "UALICE".to_owned())]);
+}
+
+#[tokio::test]
+async fn an_approver_outside_the_items_list_and_a_non_approver_with_no_list_are_refused() {
+    let fake = Fake::start().await;
+    let scratch = Scratch::new("secret-refused-listed");
+    let listed = AsksForAKeyTwice::new(&["slack:UBOB"]);
+    let refusal = flow(&fake, &scratch, &listed, async |conn, ask| {
+        click_on(conn, &ask, true, ALICE, "e2").await;
+        fake.until_text("Nothing changed").await
+    })
+    .await;
+    assert_eq!(
+        refusal["text"],
+        "Nothing changed: alice may not answer for local/github-gui."
+    );
+    assert!(matches!(grant(&scratch), Some(SecretGrant::Waiting { .. })));
+    assert!(listed.verdicts().is_empty(), "the worker was told nothing");
+
+    let fake = Fake::start().await;
+    let scratch = Scratch::new("secret-refused-open");
+    let open = AsksForAKeyTwice::new(&[]);
+    let refusal = flow(&fake, &scratch, &open, async |conn, ask| {
+        click_on(conn, &ask, true, BOB, "e2").await;
+        fake.until_text("Nothing changed").await
+    })
+    .await;
+    assert_eq!(
+        refusal["text"],
+        "Nothing changed: bob may not answer for local/github-gui."
+    );
+    assert!(matches!(grant(&scratch), Some(SecretGrant::Waiting { .. })));
+    assert!(open.verdicts().is_empty());
+}
+
+#[tokio::test]
+async fn a_second_click_is_refused_and_changes_nothing() {
+    let fake = Fake::start().await;
+    let scratch = Scratch::new("secret-twice");
+    let executor = AsksForAKeyTwice::new(&["slack:UALICE", "slack:UBOB"]);
+
+    let (first, second, third) = flow(&fake, &scratch, &executor, async |conn, ask| {
+        click_on(conn, &ask, true, ALICE, "e2").await;
+        let first = fake.until_text("Allowed by alice").await;
+        click_on(conn, &ask, false, BOB, "e3").await;
+        let second = fake.until_text("Nothing changed").await;
+        click_on(conn, &ask, true, ALICE, "e4").await;
+        fake.until_acks(4).await;
+        let third = fake
+            .until("both refusals", |slack| {
+                let refusals: Vec<Value> = slack
+                    .posts
+                    .iter()
+                    .map(|p| p.body.clone())
+                    .filter(|b| b["text"].as_str().unwrap().starts_with("Nothing changed"))
+                    .collect();
+                (refusals.len() == 2).then(|| refusals[1].clone())
+            })
+            .await;
+        (first, second, third)
+    })
+    .await;
+
+    assert_eq!(
+        first["text"],
+        "Allowed by alice: local/github-gui for this ticket."
+    );
+    for refusal in [&second, &third] {
+        assert_eq!(
+            refusal["text"],
+            "Nothing changed: local/github-gui does not wait for an answer."
+        );
+    }
+    let Some(SecretGrant::Granted { by, .. }) = grant(&scratch) else {
+        panic!("{:?}", grant(&scratch))
+    };
+    assert_eq!(by.id, "UALICE", "the first answer stands");
+    assert_eq!(
+        executor.verdicts(),
+        [(true, "UALICE".to_owned())],
+        "the worker heard one answer"
+    );
+}
+
+#[tokio::test]
+async fn a_click_whose_value_does_not_parse_is_dropped_and_acknowledged() {
+    let fake = Fake::start().await;
+    let scratch = Scratch::new("secret-bad-value");
+    let executor = AsksForAKeyTwice::new(&["slack:UALICE"]);
+
+    flow(&fake, &scratch, &executor, async |conn, ask| {
+        for (n, value) in [
+            "not json".to_owned(),
+            json!({ "ticket": "tk_1", "secret": "no-slash" }).to_string(),
+            json!({ "ticket": "tk_1" }).to_string(),
+            json!({ "ticket": "tk_1", "secret": "local/github-gui", "extra": 1 }).to_string(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            conn.send(click(
+                &format!("bad{n}"),
+                ALLOW_SECRET_ACTION,
+                &value,
+                ALICE,
+                THREAD,
+            ));
+        }
+        fake.until_acks(5).await;
+        click_on(conn, &ask, true, ALICE, "good").await;
+        fake.until_text("Allowed by alice").await;
+    })
+    .await;
+
+    let posts = fake.slack().posts.len();
+    assert_eq!(posts, 3, "the acknowledgement, the ask and one answer");
+    assert!(matches!(grant(&scratch), Some(SecretGrant::Granted { .. })));
+}
+
+#[tokio::test]
+async fn typed_allow_in_the_thread_grants_nothing_and_reaches_the_worker_as_a_trigger() {
+    let fake = Fake::start().await;
+    let scratch = Scratch::new("secret-typed");
+    let executor = AsksForAKeyTwice::new(&["slack:UALICE", "slack:UBOB"]);
+
+    flow(&fake, &scratch, &executor, async |conn, _| {
+        let mut typed = message("C1", "700.000002", "UALICE", "allow");
+        typed["thread_ts"] = json!(THREAD);
+        conn.send(event("e2", typed));
+        let mut also = message("C1", "700.000003", "UBOB", "allow local/github-gui");
+        also["thread_ts"] = json!(THREAD);
+        conn.send(event("e3", also));
+        until_some("both messages handed to the worker", || {
+            (executor.typed().len() == 2).then_some(())
+        })
+        .await;
+    })
+    .await;
+
+    let mut typed = executor.typed();
+    typed.sort();
+    assert_eq!(
+        typed,
+        ["allow", "allow local/github-gui"],
+        "typed text is only context for the worker"
+    );
+    assert!(matches!(grant(&scratch), Some(SecretGrant::Waiting { .. })));
+    assert!(executor.verdicts().is_empty());
+    assert_eq!(
+        fake.slack().posts.len(),
+        2,
+        "no answer was posted: the acknowledgement and the ask only"
+    );
 }
 
 // ---- agent serve ----
