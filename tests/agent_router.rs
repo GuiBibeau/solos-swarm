@@ -6,6 +6,7 @@
 //! and `SOLOS_NODE`.
 
 use serde_json::{Value, json};
+use solos_agent_core::MAX_EXPIRED_EVALS;
 use solos_agent_core::model::{DecisionKind, MessageKind, OutboundMessage, ThreadKey};
 use solos_agent_store::{SpendState, SqliteStore};
 use solos_swarm::agent::{AgentConfig, PiHost, ROUTER_DIR, STORE_FILE, Summary, serve_with};
@@ -20,9 +21,8 @@ use std::time::Duration;
 
 const LIMIT: Duration = Duration::from_secs(120);
 
-/// Model calls after which a `Judge` that cuts replies off gives up and
-/// answers in plain text, so a Router that never stops asking ends the test
-/// instead of hanging it.
+/// Past this many model calls a cutting-off `Judge` answers in plain text, so
+/// a Router that never stops asking fails the test instead of hanging it.
 const CALL_CAP: usize = 200;
 
 /// The Router's model: every explicit candidate on the latest prompt is
@@ -31,9 +31,6 @@ const CALL_CAP: usize = 200;
 #[derive(Default)]
 struct Judge {
     bodies: Mutex<Vec<Value>>,
-    /// How many tool calls one reply holds before the output limit cuts it
-    /// off. A prompt with more cards gets a cut-off reply of that many calls
-    /// (at least one).
     fits: Option<usize>,
 }
 
@@ -202,8 +199,6 @@ budgets: {session_microusd: 500000, router_daily_microusd: 1000000}
         std::fs::write(&path, yaml).unwrap();
         AgentConfig::load(&path).unwrap()
     }
-    /// `requests` messages from a listed bot, each on a Thread of its own, all
-    /// judged at once; an Eval left undecided expires after `eval_timeout_ms`.
     fn crowd(&self, requests: usize, eval_timeout_ms: u64) -> AgentConfig {
         let lines: Vec<String> = (1..=requests)
             .map(|n| {
@@ -396,7 +391,6 @@ async fn agent_serve_judges_through_a_scripted_router_session_and_the_broker() {
     );
 }
 
-/// The cards on each prompt the model was asked, in order.
 fn prompt_sizes(judge: &Judge) -> Vec<usize> {
     let bodies = judge.bodies.lock().unwrap();
     bodies
@@ -405,8 +399,6 @@ fn prompt_sizes(judge: &Judge) -> Vec<usize> {
         .collect()
 }
 
-/// `requests` bot messages judged at once by `judge` through a scripted
-/// session that, like Pi, asks again after a reply the output limit cut off.
 async fn judge_crowd(
     name: &str,
     requests: usize,
@@ -430,7 +422,10 @@ async fn a_queue_longer_than_the_batch_goes_out_in_bounded_prompts_and_every_can
     let judge = Arc::new(Judge::default());
     let (scratch, summary) = judge_crowd("batches", 20, 120_000, &judge).await;
 
-    assert_eq!((summary.triggers_received, summary.effects_pending), (20, 0));
+    assert_eq!(
+        (summary.triggers_received, summary.effects_pending),
+        (20, 0)
+    );
     let sizes = prompt_sizes(&judge);
     assert!(sizes.iter().all(|cards| *cards <= 6), "{sizes:?}");
     assert_eq!(sizes.iter().sum::<usize>(), 20, "{sizes:?}");
@@ -449,10 +444,16 @@ async fn a_reply_cut_off_at_the_output_limit_is_followed_by_a_smaller_prompt() {
     let judge = Arc::new(Judge::fitting(4));
     let (scratch, summary) = judge_crowd("cutoff", 20, 300, &judge).await;
 
-    assert_eq!((summary.triggers_received, summary.effects_pending), (20, 0));
+    assert_eq!(
+        (summary.triggers_received, summary.effects_pending),
+        (20, 0)
+    );
     let sizes = prompt_sizes(&judge);
     let calls = sizes.len();
-    assert!(calls < CALL_CAP, "the model was asked {calls} times: {sizes:?}");
+    assert!(
+        calls < CALL_CAP,
+        "the model was asked {calls} times: {sizes:?}"
+    );
     let mut asked = sizes.clone();
     asked.dedup();
     for pair in asked.windows(2) {
@@ -480,13 +481,17 @@ async fn a_router_whose_every_reply_is_cut_off_leaves_its_evals_to_expire() {
 
     assert_eq!((summary.triggers_received, summary.effects_pending), (4, 0));
     let calls = judge.bodies.lock().unwrap().len();
-    assert!(calls < CALL_CAP / 4, "the model was asked {calls} times");
+    let prompts = 4 * MAX_EXPIRED_EVALS as usize + 2;
+    // An ask can already be on its way when its session is ended.
+    assert!(
+        calls <= 2 * prompts,
+        "the model was asked {calls} times for {prompts} prompts"
+    );
     let decisions = scratch.store().decisions().unwrap();
     assert_eq!(decisions.len(), 4, "{decisions:?}");
     assert!(
-        decisions.iter().all(
-            |d| d.kind == DecisionKind::Unavailable && d.reason == "the Router did not decide in time"
-        ),
+        decisions.iter().all(|d| d.kind == DecisionKind::Unavailable
+            && d.reason == "the Router did not decide in time"),
         "{decisions:?}"
     );
 }

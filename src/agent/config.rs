@@ -206,6 +206,12 @@ pub enum RouterConfig {
         max_input_bytes: usize,
         #[serde(default = "default_max_output_tokens")]
         max_output_tokens: u64,
+        /// The most candidates one prompt holds, oldest first; the rest wait
+        /// for the next turn. A reply decides each of them, so this many
+        /// decisions (an accept runs to about 300 tokens) must fit in
+        /// `max_output_tokens`.
+        #[serde(default = "default_max_batch")]
+        max_batch: usize,
         /// Replaces the built-in instructions; the budgets and rules are
         /// still added after them.
         #[serde(default)]
@@ -222,6 +228,10 @@ fn default_max_input_bytes() -> usize {
 
 fn default_max_output_tokens() -> u64 {
     8_192
+}
+
+fn default_max_batch() -> usize {
+    6
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -599,6 +609,7 @@ impl AgentConfig {
             prices,
             max_input_bytes,
             max_output_tokens,
+            max_batch,
             rules,
             ..
         } = &self.router
@@ -609,6 +620,10 @@ impl AgentConfig {
                 (1..=16_777_216).contains(max_input_bytes)
                     && (1..=393_216).contains(max_output_tokens),
                 "router.max_input_bytes or router.max_output_tokens is out of range"
+            );
+            ensure!(
+                (1..=64).contains(max_batch),
+                "router.max_batch must be 1..=64"
             );
             ensure!(
                 self.budgets
@@ -958,6 +973,7 @@ budgets: {session_microusd: 500000}
             provider,
             max_input_bytes,
             max_output_tokens,
+            max_batch,
             instructions,
             rules,
             ..
@@ -967,6 +983,7 @@ budgets: {session_microusd: 500000}
         };
         assert_eq!(provider, "deepseek");
         assert_eq!((*max_input_bytes, *max_output_tokens), (1_048_576, 8_192));
+        assert_eq!(*max_batch, 6);
         assert_eq!(*instructions, None);
         assert_eq!(rules["ci-red"], "Fix a red CI run on main.");
         assert_eq!(config.budgets.router_daily_microusd, Some(1_000_000));
@@ -1012,6 +1029,24 @@ budgets: {session_microusd: 500000}
                 }),
             ),
             (
+                "no candidate in a batch",
+                pi(|yaml| {
+                    yaml.replace(
+                        "  model: deepseek-flash",
+                        "  model: deepseek-flash\n  max_batch: 0",
+                    )
+                }),
+            ),
+            (
+                "a batch above the cap",
+                pi(|yaml| {
+                    yaml.replace(
+                        "  model: deepseek-flash",
+                        "  model: deepseek-flash\n  max_batch: 65",
+                    )
+                }),
+            ),
+            (
                 "unknown field",
                 pi(|yaml| {
                     yaml.replace(
@@ -1028,6 +1063,21 @@ budgets: {session_microusd: 500000}
             );
             assert!(parse(&yaml).is_err(), "{case}: accepted\n{yaml}");
         }
+    }
+
+    #[test]
+    fn a_pi_router_takes_the_batch_size_it_is_given() {
+        let config = parse(&pi(|yaml| {
+            yaml.replace(
+                "  model: deepseek-flash",
+                "  model: deepseek-flash\n  max_batch: 3",
+            )
+        }))
+        .unwrap();
+        let RouterConfig::Pi { max_batch, .. } = &config.router else {
+            panic!("{:?}", config.router)
+        };
+        assert_eq!(*max_batch, 3);
     }
 
     const WORKERS: &str = "executor:

@@ -374,11 +374,11 @@ where
         };
         let router = match &config.router {
             RouterConfig::Scripted { .. } => None,
-            RouterConfig::Pi { .. } => {
+            RouterConfig::Pi { max_batch, .. } => {
                 let (spec, grant) = router_session(config, state_dir, &node, &pi_root)?;
                 broker.admit(spec.token.clone(), grant)?;
                 // Its first session starts with the first card, by which time the socket is bound.
-                Some(Arc::new(PiRouter::start(harness.clone(), spec)))
+                Some(Arc::new(PiRouter::start(harness.clone(), spec, *max_batch)))
             }
         };
         let executor = match (&config.executor, worker_model) {
@@ -469,6 +469,7 @@ fn router_session(
         prices,
         max_input_bytes,
         max_output_tokens,
+        max_batch: _,
         instructions,
         rules,
     } = &config.router

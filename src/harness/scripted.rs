@@ -21,8 +21,9 @@ pub enum Call {
     SubmitArtifact,
     /// Each tool call the turn's model reply asked for, with its arguments,
     /// as Pi would run them. A reply cut off at the output limit
-    /// (`finish_reason` length) with tool calls runs none of them, and the
-    /// model is asked again with the same prompt, as Pi's agent loop does.
+    /// (`finish_reason` length) with tool calls runs none of them and
+    /// reports `OutputCut`; the model is asked again with the same prompt,
+    /// as Pi's agent loop does.
     Replied,
 }
 
@@ -132,7 +133,7 @@ impl Agent {
         let mut turns = script.into_iter();
         while let Some(prompt) = inbox.recv().await {
             let calls = turns.next().unwrap_or_else(|| every_turn.clone());
-            if let Err(error) = self.turn(&prompt, &calls).await {
+            if let Err(error) = self.turn(&prompt, &calls, &events).await {
                 events.send((self.id, Err(error))).await.ok();
                 return;
             }
@@ -147,12 +148,19 @@ impl Agent {
             .ok();
     }
 
-    async fn turn(&mut self, prompt: &str, calls: &[Call]) -> Result<()> {
+    async fn turn(
+        &mut self,
+        prompt: &str,
+        calls: &[Call],
+        events: &mpsc::Sender<Observation>,
+    ) -> Result<()> {
         let mut reply = self.model(prompt).await?;
         for call in calls {
             match call {
                 Call::Replied => {
                     while cut_off(&reply) {
+                        let cut = (self.id.clone(), Ok(SessionEvent::OutputCut));
+                        events.send(cut).await.ok();
                         reply = self.model(prompt).await?;
                     }
                     let asked = reply["choices"][0]["message"]["tool_calls"]
@@ -217,7 +225,6 @@ impl Agent {
     }
 }
 
-/// A reply the output limit cut off while it was asking for tool calls.
 fn cut_off(reply: &Value) -> bool {
     let choice = &reply["choices"][0];
     choice["finish_reason"] == "length"

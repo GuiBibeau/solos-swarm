@@ -1,9 +1,14 @@
 //! The Router as one long-lived model session. Each Candidate becomes a
-//! compact card. Cards queued while the session is idle go into one prompt;
-//! cards that arrive during a turn wait for the next one. The session
-//! answers through `router_decide` on the agent broker, so this adapter
-//! never reports a Verdict itself. A session that dies is restarted, and the
-//! core's Eval expiry brings back whatever it had not decided.
+//! compact card. Cards queued while the session is idle go into one prompt,
+//! oldest first and at most `max_batch` of them; the rest, and the cards that
+//! arrive during a turn, wait for the next one. The session answers through
+//! `router_decide` on the agent broker, so this adapter never reports a
+//! Verdict itself. A session that dies is restarted, and the core's Eval
+//! expiry brings back whatever it had not decided.
+//!
+//! A reply that hits the output limit while it asks for the batch's decisions
+//! runs none of them, and Pi asks again with the same context until the
+//! Router's budget runs out.
 
 use super::broker::{DecideTerms, clip};
 use super::ports::{BoxFuture, FactSink, Router};
@@ -225,16 +230,17 @@ pub struct PiRouter {
 
 impl PiRouter {
     /// A Router whose sessions `harness` starts from `spec`, the first when
-    /// the first card arrives. Each session's id is `spec.id` and its
-    /// incarnation, so a restart keeps the transcripts before it.
-    pub fn start<H>(harness: H, spec: SessionSpec) -> Self
+    /// the first card arrives, with at most `max_batch` cards in a prompt.
+    /// Each session's id is `spec.id` and its incarnation, so a restart keeps
+    /// the transcripts before it.
+    pub fn start<H>(harness: H, spec: SessionSpec, max_batch: usize) -> Self
     where
         H: AgentHarness + Send + Sync + 'static,
         H::Session: Send + 'static,
     {
         let (cards, queue) = mpsc::unbounded_channel();
         let (stop, stopped) = watch::channel(false);
-        let task = tokio::spawn(drive(harness, spec, queue, stopped));
+        let task = tokio::spawn(drive(harness, spec, max_batch, queue, stopped));
         Self {
             cards,
             stop,
@@ -278,6 +284,7 @@ async fn close(mut session: impl Session) {
 async fn drive<H>(
     harness: H,
     base: SessionSpec,
+    max_batch: usize,
     mut cards: mpsc::UnboundedReceiver<String>,
     mut stop: watch::Receiver<bool>,
 ) where
@@ -287,7 +294,8 @@ async fn drive<H>(
     let mut queued: Vec<String> = Vec::new();
     let mut incarnation = 0u32;
     let mut backoff = RESTART_FIRST;
-    loop {
+    let mut limit = max_batch;
+    'sessions: loop {
         // No session runs while nothing waits to be judged.
         if queued.is_empty() {
             tokio::select! {
@@ -314,16 +322,17 @@ async fn drive<H>(
             }
         };
         let mut in_turn = false;
+        let mut prompted: Vec<String> = Vec::new();
         let ended = loop {
             while let Ok(card) = cards.try_recv() {
                 queued.push(card);
             }
             if !in_turn && !queued.is_empty() {
-                let prompt = batch(&queued);
-                if let Err(err) = session.prompt(&prompt).await {
+                let take = queued.len().min(limit);
+                if let Err(err) = session.prompt(&batch(&queued[..take])).await {
                     break format!("a prompt failed: {err:#}");
                 }
-                queued.clear();
+                prompted = queued.drain(..take).collect();
                 in_turn = true;
             }
             tokio::select! {
@@ -342,6 +351,24 @@ async fn drive<H>(
                     Some((_, Ok(SessionEvent::TurnEnded))) => {
                         in_turn = false;
                         backoff = RESTART_FIRST;
+                        if prompted.len() == limit {
+                            limit = (limit + 1).min(max_batch);
+                        }
+                    }
+                    Some((_, Ok(SessionEvent::OutputCut))) => {
+                        limit = (prompted.len() / 2).max(1);
+                        eprintln!(
+                            "agent: router session {} hit its output limit on a prompt of {} \
+                             cards; restarting with at most {limit} per prompt",
+                            spec.id,
+                            prompted.len()
+                        );
+                        // A card alone is not asked again; its Eval expires and comes back.
+                        if prompted.len() > 1 {
+                            queued = prompted.into_iter().chain(queued).collect();
+                        }
+                        close(session).await;
+                        continue 'sessions;
                     }
                     // The cards of a refused prompt are not retried here;
                     // their Evals expire and come back.
@@ -458,11 +485,14 @@ mod tests {
     struct Fake {
         prompts: Arc<Mutex<Vec<(String, String)>>>,
         events: Senders,
+        fits: Option<usize>,
     }
 
     struct FakeSession {
         id: String,
         prompts: Arc<Mutex<Vec<(String, String)>>>,
+        events: mpsc::Sender<Observation>,
+        fits: Option<usize>,
     }
 
     impl AgentHarness for Fake {
@@ -472,10 +502,15 @@ mod tests {
             spec: &SessionSpec,
             events: mpsc::Sender<Observation>,
         ) -> anyhow::Result<FakeSession> {
-            self.events.lock().unwrap().push((spec.id.clone(), events));
+            self.events
+                .lock()
+                .unwrap()
+                .push((spec.id.clone(), events.clone()));
             Ok(FakeSession {
                 id: spec.id.clone(),
                 prompts: self.prompts.clone(),
+                events,
+                fits: self.fits,
             })
         }
     }
@@ -487,6 +522,14 @@ mod tests {
         async fn prompt(&mut self, text: &str) -> anyhow::Result<()> {
             let entry = (self.id.clone(), text.to_owned());
             self.prompts.lock().unwrap().push(entry);
+            if let Some(fits) = self.fits {
+                let event = if evals(text).len() > fits {
+                    SessionEvent::OutputCut
+                } else {
+                    SessionEvent::TurnEnded
+                };
+                self.events.send((self.id.clone(), Ok(event))).await?;
+            }
             Ok(())
         }
         async fn stop(&mut self) -> anyhow::Result<bool> {
@@ -497,7 +540,21 @@ mod tests {
         }
     }
 
+    fn evals(prompt: &str) -> Vec<&str> {
+        prompt
+            .lines()
+            .filter_map(|line| line.strip_prefix("eval "))
+            .filter_map(|rest| rest.split(' ').next())
+            .collect()
+    }
+
     impl Fake {
+        fn fitting(fits: usize) -> Self {
+            Self {
+                fits: Some(fits),
+                ..Self::default()
+            }
+        }
         async fn prompted(&self, count: usize) -> Vec<(String, String)> {
             for _ in 0..500 {
                 let prompts = self.prompts.lock().unwrap().clone();
@@ -543,7 +600,7 @@ mod tests {
     #[tokio::test]
     async fn cards_that_arrive_during_a_turn_go_out_together_and_a_dead_session_restarts() {
         let fake = Fake::default();
-        let router = PiRouter::start(fake.clone(), spec());
+        let router = PiRouter::start(fake.clone(), spec(), 6);
         let (facts, _inbound) = FactSink::channel();
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
@@ -597,6 +654,155 @@ mod tests {
 
         router.shutdown().await;
         assert!(router.assess(candidate("ev_e"), facts).await.is_err());
+    }
+
+    async fn assess_all(router: &PiRouter, count: usize) {
+        let (facts, _inbound) = FactSink::channel();
+        for n in 1..=count {
+            router
+                .assess(candidate(&format!("ev_{n}")), facts.clone())
+                .await
+                .unwrap();
+        }
+    }
+
+    fn named(range: std::ops::RangeInclusive<usize>) -> Vec<String> {
+        range.map(|n| format!("ev_{n}")).collect()
+    }
+
+    #[tokio::test]
+    async fn a_queue_longer_than_the_batch_goes_out_oldest_first_in_bounded_prompts() {
+        let fake = Fake::default();
+        let router = PiRouter::start(fake.clone(), spec(), 3);
+        assess_all(&router, 7).await;
+
+        let first = fake.prompted(1).await;
+        assert!(
+            first[0].1.starts_with("3 new candidates. "),
+            "{}",
+            first[0].1
+        );
+        assert_eq!(evals(&first[0].1), named(1..=3));
+        fake.tell(Ok(SessionEvent::TurnEnded)).await;
+        let second = fake.prompted(2).await;
+        assert_eq!(evals(&second[1].1), named(4..=6));
+        fake.tell(Ok(SessionEvent::TurnEnded)).await;
+        let third = fake.prompted(3).await;
+        assert!(
+            third[2].1.starts_with("1 new candidate. "),
+            "{}",
+            third[2].1
+        );
+        assert_eq!(evals(&third[2].1), named(7..=7));
+        assert!(
+            third.iter().all(|(session, _)| session == "router-7-1"),
+            "a turn that ended whole keeps its session: {third:?}"
+        );
+        router.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_reply_cut_off_at_the_output_limit_restarts_the_session_with_half_the_cards() {
+        let fake = Fake::default();
+        let router = PiRouter::start(fake.clone(), spec(), 8);
+        assess_all(&router, 12).await;
+
+        let first = fake.prompted(1).await;
+        assert_eq!(evals(&first[0].1), named(1..=8));
+        fake.tell(Ok(SessionEvent::OutputCut)).await;
+        let second = fake.prompted(2).await;
+        assert_eq!(
+            second[1].0, "router-7-2",
+            "the cut-off session is not reused"
+        );
+        assert_eq!(evals(&second[1].1), named(1..=4));
+        fake.tell(Ok(SessionEvent::TurnEnded)).await;
+        let third = fake.prompted(3).await;
+        assert_eq!(
+            evals(&third[2].1),
+            named(5..=9),
+            "a whole prompt that fit earns a card"
+        );
+        fake.tell(Ok(SessionEvent::TurnEnded)).await;
+        let fourth = fake.prompted(4).await;
+        assert_eq!(evals(&fourth[3].1), named(10..=12));
+        router.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_model_that_decides_fewer_cards_than_the_batch_still_decides_every_card() {
+        let fake = Fake::fitting(4);
+        let router = PiRouter::start(fake.clone(), spec(), 6);
+        assess_all(&router, 20).await;
+
+        let mut decided: Vec<String> = Vec::new();
+        for _ in 0..500 {
+            let prompts = fake.prompts.lock().unwrap().clone();
+            decided = prompts
+                .iter()
+                .map(|(_, prompt)| evals(prompt))
+                .filter(|cards| cards.len() <= 4)
+                .flatten()
+                .map(str::to_owned)
+                .collect();
+            if decided.len() >= 20 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        decided.sort_by_key(|eval| eval[3..].parse::<usize>().unwrap());
+        assert_eq!(decided, named(1..=20));
+        let prompts = fake.prompts.lock().unwrap().clone();
+        let sizes: Vec<usize> = prompts
+            .iter()
+            .map(|(_, prompt)| evals(prompt).len())
+            .collect();
+        assert!(sizes.iter().all(|cards| *cards <= 6), "{sizes:?}");
+        for pair in sizes.windows(2) {
+            assert!(
+                pair[0] <= 4 || pair[1] < pair[0],
+                "a cut-off prompt of {} cards was followed by one of {}: {sizes:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        router.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_router_whose_every_reply_is_cut_off_asks_once_per_card_and_stops() {
+        let fake = Fake::fitting(0);
+        let router = PiRouter::start(fake.clone(), spec(), 4);
+        assess_all(&router, 5).await;
+
+        let prompts = fake.prompted(7).await;
+        let sizes: Vec<usize> = prompts
+            .iter()
+            .map(|(_, prompt)| evals(prompt).len())
+            .collect();
+        assert_eq!(sizes, [4, 2, 1, 1, 1, 1, 1]);
+        assert_eq!(evals(&prompts[2].1), named(1..=1));
+        assert_eq!(
+            evals(&prompts[6].1),
+            named(5..=5),
+            "oldest first, each card once"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            fake.prompts.lock().unwrap().len(),
+            7,
+            "nothing is asked again; the Evals expire and come back"
+        );
+
+        let (facts, _inbound) = FactSink::channel();
+        router.assess(candidate("ev_6"), facts).await.unwrap();
+        let after = fake.prompted(8).await;
+        assert_eq!(
+            evals(&after[7].1),
+            named(6..=6),
+            "a card that comes back is prompted alone"
+        );
+        router.shutdown().await;
     }
 
     #[test]
