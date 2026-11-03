@@ -116,6 +116,14 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   Approve and Stop, and `Fact::{SecretAsk, KeyUsed}` reach the Engine through the runtime. The store's schema is v5 (no
   new table), so an older build refuses a file that can hold grants; stored Tickets and messages read back unchanged.
   Nothing asks yet.
+- Agent mode, keyed `fetch_url` and `vault_list` (PR #36's design): with `vault:` in agent.yaml, `agent serve` opens
+  the vault, and refuses to start when it or its key sits under the Tickets' directory, `--pi-root` or `--node`'s
+  install. A worker's `fetch_url` takes `key`: the broker writes `KeyUsed` to the chain first, then sends the key as
+  its header only on hops whose own URL is one of the key's hosts (`broker::fetch_with`), over a client that ignores
+  the proxy variables, and scrubs the response and any error of every vault value. A first use that needs a person
+  asks once in the thread and answers 409 until the click comes back as an Input. `vault_list` (only with a vault)
+  lists the keys and logins a Ticket may use, without values, and where the Ticket stands with each. Swarm mode's
+  `fetch_url` is unchanged.
 - `collect` leaves the per-run `code/` scratch directory on the host and writes `collect-manifest.json`; `--include-code` opts back in.
 - Docs: pause mode, self-update operations, dashboard tunnel, tournament runbook, replay status.
 
