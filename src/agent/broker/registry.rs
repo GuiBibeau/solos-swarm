@@ -74,6 +74,7 @@ fn router_decide() -> ToolSpec {
                     "description": "accept with plan swarm: how many agents.",
                 },
                 "goal_template": string("accept with plan swarm: the goal template it runs, one the prompt names. Omit it for the default."),
+                "environment": string("accept with plan session: the machine its run_code runs on, one your instructions name. Omit it for the default."),
                 "budget_microusd": {
                     "type": "integer",
                     "minimum": 1,
