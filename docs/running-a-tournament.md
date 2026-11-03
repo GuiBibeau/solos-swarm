@@ -2,9 +2,9 @@
 
 Runbook distilled from the first live tournament (October 2026, a $100 ceiling, seven sequential steps). The
 driver and goal generator for it (`drive.py`, `gen.py`, `perf_report.py`, `status_line.py`, the build scripts) live
-in the local tournament directory `work/tournament-<date>/`, which is working data and not part of `main`. What is in
-`main` and used here: `scripts/remote.py`, `scripts/swarm_progress.py`, the broker's pause mode and the candidate
-channels. Commands below name the tournament scripts where the run used them. The host is called `remote-ai`.
+in the tournament directory `work/tournament-<date>/`. That directory's `.gitignore` keeps the raw run logs and
+other bulky outputs out of git. The shared pieces used here are `scripts/remote.py`, `scripts/swarm_progress.py`, the
+broker's pause mode and the candidate channels. Commands below name the tournament scripts where the run used them. The host is called `remote-ai`.
 
 ## Shape
 

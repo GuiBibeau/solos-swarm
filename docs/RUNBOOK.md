@@ -21,10 +21,9 @@ Operational commands for building, staging, running, and qualifying `solos-swarm
 ## 2. Build and verify
 
 ```bash
-npm ci && npm run build
+npm ci && npm run test:broker
 cargo build --release --locked
 cargo test --locked
-npm test
 python3 -m unittest discover -s tests -p 'test_*.py'
 ./target/release/solos-swarm doctor --pi-root . --node "$(command -v node)"
 ```
@@ -57,28 +56,19 @@ python3 scripts/bootstrap_sandbox.py \
 ## 4. Offline bundles and startup identity
 
 ```bash
-# Create signed release bundle
+# Create a bundle tar from a prepared source (the output must be outside the source)
 python3 scripts/bundle.py create \
   --source /var/lib/solos-swarm/staging \
-  --output /var/lib/solos-swarm/bundle-out \
-  --signing-key /path/to/release-ed25519.pem \
-  --key-id release-key-01 \
-  --bundle-id bundle-2026-01 \
-  --created-ms 1776000000000 \
-  --expires-ms 1778592000000
+  --output /var/lib/solos-swarm/bundle-out/candidate.tar \
+  --source-revision "$(git rev-parse HEAD)" \
+  --target x86_64-unknown-linux-gnu \
+  --requirements /path/to/requirements.json
 
 # Verify and import bundle
-python3 scripts/bundle.py verify \
-  --bundle /var/lib/solos-swarm/bundle-out \
-  --trusted-keys /etc/solos-swarm/trusted-release-keys.json \
-  --now-ms 1776000100000
+python3 scripts/bundle.py verify /var/lib/solos-swarm/bundle-out/candidate.tar
 
-python3 scripts/bundle.py import \
-  --bundle /var/lib/solos-swarm/bundle-out \
-  --trusted-keys /etc/solos-swarm/trusted-release-keys.json \
-  --destination /var/lib/solos-swarm/imported \
-  --state /var/lib/solos-swarm/bundle-state.json \
-  --now-ms 1776000100000
+python3 scripts/bundle.py import /var/lib/solos-swarm/bundle-out/candidate.tar \
+  --destination /var/lib/solos-swarm/imported
 
 # Offline SPIFFE SVID ceremony
 ./target/release/solos-swarm mvp offline-startup-request \
@@ -137,8 +127,7 @@ python3 scripts/prepare_case.py \
 
 python3 scripts/check_run.py \
   --run-dir /tmp/run-01/evidence \
-  --expected /tmp/eval-01/expected.json \
-  --candidate local-preview-01
+  --expected /tmp/eval-01/expected.json
 ```
 
 ### Remote systemd run (`SOLOS_SWARM_SSH_TARGET`)

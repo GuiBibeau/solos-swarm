@@ -116,7 +116,7 @@ the loop is useful only for what it records (the history) and for scoring the ba
 
 ## Wiring (optional, off by default, patches not applied)
 
-The tournament scripts live only on the local tournament branch, so the wiring ships as patches, each checked with
+The wiring is not in `main`. It ships as patches against the tournament scripts, each checked with
 `git apply --check` against tip 07a1dd5 and `test_goals.py` run on the patched copy:
 
 - `drive-hook.patch`: `drive.py run --replay-check`. After each close step (c1..c4) it ingests all collected evidence,
