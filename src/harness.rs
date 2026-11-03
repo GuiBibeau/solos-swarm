@@ -17,6 +17,7 @@ use tokio::{
     task::JoinHandle,
 };
 
+pub mod claude_code;
 pub mod scripted;
 
 /// What a session reports, whatever harness runs it. The end of a session's
@@ -315,6 +316,19 @@ async fn transcript(
     who: String,
     send: mpsc::Sender<Observation>,
 ) -> Result<()> {
+    frames(stdout, path, who, send, event, "Pi process exited").await
+}
+
+/// [`transcript`] for any harness whose stdout is JSON lines: `event` reads
+/// each frame, and `ended` is the clean end of the stream.
+async fn frames(
+    stdout: ChildStdout,
+    path: PathBuf,
+    who: String,
+    send: mpsc::Sender<Observation>,
+    event: fn(&Value) -> Option<SessionEvent>,
+    ended: &'static str,
+) -> Result<()> {
     let result = async {
         let mut file = tokio::fs::File::create(path).await?;
         let mut reader = BufReader::new(stdout);
@@ -336,9 +350,7 @@ async fn transcript(
     .await;
     match result {
         Ok(()) => {
-            send.send((who, Err(anyhow::anyhow!("Pi process exited"))))
-                .await
-                .ok();
+            send.send((who, Err(anyhow::anyhow!(ended)))).await.ok();
             Ok(())
         }
         Err(error) => {

@@ -13,7 +13,7 @@ use solos_agent_core::model::{
 use solos_agent_store::{SpendState, SqliteStore};
 use solos_swarm::agent::broker::{
     self, Account, AgentBroker, BrokerParts, DecideTerms, Grant, ModelTerms, Principal,
-    WorkerParts, WorkerSeat,
+    ROUTER_TOOLS, WORKER_TOOLS, WorkerParts, WorkerSeat,
 };
 use solos_swarm::agent::jsonl::{JsonlChannel, JsonlSource};
 use solos_swarm::agent::ports::{
@@ -282,6 +282,24 @@ impl Served {
     }
     async fn model(&self, text: &str) -> (u16, Value) {
         self.post("model", Some(TOKEN), model_request(text)).await
+    }
+    /// The names `GET /tools` lists for `token`.
+    async fn listed(&self, token: &str) -> Vec<String> {
+        let response = self
+            .client
+            .get("http://broker/tools")
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        let listed: Value = response.json().await.unwrap();
+        listed["tools"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{listed}"))
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_owned())
+            .collect()
     }
     /// Stop serving and close the socket, as a process exit would.
     async fn stop(mut self) {
@@ -807,6 +825,23 @@ async fn a_worker_reports_with_the_ledgers_spend_and_calls_only_its_own_tools() 
         assert_eq!(scratch.store().committed(&account, 0).unwrap(), COST);
         assert_eq!(scratch.store().committed("router", 0).unwrap(), 0);
 
+        let listed = served.listed(WORKER).await;
+        assert_eq!(
+            listed,
+            ["worker_report", "worker_handback", "fetch_url"],
+            "no run_code and no job tools on a host without run_code"
+        );
+        assert_eq!(served.broker.worker_tools(None), listed, "its grants");
+        for tool in ROUTER_TOOLS.iter().chain(&WORKER_TOOLS) {
+            let (status, reply) = served
+                .post(&format!("tool/{tool}"), Some(WORKER), json!({}))
+                .await;
+            assert_eq!(
+                status != 403,
+                listed.iter().any(|name| name == tool),
+                "GET /tools lists exactly what the worker may call: {tool} {status} {reply}"
+            );
+        }
         for (path, token) in [
             ("tool/router_decide", WORKER),
             ("tool/router_read", WORKER),

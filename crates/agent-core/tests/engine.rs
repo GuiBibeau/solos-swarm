@@ -86,7 +86,10 @@ fn accept(plan: Plan, budget: u64) -> Verdict {
 }
 
 fn session() -> Plan {
-    Plan::Session { harness: None }
+    Plan::Session {
+        harness: None,
+        environment: None,
+    }
 }
 
 fn launched(effects: &[Effect]) -> Vec<(TicketId, solos_agent_core::model::AssignmentId, Plan)> {
@@ -429,6 +432,46 @@ fn a_swarm_over_the_auto_budget_waits_for_an_approver() {
     let t = &w.engine.repos().tickets[&ticket];
     assert!(matches!(t.approval, Approval::Granted { .. }));
     assert_eq!(t.stage(), Stage::Queued);
+}
+
+#[test]
+fn a_session_plan_names_its_environment_and_one_stored_without_it_still_reads() {
+    for stored in [
+        r#"{"kind":"session"}"#,
+        r#"{"kind":"session","harness":"pi"}"#,
+    ] {
+        let plan: Plan = serde_json::from_str(stored).unwrap();
+        let Plan::Session { environment, .. } = &plan else {
+            panic!("{stored} is not a session")
+        };
+        assert_eq!(*environment, None, "{stored}");
+        assert_eq!(
+            serde_json::to_string(&plan).unwrap(),
+            stored,
+            "it writes back unchanged"
+        );
+    }
+
+    let mut w = World::new(policy());
+    let eval = w.receive_and_start_eval(slack(
+        "t1",
+        Actor::person("alice"),
+        Addressed::Mention,
+        "th1",
+        "run it on my laptop",
+    ));
+    let on_laptop = Plan::Session {
+        harness: None,
+        environment: Some("laptop".into()),
+    };
+    w.engine
+        .decide(&eval, accept(on_laptop.clone(), 500_000))
+        .unwrap();
+    assert_eq!(launched(&w.effects())[0].2, on_laptop);
+    assert_eq!(
+        serde_json::to_string(&on_laptop).unwrap(),
+        r#"{"kind":"session","environment":"laptop"}"#
+    );
 }
 
 #[test]

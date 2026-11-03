@@ -276,7 +276,10 @@ mod tests {
             }))
             .unwrap(),
             rules: Vec::new(),
-            plan: Plan::Session { harness: None },
+            plan: Plan::Session {
+                harness: None,
+                environment: None,
+            },
             budget_microusd: 1,
             recovery: false,
             inputs: Vec::new(),

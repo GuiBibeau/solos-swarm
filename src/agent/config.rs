@@ -1,16 +1,18 @@
 //! `agent.yaml`. Unknown fields are errors, like a swarm Goal's, so a typo
 //! cannot silently fall back to a default.
 
+mod nodes;
 mod sources;
 mod watchdog;
 
+pub use nodes::{AllowedNode, NodesConfig};
 pub use sources::{Interval, ReplyTo, ScheduleConfig, TimeOfDay};
 pub use watchdog::{OperatorConfig, ThresholdsConfig, WatchdogConfig};
 
 use super::goal_template::GoalTemplates;
 use super::jobs::{self, JobLimits};
 use super::simulated::TimeFactor;
-use super::{github, slack};
+use super::{github, mcp, slack};
 use crate::code::{self, Mount};
 use crate::gateway::{PriceTable, upstream_profile};
 use anyhow::{Context, Result, ensure};
@@ -33,6 +35,9 @@ pub struct AgentConfig {
     /// Without it, no Watchdog runs.
     #[serde(default)]
     pub watchdog: Option<WatchdogConfig>,
+    /// Remote nodes that run workers' commands. Without it, none connect.
+    #[serde(default)]
+    pub nodes: Option<NodesConfig>,
     /// An allowed person's follow-up on a subscribed Thread goes only to its
     /// Ticket. `false` also sends it to the Router, as `agent bench`'s
     /// `no-pass-through` design does.
@@ -77,6 +82,9 @@ pub enum SourceConfig {
     },
     /// Named schedules that fire as System Triggers of source `schedule`.
     Schedule { schedules: Vec<ScheduleConfig> },
+    /// Requests that operators file with `solos-swarm mcp --state-dir`, as
+    /// Triggers of source `mcp`, from an inbox in the state directory.
+    Mcp {},
 }
 
 fn slack_api_base() -> String {
@@ -103,6 +111,9 @@ pub enum ChannelConfig {
     /// Comments on issues and pull requests with the token and API base of
     /// the `github` Source. Serves replies to source `github`.
     Github {},
+    /// Appends replies to an outbox in the state directory, which
+    /// `solos-swarm mcp --state-dir` reads. Serves replies to source `mcp`.
+    Mcp {},
 }
 
 impl ChannelConfig {
@@ -111,6 +122,7 @@ impl ChannelConfig {
             Self::Jsonl { source, .. } => source,
             Self::Slack {} => slack::SOURCE,
             Self::Github {} => github::SOURCE,
+            Self::Mcp {} => mcp::SOURCE,
         }
     }
 }
@@ -200,7 +212,53 @@ pub enum ExecutorConfig {
         /// How `Plan::Swarm` Tickets run. Without it they fail.
         #[serde(default)]
         swarm: Option<Box<SwarmConfig>>,
+        /// The harness of a session Ticket whose Plan names none.
+        #[serde(default)]
+        harness: HarnessKind,
+        /// Where Claude Code is. Without it no session runs on Claude Code.
+        #[serde(default)]
+        claude: Option<Box<ClaudeConfig>>,
+        /// Where a session's commands run when its Plan names nowhere: a
+        /// node in `nodes.allow`, or `local` (the default).
+        #[serde(default)]
+        environment: Option<String>,
     },
+}
+
+/// The harness a worker session runs on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessKind {
+    #[default]
+    Pi,
+    ClaudeCode,
+}
+
+impl HarnessKind {
+    /// The harness a Plan names.
+    pub fn named(name: &str) -> Option<Self> {
+        match name {
+            "pi" => Some(Self::Pi),
+            "claude-code" => Some(Self::ClaudeCode),
+            _ => None,
+        }
+    }
+}
+
+/// The `claude-code` harness's install. Every path is absolute.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaudeConfig {
+    /// The `claude` executable, or with `node`, the npm package's `cli.js`.
+    pub binary: PathBuf,
+    /// The node that runs `binary`; without it `binary` runs on its own, as
+    /// the native build does.
+    #[serde(default)]
+    pub node: Option<PathBuf>,
+    /// The solos-swarm the sandbox runs for the session's tools and model
+    /// bridge; by default the one serving.
+    #[serde(default)]
+    pub solos_swarm: Option<PathBuf>,
 }
 
 /// `Plan::Swarm` Tickets: each runs a governed swarm whose Goal is rendered
@@ -351,14 +409,17 @@ impl AgentConfig {
                     *bot_token_file = base.join(&*bot_token_file);
                 }
                 SourceConfig::Github { token_file, .. } => *token_file = base.join(&*token_file),
-                SourceConfig::Schedule { .. } => {}
+                SourceConfig::Schedule { .. } | SourceConfig::Mcp {} => {}
             }
         }
         for channel in &mut config.channels {
             match channel {
                 ChannelConfig::Jsonl { path, .. } => *path = base.join(&*path),
-                ChannelConfig::Slack {} | ChannelConfig::Github {} => {}
+                ChannelConfig::Slack {} | ChannelConfig::Github {} | ChannelConfig::Mcp {} => {}
             }
+        }
+        if let Some(nodes) = &mut config.nodes {
+            nodes.resolve(base);
         }
         if let ExecutorConfig::Pi {
             provider,
@@ -404,8 +465,23 @@ impl AgentConfig {
             "the slack channel needs the slack source's bot token"
         );
         self.validate_github()?;
+        let mcp_sources = self
+            .sources
+            .iter()
+            .filter(|source| matches!(source, SourceConfig::Mcp {}))
+            .count();
+        ensure!(mcp_sources <= 1, "the agent config names two mcp sources");
+        ensure!(
+            mcp_sources == 0
+                || self
+                    .channels
+                    .iter()
+                    .any(|channel| matches!(channel, ChannelConfig::Mcp {})),
+            "the mcp source needs the mcp channel, or nobody hears back"
+        );
         self.validate_schedules(&served)?;
         self.validate_watchdog(&served)?;
+        self.validate_nodes()?;
         ensure!(
             self.budgets.session_microusd > 0,
             "budgets.session_microusd must be above zero"
@@ -481,6 +557,9 @@ impl AgentConfig {
             prepare,
             run_code,
             swarm,
+            harness,
+            claude,
+            ..
         } = &self.executor
         else {
             return Ok(());
@@ -560,6 +639,21 @@ impl AgentConfig {
         if let Some(swarm) = swarm {
             swarm.validate()?;
         }
+        ensure!(
+            *harness != HarnessKind::ClaudeCode || claude.is_some(),
+            "executor.harness claude-code needs executor.claude"
+        );
+        if let Some(claude) = claude {
+            let paths = [
+                Some(&claude.binary),
+                claude.node.as_ref(),
+                claude.solos_swarm.as_ref(),
+            ];
+            ensure!(
+                paths.into_iter().flatten().all(|path| path.is_absolute()),
+                "executor.claude's paths must be absolute"
+            );
+        }
         Ok(())
     }
 
@@ -637,7 +731,8 @@ impl SwarmConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentConfig, ChannelConfig, ExecutorConfig, JobLimits, RouterConfig, SourceConfig,
+        AgentConfig, ChannelConfig, ClaudeConfig, ExecutorConfig, HarnessKind, JobLimits,
+        RouterConfig, SourceConfig,
     };
     use std::path::PathBuf;
     use std::time::Duration;
@@ -893,6 +988,68 @@ budgets: {session_microusd: 500000}
         };
         assert_eq!((max_workers, run_code, prepare), (2, None, None));
         assert_eq!(parse(VALID).unwrap().pi_upstream(), None);
+    }
+
+    #[test]
+    fn workers_can_run_on_claude_code_where_it_is_configured() {
+        let with = |harness: &str, claude: &str| {
+            workers(|yaml| {
+                yaml.replace(
+                    "  max_workers: 3\n",
+                    &format!("  max_workers: 3\n{harness}{claude}"),
+                )
+            })
+        };
+        let binary = "  claude: {binary: /opt/claude/2.1.231}\n";
+        let config = parse(&with("  harness: claude-code\n", binary)).unwrap();
+        let ExecutorConfig::Pi {
+            harness,
+            claude: Some(install),
+            ..
+        } = &config.executor
+        else {
+            panic!("{:?}", config.executor)
+        };
+        assert_eq!(*harness, HarnessKind::ClaudeCode);
+        assert_eq!(
+            **install,
+            ClaudeConfig {
+                binary: PathBuf::from("/opt/claude/2.1.231"),
+                node: None,
+                solos_swarm: None,
+            }
+        );
+        let ExecutorConfig::Pi {
+            harness, claude, ..
+        } = parse(&workers(|yaml| yaml)).unwrap().executor
+        else {
+            panic!()
+        };
+        assert_eq!((harness, claude), (HarnessKind::Pi, None));
+        assert!(parse(&with("", binary)).is_ok(), "a Plan may still name it");
+        assert_eq!(
+            HarnessKind::named("claude-code"),
+            Some(HarnessKind::ClaudeCode)
+        );
+        assert_eq!(HarnessKind::named("codex"), None);
+        for (case, yaml) in [
+            ("no install", with("  harness: claude-code\n", "")),
+            ("an unknown harness", with("  harness: codex\n", binary)),
+            (
+                "a relative binary",
+                with("", "  claude: {binary: bin/claude}\n"),
+            ),
+            (
+                "a relative node",
+                with("", "  claude: {binary: /opt/cli.js, node: node}\n"),
+            ),
+            (
+                "an unknown field",
+                with("", "  claude: {binary: /opt/c, model: x}\n"),
+            ),
+        ] {
+            assert!(parse(&yaml).is_err(), "{case}: accepted\n{yaml}");
+        }
     }
 
     #[test]
@@ -1175,6 +1332,54 @@ budgets: {session_microusd: 500000}
         ] {
             let yaml = design("router: {kind: scripted}", executor);
             assert!(parse(&yaml).is_err(), "{executor}: accepted");
+        }
+    }
+
+    #[test]
+    fn an_mcp_source_needs_the_mcp_channel_and_an_mcp_operator_needs_a_thread() {
+        let mcp = VALID
+            .replace(
+                "  - kind: jsonl\n    path: triggers.jsonl",
+                "  - kind: jsonl\n    path: triggers.jsonl\n  - kind: mcp",
+            )
+            .replace("channels:\n", "channels:\n  - kind: mcp\n");
+        let config = parse(&mcp).unwrap();
+        assert_eq!(config.sources[1], SourceConfig::Mcp {});
+        assert_eq!(config.channels[0].source(), "mcp");
+        let watched = format!(
+            "{mcp}watchdog:\n  operator: {{source: mcp, address: {{operator: ops, thread: alerts}}}}\n"
+        );
+        parse(&watched).unwrap();
+        for (case, yaml) in [
+            (
+                "no mcp channel",
+                mcp.replace("  - kind: mcp\n  - kind: jsonl", "  - kind: jsonl"),
+            ),
+            (
+                "a jsonl channel for mcp",
+                mcp.replace(
+                    "  - kind: mcp\n  - kind: jsonl",
+                    "  - {kind: jsonl, source: mcp, path: o}\n  - kind: jsonl",
+                ),
+            ),
+            (
+                "two mcp sources",
+                mcp.replace(
+                    "  - kind: mcp\nchannels",
+                    "  - kind: mcp\n  - kind: mcp\nchannels",
+                ),
+            ),
+            (
+                "an mcp operator with no thread",
+                watched.replace(", thread: alerts", ""),
+            ),
+            (
+                "an mcp operator with a colon",
+                watched.replace("operator: ops", "operator: 'o:ps'"),
+            ),
+        ] {
+            assert_ne!(yaml, mcp, "{case}: the case did not change the config");
+            assert!(parse(&yaml).is_err(), "{case}: accepted\n{yaml}");
         }
     }
 

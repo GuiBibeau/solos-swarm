@@ -6,10 +6,12 @@
 pub mod bench;
 pub mod broker;
 pub mod config;
+pub mod environment;
 pub mod github;
 pub mod goal_template;
 pub mod jobs;
 pub mod jsonl;
+pub mod mcp;
 pub mod pi_executor;
 pub mod pi_router;
 pub mod ports;
@@ -29,12 +31,16 @@ pub use runtime::{Adapters, HOST_RESTARTED, RunOptions, Runtime, Summary};
 use crate::broker::{now_ms, write_json};
 use crate::code::{CodeConfig, CodeExecutor};
 use crate::gateway::{Provider, provider_for, upstream_profile};
+use crate::harness::claude_code::ClaudeCodeHarness;
 use crate::harness::{AgentHarness, PiHarness, Role, SessionSpec};
+use crate::remote::Listener;
 use anyhow::{Context, Result, bail, ensure};
 use broker::{
     AgentBroker, BrokerParts, DecideTerms, Grant, ModelTerms, Principal, ROUTER_TOOLS, WorkerParts,
 };
-use config::{ChannelConfig, ExecutorConfig, RouterConfig, RunCodeConfig, SourceConfig};
+use config::{
+    ChannelConfig, ClaudeConfig, ExecutorConfig, RouterConfig, RunCodeConfig, SourceConfig,
+};
 use github::{GithubApi, GithubChannel, GithubSource};
 use goal_template::GoalTemplates;
 use jsonl::{JsonlChannel, JsonlSource};
@@ -166,10 +172,20 @@ where
     private_dir(state_dir)?;
     let store = SqliteStore::open(state_dir.join(STORE_FILE)).context("cannot open the store")?;
     let (facts, inbound) = ports::FactSink::channel();
+    let nodes = match &config.nodes {
+        Some(nodes) => Some(Listener::start(nodes).await?),
+        None => None,
+    };
     let pi = match (config.pi_upstream(), host) {
         (None, _) => None,
         (Some(_), None) => bail!("a pi router or pi workers need a session host"),
-        (Some(_), Some(host)) => Some(PiParts::new(&config, state_dir, host, facts.clone())?),
+        (Some(_), Some(host)) => Some(PiParts::new(
+            &config,
+            state_dir,
+            host,
+            facts.clone(),
+            nodes.as_ref(),
+        )?),
     };
     let mut router: Arc<dyn Router> = match pi.as_ref().and_then(|pi| pi.router.clone()) {
         Some(router) => router,
@@ -222,6 +238,9 @@ where
     if let Some(served) = served {
         served.stop().await;
     }
+    if let Some(nodes) = nodes {
+        nodes.stop().await;
+    }
     summary
 }
 
@@ -262,6 +281,7 @@ where
         state_dir: &Path,
         host: PiHost<H>,
         facts: ports::FactSink,
+        nodes: Option<&Listener>,
     ) -> Result<Self> {
         let PiHost {
             harness,
@@ -318,7 +338,14 @@ where
             decide: DecideTerms::for_config(config),
             workers,
         };
-        let broker = AgentBroker::with_jobs(parts, job_limits)?;
+        let remote = environment::Nodes {
+            default: match &config.executor {
+                ExecutorConfig::Pi { environment, .. } => environment.clone(),
+                ExecutorConfig::Scripted {} | ExecutorConfig::Simulated { .. } => None,
+            },
+            nodes: nodes.map(Listener::environments).unwrap_or_default(),
+        };
+        let broker = AgentBroker::with_nodes(parts, job_limits, remote)?;
         let swarm = match &config.executor {
             ExecutorConfig::Pi {
                 provider: name,
@@ -357,11 +384,19 @@ where
                 ExecutorConfig::Pi {
                     max_workers,
                     prepare,
+                    harness: default_harness,
+                    claude,
                     ..
                 },
                 Some(model),
             ) => Some(Arc::new(PiExecutor::new(PiExecutorParts {
                 harness,
+                claude: claude
+                    .as_deref()
+                    .map(claude_harness)
+                    .transpose()?
+                    .map(Arc::new),
+                default_harness: *default_harness,
                 broker: broker.clone(),
                 tickets_dir,
                 broker_socket: state_dir.join(broker::SOCKET_FILE),
@@ -393,6 +428,20 @@ where
             socket,
         })
     }
+}
+
+/// The `claude-code` harness of `install`, its paths resolved. Its sandbox
+/// runs this binary for the session's tools unless `install` names another.
+fn claude_harness(install: &ClaudeConfig) -> Result<ClaudeCodeHarness> {
+    let solos_swarm = match &install.solos_swarm {
+        Some(path) => path.clone(),
+        None => std::env::current_exe().context("cannot find this solos-swarm binary")?,
+    };
+    Ok(ClaudeCodeHarness {
+        binary: canonical(&install.binary)?,
+        node: install.node.as_deref().map(canonical).transpose()?,
+        solos_swarm: canonical(&solos_swarm)?,
+    })
 }
 
 /// The workers' `run_code` sandbox, with every scratch directory under the
@@ -458,12 +507,14 @@ fn router_session(
             max_input_bytes: *max_input_bytes,
             max_output_tokens: *max_output_tokens,
         },
-        system_prompt: Some(pi_router::system_prompt(
-            instructions.as_deref(),
-            &config.policy,
-            rules,
-            &DecideTerms::for_config(config),
-        )),
+        system_prompt: Some(
+            pi_router::system_prompt(
+                instructions.as_deref(),
+                &config.policy,
+                rules,
+                &DecideTerms::for_config(config),
+            ) + &config.environment_note(),
+        ),
     };
     Ok((spec, grant))
 }
@@ -554,6 +605,10 @@ impl Io {
                         .collect::<Result<_>>()?;
                     sources.push(Box::new(ScheduleSource::new(schedules, follow)));
                 }
+                SourceConfig::Mcp {} => {
+                    let inbox = mcp::open_inbox(state_dir)?;
+                    sources.push(Box::new(JsonlSource::new(inbox, follow)));
+                }
             }
         }
         let mut channels: BTreeMap<String, Arc<dyn Channel>> = BTreeMap::new();
@@ -570,6 +625,10 @@ impl Io {
                         .clone()
                         .context("the github channel needs a github source")?,
                 )),
+                ChannelConfig::Mcp {} => {
+                    mcp::open_dir(state_dir)?;
+                    Arc::new(JsonlChannel::open(mcp::outbox(state_dir))?)
+                }
             };
             channels.insert(channel.source().to_owned(), adapter);
         }
@@ -587,7 +646,8 @@ impl Io {
     }
 }
 
-async fn shutdown() {
+/// SIGINT or SIGTERM.
+pub async fn shutdown() {
     let terminate = async {
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
             Ok(mut signal) => {

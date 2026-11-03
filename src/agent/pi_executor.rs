@@ -1,16 +1,18 @@
 //! The Executor that runs each Assignment of a `Plan::Session` Ticket as
-//! one worker session on an `AgentHarness`: Pi in bwrap in production,
-//! scripted in tests. A worker works in its Ticket's directory under the
-//! state directory, calls the model and its tools through the agent broker
-//! on the Ticket's account, and reports with `worker_report`; it never
-//! talks to people. At most `max_workers` sessions live at once, and a
-//! launch past that waits for a slot.
+//! one worker session on an `AgentHarness`: Pi or Claude Code in bwrap in
+//! production, scripted in tests. A worker works in its Ticket's directory
+//! under the state directory, calls the model and its tools through the
+//! agent broker on the Ticket's account, and reports with `worker_report`;
+//! it never talks to people. At most `max_workers` sessions live at once,
+//! and a launch past that waits for a slot.
 
 use super::broker::{self, AgentBroker, WorkerSeat, clip};
-use super::jobs::JOB_TOOLS;
+use super::config::HarnessKind;
+use super::environment::{self, Launchable};
 use super::ports::{BoxFuture, Delivered, Delivery, Executor, Fact, FactSink, Launch};
 use super::swarm_executor::SwarmExecutor;
 use crate::broker::write_json;
+use crate::harness::claude_code::ClaudeCodeHarness;
 use crate::harness::{
     AgentHarness, JOIN_WAIT, Observation, Role, STOP_WAIT, Session, SessionEvent, SessionSpec,
 };
@@ -179,27 +181,41 @@ pub fn delivery_text(ticket: &TicketId, inputs: &[Delivered]) -> String {
 
 /// What runs a Plan. Every launch goes through here.
 enum Runner {
-    Session,
+    Session(HarnessKind),
     Swarm,
     Unavailable(String),
 }
 
-fn runner(plan: &Plan) -> Runner {
+/// A session runs on the harness its Plan names, else on `default`; Claude
+/// Code only where it is configured.
+fn runner(plan: &Plan, default: HarnessKind, claude: bool) -> Runner {
+    let session = |kind| match kind {
+        HarnessKind::ClaudeCode if !claude => {
+            Runner::Unavailable("the claude-code harness is not available here".into())
+        }
+        kind => Runner::Session(kind),
+    };
     match plan {
-        Plan::Session { harness: None } => Runner::Session,
+        Plan::Session { harness: None, .. } => session(default),
         Plan::Session {
             harness: Some(name),
-        } if name == "pi" => Runner::Session,
-        Plan::Session {
-            harness: Some(name),
-        } => Runner::Unavailable(format!("the {name} harness is not available here")),
+            ..
+        } => match HarnessKind::named(name) {
+            Some(kind) => session(kind),
+            None => Runner::Unavailable(format!("the {name} harness is not available here")),
+        },
         Plan::Swarm { .. } => Runner::Swarm,
     }
 }
 
-/// Where workers run and what they are given.
-pub struct PiExecutorParts<H> {
+/// Where workers run and what they are given. `H` runs Pi sessions and `C`
+/// Claude Code sessions.
+pub struct PiExecutorParts<H, C = ClaudeCodeHarness> {
     pub harness: Arc<H>,
+    /// Runs the sessions whose harness is `claude-code`; without it they fail.
+    pub claude: Option<Arc<C>>,
+    /// The harness of a session whose Plan names none.
+    pub default_harness: HarnessKind,
     pub broker: AgentBroker,
     /// Each Ticket's directory is made here.
     pub tickets_dir: PathBuf,
@@ -216,13 +232,12 @@ pub struct PiExecutorParts<H> {
     pub swarm: Option<SwarmExecutor<H>>,
 }
 
-pub struct PiExecutor<H> {
-    inner: Arc<Inner<H>>,
+pub struct PiExecutor<H, C = ClaudeCodeHarness> {
+    inner: Arc<Inner<H, C>>,
 }
 
-struct Inner<H> {
-    parts: PiExecutorParts<H>,
-    grants: Vec<String>,
+struct Inner<H, C> {
+    parts: PiExecutorParts<H, C>,
     slots: Arc<Semaphore>,
     workers: Mutex<BTreeMap<AssignmentId, Worker>>,
 }
@@ -287,26 +302,20 @@ async fn finish(mut task: JoinHandle<()>) {
     }
 }
 
-impl<H> PiExecutor<H>
+impl<H, C> PiExecutor<H, C>
 where
     H: AgentHarness + Send + Sync + 'static,
     H::Session: Send + 'static,
+    C: AgentHarness + Send + Sync + 'static,
+    C::Session: Send + 'static,
 {
-    pub fn new(parts: PiExecutorParts<H>) -> Result<Self> {
+    pub fn new(parts: PiExecutorParts<H, C>) -> Result<Self> {
         ensure!(parts.max_workers > 0, "a pi executor needs a worker slot");
-        let mut grants: Vec<String> = ["worker_report", "worker_handback", "fetch_url"]
-            .map(String::from)
-            .to_vec();
-        if parts.broker.offers_run_code() {
-            grants.push("run_code".into());
-            grants.extend(JOB_TOOLS.map(String::from));
-        }
         private_dir(&parts.tickets_dir)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 slots: Arc::new(Semaphore::new(parts.max_workers)),
                 parts,
-                grants,
                 workers: Mutex::new(BTreeMap::new()),
             }),
         })
@@ -328,17 +337,29 @@ where
     }
 }
 
-impl<H> Executor for PiExecutor<H>
+impl<H, C> Executor for PiExecutor<H, C>
 where
     H: AgentHarness + Send + Sync + 'static,
     H::Session: Send + 'static,
+    C: AgentHarness + Send + Sync + 'static,
+    C::Session: Send + 'static,
 {
     fn launch(&self, launch: Launch, facts: FactSink) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
-            match (runner(&launch.plan), &self.inner.parts.swarm) {
-                (Runner::Session, _) => {
-                    self.inner.start(launch, facts);
-                    Ok(())
+            let parts = &self.inner.parts;
+            let runner = runner(&launch.plan, parts.default_harness, parts.claude.is_some());
+            match (runner, &parts.swarm) {
+                (Runner::Session(harness), _) => {
+                    let environments = parts.broker.environments();
+                    match environments.launchable(environment::named(&launch.plan)) {
+                        Launchable::Now => {
+                            self.inner.start(launch, facts, harness);
+                            Ok(())
+                        }
+                        // The effect runner's backoff holds the Launch until the node is back.
+                        Launchable::Later(why) => Err(anyhow!(why)),
+                        Launchable::Never(why) => failed(&facts, &launch, false, &why, 0).await,
+                    }
                 }
                 (Runner::Swarm, Some(swarm)) => swarm.launch(launch, facts).await,
                 (Runner::Swarm, None) => {
@@ -394,10 +415,12 @@ where
     }
 }
 
-impl<H> Inner<H>
+impl<H, C> Inner<H, C>
 where
     H: AgentHarness + Send + Sync + 'static,
     H::Session: Send + 'static,
+    C: AgentHarness + Send + Sync + 'static,
+    C::Session: Send + 'static,
 {
     fn workers(&self) -> MutexGuard<'_, BTreeMap<AssignmentId, Worker>> {
         self.workers
@@ -408,7 +431,7 @@ where
     /// Start a worker for `launch`, once per Assignment. The table stays
     /// locked until it holds the worker, so a worker that ends at once
     /// still finds itself there to remove.
-    fn start(self: &Arc<Self>, launch: Launch, facts: FactSink) {
+    fn start(self: &Arc<Self>, launch: Launch, facts: FactSink, harness: HarnessKind) {
         let mut workers = self.workers();
         if workers.contains_key(&launch.assignment) {
             return;
@@ -416,7 +439,7 @@ where
         let id = launch.assignment.clone();
         let (inputs, inbox) = mpsc::unbounded_channel();
         let (stop, stopped) = watch::channel(false);
-        let task = tokio::spawn(self.clone().work(launch, facts, inbox, stopped));
+        let task = tokio::spawn(self.clone().work(launch, facts, harness, inbox, stopped));
         workers.insert(id, Worker { inputs, stop, task });
     }
 
@@ -424,6 +447,7 @@ where
         self: Arc<Self>,
         launch: Launch,
         facts: FactSink,
+        harness: HarnessKind,
         mut inbox: mpsc::UnboundedReceiver<Vec<Delivered>>,
         mut stop: watch::Receiver<bool>,
     ) {
@@ -434,7 +458,7 @@ where
         if let Some(_slot) = slot {
             let mut run = Run::default();
             let ended = self
-                .session(&launch, &facts, &mut inbox, &mut stop, &mut run)
+                .session(&launch, &facts, harness, &mut inbox, &mut stop, &mut run)
                 .await
                 .unwrap_or_else(|err| Some(format!("{err:#}")));
             if let Some(why) = ended {
@@ -463,6 +487,7 @@ where
         &self,
         launch: &Launch,
         facts: &FactSink,
+        harness: HarnessKind,
         inbox: &mut mpsc::UnboundedReceiver<Vec<Delivered>>,
         stop: &mut watch::Receiver<bool>,
         run: &mut Run,
@@ -470,15 +495,27 @@ where
         let parts = &self.parts;
         let dir = self.ticket_dir(&launch.ticket)?;
         let work = dir.join(WORK_DIR);
-        self.prepare(&launch.ticket, &dir, &work).await?;
+        let named = environment::named(&launch.plan);
+        let environments = parts.broker.environments();
+        // A node's /work is its own, so this host's prepare has nothing to set up there.
+        if environments.is_local(named) {
+            self.prepare(&launch.ticket, &dir, &work).await?;
+        }
         let token = broker::new_token();
-        let run_code = parts.broker.offers_run_code();
+        let grants: Vec<String> = parts
+            .broker
+            .worker_tools(named)
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let run_code = grants.iter().any(|tool| tool == "run_code");
         let seat = WorkerSeat::new(
             launch.ticket.clone(),
             launch.assignment.clone(),
             work,
             launch.budget_microusd,
-        );
+        )
+        .in_environment(named.map(str::to_owned));
         let prompt = system_prompt(launch.budget_microusd, run_code);
         let seat = parts.broker.admit_worker(token.clone(), seat, prompt)?;
         let _revoke = Revoke {
@@ -489,7 +526,7 @@ where
         let spec = SessionSpec {
             id: launch.assignment.to_string(),
             role: Role::TicketWorker,
-            grants: self.grants.clone(),
+            grants,
             token,
             model: parts.model.clone(),
             pi_settings: dir.join("pi-settings.json"),
@@ -499,11 +536,6 @@ where
             pi_root: parts.pi_root.clone(),
         };
         let (events_tx, mut events) = mpsc::channel(64);
-        let mut session = parts
-            .harness
-            .start(&spec, events_tx)
-            .await
-            .context("the worker's session did not start")?;
         let turns = Turns {
             launch,
             facts,
@@ -511,10 +543,27 @@ where
             broker: &parts.broker,
             run_code,
         };
-        let outcome = turns
-            .play(&mut session, &mut events, inbox, stop, run)
-            .await;
-        close(session).await;
+        const STARTED: &str = "the worker's session did not start";
+        // Each arm is the same generic turn loop on its harness's own
+        // session type, so the port keeps its static dispatch.
+        let outcome = match harness {
+            HarnessKind::Pi => {
+                let session = parts
+                    .harness
+                    .start(&spec, events_tx)
+                    .await
+                    .context(STARTED)?;
+                turns.drive(session, &mut events, inbox, stop, run).await
+            }
+            HarnessKind::ClaudeCode => {
+                let claude = parts
+                    .claude
+                    .as_ref()
+                    .context("this agent runs no Claude Code")?;
+                let session = claude.start(&spec, events_tx).await.context(STARTED)?;
+                turns.drive(session, &mut events, inbox, stop, run).await
+            }
+        };
         seat.stop_jobs().await;
         outcome
     }
@@ -587,6 +636,20 @@ struct Turns<'a> {
 }
 
 impl Turns<'_> {
+    /// [`play`](Self::play) `session` to its end, then close it.
+    async fn drive(
+        &self,
+        mut session: impl Session,
+        events: &mut mpsc::Receiver<Observation>,
+        inbox: &mut mpsc::UnboundedReceiver<Vec<Delivered>>,
+        stop: &mut watch::Receiver<bool>,
+        run: &mut Run,
+    ) -> Result<Option<String>> {
+        let outcome = self.play(&mut session, events, inbox, stop, run).await;
+        close(session).await;
+        outcome
+    }
+
     /// Report started, prompt the assignment, and keep prompting until the
     /// worker is stopped or gone. Inputs that come during a turn wait for
     /// the next one; an Input the session already has is not sent again.
@@ -738,8 +801,14 @@ mod tests {
     use super::{
         PREPARED, PiExecutor, PiExecutorParts, QUIET_TURN, WORK_DIR, assignment_text, delivery_text,
     };
-    use crate::agent::broker::{AgentBroker, BrokerParts, DecideTerms, ModelTerms, WorkerParts};
+    use crate::agent::broker::{
+        AgentBroker, BrokerParts, DecideTerms, ModelTerms, WORKER_TOOLS, WorkerParts,
+    };
+    use crate::agent::config::HarnessKind;
+    use crate::agent::environment::{ExecutionEnvironment, Nodes, Offline, Work};
+    use crate::agent::jobs::JobLimits;
     use crate::agent::ports::{Delivered, Delivery, Executor, Fact, FactSink, Inbound, Launch};
+    use crate::code::{OutputBounds, Started};
     use crate::gateway::{Dispatch, PriceTable, Provider, Upstream};
     use crate::harness::{AgentHarness, Observation, Session, SessionEvent, SessionSpec};
     use serde_json::Value;
@@ -748,8 +817,9 @@ mod tests {
         TicketId, Trigger, TriggerId,
     };
     use solos_agent_store::SqliteStore;
+    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -768,6 +838,8 @@ mod tests {
     #[derive(Clone, Default)]
     struct Fake {
         events: Events,
+        /// Each session's grants, by its id.
+        grants: Arc<Mutex<BTreeMap<String, Vec<String>>>>,
         prompts: Arc<Mutex<Vec<(String, String)>>>,
         live: Arc<AtomicUsize>,
         most: Arc<AtomicUsize>,
@@ -788,6 +860,8 @@ mod tests {
             events: mpsc::Sender<Observation>,
         ) -> anyhow::Result<FakeSession> {
             self.events.lock().unwrap().push((spec.id.clone(), events));
+            let grants = spec.grants.clone();
+            self.grants.lock().unwrap().insert(spec.id.clone(), grants);
             let live = self.live.fetch_add(1, Ordering::SeqCst) + 1;
             self.most.fetch_max(live, Ordering::SeqCst);
             Ok(FakeSession {
@@ -834,6 +908,9 @@ mod tests {
             let events = self.events.lock().unwrap();
             events.iter().map(|(id, _)| id.clone()).collect()
         }
+        fn grants(&self, id: &str) -> Vec<String> {
+            self.grants.lock().unwrap()[id].clone()
+        }
         async fn tell(&self, id: &str, event: anyhow::Result<SessionEvent>) {
             let sender = self
                 .events
@@ -848,8 +925,10 @@ mod tests {
     }
 
     struct World {
-        executor: PiExecutor<Fake>,
+        executor: PiExecutor<Fake, Fake>,
         fake: Fake,
+        /// Runs the sessions on the `claude-code` harness.
+        claude: Fake,
         facts: FactSink,
         inbound: mpsc::Receiver<Inbound>,
         dir: PathBuf,
@@ -857,6 +936,17 @@ mod tests {
 
     impl World {
         fn new(max_workers: usize, prepare: Option<&str>) -> Self {
+            Self::on(HarnessKind::Pi, max_workers, prepare)
+        }
+        fn on(default_harness: HarnessKind, max_workers: usize, prepare: Option<&str>) -> Self {
+            Self::with_nodes(default_harness, max_workers, prepare, Nodes::default())
+        }
+        fn with_nodes(
+            default_harness: HarnessKind,
+            max_workers: usize,
+            prepare: Option<&str>,
+            nodes: Nodes,
+        ) -> Self {
             let dir = std::env::temp_dir().join(format!("pi-executor-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&dir).unwrap();
             let (facts, inbound) = FactSink::channel();
@@ -870,7 +960,7 @@ mod tests {
                 max_input_bytes: 65_536,
                 max_output_tokens: 1_024,
             };
-            let broker = AgentBroker::new(BrokerParts {
+            let parts = BrokerParts {
                 dir: dir.clone(),
                 store: SqliteStore::open_in_memory().unwrap(),
                 provider: Arc::new(Silent),
@@ -881,11 +971,13 @@ mod tests {
                     swarm: None,
                 },
                 workers: Some(WorkerParts { terms, code: None }),
-            })
-            .unwrap();
-            let fake = Fake::default();
+            };
+            let broker = AgentBroker::with_nodes(parts, JobLimits::default(), nodes).unwrap();
+            let (fake, claude) = (Fake::default(), Fake::default());
             let executor = PiExecutor::new(PiExecutorParts {
                 harness: Arc::new(fake.clone()),
+                claude: Some(Arc::new(claude.clone())),
+                default_harness,
                 broker,
                 tickets_dir: dir.join("tickets"),
                 broker_socket: dir.join("broker.sock"),
@@ -900,6 +992,7 @@ mod tests {
             Self {
                 executor,
                 fake,
+                claude,
                 facts,
                 inbound,
                 dir,
@@ -974,7 +1067,10 @@ mod tests {
             scope: "Make tests/retry.rs pass ten times in a row.".into(),
             origin: trigger("t0", Actor::person("alice"), "Fix the flaky test"),
             rules: Vec::new(),
-            plan: Plan::Session { harness: None },
+            plan: Plan::Session {
+                harness: None,
+                environment: None,
+            },
             budget_microusd: 500_000,
             recovery: false,
             inputs: Vec::new(),
@@ -1187,6 +1283,177 @@ mod tests {
         );
         w.launch(launch("tk_2", "as_2")).await;
         assert!(started(&w.fact().await, "as_2"));
+    }
+
+    #[tokio::test]
+    async fn a_session_runs_on_the_harness_its_plan_names_else_on_the_default() {
+        let mut w = World::new(4, None);
+        let on = |harness: Option<&str>, ticket: &str| {
+            let mut launch = launch(ticket, &format!("as_{ticket}"));
+            launch.plan = Plan::Session {
+                harness: harness.map(String::from),
+                environment: None,
+            };
+            launch
+        };
+        w.launch(on(None, "a")).await;
+        assert!(started(&w.fact().await, "as_a"));
+        w.launch(on(Some("claude-code"), "b")).await;
+        assert!(started(&w.fact().await, "as_b"));
+        w.launch(on(Some("pi"), "c")).await;
+        assert!(started(&w.fact().await, "as_c"));
+        assert_eq!(w.fake.started(), ["as_a", "as_c"]);
+        assert_eq!(w.claude.started(), ["as_b"]);
+        let prompts = w.claude.prompted(1).await;
+        assert!(prompts[0].1.starts_with("Ticket b: "), "{}", prompts[0].1);
+
+        w.claude.tell("as_b", Ok(SessionEvent::TurnEnded)).await;
+        let Fact::Report { report, .. } = w.fact().await else {
+            panic!("no report")
+        };
+        assert_eq!(
+            report.status,
+            ReportStatus::Waiting,
+            "a quiet turn, as on Pi"
+        );
+        w.claude
+            .tell("as_b", Ok(SessionEvent::Rejected("API Error: 403".into())))
+            .await;
+        let Fact::Report { report, .. } = w.fact().await else {
+            panic!("no report")
+        };
+        assert_eq!(report.status, ReportStatus::Failed);
+        assert!(report.text.contains("API Error: 403"), "{}", report.text);
+        assert!(matches!(w.fact().await, Fact::Ended { .. }));
+
+        w.launch(on(Some("codex"), "d")).await;
+        let why = failure(&mut w, "as_d").await;
+        assert!(
+            why.contains("the codex harness is not available here"),
+            "{why}"
+        );
+        w.executor.shutdown().await;
+        assert_eq!(w.claude.live.load(Ordering::SeqCst), 0);
+
+        let mut claude = World::on(HarnessKind::ClaudeCode, 1, None);
+        claude.launch(on(None, "e")).await;
+        assert!(started(&claude.fact().await, "as_e"));
+        assert_eq!(claude.claude.started(), ["as_e"]);
+        assert!(claude.fake.started().is_empty());
+        claude.executor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn without_claude_code_configured_a_plan_naming_it_fails() {
+        let dir = std::env::temp_dir().join(format!("pi-executor-{}", uuid::Uuid::new_v4()));
+        let mut w = World::new(1, None);
+        let broker = w.executor.inner.parts.broker.clone();
+        let fake = Fake::default();
+        let executor: PiExecutor<Fake, Fake> = PiExecutor::new(PiExecutorParts {
+            harness: Arc::new(fake.clone()),
+            claude: None,
+            default_harness: HarnessKind::Pi,
+            broker,
+            tickets_dir: dir.join("tickets"),
+            broker_socket: dir.join("broker.sock"),
+            node: dir.join("node"),
+            pi_root: dir.clone(),
+            model: "deepseek-flash".into(),
+            max_workers: 1,
+            prepare: None,
+            swarm: None,
+        })
+        .unwrap();
+        let mut asks = launch("tk_1", "as_1");
+        asks.plan = Plan::Session {
+            harness: Some("claude-code".into()),
+            environment: None,
+        };
+        executor.launch(asks, w.facts.clone()).await.unwrap();
+        let why = failure(&mut w, "as_1").await;
+        assert!(
+            why.contains("the claude-code harness is not available here"),
+            "{why}"
+        );
+        assert!(fake.started().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A node whose connection the test switches; nothing runs on it here.
+    struct Laptop(AtomicBool);
+
+    impl ExecutionEnvironment for Laptop {
+        fn ready(&self) -> Result<(), Offline> {
+            if self.0.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(Offline("node laptop is offline".into()))
+            }
+        }
+        fn run_code(&self, _: Work<'_>, _: &Value) -> anyhow::Result<Started> {
+            anyhow::bail!("not in this test")
+        }
+        fn job(
+            &self,
+            _: Work<'_>,
+            _: &str,
+            _: Duration,
+            _: OutputBounds,
+        ) -> anyhow::Result<Started> {
+            anyhow::bail!("not in this test")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_on_a_node_gets_run_code_there_on_either_harness_and_waits_for_it() {
+        let laptop = Arc::new(Laptop(AtomicBool::new(true)));
+        let nodes = Nodes {
+            default: None,
+            nodes: BTreeMap::from([(
+                "laptop".to_owned(),
+                laptop.clone() as Arc<dyn ExecutionEnvironment>,
+            )]),
+        };
+        let mut w = World::with_nodes(HarnessKind::Pi, 4, None, nodes);
+        let on = |harness: &str, environment: Option<&str>, ticket: &str| {
+            let mut launch = launch(ticket, &format!("as_{ticket}"));
+            launch.plan = Plan::Session {
+                harness: Some(harness.into()),
+                environment: environment.map(String::from),
+            };
+            launch
+        };
+        w.launch(on("claude-code", Some("laptop"), "a")).await;
+        assert!(started(&w.fact().await, "as_a"));
+        w.launch(on("claude-code", None, "b")).await;
+        assert!(started(&w.fact().await, "as_b"));
+        w.launch(on("pi", Some("laptop"), "c")).await;
+        assert!(started(&w.fact().await, "as_c"));
+        assert_eq!(
+            w.claude.grants("as_a"),
+            WORKER_TOOLS,
+            "run_code on the node"
+        );
+        assert_eq!(
+            w.claude.grants("as_b"),
+            ["worker_report", "worker_handback", "fetch_url"],
+            "this host offers no run_code"
+        );
+        assert_eq!(w.fake.grants("as_c"), w.claude.grants("as_a"), "as on Pi");
+
+        laptop.0.store(false, Ordering::SeqCst);
+        let held = w
+            .executor
+            .launch(on("claude-code", Some("laptop"), "d"), w.facts.clone())
+            .await
+            .expect_err("a launch on an offline node started");
+        assert!(
+            format!("{held:#}").contains("node laptop is offline"),
+            "{held:#}"
+        );
+        w.no_fact().await;
+        assert_eq!(w.claude.started(), ["as_a", "as_b"]);
+        w.executor.shutdown().await;
     }
 
     fn count(path: &Path) -> usize {

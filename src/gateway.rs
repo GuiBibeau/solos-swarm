@@ -1,8 +1,10 @@
 //! The model gate both modes share: pricing and receipts, the upstream
-//! profiles and their transport, the request contract and the pause gate.
+//! profiles and their transport, the request contract, the pause gate, and
+//! the Anthropic Messages wire over the chat one.
 //! Swarm mode's broker and agent mode's broker each keep their own ledger and
 //! principals, and call these for everything else.
 
+pub mod anthropic;
 pub mod pause;
 pub mod pricing;
 pub mod upstream;

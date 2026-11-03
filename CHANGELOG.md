@@ -72,6 +72,21 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   their own lines). The research words in the swarm runtime are now optional Goal fields: `nudges`, one template
   per escalation stage, and `record_fields`, the Task fields a host-filed record reads. `Goal::validate` checks
   them, a Goal template can set them, and a Goal without them runs exactly as before.
+- Agent mode, P7a: `solos-swarm mcp`, a hand-written stdio MCP server. `--socket --token-file` offers one principal's
+  broker tools (the broker's new `GET /tools`, from a Rust tool registry the Pi extension's schemas are tested
+  against), with refusals as `isError` results and pauses waited out; `--state-dir --operator` offers `agent_status`,
+  `agent_request` (a Trigger from `mcp:<operator>` through the new `kind: mcp` Source) and `agent_replies` (the
+  `kind: mcp` Channel's outbox).
+- Agent mode, P7b: Claude Code workers. `executor.harness: claude-code` (or a Plan naming it) runs a session Ticket
+  on the installed `claude`, headless in bwrap with no network and no key, its only tools the broker's through
+  `solos-swarm mcp`, and its model the agent broker's new Anthropic Messages facade (`POST /v1/messages`, SSE too,
+  translated in `src/gateway/anthropic.rs`), held and settled on the Ticket's account and refused while paused,
+  through a loopback port that the hidden `solos-swarm bridge` pipes to the broker socket.
+- Agent mode, P9: remote nodes (`src/remote/`, `src/agent/environment.rs`). `solos-swarm node serve` dials the
+  agent over TLS where each side pins the other's certificate (`node init`, `agent init-nodes`), and runs the
+  `run_code` and background jobs of the Tickets bound to it in its own bwrap sandbox, with its own mounts and
+  secrets that never leave it; `Plan::Session` gains an optional `environment` (stored Plans read as before), an
+  offline node holds its Tickets' launches until it connects, and swarm mode is unchanged.
 - Agent mode, P10: `solos-swarm agent bench` reproduces the super-agent article's ablation on a seeded stream of chat
   and CI Triggers with work requests (`agent workload` writes one), simulated work (`executor: {kind: simulated}`)
   and three designs (`super-agent`, `no-pass-through` through the new `pass_through: false` and

@@ -49,6 +49,17 @@ enum Action {
         #[arg(last = true)]
         args: Vec<String>,
     },
+    /// Inside a harness's sandbox: serve a loopback TCP port as a pipe to the
+    /// broker's Unix socket while the program after `--` runs, and exit with it.
+    #[command(hide = true)]
+    Bridge {
+        #[arg(long)]
+        listen: std::net::SocketAddr,
+        #[arg(long)]
+        socket: PathBuf,
+        #[arg(last = true, required = true)]
+        program: Vec<OsString>,
+    },
     Mvp {
         #[command(subcommand)]
         command: mvp::MvpCommand,
@@ -57,6 +68,37 @@ enum Action {
     Agent {
         #[command(subcommand)]
         command: AgentCommand,
+    },
+    /// A machine that runs an agent's commands: it dials out to the agent and
+    /// runs what it is sent in its own sandbox.
+    Node {
+        #[command(subcommand)]
+        command: NodeCommand,
+    },
+    /// A Model Context Protocol server on stdin and stdout, for an MCP host
+    /// such as Claude Code or Codex. With --socket and --token-file it offers
+    /// one principal's tools through its broker; with --state-dir and
+    /// --operator, an operator's tools over an agent.
+    Mcp {
+        /// The broker's socket, such as an agent's `<state dir>/broker.sock`.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// The principal's bearer token. Read once and deleted.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+        /// How long one call waits out a paused broker before it reports the
+        /// pause. Default 45.
+        #[arg(long)]
+        max_pause_wait_secs: Option<u64>,
+        /// The agent's state directory.
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Who files the requests; the Policy names them `mcp:<operator>`.
+        #[arg(long)]
+        operator: Option<String>,
+        /// The agent's config, for `agent_status`.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     Run {
         #[arg(long)]
@@ -208,6 +250,45 @@ enum AgentCommand {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Write the key and self-signed certificate the agent's node listener
+    /// serves, and print the fingerprint each node's config pins.
+    InitNodes {
+        /// Created if missing; an existing key is never replaced.
+        #[arg(long)]
+        dir: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum NodeCommand {
+    /// Write this machine's key and self-signed certificate, and print the
+    /// fingerprint the agent's `nodes.allow` pins.
+    Init {
+        /// Created if missing; an existing key is never replaced.
+        #[arg(long)]
+        dir: PathBuf,
+    },
+    /// Dial the agent and run what it sends until SIGINT or SIGTERM, dialing
+    /// again whenever the connection ends.
+    Serve {
+        /// The node's name, the agent's address and fingerprint, its own
+        /// certificate, sandbox mounts and secrets.
+        #[arg(long)]
+        config: PathBuf,
+    },
+}
+
+/// Write an identity in `dir` and say what to do with its fingerprint.
+fn init_identity(dir: &Path, subject: &str, peer: &str) -> Result<()> {
+    let fingerprint = solos_swarm::remote::tls::init(dir, subject)?;
+    let (cert, key) = solos_swarm::remote::tls::files(dir);
+    eprintln!(
+        "wrote {} and {}; pin this fingerprint in {peer}:",
+        cert.display(),
+        key.display()
+    );
+    println!("{fingerprint}");
+    Ok(())
 }
 
 /// Read a one-use credential file and delete it, whether or not the read
@@ -217,6 +298,20 @@ fn consume_credential(path: &Path) -> Result<Zeroizing<String>> {
     let _ = fs::remove_file(path);
     let raw = Zeroizing::new(result.context("cannot read broker credential")?);
     Ok(Zeroizing::new(raw.trim().to_owned()))
+}
+
+/// `bridge`: exit with the program's status, as if it ran alone.
+async fn bridge(
+    listen: std::net::SocketAddr,
+    socket: PathBuf,
+    program: Vec<OsString>,
+) -> Result<()> {
+    let (program, args) = program
+        .split_first()
+        .context("the bridge names no program")?;
+    let bridge = solos_swarm::bridge::Bridge::bind(listen, socket).await?;
+    let status = bridge.run(program, args).await?;
+    std::process::exit(status.code().unwrap_or(1))
 }
 
 /// One legacy preview run: a frozen Goal, the pinned Pi tree and one credential.
@@ -305,6 +400,16 @@ fn main() {
             let policy = serde_json::from_slice(&fs::read(policy)?)?;
             solos_swarm::sandbox::enter_process(&policy, &node, &args)
         })(),
+        // One thread: it only pipes bytes, inside every harness sandbox.
+        Action::Bridge {
+            listen,
+            socket,
+            program,
+        } => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("runtime startup failed")
+            .and_then(|runtime| runtime.block_on(bridge(listen, socket, program))),
         command => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -318,7 +423,7 @@ fn main() {
 }
 async fn execute(command: Action) -> Result<()> {
     match command {
-        Action::WasiWorker { .. } | Action::SandboxEnter { .. } => {
+        Action::WasiWorker { .. } | Action::SandboxEnter { .. } | Action::Bridge { .. } => {
             anyhow::bail!("guard must enter before async runtime")
         }
         Action::Mvp { command } => mvp::execute(command).await,
@@ -418,6 +523,60 @@ async fn execute(command: Action) -> Result<()> {
                 json!({"triggers": workload.triggers.len(), "requests": workload.requests, "out": out})
             );
             Ok(())
+        }
+        Action::Agent {
+            command: AgentCommand::InitNodes { dir },
+        } => init_identity(
+            &dir,
+            solos_swarm::remote::tls::AGENT_NAME,
+            "each node's agent.fingerprint",
+        ),
+        Action::Node {
+            command: NodeCommand::Init { dir },
+        } => init_identity(
+            &dir,
+            solos_swarm::remote::tls::NODE_NAME,
+            "the agent's nodes.allow.<name>.fingerprint",
+        ),
+        Action::Node {
+            command: NodeCommand::Serve { config },
+        } => {
+            ensure!(
+                std::env::consts::OS == "linux",
+                "a node's sandbox requires Linux"
+            );
+            let config = solos_swarm::remote::NodeConfig::load(&config)?;
+            let node = solos_swarm::remote::Node::new(&config)?;
+            node.serve(solos_swarm::agent::shutdown()).await
+        }
+        Action::Mcp {
+            socket,
+            token_file,
+            max_pause_wait_secs,
+            state_dir,
+            operator,
+            config,
+        } => {
+            use solos_swarm::agent::AgentConfig;
+            use solos_swarm::mcp::{self, operator::OperatorTools, proxy};
+            // First, so no usage error can leave the token on disk.
+            let token = token_file.as_deref().map(consume_credential).transpose()?;
+            match (socket, token, state_dir, operator) {
+                (Some(socket), Some(token), None, None) if config.is_none() => {
+                    ensure!(!token.is_empty(), "the token file is empty");
+                    let wait =
+                        max_pause_wait_secs.map_or(proxy::DEFAULT_PAUSE_WAIT, Duration::from_secs);
+                    mcp::serve_stdio(proxy::BrokerTools::new(&socket, token, wait)?).await
+                }
+                (None, None, Some(state_dir), Some(operator)) if max_pause_wait_secs.is_none() => {
+                    let config = config.as_deref().map(AgentConfig::load).transpose()?;
+                    mcp::serve_stdio(OperatorTools::new(state_dir, operator, config)?).await
+                }
+                _ => anyhow::bail!(
+                    "mcp takes --socket and --token-file [--max-pause-wait-secs], or --state-dir \
+                     and --operator [--config]"
+                ),
+            }
         }
         Action::Run {
             config,
