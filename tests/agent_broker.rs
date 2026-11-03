@@ -55,7 +55,11 @@ enum Behaviour {
     Answer,
     Fail,
     NoReceipt,
+    Hang,
+    Slow,
 }
+
+const SLOW: Duration = Duration::from_millis(600);
 
 /// Answers every call with a fixed completion, and keeps what it was sent.
 struct Scripted {
@@ -86,9 +90,15 @@ impl Provider for Scripted {
             let usage =
                 json!({"prompt_tokens":100,"prompt_cache_hit_tokens":0,"completion_tokens":50});
             match behaviour {
-                Behaviour::Answer => Ok(
-                    json!({"id":"receipt-1","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":usage}),
-                ),
+                Behaviour::Answer | Behaviour::Slow => {
+                    if behaviour == Behaviour::Slow {
+                        tokio::time::sleep(SLOW).await;
+                    }
+                    Ok(
+                        json!({"id":"receipt-1","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":usage}),
+                    )
+                }
+                Behaviour::Hang => std::future::pending().await,
                 Behaviour::Fail => Err(anyhow::anyhow!(
                     "provider transport failure; outcome unknown"
                 )),
@@ -252,6 +262,7 @@ fn terms() -> ModelTerms {
         prices: PRICES,
         max_input_bytes: 65_536,
         max_output_tokens: MAX_OUTPUT,
+        call_limit: None,
     }
 }
 
@@ -541,6 +552,57 @@ async fn a_failed_call_releases_its_hold_and_an_unreadable_receipt_is_charged_at
     );
 }
 
+#[tokio::test]
+async fn a_call_past_its_limit_is_dropped_and_its_hold_released_while_an_unlimited_token_waits() {
+    let scratch = Scratch::new("limit");
+    let provider = Scripted::new();
+    let (_runtime, served) = model_only(&scratch, provider.clone(), 1_000_000);
+    let limited = Grant {
+        terms: ModelTerms {
+            call_limit: Some(SLOW / 3),
+            ..terms()
+        },
+        ..grant(1_000_000)
+    };
+    served.broker.admit("limited".into(), limited).unwrap();
+    let on = &served;
+    let ask = |token: &'static str| async move {
+        let call = on.post("model", Some(token), model_request("judge"));
+        tokio::time::timeout(SLOW * 10, call)
+            .await
+            .expect("the call was never dropped")
+    };
+
+    provider.set(Behaviour::Hang);
+    let started = std::time::Instant::now();
+    let (status, reply) = ask("limited").await;
+    assert_eq!(status, 403, "{reply}");
+    assert!(
+        reply["error"].as_str().unwrap().contains("took longer"),
+        "{reply}"
+    );
+    assert!(started.elapsed() < SLOW * 5, "{:?}", started.elapsed());
+    assert_eq!(scratch.store().committed("router", 0).unwrap(), 0);
+
+    provider.set(Behaviour::Slow);
+    assert_eq!(ask(TOKEN).await.0, 200, "a token without a limit waits");
+    assert_eq!(ask("limited").await.0, 403, "a slow call is dropped");
+    provider.set(Behaviour::Answer);
+    assert_eq!(ask("limited").await.0, 200, "a prompt call goes through");
+
+    let rows = scratch.store().spend("router").unwrap();
+    let closed: Vec<_> = rows.iter().map(|r| (r.state, r.cost_microusd)).collect();
+    assert_eq!(
+        closed,
+        [
+            (SpendState::Released, 0),
+            (SpendState::Settled, COST),
+            (SpendState::Released, 0),
+            (SpendState::Settled, COST)
+        ]
+    );
+}
+
 /// Run `body` against a live runtime, then stop it.
 async fn with_runtime<F: Future<Output = ()>>(runtime: Runtime, body: F) {
     let (stop, stopped) = oneshot::channel::<()>();
@@ -582,6 +644,8 @@ async fn router_decide_becomes_the_engines_decision_and_a_refused_one_is_a_tool_
         assert_eq!(status, 409, "{refused}");
         let why = refused["error"].as_str().unwrap();
         assert!(why.contains(eval.as_str()), "{why}");
+        assert!(why.contains("closed"), "{why}");
+        assert!(why.contains("No eval is open now"), "{why}");
 
         let too_big = json!({"eval":eval,"decision":"accept","reason":"r","title":"T","scope":"S","budget_microusd":2_000_001});
         let (status, refused) = served.post("tool/router_decide", Some(TOKEN), too_big).await;
@@ -608,6 +672,117 @@ async fn router_decide_becomes_the_engines_decision_and_a_refused_one_is_a_tool_
     assert_eq!(decision.kind, DecisionKind::Accept);
     assert_eq!(decision.reason, "alice asked");
     assert_eq!(store.tickets().unwrap()[0].title, "Summarise the incident");
+}
+
+/// The Candidates the Router has been sent, once there are `count` of them.
+async fn candidates(router: &Holding, count: usize) -> Vec<Candidate> {
+    loop {
+        let sent = router.candidates.lock().unwrap().clone();
+        if sent.len() >= count {
+            return sent;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn ignore(eval: &impl serde::Serialize) -> Value {
+    json!({"eval":eval,"decision":"ignore","reason":"chatter"})
+}
+
+#[tokio::test]
+async fn a_router_that_decides_a_decided_eval_again_is_told_which_evals_are_open_by_thread() {
+    let scratch = Scratch::new("closed");
+    scratch.append(&request("t-a", "T1", "Summarise the incident report"));
+    scratch.append(&request("t-b", "T2", "Fix the flaky test"));
+    let router = Arc::new(Holding::default());
+    let runtime = scratch.runtime(router.clone(), false);
+    let served = serve(&scratch, Scripted::new(), runtime.facts(), 1_000_000);
+
+    with_runtime(runtime, async {
+        let sent = candidates(&router, 2).await;
+        let (first, second) = (&sent[0], &sent[1]);
+        let decide = |eval| served.post("tool/router_decide", Some(TOKEN), ignore(eval));
+
+        assert_eq!(decide(&first.eval).await.0, 200);
+        let (status, refused) = decide(&first.eval).await;
+
+        assert_eq!(status, 409, "{refused}");
+        let why = refused["error"].as_str().unwrap();
+        assert!(
+            why.starts_with(&format!("refused: {} is closed", first.eval)),
+            "{why}"
+        );
+        assert!(why.contains("Do not retry it"), "{why}");
+        assert!(
+            why.contains(&format!("{} (thread {})", second.eval, second.thread)),
+            "{why}"
+        );
+        assert!(!why.contains(&format!("{} (thread", first.eval)), "{why}");
+
+        assert_eq!(decide(&second.eval).await.0, 200);
+        let (_, refused) = decide(&second.eval).await;
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap()
+                .contains("No eval is open now"),
+            "{refused}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_router_that_replays_an_expired_eval_finds_the_open_one_for_its_thread_in_the_refusal() {
+    let scratch = Scratch::new("expired");
+    scratch.append(&request("t-ask", "T1", "Summarise the incident report"));
+    let router = Arc::new(Holding::default());
+    let policy = AllowlistPolicy {
+        people: ["slack:alice".to_owned()].into(),
+        eval_timeout_ms: 500,
+        ..AllowlistPolicy::default()
+    };
+    let runtime = scratch.runtime_under(policy, router.clone(), false);
+    let served = serve(&scratch, Scripted::new(), runtime.facts(), 1_000_000);
+
+    with_runtime(runtime, async {
+        let sent = candidates(&router, 2).await;
+        let (stale, current) = (&sent[0], &sent[1]);
+        assert_ne!(stale.eval, current.eval);
+        assert_eq!(stale.thread, current.thread, "the same triggers, a new id");
+
+        let mut asked = 0;
+        let mut eval = stale.eval.to_string();
+        let decided = loop {
+            asked += 1;
+            let (status, answer) = served
+                .post("tool/router_decide", Some(TOKEN), ignore(&eval))
+                .await;
+            if status == 200 {
+                break answer;
+            }
+            assert_eq!(status, 409, "{answer}");
+            let why = answer["error"].as_str().unwrap();
+            eval = open_on(why, stale.thread.as_str())
+                .unwrap_or_else(|| panic!("the refusal names no open eval on the thread: {why}"));
+            assert!(asked < 3, "still refused after {asked} calls: {why}");
+        };
+
+        assert_eq!(asked, 2, "one refusal, then the eval it named");
+        assert_eq!(decided["kind"], "ignore");
+        assert_eq!(eval, current.eval.as_str());
+    })
+    .await;
+}
+
+/// The eval a refusal lists as open on `thread`, reading `id (thread key)` entries.
+fn open_on(refusal: &str, thread: &str) -> Option<String> {
+    let listed = refusal.split("Evals open now: ").nth(1)?;
+    let listed = listed.split(". ").next()?;
+    listed.split(", ").find_map(|entry| {
+        let (id, key) = entry.split_once(" (thread ")?;
+        (key.trim_end_matches(')') == thread).then(|| id.to_owned())
+    })
 }
 
 /// Above `auto_approve_microusd` a Ticket waits for a person's approval,

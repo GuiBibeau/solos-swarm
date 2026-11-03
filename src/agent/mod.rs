@@ -317,6 +317,7 @@ where
                     prices: *prices,
                     max_input_bytes: *max_input_bytes,
                     max_output_tokens: *max_output_tokens,
+                    call_limit: None,
                 };
                 Some(WorkerParts { terms, code })
             }
@@ -509,6 +510,7 @@ fn router_session(
             prices: *prices,
             max_input_bytes: *max_input_bytes,
             max_output_tokens: *max_output_tokens,
+            call_limit: None,
         },
         system_prompt: Some(
             pi_router::system_prompt(

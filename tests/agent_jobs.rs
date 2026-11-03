@@ -91,6 +91,7 @@ fn terms() -> ModelTerms {
         },
         max_input_bytes: 65_536,
         max_output_tokens: 1_024,
+        call_limit: None,
     }
 }
 

@@ -37,6 +37,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 use tokio::net::UnixListener;
 
 /// The broker's socket in the state directory.
@@ -238,6 +239,9 @@ pub struct ModelTerms {
     pub prices: PriceTable,
     pub max_input_bytes: usize,
     pub max_output_tokens: u64,
+    /// The longest one call may take before it is dropped and its hold
+    /// released, or no limit beyond the transport's own.
+    pub call_limit: Option<Duration>,
 }
 
 /// What one token admits.

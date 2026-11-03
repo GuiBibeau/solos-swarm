@@ -32,12 +32,20 @@ const CALL_CAP: usize = 200;
 struct Judge {
     bodies: Mutex<Vec<Value>>,
     fits: Option<usize>,
+    hangs_first: bool,
 }
 
 impl Judge {
     fn fitting(fits: usize) -> Self {
         Self {
             fits: Some(fits),
+            ..Self::default()
+        }
+    }
+
+    fn hanging_at_first() -> Self {
+        Self {
+            hangs_first: true,
             ..Self::default()
         }
     }
@@ -77,6 +85,9 @@ impl Provider for Judge {
         let messages = body["messages"].as_array().cloned().unwrap_or_default();
         let last = messages.last().cloned().unwrap_or(Value::Null);
         let n = self.bodies.lock().unwrap().len();
+        if self.hangs_first && n == 1 {
+            return Box::pin(std::future::pending());
+        }
         let asked = cards(&text(&last));
         let given_up = self.fits.is_some() && n > CALL_CAP;
         let (kept, cut) = match self.fits {
@@ -442,7 +453,7 @@ async fn a_queue_longer_than_the_batch_goes_out_in_bounded_prompts_and_every_can
 #[tokio::test]
 async fn a_reply_cut_off_at_the_output_limit_is_followed_by_a_smaller_prompt() {
     let judge = Arc::new(Judge::fitting(4));
-    let (scratch, summary) = judge_crowd("cutoff", 20, 300, &judge).await;
+    let (scratch, summary) = judge_crowd("cutoff", 20, 1_000, &judge).await;
 
     assert_eq!(
         (summary.triggers_received, summary.effects_pending),
@@ -477,7 +488,7 @@ async fn a_reply_cut_off_at_the_output_limit_is_followed_by_a_smaller_prompt() {
 #[tokio::test]
 async fn a_router_whose_every_reply_is_cut_off_leaves_its_evals_to_expire() {
     let judge = Arc::new(Judge::fitting(0));
-    let (scratch, summary) = judge_crowd("always-cut", 4, 300, &judge).await;
+    let (scratch, summary) = judge_crowd("always-cut", 4, 1_000, &judge).await;
 
     assert_eq!((summary.triggers_received, summary.effects_pending), (4, 0));
     let calls = judge.bodies.lock().unwrap().len();
@@ -493,6 +504,33 @@ async fn a_router_whose_every_reply_is_cut_off_leaves_its_evals_to_expire() {
         decisions.iter().all(|d| d.kind == DecisionKind::Unavailable
             && d.reason == "the Router did not decide in time"),
         "{decisions:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_model_call_that_hangs_ends_within_its_eval_and_the_router_decides_again() {
+    let judge = Arc::new(Judge::hanging_at_first());
+    let started = std::time::Instant::now();
+    let (scratch, summary) = judge_crowd("hang", 3, 2_000, &judge).await;
+
+    assert_eq!((summary.triggers_received, summary.effects_pending), (3, 0));
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "the run took {:?}",
+        started.elapsed()
+    );
+    let decisions = scratch.store().decisions().unwrap();
+    assert_eq!(decisions.len(), 3, "{decisions:?}");
+    assert!(
+        decisions
+            .iter()
+            .all(|d| d.kind == DecisionKind::Ignore && d.reason == "nobody asked for work"),
+        "{decisions:?}"
+    );
+    let rows = scratch.store().spend("router").unwrap();
+    assert!(
+        rows.iter().all(|row| row.state != SpendState::Held),
+        "the hung call's hold was left open: {rows:?}"
     );
 }
 

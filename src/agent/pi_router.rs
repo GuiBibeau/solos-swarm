@@ -477,6 +477,20 @@ mod tests {
         assert!(prompt.starts_with("2 new candidates. Decide each with router_decide"));
     }
 
+    #[test]
+    fn a_prompt_says_that_only_the_ids_in_it_can_be_decided() {
+        let prompt = batch(&["eval ev_9 | thread T1 | explicit".to_owned()]);
+        assert!(
+            prompt.starts_with(
+                "1 new candidate. Decide each with router_decide, by its eval id. Only the ids in \
+                 this prompt can be decided: an id from an earlier prompt has expired or was \
+                 decided, even when its thread is the same.\n\n"
+            ),
+            "{prompt}"
+        );
+        assert_eq!(evals(&prompt), ["ev_9"], "the note is not read as a card");
+    }
+
     type Senders = Arc<Mutex<Vec<(String, mpsc::Sender<Observation>)>>>;
 
     /// Records every prompt by session id and hands the test each session's
