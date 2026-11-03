@@ -28,12 +28,15 @@ pub use runtime::{Adapters, HOST_RESTARTED, RunOptions, Runtime, Summary};
 use crate::broker::{now_ms, write_json};
 use crate::code::{CodeConfig, CodeExecutor};
 use crate::gateway::{Provider, provider_for, upstream_profile};
+use crate::harness::claude_code::ClaudeCodeHarness;
 use crate::harness::{AgentHarness, PiHarness, Role, SessionSpec};
 use anyhow::{Context, Result, bail, ensure};
 use broker::{
     AgentBroker, BrokerParts, DecideTerms, Grant, ModelTerms, Principal, ROUTER_TOOLS, WorkerParts,
 };
-use config::{ChannelConfig, ExecutorConfig, RouterConfig, RunCodeConfig, SourceConfig};
+use config::{
+    ChannelConfig, ClaudeConfig, ExecutorConfig, RouterConfig, RunCodeConfig, SourceConfig,
+};
 use github::{GithubApi, GithubChannel, GithubSource};
 use goal_template::GoalTemplates;
 use jsonl::{JsonlChannel, JsonlSource};
@@ -313,11 +316,19 @@ where
                 ExecutorConfig::Pi {
                     max_workers,
                     prepare,
+                    harness: default_harness,
+                    claude,
                     ..
                 },
                 Some(model),
             ) => Some(Arc::new(PiExecutor::new(PiExecutorParts {
                 harness,
+                claude: claude
+                    .as_deref()
+                    .map(claude_harness)
+                    .transpose()?
+                    .map(Arc::new),
+                default_harness: *default_harness,
                 broker: broker.clone(),
                 tickets_dir,
                 broker_socket: state_dir.join(broker::SOCKET_FILE),
@@ -349,6 +360,20 @@ where
             socket,
         })
     }
+}
+
+/// The `claude-code` harness of `install`, its paths resolved. Its sandbox
+/// runs this binary for the session's tools unless `install` names another.
+fn claude_harness(install: &ClaudeConfig) -> Result<ClaudeCodeHarness> {
+    let solos_swarm = match &install.solos_swarm {
+        Some(path) => path.clone(),
+        None => std::env::current_exe().context("cannot find this solos-swarm binary")?,
+    };
+    Ok(ClaudeCodeHarness {
+        binary: canonical(&install.binary)?,
+        node: install.node.as_deref().map(canonical).transpose()?,
+        solos_swarm: canonical(&solos_swarm)?,
+    })
 }
 
 /// The workers' `run_code` sandbox, with every scratch directory under the

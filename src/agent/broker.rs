@@ -560,6 +560,9 @@ impl AgentBroker {
             .route("/tool/{name}", post(tool))
             .route("/tools", get(tools))
             .route("/session", post(session))
+            .route("/v1/messages", post(messages::messages))
+            .route("/api/hello", get(messages::hello))
+            .fallback(messages::unrouted)
             // Above the admitted input on purpose, as in swarm mode: a
             // session replays its whole conversation, so the wire body may
             // exceed what the model limit admits, and is refused with a reason.
@@ -568,10 +571,10 @@ impl AgentBroker {
     }
 
     fn authenticate(&self, headers: &HeaderMap) -> std::result::Result<Arc<Grant>, Refusal> {
-        let token = headers
-            .get("authorization")
-            .and_then(|h| h.to_str().ok())
+        let header = |name| headers.get(name).and_then(|h| h.to_str().ok());
+        let token = header("authorization")
             .and_then(|h| h.strip_prefix("Bearer "))
+            .or_else(|| header("x-api-key"))
             .ok_or_else(|| forbidden("missing identity"))?;
         self.inner
             .grants
@@ -631,55 +634,85 @@ async fn model(
 ) -> Reply {
     let grant = broker.authenticate(&headers)?;
     let terms = &grant.terms;
-    let input_bytes = serde_json::to_vec(&body).map_err(forbidden)?.len();
-    if input_bytes > terms.max_input_bytes {
-        return Err(forbidden("request exceeds the model limit"));
-    }
-    // Before any hold: a paused call costs nothing and leaves no row.
-    if let Some(wait) = gateway::effective_control(&broker.inner.dir, gateway::unix_secs()) {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(gateway::paused_reply(wait)),
-        ));
-    }
-    gateway::admit_request(&body, &terms.upstream.model, |name| {
-        grant.principal.tools().contains(&name)
-    })
-    .map_err(forbidden)?;
-    if broker.inner.overrun.load(Ordering::SeqCst) {
-        return Err(forbidden(
-            "an earlier call cost more than its hold, so model calls are stopped",
-        ));
-    }
-    let hold = terms
-        .prices
-        .request_hold(input_bytes, terms.max_output_tokens);
-    let now = now_ms();
-    let (since_ms, cap) = grant.account.allowance(now);
-    let (account, provider) = (grant.account.key(), terms.upstream.provider.clone());
-    let reservation = broker
-        .store(move |store| {
-            store.reserve(&HoldRequest {
-                account: &account,
-                provider: &provider,
-                since_ms,
-                cap_microusd: cap,
-                hold_microusd: hold,
-                at_ms: now,
-            })
-        })
-        .await
-        .map_err(failed)?;
-    let id = match reservation {
-        Reservation::Held(id) => id,
-        Reservation::Refused { committed } => {
-            return Err(forbidden(grant.account.cap_reached(committed, cap)));
-        }
+    let call = Call {
+        input_bytes: serde_json::to_vec(&body).map_err(forbidden)?.len(),
+        admitted: gateway::admit_request(&body, &terms.upstream.model, |name| {
+            grant.principal.tools().contains(&name)
+        }),
+        max_output_tokens: terms.max_output_tokens,
+        upstream: gateway::upstream_body(&terms.upstream.model, &body, terms.max_output_tokens),
     };
-    let upstream = gateway::upstream_body(&terms.upstream.model, &body, terms.max_output_tokens);
-    // Its own task, so a session that hangs up mid-call still gets its hold closed.
-    let call = tokio::spawn(dispatch(broker.clone(), grant.clone(), id, hold, upstream));
-    call.await.map_err(failed)?
+    call.send(&broker, &grant).await
+}
+
+/// One model call a session asked for, before the broker's checks.
+struct Call {
+    /// What the hold prices as input and the model limit bounds.
+    input_bytes: usize,
+    /// Whether the request is inside the model contract.
+    admitted: Result<()>,
+    /// What the hold prices as output.
+    max_output_tokens: u64,
+    upstream: Value,
+}
+
+impl Call {
+    /// Refuse the call past the model limit, while paused, outside the
+    /// contract, after an overrun or past the account's cap; else hold it,
+    /// send it upstream and settle it.
+    async fn send(self, broker: &AgentBroker, grant: &Arc<Grant>) -> Reply {
+        let terms = &grant.terms;
+        if self.input_bytes > terms.max_input_bytes {
+            return Err(forbidden("request exceeds the model limit"));
+        }
+        // Before any hold: a paused call costs nothing and leaves no row.
+        if let Some(wait) = gateway::effective_control(&broker.inner.dir, gateway::unix_secs()) {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(gateway::paused_reply(wait)),
+            ));
+        }
+        self.admitted.map_err(forbidden)?;
+        if broker.inner.overrun.load(Ordering::SeqCst) {
+            return Err(forbidden(
+                "an earlier call cost more than its hold, so model calls are stopped",
+            ));
+        }
+        let hold = terms
+            .prices
+            .request_hold(self.input_bytes, self.max_output_tokens);
+        let now = now_ms();
+        let (since_ms, cap) = grant.account.allowance(now);
+        let (account, provider) = (grant.account.key(), terms.upstream.provider.clone());
+        let reservation = broker
+            .store(move |store| {
+                store.reserve(&HoldRequest {
+                    account: &account,
+                    provider: &provider,
+                    since_ms,
+                    cap_microusd: cap,
+                    hold_microusd: hold,
+                    at_ms: now,
+                })
+            })
+            .await
+            .map_err(failed)?;
+        let id = match reservation {
+            Reservation::Held(id) => id,
+            Reservation::Refused { committed } => {
+                return Err(forbidden(grant.account.cap_reached(committed, cap)));
+            }
+        };
+        // Its own task, so a session that hangs up mid-call still gets its hold closed.
+        let call = tokio::spawn(dispatch(
+            broker.clone(),
+            grant.clone(),
+            id,
+            hold,
+            self.upstream,
+        ));
+        call.await.map_err(failed)?
+    }
 }
 
 /// Send one held call upstream and close its hold: settled at the receipt's
@@ -1268,6 +1301,8 @@ fn thread_summary(
         "earlier_decisions": earlier_decisions,
     })))
 }
+
+mod messages;
 
 #[cfg(test)]
 mod tests {

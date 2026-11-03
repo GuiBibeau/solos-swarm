@@ -77,6 +77,11 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   against), with refusals as `isError` results and pauses waited out; `--state-dir --operator` offers `agent_status`,
   `agent_request` (a Trigger from `mcp:<operator>` through the new `kind: mcp` Source) and `agent_replies` (the
   `kind: mcp` Channel's outbox).
+- Agent mode, P7b: Claude Code workers. `executor.harness: claude-code` (or a Plan naming it) runs a session Ticket
+  on the installed `claude`, headless in bwrap with no network and no key, its only tools the broker's through
+  `solos-swarm mcp`, and its model the agent broker's new Anthropic Messages facade (`POST /v1/messages`, SSE too,
+  translated in `src/gateway/anthropic.rs`), held and settled on the Ticket's account and refused while paused,
+  through a loopback port that the hidden `solos-swarm bridge` pipes to the broker socket.
 - `collect` leaves the per-run `code/` scratch directory on the host and writes `collect-manifest.json`; `--include-code` opts back in.
 - Docs: pause mode, self-update operations, dashboard tunnel, tournament runbook, replay status.
 
