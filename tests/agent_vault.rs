@@ -23,7 +23,7 @@ use solos_swarm::gateway::{Dispatch, PriceTable, Provider, Upstream};
 use solos_swarm::vault::{
     Approval, ItemKind, KeyScheme, NewItem, SandboxView, SecretValue, Vault, VaultConfig,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -133,7 +133,7 @@ impl World {
             executor: started.clone(),
         };
         let policy = AllowlistPolicy {
-            people: ["slack:alice".to_owned()].into(),
+            people: ["slack:alice".to_owned(), "github:alice".to_owned()].into(),
             ..AllowlistPolicy::default()
         };
         let options = RunOptions {
@@ -149,8 +149,12 @@ impl World {
             let view = SandboxView::new([]);
             Vault::init(&config, &view).unwrap();
             VaultParts {
-                vault: Vault::open(&config, &view).unwrap(),
-                takes_approvals,
+                vault: Arc::new(Vault::open(&config, &view).unwrap()),
+                asks_on: if takes_approvals {
+                    ["slack".to_owned()].into()
+                } else {
+                    BTreeSet::new()
+                },
             }
         });
         let parts = BrokerParts {
@@ -167,6 +171,7 @@ impl World {
                 terms: terms(),
                 code: None,
                 vault,
+                browser: None,
             }),
         };
         let broker = AgentBroker::new(parts).unwrap();
@@ -223,16 +228,20 @@ impl World {
     }
 
     fn ask(&self) {
+        self.ask_on("slack");
+    }
+
+    fn ask_on(&self, source: &str) {
         let trigger = Trigger {
             id: TriggerId::new("t1"),
-            source: "slack".into(),
+            source: source.into(),
             at_ms: 1_000,
             actor: Actor::person("alice"),
             addressed: Addressed::Mention,
             text: "use the API".into(),
             threads: vec![ThreadKey::new("T1")],
             reply_to: vec![ChannelRef {
-                source: "slack".into(),
+                source: source.into(),
                 address: BTreeMap::from([("thread_ts".to_owned(), "T1".to_owned())]),
             }],
             meta: json!({}),
@@ -862,7 +871,10 @@ async fn an_item_that_needs_approval_is_refused_where_nobody_can_approve() {
             (status, &reply["error"]),
             (
                 403,
-                &json!("probe needs a person's approval, and this agent takes none")
+                &json!(
+                    "probe needs a person's approval, and none of this ticket's channels can ask \
+                     for one: only a Slack or Discord thread with an approver shows the buttons"
+                )
             )
         );
         let (_, listed) = w.post("vault_list", &token, json!({})).await;
@@ -871,6 +883,47 @@ async fn an_item_that_needs_approval_is_refused_where_nobody_can_approve() {
     .await;
 
     assert!(w.store().tickets().unwrap()[0].secrets.is_empty());
+    assert!(site.visits().is_empty());
+}
+
+#[tokio::test]
+async fn a_first_use_on_a_ticket_whose_channels_cannot_ask_is_refused_not_left_waiting() {
+    let mut w = World::new("no-buttons");
+    let site = Site::start(w.store_path()).await;
+    w.key(
+        "probe",
+        &site.host,
+        &[],
+        Approval::FirstUse,
+        KEY_WITH_JSON_ESCAPES,
+    );
+    w.ask_on("github");
+
+    let runtime = w.runtime.take().unwrap();
+    with_runtime(runtime, async {
+        let token = w.admit_worker().await;
+        let fetch = json!({"url": site.url("/echo"), "key": "probe"});
+        let (status, reply) = w.post("fetch_url", &token, fetch).await;
+        assert_eq!(
+            (status, &reply["error"]),
+            (
+                403,
+                &json!(
+                    "probe needs a person's approval, and none of this ticket's channels can ask \
+                     for one: only a Slack or Discord thread with an approver shows the buttons"
+                )
+            ),
+            "this agent takes approvals on Slack, and this Ticket answers on GitHub"
+        );
+        let (_, listed) = w.post("vault_list", &token, json!({})).await;
+        assert_eq!(listed["keys"][0]["approval"], "no_approver");
+    })
+    .await;
+
+    assert!(
+        w.store().tickets().unwrap()[0].secrets.is_empty(),
+        "nobody was asked"
+    );
     assert!(site.visits().is_empty());
 }
 

@@ -182,6 +182,7 @@ fn serve(scratch: &Scratch, budget_microusd: u64) -> Served {
             terms: terms(),
             code: None,
             vault: None,
+            browser: None,
         }),
     })
     .unwrap();
@@ -575,6 +576,7 @@ async fn a_real_claude_code_worker_reports_ready_through_the_facade() {
         provider: reporter.clone(),
         pi_root: scratch.root.clone(),
         node: scratch.root.join("node"),
+        browser: solos_swarm::browse::Launcher::Lightpanda,
     };
 
     let state = scratch.state();
@@ -721,6 +723,7 @@ async fn a_real_claude_code_worker_runs_its_code_on_its_tickets_node() {
         provider: reporter.clone(),
         pi_root: root.clone(),
         node: root.join("node"),
+        browser: solos_swarm::browse::Launcher::Lightpanda,
     };
     let (cert, key) = tls::files(&root.join("laptop-tls"));
     let node = Node::new(&NodeConfig {

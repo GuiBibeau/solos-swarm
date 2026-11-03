@@ -23,6 +23,7 @@ pub mod simulated;
 pub mod slack;
 pub mod status;
 pub mod swarm_executor;
+pub mod trail;
 pub mod utc;
 pub mod watchdog;
 
@@ -30,6 +31,7 @@ pub use config::AgentConfig;
 pub use runtime::{Adapters, HOST_RESTARTED, RunOptions, Runtime, Summary};
 
 use crate::broker::{now_ms, write_json};
+use crate::browse::{Browsers, Launcher, TrailSigner};
 use crate::code::{CodeConfig, CodeExecutor};
 use crate::gateway::{Provider, provider_for, upstream_profile};
 use crate::harness::claude_code::ClaudeCodeHarness;
@@ -37,6 +39,7 @@ use crate::harness::{AgentHarness, PiHarness, Role, SessionSpec};
 use crate::remote::Listener;
 use crate::vault::Vault;
 use anyhow::{Context, Result, bail, ensure};
+use broker::browser::{BrowserParts, LocalBrowser};
 use broker::{
     AgentBroker, BrokerParts, DecideTerms, Grant, ModelTerms, Principal, ROUTER_TOOLS, VaultParts,
     WorkerParts,
@@ -73,6 +76,10 @@ pub const ROUTER_DIR: &str = "router";
 
 /// Each Ticket's directory, in the state directory.
 pub const TICKETS_DIR: &str = "tickets";
+/// The browsers' session directories and sockets, unless `browser.runtime_dir` says.
+pub const BROWSER_DIR: &str = "browser";
+/// The trail's blobs, unless `trail.path` says.
+pub const TRAIL_DIR: &str = "trail";
 
 /// What `agent serve` takes besides its config file. A Pi Router or Pi
 /// workers need the last three; scripted ones need none.
@@ -95,6 +102,7 @@ pub struct PiHost<H> {
     pub provider: Arc<dyn Provider>,
     pub pi_root: PathBuf,
     pub node: PathBuf,
+    pub browser: Launcher,
 }
 
 /// `solos-swarm agent serve`. With `until_idle`, Sources read what is there
@@ -138,6 +146,7 @@ pub async fn serve_until(
                 provider: Arc::new(provider),
                 pi_root,
                 node,
+                browser: Launcher::Lightpanda,
             })
         }
     };
@@ -235,6 +244,12 @@ where
         Some(pi) => Some(pi.serve(state_dir)?),
         None => None,
     };
+    let runtime = match &served {
+        Some(served) if served.browsers.is_some() => {
+            runtime.with_closing(broker::browser::close_all(served.broker.clone()))
+        }
+        _ => runtime,
+    };
     let summary = runtime.run(stop).await;
     if let Some(watchdog) = watchdog {
         watchdog.stop().await;
@@ -273,6 +288,7 @@ struct PiParts<H> {
     broker: AgentBroker,
     router: Option<Arc<PiRouter>>,
     executor: Option<Arc<PiExecutor<H>>>,
+    browsers: Option<Arc<Browsers>>,
 }
 
 impl<H> PiParts<H>
@@ -292,10 +308,17 @@ where
             provider,
             pi_root,
             node,
+            browser: launcher,
         } = host;
         let harness = Arc::new(harness);
         let (pi_root, node) = (canonical(&pi_root)?, canonical(&node)?);
         let tickets_dir = canonical(state_dir)?.join(TICKETS_DIR);
+        let readable = config.sandbox_view().and([
+            tickets_dir.clone(),
+            crate::harness::node_root(&node).to_owned(),
+            pi_root.clone(),
+        ]);
+        let mut browsers = None;
         let workers = match &config.executor {
             ExecutorConfig::Scripted {} | ExecutorConfig::Simulated { .. } => None,
             ExecutorConfig::Pi {
@@ -323,19 +346,32 @@ where
                 };
                 let vault = match &config.vault {
                     None => None,
-                    Some(vault) => {
-                        let view = config.sandbox_view().and([
-                            tickets_dir.clone(),
-                            crate::harness::node_root(&node).to_owned(),
-                            pi_root.clone(),
-                        ]);
-                        Some(VaultParts {
-                            vault: Vault::open(vault, &view).context("vault")?,
-                            takes_approvals: config.takes_approvals(),
-                        })
+                    Some(vault) => Some(VaultParts {
+                        vault: Arc::new(Vault::open(vault, &readable).context("vault")?),
+                        asks_on: config.approval_sources(),
+                    }),
+                };
+                let browser = match &config.browser {
+                    None => None,
+                    Some(browser) => {
+                        let opened = local_browsers(
+                            config,
+                            browser,
+                            state_dir,
+                            &readable,
+                            vault.as_ref().map(|parts| parts.vault.clone()),
+                            launcher,
+                        )?;
+                        browsers = Some(opened.0.clone());
+                        Some(opened.1)
                     }
                 };
-                Some(WorkerParts { terms, code, vault })
+                Some(WorkerParts {
+                    terms,
+                    code,
+                    vault,
+                    browser,
+                })
             }
         };
         let worker_model = workers
@@ -432,6 +468,7 @@ where
             broker,
             router,
             executor,
+            browsers,
         })
     }
 
@@ -441,12 +478,54 @@ where
         let app = self.broker.router()?;
         let server = tokio::spawn(async move { axum::serve(listener, app).await });
         Ok(Served {
+            reaper: broker::browser::spawn_reaper(&self.broker),
+            broker: self.broker,
             router: self.router,
             executor: self.executor,
+            browsers: self.browsers,
             server,
             socket,
         })
     }
+}
+
+fn local_browsers(
+    config: &AgentConfig,
+    browser: &crate::browse::BrowserConfig,
+    state_dir: &Path,
+    readable: &crate::vault::SandboxView,
+    vault: Option<Arc<Vault>>,
+    launcher: Launcher,
+) -> Result<(Arc<Browsers>, BrowserParts)> {
+    let state_dir = canonical(state_dir)?;
+    let signer = TrailSigner::load(&browser.audit_key, readable).context("browser.audit_key")?;
+    let runtime_dir = match &browser.runtime_dir {
+        Some(dir) => dir.clone(),
+        None => state_dir.join(BROWSER_DIR),
+    };
+    readable
+        .hides(&runtime_dir)
+        .context("browser.runtime_dir")?;
+    let blob_dir = match &config.trail.path {
+        Some(path) => path.clone(),
+        None => state_dir.join(TRAIL_DIR),
+    };
+    readable.hides(&blob_dir).context("trail.path")?;
+    let blobs = trail::BlobStore::open(&blob_dir, &config.trail).context("trail")?;
+    let browsers = Arc::new(
+        Browsers::new(
+            browser,
+            environment::LOCAL,
+            &runtime_dir,
+            vault,
+            signer,
+            launcher,
+        )
+        .context("browser")?,
+    );
+    let place = Arc::new(LocalBrowser::new(browsers.clone()));
+    let idle = Duration::from_secs(browser.idle_secs);
+    Ok((browsers, BrowserParts::new(place, blobs, idle)))
 }
 
 /// The `claude-code` harness of `install`, its paths resolved. Its sandbox
@@ -547,8 +626,11 @@ fn canonical(path: &Path) -> Result<PathBuf> {
 }
 
 struct Served<H> {
+    broker: AgentBroker,
     router: Option<Arc<PiRouter>>,
     executor: Option<Arc<PiExecutor<H>>>,
+    browsers: Option<Arc<Browsers>>,
+    reaper: Option<tokio::task::JoinHandle<()>>,
     server: tokio::task::JoinHandle<std::io::Result<()>>,
     socket: PathBuf,
 }
@@ -561,11 +643,17 @@ where
     /// End every session, then the broker. The Engine is not told about
     /// the workers; the next start recovers their Assignments.
     async fn stop(self) {
+        if let Some(reaper) = &self.reaper {
+            reaper.abort();
+        }
         if let Some(router) = &self.router {
             router.shutdown().await;
         }
         if let Some(executor) = &self.executor {
             executor.shutdown().await;
+        }
+        if let Some(browsers) = &self.browsers {
+            browsers.shutdown().await;
         }
         self.server.abort();
         let _ = self.server.await;

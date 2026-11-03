@@ -267,6 +267,7 @@ async fn broker_on(
             terms: terms(),
             code: None,
             vault: None,
+            browser: None,
         }),
     })
     .unwrap();
@@ -404,13 +405,18 @@ async fn a_router_and_a_worker_each_list_and_call_only_their_own_tools() {
         "job_wait",
         "job_stop",
         "vault_list",
+        "browser_open",
+        "browser_act",
+        "browser_login",
+        "browser_read",
     ];
     expected.retain(|name| !unavailable.contains(&name.as_str()));
     let mut names = worker.names().await;
     names.sort();
     assert_eq!(
         names, expected,
-        "a worker sees worker tools only, and no run_code, job tools or vault_list on this host"
+        "a worker sees worker tools only, and no run_code, job tools, vault_list or browser on \
+         this host"
     );
     for absent in ["run_code", "job_start"] {
         let reply = worker

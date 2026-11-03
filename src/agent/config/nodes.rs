@@ -94,10 +94,22 @@ impl AgentConfig {
     }
 
     /// What the Router's prompt says about where a session can run, if
-    /// the agent has nodes.
+    /// the agent has nodes, and about the browser, if it has one.
     pub fn environment_note(&self) -> String {
+        let browser = match (&self.browser, &self.vault) {
+            (None, _) => "",
+            (Some(_), None) => {
+                "\nBrowser: a session on this host has a headless browser for work that needs a \
+                 web page; every step it takes is recorded and signed."
+            }
+            (Some(_), Some(_)) => {
+                "\nBrowser: a session on this host has a headless browser for work that needs a \
+                 web page, and it can sign in with the vault's logins without seeing them; every \
+                 step it takes is recorded and signed."
+            }
+        };
         let Some(nodes) = &self.nodes else {
-            return String::new();
+            return browser.to_owned();
         };
         let default = match &self.executor {
             ExecutorConfig::Pi {
@@ -106,9 +118,14 @@ impl AgentConfig {
             } => name.as_str(),
             _ => LOCAL,
         };
+        let here = if self.browser.is_some() {
+            "this host, with the browser"
+        } else {
+            "this host"
+        };
         let mut note = format!(
-            "\nMachines: a session's run_code runs on {default} unless the accept names an \
-             `environment`: {LOCAL} (this host)"
+            "{browser}\nMachines: a session's run_code runs on {default} unless the accept names \
+             an `environment`: {LOCAL} ({here})"
         );
         for (name, node) in &nodes.allow {
             let _ = match &node.about {
@@ -176,6 +193,26 @@ budgets: {{session_microusd: 500000}}
         let nodes = loaded.nodes.unwrap();
         assert_eq!(nodes.allow["laptop"].fingerprint.to_string(), FINGERPRINT);
         assert!(config("", "").unwrap().environment_note().is_empty());
+    }
+
+    #[test]
+    fn the_router_is_told_which_machine_has_the_browser() {
+        let browser = "browser: {lightpanda: /opt/lightpanda, audit_key: /keys/trail.key}";
+        let laptop = format!("    laptop: {{fingerprint: \"{FINGERPRINT}\"}}\n");
+        let alone = config(browser, "").unwrap().environment_note();
+        assert!(
+            alone.starts_with("\nBrowser: a session on this host has a headless browser")
+                && !alone.contains("Machines"),
+            "{alone}"
+        );
+        let with_nodes = config(&format!("{browser}\n{}", nodes(&laptop)), "")
+            .unwrap()
+            .environment_note();
+        assert!(
+            with_nodes.contains("local (this host, with the browser), laptop."),
+            "{with_nodes}"
+        );
+        assert!(!alone.contains("vault"), "no vault, no logins: {alone}");
     }
 
     #[test]

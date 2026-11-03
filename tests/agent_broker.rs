@@ -11,6 +11,7 @@ use solos_agent_core::model::{
     MessageKind, OutboundMessage, ReportStatus, ThreadKey, TicketId, Trigger, TriggerId,
 };
 use solos_agent_store::{SpendState, SqliteStore};
+use solos_swarm::agent::broker::browser::{BrowserParts, LocalBrowser};
 use solos_swarm::agent::broker::registry::{self, PrincipalKind};
 use solos_swarm::agent::broker::{
     self, Account, AgentBroker, BrokerParts, DecideTerms, Grant, ModelTerms, Principal,
@@ -23,11 +24,14 @@ use solos_swarm::agent::ports::{
     BoxFuture, Channel, Delivery, Executor, Fact, FactSink, Launch, Router,
 };
 use solos_swarm::agent::scripted::{ScriptedExecutor, ScriptedRouter};
+use solos_swarm::agent::trail::{BlobStore, TrailStoreConfig};
 use solos_swarm::agent::{Adapters, AgentConfig, RunOptions, Runtime, STORE_FILE};
+use solos_swarm::browse::fake::FakeCdp;
+use solos_swarm::browse::{BrowserConfig, Browsers, Launcher, TrailSigner};
 use solos_swarm::code::{OutputBounds, Started};
 use solos_swarm::gateway::{Dispatch, PriceTable, Provider, Upstream, upstream_body};
 use solos_swarm::vault::{SandboxView, Vault, VaultConfig};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -353,8 +357,17 @@ fn serve_deciding(
         daily,
         decide,
         Nodes::default(),
-        None,
+        workers(None, None),
     )
+}
+
+fn workers(vault: Option<VaultParts>, browser: Option<BrowserParts>) -> WorkerParts {
+    WorkerParts {
+        terms: terms(),
+        code: None,
+        vault,
+        browser,
+    }
 }
 
 fn serve_on(
@@ -364,7 +377,7 @@ fn serve_on(
     daily: u64,
     decide: DecideTerms,
     nodes: Nodes,
-    vault: Option<VaultParts>,
+    workers: WorkerParts,
 ) -> Served {
     let parts = BrokerParts {
         dir: scratch.state(),
@@ -372,11 +385,7 @@ fn serve_on(
         provider,
         facts,
         decide,
-        workers: Some(WorkerParts {
-            terms: terms(),
-            code: None,
-            vault,
-        }),
+        workers: Some(workers),
     };
     let broker = AgentBroker::with_nodes(parts, JobLimits::default(), nodes).unwrap();
     broker.admit(TOKEN.into(), grant(daily)).unwrap();
@@ -1309,7 +1318,29 @@ impl ExecutionEnvironment for Laptop {
 const HERE: &str = "worker-here";
 const THERE: &str = "worker-there";
 
-fn serve_with_a_node_and_a_vault(scratch: &Scratch) -> (Runtime, Served) {
+fn local_browser(scratch: &Scratch) -> (FakeCdp, BrowserParts) {
+    let view = SandboxView::new([]);
+    let key = scratch.root.join("trail.key");
+    TrailSigner::init(&key, &view).unwrap();
+    let fake = FakeCdp::start(&scratch.root.join("cdp.sock"), Vec::new()).unwrap();
+    let config: BrowserConfig =
+        serde_json::from_value(json!({"lightpanda": "/nowhere", "audit_key": key})).unwrap();
+    let browsers = Browsers::new(
+        &config,
+        "local",
+        &scratch.root.join("run"),
+        None,
+        TrailSigner::load(&key, &view).unwrap(),
+        Launcher::Socket(fake.socket().to_owned()),
+    )
+    .unwrap();
+    let blobs = BlobStore::open(&scratch.state().join("trail"), &TrailStoreConfig::default());
+    let place = Arc::new(LocalBrowser::new(Arc::new(browsers)));
+    let parts = BrowserParts::new(place, blobs.unwrap(), Duration::from_secs(1_800));
+    (fake, parts)
+}
+
+fn serve_with_a_node_a_vault_and_a_browser(scratch: &Scratch) -> (Runtime, Served, FakeCdp) {
     let runtime = scratch.runtime(Arc::new(Holding::default()), true);
     let nodes = Nodes {
         default: None,
@@ -1325,9 +1356,10 @@ fn serve_with_a_node_and_a_vault(scratch: &Scratch) -> (Runtime, Served) {
     let view = SandboxView::new([]);
     Vault::init(&config, &view).unwrap();
     let vault = VaultParts {
-        vault: Vault::open(&config, &view).unwrap(),
-        takes_approvals: false,
+        vault: Arc::new(Vault::open(&config, &view).unwrap()),
+        asks_on: BTreeSet::new(),
     };
+    let (fake, browser) = local_browser(scratch);
     let served = serve_on(
         scratch,
         Scripted::new(),
@@ -1335,7 +1367,7 @@ fn serve_with_a_node_and_a_vault(scratch: &Scratch) -> (Runtime, Served) {
         1_000_000,
         TERMS,
         nodes,
-        Some(vault),
+        workers(Some(vault), Some(browser)),
     );
     for (token, ticket, environment) in
         [(HERE, "tk_here", None), (THERE, "tk_there", Some("laptop"))]
@@ -1352,13 +1384,13 @@ fn serve_with_a_node_and_a_vault(scratch: &Scratch) -> (Runtime, Served) {
             .admit_worker(token.into(), seat, "You are a worker.".into())
             .unwrap();
     }
-    (runtime, served)
+    (runtime, served, fake)
 }
 
 #[tokio::test]
 async fn a_seat_may_call_exactly_the_tools_it_is_offered() {
     let scratch = Scratch::new("offered");
-    let (_runtime, served) = serve_with_a_node_and_a_vault(&scratch);
+    let (_runtime, served, _fake) = serve_with_a_node_a_vault_and_a_browser(&scratch);
 
     for (token, environment) in [(HERE, None), (THERE, Some("laptop"))] {
         let offered = served.listed(token).await;
@@ -1371,8 +1403,12 @@ async fn a_seat_may_call_exactly_the_tools_it_is_offered() {
             let (status, reply) = served
                 .post(&format!("tool/{tool}"), Some(token), json!({}))
                 .await;
-            let refused = (status, reply["error"].as_str())
-                == (403, Some("run_code is not available on this host"));
+            let refused = status == 403
+                && [
+                    Some("run_code is not available on this host"),
+                    Some("no browser where this ticket runs"),
+                ]
+                .contains(&reply["error"].as_str());
             assert_eq!(
                 offered.iter().any(|name| name == tool),
                 !refused,
@@ -1382,8 +1418,17 @@ async fn a_seat_may_call_exactly_the_tools_it_is_offered() {
     }
     assert_eq!(
         served.listed(THERE).await,
-        WORKER_TOOLS,
-        "a node's worker has them all"
+        [
+            "worker_report",
+            "worker_handback",
+            "run_code",
+            "job_start",
+            "job_wait",
+            "job_stop",
+            "fetch_url",
+            "vault_list"
+        ],
+        "a node's worker has run_code there and no browser"
     );
     assert_eq!(
         served.listed(HERE).await,
@@ -1391,22 +1436,36 @@ async fn a_seat_may_call_exactly_the_tools_it_is_offered() {
             "worker_report",
             "worker_handback",
             "fetch_url",
-            "vault_list"
+            "vault_list",
+            "browser_open",
+            "browser_act",
+            "browser_login",
+            "browser_read"
         ],
-        "this host has no run_code"
+        "this host has a browser and no run_code"
     );
 }
 
 #[tokio::test]
 async fn every_tool_has_a_handler() {
     let scratch = Scratch::new("handlers");
-    let (_runtime, served) = serve_with_a_node_and_a_vault(&scratch);
+    let (_runtime, served, _fake) = serve_with_a_node_a_vault_and_a_browser(&scratch);
+    let (here, there) = (served.listed(HERE).await, served.listed(THERE).await);
 
-    for (kind, token) in [
-        (PrincipalKind::Router, TOKEN),
-        (PrincipalKind::Worker, THERE),
-    ] {
+    for kind in [PrincipalKind::Router, PrincipalKind::Worker] {
         for tool in registry::tools(kind) {
+            let token = match kind {
+                PrincipalKind::Router => TOKEN,
+                PrincipalKind::Worker if there.iter().any(|name| name == tool.name) => THERE,
+                PrincipalKind::Worker => {
+                    assert!(
+                        here.iter().any(|name| name == tool.name),
+                        "{} is offered nowhere",
+                        tool.name
+                    );
+                    HERE
+                }
+            };
             let (status, reply) = served
                 .post(&format!("tool/{}", tool.name), Some(token), json!({}))
                 .await;

@@ -12,7 +12,9 @@ pub use watchdog::{OperatorConfig, ThresholdsConfig, WatchdogConfig};
 use super::goal_template::GoalTemplates;
 use super::jobs::{self, JobLimits};
 use super::simulated::TimeFactor;
+use super::trail::TrailStoreConfig;
 use super::{discord, github, mcp, slack};
+use crate::browse::BrowserConfig;
 use crate::code::{self, Mount};
 use crate::gateway::{PriceTable, upstream_profile};
 use crate::vault::{SandboxView, VaultConfig};
@@ -46,6 +48,12 @@ pub struct AgentConfig {
     pub pass_through: bool,
     #[serde(default)]
     pub vault: Option<VaultConfig>,
+    /// Workers' headless browser. Without it, no browser tools.
+    #[serde(default)]
+    pub browser: Option<BrowserConfig>,
+    /// Where the browser's trail blobs are kept, and how much.
+    #[serde(default)]
+    pub trail: TrailStoreConfig,
 }
 
 fn pass_through() -> bool {
@@ -496,6 +504,12 @@ impl AgentConfig {
         if let Some(vault) = &mut config.vault {
             vault.resolve(base);
         }
+        if let Some(browser) = &mut config.browser {
+            browser.lightpanda = base.join(&browser.lightpanda);
+            browser.audit_key = base.join(&browser.audit_key);
+            browser.runtime_dir = browser.runtime_dir.as_ref().map(|dir| base.join(dir));
+        }
+        config.trail.path = config.trail.path.as_ref().map(|path| base.join(path));
         if let ExecutorConfig::Pi {
             provider,
             swarm: Some(swarm),
@@ -585,6 +599,16 @@ impl AgentConfig {
         self.validate_schedules(&served)?;
         self.validate_watchdog(&served)?;
         self.validate_nodes()?;
+        ensure!(
+            self.browser.is_none() || matches!(self.executor, ExecutorConfig::Pi { .. }),
+            "browser needs executor: pi, whose workers have its tools"
+        );
+        ensure!(
+            self.browser
+                .as_ref()
+                .is_none_or(|browser| browser.idle_secs > 0),
+            "browser.idle_secs must be above zero"
+        );
         ensure!(
             self.budgets.session_microusd > 0,
             "budgets.session_microusd must be above zero"
@@ -789,8 +813,20 @@ impl AgentConfig {
     /// `policy.auto_approve_microusd`: only the slack and discord channels'
     /// buttons take approvals, from an approver on the same source.
     pub fn takes_approvals(&self) -> bool {
-        (self.slack_channel() && self.approver_on(slack::SOURCE))
-            || (self.discord_channel() && self.approver_on(discord::SOURCE))
+        !self.approval_sources().is_empty()
+    }
+
+    /// The Sources whose Channel here shows a person Allow and Deny and has
+    /// an approver: a Ticket that answers on one of them takes approvals.
+    pub fn approval_sources(&self) -> BTreeSet<String> {
+        [
+            (slack::SOURCE, self.slack_channel()),
+            (discord::SOURCE, self.discord_channel()),
+        ]
+        .into_iter()
+        .filter(|(source, channel)| *channel && self.approver_on(source))
+        .map(|(source, _)| source.to_owned())
+        .collect()
     }
 
     fn slack_channel(&self) -> bool {
@@ -897,6 +933,47 @@ budgets: {session_microusd: 500000}
                 path: dir.join("out/outbox.jsonl")
             }]
         );
+    }
+
+    #[test]
+    fn a_browser_loads_with_its_paths_beside_the_config_and_needs_pi_workers() {
+        let pi = VALID.replace(
+            "executor: {kind: scripted}",
+            "executor: {kind: pi, provider: deepseek, model: deepseek-flash, prices: \
+             {input_microusd_per_million: 300000, output_microusd_per_million: 1200000}}",
+        );
+        let browser = "browser: {lightpanda: bin/lightpanda, audit_key: keys/trail.key}\n\
+                       trail: {path: blobs, ticket_max_bytes: 1000}\n";
+        let dir = std::env::temp_dir().join(format!("agent-config-browser-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.yaml");
+        std::fs::write(&path, format!("{pi}{browser}")).unwrap();
+        let config = AgentConfig::load(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let loaded = config.browser.unwrap();
+        assert_eq!(
+            (loaded.lightpanda, loaded.audit_key, loaded.idle_secs),
+            (
+                dir.join("bin/lightpanda"),
+                dir.join("keys/trail.key"),
+                1_800
+            )
+        );
+        assert_eq!(config.trail.path, Some(dir.join("blobs")));
+        assert_eq!(
+            (config.trail.max_bytes, config.trail.ticket_max_bytes),
+            (8 << 30, 1_000)
+        );
+
+        let why = parse(&format!("{VALID}{browser}")).unwrap_err().to_string();
+        assert!(why.contains("browser needs executor: pi"), "{why}");
+        let idle = browser.replace("trail.key}", "trail.key, idle_secs: 0}");
+        let why = parse(&format!("{pi}{idle}")).unwrap_err().to_string();
+        assert!(
+            why.contains("browser.idle_secs must be above zero"),
+            "{why}"
+        );
+        assert!(parse(&pi).unwrap().browser.is_none());
     }
 
     #[test]
@@ -1703,8 +1780,14 @@ budgets: {session_microusd: 500000}
     #[test]
     fn only_a_slack_channel_with_a_slack_approver_takes_approvals() {
         assert!(parse(SLACK).unwrap().takes_approvals());
+        assert_eq!(
+            parse(SLACK).unwrap().approval_sources(),
+            ["slack".to_owned()].into(),
+            "a Ticket that answers on Slack takes approvals here, and only such a Ticket"
+        );
         let elsewhere = SLACK.replace("approvers: [slack:U1]", "approvers: [github:U1]");
         assert!(!parse(&elsewhere).unwrap().takes_approvals());
+        assert!(parse(&elsewhere).unwrap().approval_sources().is_empty());
         let unheard = VALID.replace(
             "bots: [github:ci]",
             "bots: [github:ci]\n  approvers: [slack:alice]",

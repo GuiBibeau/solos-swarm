@@ -2,8 +2,8 @@
 //! Adapters run concurrently and send facts and Effect outcomes back to it.
 
 use super::ports::{
-    Answer, Applied, Channel, Command, Delivered, Delivery, Executor, Fact, FactSink, Failure,
-    Inbound, Launch, Order, Router, SendOptions, SendOutcome, Source,
+    Answer, Applied, BoxFuture, Channel, Command, Delivered, Delivery, Executor, Fact, FactSink,
+    Failure, Inbound, Launch, Order, Router, SendOptions, SendOutcome, Source,
 };
 use super::watchdog;
 use crate::broker::now_ms;
@@ -106,6 +106,7 @@ pub struct Runtime {
     /// Answers to commands, waiting to go out. They are not Effects: a crash
     /// loses an unsent one, never the command's own outcome.
     replies: Vec<OutboundMessage>,
+    closing: Option<BoxFuture<'static, ()>>,
 }
 
 impl Runtime {
@@ -147,7 +148,15 @@ impl Runtime {
             gate_checked: None,
             recovered: None,
             replies: Vec::new(),
+            closing: None,
         }
+    }
+
+    /// Before `run` returns, run `closing` while the facts it sends are
+    /// still applied, such as each open browser's signed Close.
+    pub fn with_closing(mut self, closing: impl Future<Output = ()> + Send + 'static) -> Self {
+        self.closing = Some(Box::pin(closing));
+        self
     }
 
     /// Pause while `dir`'s pause gate is shut, as a broker does.
@@ -212,6 +221,15 @@ impl Runtime {
                 Some(message) = inbound.recv() => self.inbound(message)?,
                 Some(joined) = work.join_next_with_id() => self.reap(joined)?,
                 _ = tick.tick() => {}
+            }
+        }
+        if let Some(mut closing) = self.closing.take() {
+            loop {
+                tokio::select! {
+                    biased;
+                    () = &mut closing => break,
+                    Some(message) = inbound.recv() => self.inbound(message)?,
+                }
             }
         }
         let pending = self

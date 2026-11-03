@@ -371,6 +371,12 @@ impl Browsers {
         }
     }
 
+    /// Answer `call` with a signed refusal and act on nothing, for a reason
+    /// the agent has, such as a full trail store.
+    pub fn refuse(&self, call: &BrowseCall, why: String) -> Browsed {
+        self.answer(call, None, Raw::Refused(why))
+    }
+
     /// The vault items one Ticket may use on this machine, without values.
     pub fn catalog(&self, context: &UseContext) -> Result<Vec<ItemInfo>> {
         catalog(self.vault.as_deref(), context)

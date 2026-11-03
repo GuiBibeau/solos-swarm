@@ -111,7 +111,7 @@ pub enum Standing {
     Waiting,
     Granted,
     Denied,
-    /// It needs a person's approval, and this agent takes none.
+    /// It needs a person's approval, and no Channel of the Ticket can ask.
     NoApprover,
 }
 
@@ -141,7 +141,8 @@ pub fn use_rule(item: &ItemInfo, context: &UseContext) -> Admission<()> {
         Standing::None | Standing::Granted => Admission::Allowed(()),
         Standing::Denied => Admission::Refused(format!("a person denied {name} for this ticket")),
         Standing::NoApprover => Admission::Refused(format!(
-            "{name} needs a person's approval, and this agent takes none"
+            "{name} needs a person's approval, and none of this ticket's channels can ask for \
+             one: only a Slack or Discord thread with an approver shows the buttons"
         )),
         Standing::Needed | Standing::Waiting => Admission::NeedsApproval {
             secret: format!("{}/{name}", context.environment),

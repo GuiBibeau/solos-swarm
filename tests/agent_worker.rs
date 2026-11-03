@@ -261,6 +261,7 @@ impl Scratch {
             provider: model,
             pi_root: self.root.clone(),
             node: self.root.join("node"),
+            browser: solos_swarm::browse::Launcher::Lightpanda,
         }
     }
     async fn serve<H>(&self, config: AgentConfig, host: PiHost<H>) -> Summary
@@ -890,6 +891,7 @@ async fn a_real_pi_worker_runs_code_in_its_ticket_directory_and_reports_ready() 
         provider: real.clone(),
         pi_root,
         node,
+        browser: solos_swarm::browse::Launcher::Lightpanda,
     };
 
     let summary = scratch
@@ -1005,6 +1007,7 @@ async fn serve_refuses_a_vault_where_a_worker_sandbox_can_read_it() {
             provider: Model::new(Box::new(|_| Vec::new())),
             pi_root: pi_root.clone(),
             node: node.clone(),
+            browser: solos_swarm::browse::Launcher::Lightpanda,
         };
         let served = tokio::time::timeout(
             LIMIT,

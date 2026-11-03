@@ -5,6 +5,7 @@
 //! either. Each token names a principal, and every model call is held and
 //! settled against the principal's account in the agent Store.
 
+pub mod browser;
 pub mod registry;
 mod secrets;
 
@@ -22,6 +23,7 @@ use axum::{
     Json,
     extract::{DefaultBodyLimit, Path as RoutePath, State},
     http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use registry::{Cap, Caps, PrincipalKind};
@@ -35,7 +37,7 @@ use solos_agent_core::model::{
 use solos_agent_store::{
     Charge, HoldId, HoldRequest, Reservation, SqliteStore, StoreError, Tokens,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -96,6 +98,7 @@ pub struct WorkerSeat {
     turn: Mutex<Option<ReportStatus>>,
     fetched_bytes: AtomicU64,
     jobs: Arc<Jobs>,
+    browser: browser::SeatBrowser,
 }
 
 impl WorkerSeat {
@@ -115,6 +118,7 @@ impl WorkerSeat {
             turn: Mutex::new(None),
             fetched_bytes: AtomicU64::new(0),
             jobs: Arc::default(),
+            browser: browser::SeatBrowser::default(),
         }
     }
 
@@ -339,12 +343,16 @@ pub struct WorkerParts {
     pub code: Option<Arc<CodeExecutor>>,
     /// `None`: no `vault_list`, and `fetch_url` takes no key.
     pub vault: Option<VaultParts>,
+    /// `None`: no browser tools.
+    pub browser: Option<browser::BrowserParts>,
 }
 
 pub struct VaultParts {
-    pub vault: Vault,
-    /// A Channel here can ask a person to approve an item's first use.
-    pub takes_approvals: bool,
+    pub vault: Arc<Vault>,
+    /// The Sources whose Channel here can ask a person to approve an
+    /// item's first use. A Ticket takes approvals when one of its Channels
+    /// is on one of them.
+    pub asks_on: BTreeSet<String>,
 }
 
 #[derive(Clone)]
@@ -510,15 +518,36 @@ impl AgentBroker {
     }
 
     fn capabilities(&self, environment: Option<&str>) -> Caps {
-        let have = self.inner.environments.capabilities(environment);
-        match self.vault() {
-            Some(_) => have.with(Cap::Vault),
-            None => have,
+        let mut have = self.inner.environments.capabilities(environment);
+        if self.vault().is_some() {
+            have = have.with(Cap::Vault);
         }
+        if self.browser().is_some() && self.inner.environments.is_local(environment) {
+            have = have.with(Cap::Browser);
+        }
+        have
     }
 
     fn vault(&self) -> Option<&VaultParts> {
         self.inner.workers.as_ref()?.vault.as_ref()
+    }
+
+    fn browser(&self) -> Option<&browser::BrowserParts> {
+        self.inner.workers.as_ref()?.browser.as_ref()
+    }
+
+    fn worker_seats(&self) -> Vec<Arc<WorkerSeat>> {
+        let grants = match self.inner.grants.read() {
+            Ok(grants) => grants,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        grants
+            .values()
+            .filter_map(|grant| match &grant.principal {
+                Principal::Worker(seat) => Some(seat.clone()),
+                Principal::Router => None,
+            })
+            .collect()
     }
 
     fn unmet_need(&self, principal: &Principal, name: &str) -> Option<String> {
@@ -832,7 +861,7 @@ async fn tool(
     RoutePath(name): RoutePath<String>,
     headers: HeaderMap,
     Json(args): Json<Value>,
-) -> Reply {
+) -> std::result::Result<Response, Refusal> {
     let grant = broker.authenticate(&headers)?;
     if !grant.principal.tools().contains(&name.as_str()) {
         return Err(forbidden("tool outside admitted grants"));
@@ -840,7 +869,7 @@ async fn tool(
     if let Some(why) = broker.unmet_need(&grant.principal, &name) {
         return Err(forbidden(why));
     }
-    match (&grant.principal, name.as_str()) {
+    let reply = match (&grant.principal, name.as_str()) {
         (Principal::Router, "router_decide") => decide(&broker, args).await,
         (Principal::Router, "router_read") => read(&broker, args).await,
         (Principal::Worker(seat), "worker_report") => report(&broker, seat, args).await,
@@ -860,8 +889,13 @@ async fn tool(
         }
         (Principal::Worker(seat), "fetch_url") => fetch_url(&broker, seat, args).await,
         (Principal::Worker(seat), "vault_list") => secrets::vault_list(&broker, seat).await,
+        (
+            Principal::Worker(seat),
+            tool @ ("browser_open" | "browser_act" | "browser_login" | "browser_read"),
+        ) => return browser::call(&broker, seat, tool, args).await,
         _ => Err(forbidden("unknown tool")),
-    }
+    };
+    reply.map(IntoResponse::into_response)
 }
 
 fn arguments<T: serde::de::DeserializeOwned>(args: Value) -> std::result::Result<T, Refusal> {
