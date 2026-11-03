@@ -583,6 +583,8 @@ Without pass-through completion stayed about the same, but the Router made about
   generator is SplitMix64, written out). Message times follow `per_minute`, as a Poisson stream or evenly. Requests
   are addressed (`@agent ...`) by allowed people (`dev-N`), each on its own Thread, within the first `request_span`
   of the stream, and each carries its expected work, drawn uniformly from `work_minutes`, as `meta.bench.work_ms`.
+  No two requests ask for the same task, so a spec takes at most 24 requests: a model Router reads a repeated task
+  as work already done and ignores it (#37).
   Follow-ups by a request's author and CI messages (from `ci-bot`, which is on `policy.bots`, or `deploy-bot`,
   which is not) land on request Threads, 10 to 50% and 20 to 90% of the way through the request's expected work.
   The rest is chatter from allowed people and from people not on the list (`guest-N`); only the latter mention
@@ -592,7 +594,7 @@ Without pass-through completion stayed about the same, but the Router made about
   ```yaml
   seed: 1                 # run n (from 0) of every design uses seed + n
   messages: 300           # every Trigger, requests included
-  requests: 20
+  requests: 20            # at most 24
   follow_ups: 40
   ci_messages: 40
   per_minute: 5           # about an hour of stream
