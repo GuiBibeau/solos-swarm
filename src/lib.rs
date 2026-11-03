@@ -31,6 +31,7 @@ pub mod progress;
 pub mod provider;
 pub mod qa;
 pub mod quota;
+pub mod remote;
 pub mod resource_guard;
 pub mod runtime;
 pub mod sandbox;

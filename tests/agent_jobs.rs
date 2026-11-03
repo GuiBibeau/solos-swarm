@@ -347,7 +347,7 @@ async fn get_tools_lists_run_code_and_the_job_tools_on_a_host_with_run_code_and_
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
     assert_eq!(names, WORKER_TOOLS);
-    assert_eq!(w.broker.worker_tools(), WORKER_TOOLS, "its grants");
+    assert_eq!(w.broker.worker_tools(None), WORKER_TOOLS, "its grants");
     for tool in ROUTER_TOOLS.iter().chain(&WORKER_TOOLS) {
         let (status, reply) = w.post(tool, &token, json!({})).await;
         assert_eq!(

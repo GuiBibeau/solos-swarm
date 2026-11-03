@@ -409,7 +409,10 @@ fn gen_trigger(rng: &mut Lcg, w: &mut World) -> Trigger {
 
 fn gen_accept(rng: &mut Lcg) -> Accept {
     let plan = if rng.chance(70) {
-        Plan::Session { harness: None }
+        Plan::Session {
+            harness: None,
+            environment: None,
+        }
     } else {
         let agents = if rng.chance(12) {
             rng.pick(&[0, 31])

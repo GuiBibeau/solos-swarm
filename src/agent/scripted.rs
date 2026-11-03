@@ -47,7 +47,10 @@ impl ScriptedRouter {
             title,
             scope: texts.join("\n"),
             reason: "an explicit request".into(),
-            plan: Plan::Session { harness: None },
+            plan: Plan::Session {
+                harness: None,
+                environment: None,
+            },
             budget_microusd: self.budget_microusd,
             acknowledge: Acknowledge::Standard,
             rules: Vec::new(),

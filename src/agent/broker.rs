@@ -9,6 +9,7 @@ pub mod registry;
 
 use super::AgentConfig;
 use super::config::ExecutorConfig;
+use super::environment::{Environments, Nodes};
 use super::jobs::{Host, JOB_TOOLS, JobLimits, Jobs, Refused};
 use super::ports::{Applied, Fact, FactSink};
 use crate::broker::{FETCH_TOTAL_BYTES, fetch, now_ms};
@@ -42,7 +43,7 @@ pub const SOCKET_FILE: &str = "broker.sock";
 /// What the Router's sessions may call. No `run_code`, no `fetch_url`.
 pub const ROUTER_TOOLS: [&str; 2] = ["router_decide", "router_read"];
 /// What a worker's sessions may call. `run_code` and the job tools need the
-/// host to offer `run_code`.
+/// worker's environment to offer `run_code`.
 pub const WORKER_TOOLS: [&str; 7] = [
     "worker_report",
     "worker_handback",
@@ -94,6 +95,8 @@ pub struct WorkerSeat {
     pub assignment: AssignmentId,
     /// `run_code`'s `/work`.
     pub work_dir: PathBuf,
+    /// Where its commands run, as its Plan names it.
+    environment: Option<String>,
     /// The Ticket's whole budget, which every Assignment of it shares.
     pub budget_microusd: MicroUsd,
     /// The Ticket account's spend from this time on is this Assignment's.
@@ -115,12 +118,19 @@ impl WorkerSeat {
             ticket,
             assignment,
             work_dir,
+            environment: None,
             budget_microusd,
             since_ms: now_ms(),
             turn: Mutex::new(None),
             fetched_bytes: AtomicU64::new(0),
             jobs: Arc::default(),
         }
+    }
+
+    /// Its commands run where its Plan's `environment` names.
+    pub fn in_environment(mut self, environment: Option<String>) -> Self {
+        self.environment = environment;
+        self
     }
 
     pub fn account(&self) -> Account {
@@ -355,6 +365,7 @@ struct Inner {
     /// so every later model call is refused.
     overrun: AtomicBool,
     jobs: JobLimits,
+    environments: Environments,
 }
 
 type Refusal = (StatusCode, Json<Value>);
@@ -407,6 +418,12 @@ impl AgentBroker {
 
     /// [`new`](Self::new), with `jobs` bounding the workers' background jobs.
     pub fn with_jobs(parts: BrokerParts, jobs: JobLimits) -> Result<Self> {
+        Self::with_nodes(parts, jobs, Nodes::default())
+    }
+
+    /// [`with_jobs`](Self::with_jobs), with remote nodes a worker's
+    /// commands may run on.
+    pub fn with_nodes(parts: BrokerParts, jobs: JobLimits, nodes: Nodes) -> Result<Self> {
         let BrokerParts {
             dir,
             mut store,
@@ -421,6 +438,7 @@ impl AgentBroker {
                 "agent: charged {orphans} model calls a previous run left open at their hold"
             );
         }
+        let local = workers.as_ref().and_then(|parts| parts.code.clone());
         Ok(Self {
             inner: Arc::new(Inner {
                 dir,
@@ -428,6 +446,7 @@ impl AgentBroker {
                 provider,
                 facts,
                 decide,
+                environments: Environments::new(local, nodes),
                 workers,
                 client: crate::swarm::http_client()?,
                 grants: RwLock::new(BTreeMap::new()),
@@ -470,19 +489,17 @@ impl AgentBroker {
         Ok(seat)
     }
 
-    /// Whether this broker offers workers `run_code`.
-    pub fn offers_run_code(&self) -> bool {
-        self.inner
-            .workers
-            .as_ref()
-            .is_some_and(|parts| parts.code.is_some())
+    /// Where workers' commands may run.
+    pub fn environments(&self) -> &Environments {
+        &self.inner.environments
     }
 
-    /// What a worker may call on this host: the worker tools, less
-    /// `run_code` and the job tools, which run in its sandbox, where this
-    /// host offers no `run_code`. A worker's grants and its `GET /tools`.
-    pub fn worker_tools(&self) -> Vec<&'static str> {
-        let run_code = self.offers_run_code();
+    /// What a worker whose Plan names `environment` may call: the worker
+    /// tools, less `run_code` and the job tools, which run in that
+    /// environment's sandbox, where it offers no `run_code`. A worker's
+    /// grants and its `GET /tools`.
+    pub fn worker_tools(&self, environment: Option<&str>) -> Vec<&'static str> {
+        let run_code = self.inner.environments.offers_run_code(environment);
         WORKER_TOOLS
             .into_iter()
             .filter(|tool| run_code || !(*tool == "run_code" || JOB_TOOLS.contains(tool)))
@@ -611,14 +628,14 @@ async fn session(State(broker): State<AgentBroker>, headers: HeaderMap) -> Reply
 }
 
 /// The calling principal's tools from the registry: a worker's without
-/// `run_code` and the job tools where this host offers no `run_code`, so an
-/// MCP host lists only what it can call.
+/// `run_code` and the job tools where its environment offers no
+/// `run_code`, so an MCP host lists only what it can call.
 async fn tools(State(broker): State<AgentBroker>, headers: HeaderMap) -> Reply {
     let grant = broker.authenticate(&headers)?;
     let kind = grant.principal.kind();
     let callable = match &grant.principal {
         Principal::Router => ROUTER_TOOLS.to_vec(),
-        Principal::Worker(_) => broker.worker_tools(),
+        Principal::Worker(seat) => broker.worker_tools(seat.environment.as_deref()),
     };
     let offered: Vec<_> = registry::tools(kind)
         .into_iter()
@@ -843,6 +860,8 @@ struct DecideArgs {
     #[serde(default)]
     goal_template: Option<String>,
     #[serde(default)]
+    environment: Option<String>,
+    #[serde(default)]
     budget_microusd: Option<MicroUsd>,
     #[serde(default)]
     acknowledge: Option<String>,
@@ -866,11 +885,15 @@ impl DecideArgs {
             },
             Choice::Accept => {
                 let plan = match (self.plan.unwrap_or(PlanKind::Session), self.agents) {
-                    (PlanKind::Session, None) if self.goal_template.is_none() => {
-                        Plan::Session { harness: None }
-                    }
+                    (PlanKind::Session, None) if self.goal_template.is_none() => Plan::Session {
+                        harness: None,
+                        environment: self.environment,
+                    },
                     (PlanKind::Session, _) => {
                         return Err("agents and goal_template are for a swarm plan only".into());
+                    }
+                    (PlanKind::Swarm, Some(_)) if self.environment.is_some() => {
+                        return Err("environment is for a session plan only".into());
                     }
                     (PlanKind::Swarm, Some(agents)) => {
                         let swarm = terms.swarm.as_ref().ok_or(
@@ -919,6 +942,18 @@ impl DecideArgs {
 /// comes back, so a refusal reaches the model as a tool error.
 async fn decide(broker: &AgentBroker, args: Value) -> Reply {
     let args: DecideArgs = arguments(args)?;
+    let environments = &broker.inner.environments;
+    if let Some(name) = &args.environment
+        && !environments.knows(name)
+    {
+        return Err(refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "there is no environment {name}; the environments are {}",
+                environments.names().join(", ")
+            ),
+        ));
+    }
     let (eval, verdict) = args
         .verdict(&broker.inner.decide)
         .map_err(|why| refuse(StatusCode::UNPROCESSABLE_ENTITY, why))?;
@@ -1070,19 +1105,19 @@ async fn run_code(broker: &AgentBroker, seat: &Arc<WorkerSeat>, args: Value) -> 
         .map_err(refused)
 }
 
-/// Where `seat`'s jobs run, when this host offers `run_code`.
+/// Where `seat`'s jobs run, when its environment offers `run_code`.
 fn job_host<'a>(
     broker: &'a AgentBroker,
     seat: &'a WorkerSeat,
 ) -> std::result::Result<Host<'a>, Refusal> {
-    let code = broker
+    let environment = broker
         .inner
-        .workers
-        .as_ref()
-        .and_then(|parts| parts.code.as_ref())
+        .environments
+        .get(seat.environment.as_deref())
+        .map_err(forbidden)?
         .ok_or_else(|| forbidden("run_code is not available on this host"))?;
     Ok(Host {
-        code,
+        environment: environment.as_ref(),
         limits: broker.inner.jobs,
         facts: &broker.inner.facts,
         ticket: &seat.ticket,
@@ -1096,6 +1131,7 @@ fn refused(refusal: Refused) -> Refusal {
         Refused::BadArguments(why) => refuse(StatusCode::UNPROCESSABLE_ENTITY, why),
         Refused::Unknown(why) => refuse(StatusCode::NOT_FOUND, why),
         Refused::Full(why) => refuse(StatusCode::CONFLICT, why),
+        Refused::Offline(why) => refuse(StatusCode::SERVICE_UNAVAILABLE, why),
     }
 }
 
@@ -1352,9 +1388,29 @@ mod tests {
         .unwrap() else {
             panic!("not an accept")
         };
-        assert_eq!(accept.plan, Plan::Session { harness: None });
+        assert_eq!(
+            accept.plan,
+            Plan::Session {
+                harness: None,
+                environment: None
+            }
+        );
         assert_eq!(accept.budget_microusd, 500_000);
         assert_eq!(accept.acknowledge, Acknowledge::Standard);
+        let Verdict::Accept(remote) = verdict(json!({
+            "eval":"ev_1","decision":"accept","reason":"asked","title":"T","scope":"S",
+            "environment":"laptop"
+        }))
+        .unwrap() else {
+            panic!("not an accept")
+        };
+        assert_eq!(
+            remote.plan,
+            Plan::Session {
+                harness: None,
+                environment: Some("laptop".into())
+            }
+        );
         let Verdict::Accept(swarm) = verdict(json!({
             "eval":"ev_1","decision":"accept","reason":"wide","title":"T","scope":"S",
             "plan":"swarm","agents":4,"budget_microusd":2_000_000,"acknowledge":""
@@ -1437,6 +1493,10 @@ mod tests {
             (
                 "an unknown goal template",
                 json!({"eval":"ev_1","decision":"accept","reason":"r","title":"T","scope":"S","plan":"swarm","agents":2,"goal_template":"tournament"}),
+            ),
+            (
+                "an environment for a swarm",
+                json!({"eval":"ev_1","decision":"accept","reason":"r","title":"T","scope":"S","plan":"swarm","agents":2,"environment":"laptop"}),
             ),
         ] {
             assert!(verdict(args).is_err(), "{case}");

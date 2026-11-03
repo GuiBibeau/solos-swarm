@@ -8,6 +8,7 @@
 
 use super::broker::{self, AgentBroker, WorkerSeat, clip};
 use super::config::HarnessKind;
+use super::environment::{self, Launchable};
 use super::ports::{BoxFuture, Delivered, Delivery, Executor, Fact, FactSink, Launch};
 use super::swarm_executor::SwarmExecutor;
 use crate::broker::write_json;
@@ -195,9 +196,10 @@ fn runner(plan: &Plan, default: HarnessKind, claude: bool) -> Runner {
         kind => Runner::Session(kind),
     };
     match plan {
-        Plan::Session { harness: None } => session(default),
+        Plan::Session { harness: None, .. } => session(default),
         Plan::Session {
             harness: Some(name),
+            ..
         } => match HarnessKind::named(name) {
             Some(kind) => session(kind),
             None => Runner::Unavailable(format!("the {name} harness is not available here")),
@@ -236,7 +238,6 @@ pub struct PiExecutor<H, C = ClaudeCodeHarness> {
 
 struct Inner<H, C> {
     parts: PiExecutorParts<H, C>,
-    grants: Vec<String>,
     slots: Arc<Semaphore>,
     workers: Mutex<BTreeMap<AssignmentId, Worker>>,
 }
@@ -310,18 +311,11 @@ where
 {
     pub fn new(parts: PiExecutorParts<H, C>) -> Result<Self> {
         ensure!(parts.max_workers > 0, "a pi executor needs a worker slot");
-        let grants = parts
-            .broker
-            .worker_tools()
-            .into_iter()
-            .map(String::from)
-            .collect();
         private_dir(&parts.tickets_dir)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 slots: Arc::new(Semaphore::new(parts.max_workers)),
                 parts,
-                grants,
                 workers: Mutex::new(BTreeMap::new()),
             }),
         })
@@ -356,8 +350,16 @@ where
             let runner = runner(&launch.plan, parts.default_harness, parts.claude.is_some());
             match (runner, &parts.swarm) {
                 (Runner::Session(harness), _) => {
-                    self.inner.start(launch, facts, harness);
-                    Ok(())
+                    let environments = parts.broker.environments();
+                    match environments.launchable(environment::named(&launch.plan)) {
+                        Launchable::Now => {
+                            self.inner.start(launch, facts, harness);
+                            Ok(())
+                        }
+                        // The effect runner's backoff holds the Launch until the node is back.
+                        Launchable::Later(why) => Err(anyhow!(why)),
+                        Launchable::Never(why) => failed(&facts, &launch, false, &why, 0).await,
+                    }
                 }
                 (Runner::Swarm, Some(swarm)) => swarm.launch(launch, facts).await,
                 (Runner::Swarm, None) => {
@@ -493,15 +495,27 @@ where
         let parts = &self.parts;
         let dir = self.ticket_dir(&launch.ticket)?;
         let work = dir.join(WORK_DIR);
-        self.prepare(&launch.ticket, &dir, &work).await?;
+        let named = environment::named(&launch.plan);
+        let environments = parts.broker.environments();
+        // A node's /work is its own, so this host's prepare has nothing to set up there.
+        if environments.is_local(named) {
+            self.prepare(&launch.ticket, &dir, &work).await?;
+        }
         let token = broker::new_token();
-        let run_code = parts.broker.offers_run_code();
+        let grants: Vec<String> = parts
+            .broker
+            .worker_tools(named)
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let run_code = grants.iter().any(|tool| tool == "run_code");
         let seat = WorkerSeat::new(
             launch.ticket.clone(),
             launch.assignment.clone(),
             work,
             launch.budget_microusd,
-        );
+        )
+        .in_environment(named.map(str::to_owned));
         let prompt = system_prompt(launch.budget_microusd, run_code);
         let seat = parts.broker.admit_worker(token.clone(), seat, prompt)?;
         let _revoke = Revoke {
@@ -512,7 +526,7 @@ where
         let spec = SessionSpec {
             id: launch.assignment.to_string(),
             role: Role::TicketWorker,
-            grants: self.grants.clone(),
+            grants,
             token,
             model: parts.model.clone(),
             pi_settings: dir.join("pi-settings.json"),
@@ -787,9 +801,14 @@ mod tests {
     use super::{
         PREPARED, PiExecutor, PiExecutorParts, QUIET_TURN, WORK_DIR, assignment_text, delivery_text,
     };
-    use crate::agent::broker::{AgentBroker, BrokerParts, DecideTerms, ModelTerms, WorkerParts};
+    use crate::agent::broker::{
+        AgentBroker, BrokerParts, DecideTerms, ModelTerms, WORKER_TOOLS, WorkerParts,
+    };
     use crate::agent::config::HarnessKind;
+    use crate::agent::environment::{ExecutionEnvironment, Nodes, Offline, Work};
+    use crate::agent::jobs::JobLimits;
     use crate::agent::ports::{Delivered, Delivery, Executor, Fact, FactSink, Inbound, Launch};
+    use crate::code::{OutputBounds, Started};
     use crate::gateway::{Dispatch, PriceTable, Provider, Upstream};
     use crate::harness::{AgentHarness, Observation, Session, SessionEvent, SessionSpec};
     use serde_json::Value;
@@ -798,8 +817,9 @@ mod tests {
         TicketId, Trigger, TriggerId,
     };
     use solos_agent_store::SqliteStore;
+    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -818,6 +838,8 @@ mod tests {
     #[derive(Clone, Default)]
     struct Fake {
         events: Events,
+        /// Each session's grants, by its id.
+        grants: Arc<Mutex<BTreeMap<String, Vec<String>>>>,
         prompts: Arc<Mutex<Vec<(String, String)>>>,
         live: Arc<AtomicUsize>,
         most: Arc<AtomicUsize>,
@@ -838,6 +860,8 @@ mod tests {
             events: mpsc::Sender<Observation>,
         ) -> anyhow::Result<FakeSession> {
             self.events.lock().unwrap().push((spec.id.clone(), events));
+            let grants = spec.grants.clone();
+            self.grants.lock().unwrap().insert(spec.id.clone(), grants);
             let live = self.live.fetch_add(1, Ordering::SeqCst) + 1;
             self.most.fetch_max(live, Ordering::SeqCst);
             Ok(FakeSession {
@@ -884,6 +908,9 @@ mod tests {
             let events = self.events.lock().unwrap();
             events.iter().map(|(id, _)| id.clone()).collect()
         }
+        fn grants(&self, id: &str) -> Vec<String> {
+            self.grants.lock().unwrap()[id].clone()
+        }
         async fn tell(&self, id: &str, event: anyhow::Result<SessionEvent>) {
             let sender = self
                 .events
@@ -912,6 +939,14 @@ mod tests {
             Self::on(HarnessKind::Pi, max_workers, prepare)
         }
         fn on(default_harness: HarnessKind, max_workers: usize, prepare: Option<&str>) -> Self {
+            Self::with_nodes(default_harness, max_workers, prepare, Nodes::default())
+        }
+        fn with_nodes(
+            default_harness: HarnessKind,
+            max_workers: usize,
+            prepare: Option<&str>,
+            nodes: Nodes,
+        ) -> Self {
             let dir = std::env::temp_dir().join(format!("pi-executor-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&dir).unwrap();
             let (facts, inbound) = FactSink::channel();
@@ -925,7 +960,7 @@ mod tests {
                 max_input_bytes: 65_536,
                 max_output_tokens: 1_024,
             };
-            let broker = AgentBroker::new(BrokerParts {
+            let parts = BrokerParts {
                 dir: dir.clone(),
                 store: SqliteStore::open_in_memory().unwrap(),
                 provider: Arc::new(Silent),
@@ -936,8 +971,8 @@ mod tests {
                     swarm: None,
                 },
                 workers: Some(WorkerParts { terms, code: None }),
-            })
-            .unwrap();
+            };
+            let broker = AgentBroker::with_nodes(parts, JobLimits::default(), nodes).unwrap();
             let (fake, claude) = (Fake::default(), Fake::default());
             let executor = PiExecutor::new(PiExecutorParts {
                 harness: Arc::new(fake.clone()),
@@ -1031,7 +1066,10 @@ mod tests {
             title: "Fix the flaky test".into(),
             scope: "Make tests/retry.rs pass ten times in a row.".into(),
             rules: Vec::new(),
-            plan: Plan::Session { harness: None },
+            plan: Plan::Session {
+                harness: None,
+                environment: None,
+            },
             budget_microusd: 500_000,
             recovery: false,
             inputs: Vec::new(),
@@ -1253,6 +1291,7 @@ mod tests {
             let mut launch = launch(ticket, &format!("as_{ticket}"));
             launch.plan = Plan::Session {
                 harness: harness.map(String::from),
+                environment: None,
             };
             launch
         };
@@ -1327,6 +1366,7 @@ mod tests {
         let mut asks = launch("tk_1", "as_1");
         asks.plan = Plan::Session {
             harness: Some("claude-code".into()),
+            environment: None,
         };
         executor.launch(asks, w.facts.clone()).await.unwrap();
         let why = failure(&mut w, "as_1").await;
@@ -1336,6 +1376,83 @@ mod tests {
         );
         assert!(fake.started().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A node whose connection the test switches; nothing runs on it here.
+    struct Laptop(AtomicBool);
+
+    impl ExecutionEnvironment for Laptop {
+        fn ready(&self) -> Result<(), Offline> {
+            if self.0.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(Offline("node laptop is offline".into()))
+            }
+        }
+        fn run_code(&self, _: Work<'_>, _: &Value) -> anyhow::Result<Started> {
+            anyhow::bail!("not in this test")
+        }
+        fn job(
+            &self,
+            _: Work<'_>,
+            _: &str,
+            _: Duration,
+            _: OutputBounds,
+        ) -> anyhow::Result<Started> {
+            anyhow::bail!("not in this test")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_on_a_node_gets_run_code_there_on_either_harness_and_waits_for_it() {
+        let laptop = Arc::new(Laptop(AtomicBool::new(true)));
+        let nodes = Nodes {
+            default: None,
+            nodes: BTreeMap::from([(
+                "laptop".to_owned(),
+                laptop.clone() as Arc<dyn ExecutionEnvironment>,
+            )]),
+        };
+        let mut w = World::with_nodes(HarnessKind::Pi, 4, None, nodes);
+        let on = |harness: &str, environment: Option<&str>, ticket: &str| {
+            let mut launch = launch(ticket, &format!("as_{ticket}"));
+            launch.plan = Plan::Session {
+                harness: Some(harness.into()),
+                environment: environment.map(String::from),
+            };
+            launch
+        };
+        w.launch(on("claude-code", Some("laptop"), "a")).await;
+        assert!(started(&w.fact().await, "as_a"));
+        w.launch(on("claude-code", None, "b")).await;
+        assert!(started(&w.fact().await, "as_b"));
+        w.launch(on("pi", Some("laptop"), "c")).await;
+        assert!(started(&w.fact().await, "as_c"));
+        assert_eq!(
+            w.claude.grants("as_a"),
+            WORKER_TOOLS,
+            "run_code on the node"
+        );
+        assert_eq!(
+            w.claude.grants("as_b"),
+            ["worker_report", "worker_handback", "fetch_url"],
+            "this host offers no run_code"
+        );
+        assert_eq!(w.fake.grants("as_c"), w.claude.grants("as_a"), "as on Pi");
+
+        laptop.0.store(false, Ordering::SeqCst);
+        let held = w
+            .executor
+            .launch(on("claude-code", Some("laptop"), "d"), w.facts.clone())
+            .await
+            .expect_err("a launch on an offline node started");
+        assert!(
+            format!("{held:#}").contains("node laptop is offline"),
+            "{held:#}"
+        );
+        w.no_fact().await;
+        assert_eq!(w.claude.started(), ["as_a", "as_b"]);
+        w.executor.shutdown().await;
     }
 
     fn count(path: &Path) -> usize {

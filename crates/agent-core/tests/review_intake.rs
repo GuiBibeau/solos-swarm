@@ -173,7 +173,10 @@ fn accept_rules(budget: u64, rules: Vec<String>) -> Verdict {
         title: "Fix the flaky test".into(),
         scope: "Reproduce and fix the flake".into(),
         reason: "asked".into(),
-        plan: Plan::Session { harness: None },
+        plan: Plan::Session {
+            harness: None,
+            environment: None,
+        },
         budget_microusd: budget,
         acknowledge: Acknowledge::Silent,
         rules,

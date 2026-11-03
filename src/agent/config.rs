@@ -1,9 +1,11 @@
 //! `agent.yaml`. Unknown fields are errors, like a swarm Goal's, so a typo
 //! cannot silently fall back to a default.
 
+mod nodes;
 mod sources;
 mod watchdog;
 
+pub use nodes::{AllowedNode, NodesConfig};
 pub use sources::{Interval, ReplyTo, ScheduleConfig, TimeOfDay};
 pub use watchdog::{OperatorConfig, ThresholdsConfig, WatchdogConfig};
 
@@ -32,6 +34,9 @@ pub struct AgentConfig {
     /// Without it, no Watchdog runs.
     #[serde(default)]
     pub watchdog: Option<WatchdogConfig>,
+    /// Remote nodes that run workers' commands. Without it, none connect.
+    #[serde(default)]
+    pub nodes: Option<NodesConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -182,6 +187,10 @@ pub enum ExecutorConfig {
         /// Where Claude Code is. Without it no session runs on Claude Code.
         #[serde(default)]
         claude: Option<Box<ClaudeConfig>>,
+        /// Where a session's commands run when its Plan names nowhere: a
+        /// node in `nodes.allow`, or `local` (the default).
+        #[serde(default)]
+        environment: Option<String>,
     },
 }
 
@@ -364,6 +373,9 @@ impl AgentConfig {
                 ChannelConfig::Slack {} | ChannelConfig::Github {} | ChannelConfig::Mcp {} => {}
             }
         }
+        if let Some(nodes) = &mut config.nodes {
+            nodes.resolve(base);
+        }
         if let ExecutorConfig::Pi {
             provider,
             swarm: Some(swarm),
@@ -424,6 +436,7 @@ impl AgentConfig {
         );
         self.validate_schedules(&served)?;
         self.validate_watchdog(&served)?;
+        self.validate_nodes()?;
         ensure!(
             self.budgets.session_microusd > 0,
             "budgets.session_microusd must be above zero"
@@ -486,6 +499,7 @@ impl AgentConfig {
             swarm,
             harness,
             claude,
+            ..
         } = &self.executor
         else {
             return Ok(());

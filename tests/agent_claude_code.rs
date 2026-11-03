@@ -1,9 +1,9 @@
 //! The agent broker's Anthropic Messages facade over HTTP on its Unix
 //! socket, with a scripted provider: a worker's calls held and settled on
 //! its Ticket's account, the pause, the budget and the contract, as
-//! `/model` has them. The ignored test runs the installed Claude Code as a
-//! worker through `ClaudeCodeHarness` in bwrap, in `agent serve`, and needs
-//! `SOLOS_CLAUDE`.
+//! `/model` has them. The ignored tests run the installed Claude Code as a
+//! worker through `ClaudeCodeHarness` in bwrap, in `agent serve`, here and
+//! on a Ticket bound to a remote node, and need `SOLOS_CLAUDE`.
 
 use serde_json::{Value, json};
 use solos_agent_core::model::{AssignmentId, MessageKind, OutboundMessage, TicketId};
@@ -19,6 +19,8 @@ use solos_swarm::agent::{
 use solos_swarm::gateway::anthropic::Chat;
 use solos_swarm::gateway::{Dispatch, PriceTable, Provider, Upstream};
 use solos_swarm::harness::PiHarness;
+use solos_swarm::remote::daemon::{AgentEndpoint, SandboxConfig, SecretsConfig};
+use solos_swarm::remote::{Node, NodeConfig, tls};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -484,9 +486,11 @@ async fn what_the_contract_refuses_is_refused_as_a_messages_client_reads_it() {
     assert_eq!(hello.unwrap().status(), 200, "Claude Code's preconnect");
 }
 
-/// The upstream of the real run: a prompt gets a `progress` report, its tool
-/// result a `ready` one, and anything after a closing line.
+/// The upstream of the real run: a prompt gets the call `first` (a broker
+/// tool and its arguments), its tool result a `ready` report, and anything
+/// after a closing line.
 struct Reporter {
+    first: (&'static str, Value),
     bodies: Mutex<Vec<Value>>,
 }
 
@@ -500,14 +504,17 @@ impl Provider for Reporter {
         let results = body["messages"].as_array().map_or(0, |messages| {
             messages.iter().filter(|m| m["role"] == "tool").count()
         });
-        let report = match results {
-            0 => Some(json!({"status": "progress", "text": "Saying hello"})),
-            1 => Some(json!({"status": "ready", "text": "Done: hello from Claude Code"})),
+        let call = match results {
+            0 => Some(self.first.clone()),
+            1 => Some((
+                "worker_report",
+                json!({"status": "ready", "text": "Done: hello from Claude Code"}),
+            )),
             _ => None,
         };
-        let (message, finish) = if let Some(report) = report {
+        let (message, finish) = if let Some((tool, arguments)) = call {
             let call = json!({"id": format!("call-{n}"), "type": "function", "function": {
-                "name": "mcp__swarm__worker_report", "arguments": report.to_string()}});
+                "name": format!("mcp__swarm__{tool}"), "arguments": arguments.to_string()}});
             (
                 json!({"role": "assistant", "content": null, "tool_calls": [call]}),
                 "tool_calls",
@@ -555,6 +562,10 @@ async fn a_real_claude_code_worker_reports_ready_through_the_facade() {
     std::fs::write(&path, yaml).unwrap();
     let config = AgentConfig::load(&path).unwrap();
     let reporter = Arc::new(Reporter {
+        first: (
+            "worker_report",
+            json!({"status": "progress", "text": "Saying hello"}),
+        ),
         bodies: Mutex::new(Vec::new()),
     });
     let host = PiHost {
@@ -654,4 +665,134 @@ async fn a_real_claude_code_worker_reports_ready_through_the_facade() {
         !dir.join(format!("{assignment}.token")).exists(),
         "the token file is gone with the session"
     );
+}
+
+/// `SOLOS_CLAUDE=$(readlink -f ~/.local/bin/claude) cargo test --test
+/// agent_claude_code -- --ignored --nocapture`: the same worker on a Ticket
+/// bound to a node, whose `run_code` runs in the node's sandbox, not here.
+#[tokio::test]
+#[ignore = "needs Linux, bwrap and an installed Claude Code"]
+async fn a_real_claude_code_worker_runs_its_code_on_its_tickets_node() {
+    let claude = PathBuf::from(std::env::var_os("SOLOS_CLAUDE").expect("SOLOS_CLAUDE"));
+    let scratch = Scratch::new("node");
+    let root = &scratch.root;
+    std::fs::write(root.join("node"), "").unwrap();
+    let agent = tls::init(&root.join("agent-tls"), tls::AGENT_NAME).unwrap();
+    let laptop = tls::init(&root.join("laptop-tls"), tls::NODE_NAME).unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let line = json!({"id": "t-ask", "source": "slack", "at_ms": 1_793_613_600_000u64,
+        "actor": {"id": "alice", "kind": "person"}, "addressed": "mention",
+        "text": "Say hello from my laptop", "threads": ["T1"],
+        "reply_to": [{"source": "slack", "address": {"thread_ts": "T1"}}]});
+    std::fs::write(root.join("triggers.jsonl"), format!("{line}\n")).unwrap();
+    let yaml = format!(
+        "policy:\n  people: [slack:alice]\n\
+         sources:\n  - {{kind: jsonl, path: triggers.jsonl}}\n\
+         channels:\n  - {{kind: jsonl, source: slack, path: outbox.jsonl}}\n\
+         router: {{kind: scripted}}\n\
+         executor:\n  kind: pi\n  provider: deepseek\n  model: {MODEL}\n  \
+         prices: {{input_microusd_per_million: 300000, output_microusd_per_million: 1200000, \
+         cache_hit_microusd_per_million: 6000}}\n  max_output_tokens: {MAX_OUTPUT}\n  \
+         harness: claude-code\n  claude: {{binary: {}, solos_swarm: {}}}\n  environment: laptop\n\
+         budgets: {{session_microusd: 500000}}\n\
+         nodes:\n  listen: 127.0.0.1:{port}\n  cert: agent-tls/cert.pem\n  key: agent-tls/key.pem\n  \
+         allow:\n    laptop: {{fingerprint: \"{laptop}\"}}\n",
+        claude.display(),
+        env!("CARGO_BIN_EXE_solos-swarm"),
+    );
+    let path = root.join("agent.yaml");
+    std::fs::write(&path, yaml).unwrap();
+    let config = AgentConfig::load(&path).unwrap();
+    let reporter = Arc::new(Reporter {
+        first: (
+            "run_code",
+            json!({"code": "echo hello from the laptop | tee here.txt"}),
+        ),
+        bodies: Mutex::new(Vec::new()),
+    });
+    let host = PiHost {
+        harness: PiHarness,
+        provider: reporter.clone(),
+        pi_root: root.clone(),
+        node: root.join("node"),
+    };
+    let (cert, key) = tls::files(&root.join("laptop-tls"));
+    let node = Node::new(&NodeConfig {
+        name: "laptop".into(),
+        agent: AgentEndpoint {
+            address: format!("127.0.0.1:{port}"),
+            fingerprint: agent,
+        },
+        cert,
+        key,
+        work_root: root.join("laptop-work"),
+        sandbox: SandboxConfig::default(),
+        secrets: SecretsConfig::default(),
+    })
+    .unwrap();
+    let daemon = tokio::spawn(async move { node.serve(std::future::pending()).await });
+
+    let state = scratch.state();
+    let serving = serve_with(config, &state, true, Some(host));
+    let summary = tokio::time::timeout(Duration::from_secs(180), serving)
+        .await
+        .expect("serve did not go idle")
+        .unwrap();
+    daemon.abort();
+
+    eprintln!("summary: {}", json!(summary));
+    let sent: Vec<OutboundMessage> = std::fs::read_to_string(root.join("outbox.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let kinds: Vec<MessageKind> = sent.iter().map(|m| m.kind).collect();
+    assert_eq!(kinds, [MessageKind::Acknowledgement, MessageKind::Result]);
+    let ticket = &scratch.store().tickets().unwrap()[0];
+    let bodies = reporter.bodies.lock().unwrap().clone();
+    let mut tools: Vec<&str> = bodies[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect();
+    tools.sort_unstable();
+    assert_eq!(
+        tools,
+        [
+            "mcp__swarm__fetch_url",
+            "mcp__swarm__job_start",
+            "mcp__swarm__job_stop",
+            "mcp__swarm__job_wait",
+            "mcp__swarm__run_code",
+            "mcp__swarm__worker_handback",
+            "mcp__swarm__worker_report"
+        ],
+        "run_code and the job tools, on the node, though this host has no run_code"
+    );
+    let result = bodies[1]["messages"].as_array().unwrap().last().unwrap();
+    assert_eq!(result["role"], "tool");
+    let receipt: Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        (&receipt["exit_code"], &receipt["stdout"]),
+        (&json!(0), &json!("hello from the laptop\n")),
+        "the node's receipt, through the MCP server and Claude Code: {receipt}"
+    );
+    let on_node = root
+        .join("laptop-work")
+        .join(ticket.id.as_str())
+        .join("here.txt");
+    assert_eq!(
+        std::fs::read_to_string(on_node).unwrap(),
+        "hello from the laptop\n"
+    );
+    let here = state
+        .join(TICKETS_DIR)
+        .join(ticket.id.as_str())
+        .join("work/here.txt");
+    assert!(!here.exists(), "run_code ran on the agent's host");
 }

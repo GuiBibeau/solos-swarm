@@ -953,7 +953,10 @@ mod tests {
                 source: "slack".into(),
                 budget_microusd: 1_000_000,
             },
-            plan: Plan::Session { harness: None },
+            plan: Plan::Session {
+                harness: None,
+                environment: None,
+            },
             channels: vec![ChannelRef {
                 source: "slack".into(),
                 address: BTreeMap::from([("channel".to_owned(), "C1".to_owned())]),

@@ -74,7 +74,10 @@ fn accept(plan: Plan, budget: u64) -> Verdict {
 }
 
 fn session() -> Plan {
-    Plan::Session { harness: None }
+    Plan::Session {
+        harness: None,
+        environment: None,
+    }
 }
 
 fn launched(effects: &[Effect]) -> Vec<(TicketId, solos_agent_core::model::AssignmentId, Plan)> {

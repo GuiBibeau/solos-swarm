@@ -142,7 +142,10 @@ fn accept() -> Verdict {
         title: "Fix it".into(),
         scope: "Fix it".into(),
         reason: "asked".into(),
-        plan: Plan::Session { harness: None },
+        plan: Plan::Session {
+            harness: None,
+            environment: None,
+        },
         budget_microusd: 1_000_000,
         acknowledge: Acknowledge::Silent,
         rules: Vec::new(),

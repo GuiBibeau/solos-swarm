@@ -5,6 +5,7 @@
 
 pub mod broker;
 pub mod config;
+pub mod environment;
 pub mod github;
 pub mod goal_template;
 pub mod jobs;
@@ -30,6 +31,7 @@ use crate::code::{CodeConfig, CodeExecutor};
 use crate::gateway::{Provider, provider_for, upstream_profile};
 use crate::harness::claude_code::ClaudeCodeHarness;
 use crate::harness::{AgentHarness, PiHarness, Role, SessionSpec};
+use crate::remote::Listener;
 use anyhow::{Context, Result, bail, ensure};
 use broker::{
     AgentBroker, BrokerParts, DecideTerms, Grant, ModelTerms, Principal, ROUTER_TOOLS, WorkerParts,
@@ -154,10 +156,20 @@ where
     private_dir(state_dir)?;
     let store = SqliteStore::open(state_dir.join(STORE_FILE)).context("cannot open the store")?;
     let (facts, inbound) = ports::FactSink::channel();
+    let nodes = match &config.nodes {
+        Some(nodes) => Some(Listener::start(nodes).await?),
+        None => None,
+    };
     let pi = match (config.pi_upstream(), host) {
         (None, _) => None,
         (Some(_), None) => bail!("a pi router or pi workers need a session host"),
-        (Some(_), Some(host)) => Some(PiParts::new(&config, state_dir, host, facts.clone())?),
+        (Some(_), Some(host)) => Some(PiParts::new(
+            &config,
+            state_dir,
+            host,
+            facts.clone(),
+            nodes.as_ref(),
+        )?),
     };
     let router: Arc<dyn Router> = match pi.as_ref().and_then(|pi| pi.router.clone()) {
         Some(router) => router,
@@ -191,6 +203,9 @@ where
     if let Some(served) = served {
         served.stop().await;
     }
+    if let Some(nodes) = nodes {
+        nodes.stop().await;
+    }
     summary
 }
 
@@ -221,6 +236,7 @@ where
         state_dir: &Path,
         host: PiHost<H>,
         facts: ports::FactSink,
+        nodes: Option<&Listener>,
     ) -> Result<Self> {
         let PiHost {
             harness,
@@ -277,7 +293,14 @@ where
             decide: DecideTerms::for_config(config),
             workers,
         };
-        let broker = AgentBroker::with_jobs(parts, job_limits)?;
+        let remote = environment::Nodes {
+            default: match &config.executor {
+                ExecutorConfig::Pi { environment, .. } => environment.clone(),
+                ExecutorConfig::Scripted {} => None,
+            },
+            nodes: nodes.map(Listener::environments).unwrap_or_default(),
+        };
+        let broker = AgentBroker::with_nodes(parts, job_limits, remote)?;
         let swarm = match &config.executor {
             ExecutorConfig::Pi {
                 provider: name,
@@ -439,12 +462,14 @@ fn router_session(
             max_input_bytes: *max_input_bytes,
             max_output_tokens: *max_output_tokens,
         },
-        system_prompt: Some(pi_router::system_prompt(
-            instructions.as_deref(),
-            &config.policy,
-            rules,
-            &DecideTerms::for_config(config),
-        )),
+        system_prompt: Some(
+            pi_router::system_prompt(
+                instructions.as_deref(),
+                &config.policy,
+                rules,
+                &DecideTerms::for_config(config),
+            ) + &config.environment_note(),
+        ),
     };
     Ok((spec, grant))
 }
@@ -576,7 +601,8 @@ impl Io {
     }
 }
 
-async fn shutdown() {
+/// SIGINT or SIGTERM.
+pub async fn shutdown() {
     let terminate = async {
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
             Ok(mut signal) => {

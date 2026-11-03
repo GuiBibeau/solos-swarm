@@ -831,7 +831,7 @@ async fn a_worker_reports_with_the_ledgers_spend_and_calls_only_its_own_tools() 
             ["worker_report", "worker_handback", "fetch_url"],
             "no run_code and no job tools on a host without run_code"
         );
-        assert_eq!(served.broker.worker_tools(), listed, "its grants");
+        assert_eq!(served.broker.worker_tools(None), listed, "its grants");
         for tool in ROUTER_TOOLS.iter().chain(&WORKER_TOOLS) {
             let (status, reply) = served
                 .post(&format!("tool/{tool}"), Some(WORKER), json!({}))

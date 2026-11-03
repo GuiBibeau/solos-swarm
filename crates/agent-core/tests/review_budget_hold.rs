@@ -70,7 +70,10 @@ fn verdict(plan: Plan, budget: u64) -> Verdict {
 }
 
 fn session() -> Plan {
-    Plan::Session { harness: None }
+    Plan::Session {
+        harness: None,
+        environment: None,
+    }
 }
 
 fn rep(status: ReportStatus, question: Option<&str>) -> ReportIn {

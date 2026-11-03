@@ -47,7 +47,10 @@ fn script<R: Repositories>(e: &mut AnyEngine<R>, now: &Cell<u64>) -> EvalId {
     e.receive(slack("t1", alice(), "th1", "@agent fix the flake"))
         .unwrap();
     let eval = one_eval(e);
-    let session = Plan::Session { harness: None };
+    let session = Plan::Session {
+        harness: None,
+        environment: None,
+    };
     let first = ticket_of(e, &eval, accept("Fix the flake", session, 1_000_000));
     let assignment = latest(e, &first);
     e.assignment_started(&first, &assignment).unwrap();

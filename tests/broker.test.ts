@@ -239,6 +239,7 @@ test("the router tool set talks to the broker, takes its system prompt and sees 
         assert.deepEqual(body.tools.map((tool: { function: { name: string } }) => tool.function.name).sort(), routerNames);
         const decide = body.tools.find((tool: { function: { name: string } }) => tool.function.name === "router_decide");
         assert.deepEqual(decide.function.parameters.properties.decision.enum, ["accept", "ignore", "stop"]);
+        assert.equal(decide.function.parameters.properties.environment.type, "string");
         const system = body.messages.find((message: { role: string }) => message.role === "system");
         assert.ok(JSON.stringify(system?.content ?? "").includes("You are the test Router."), JSON.stringify(body.messages));
         if (modelCalls === 1) {
