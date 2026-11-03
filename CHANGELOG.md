@@ -72,6 +72,11 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   their own lines). The research words in the swarm runtime are now optional Goal fields: `nudges`, one template
   per escalation stage, and `record_fields`, the Task fields a host-filed record reads. `Goal::validate` checks
   them, a Goal template can set them, and a Goal without them runs exactly as before.
+- Agent mode, P7a: `solos-swarm mcp`, a hand-written stdio MCP server. `--socket --token-file` offers one principal's
+  broker tools (the broker's new `GET /tools`, from a Rust tool registry the Pi extension's schemas are tested
+  against), with refusals as `isError` results and pauses waited out; `--state-dir --operator` offers `agent_status`,
+  `agent_request` (a Trigger from `mcp:<operator>` through the new `kind: mcp` Source) and `agent_replies` (the
+  `kind: mcp` Channel's outbox).
 - Agent mode, P7b: Claude Code workers. `executor.harness: claude-code` (or a Plan naming it) runs a session Ticket
   on the installed `claude`, headless in bwrap with no network and no key, its only tools the broker's through
   `solos-swarm mcp`, and its model the agent broker's new Anthropic Messages facade (`POST /v1/messages`, SSE too,

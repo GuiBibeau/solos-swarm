@@ -3,7 +3,7 @@
 
 use super::{AgentConfig, Interval};
 use crate::agent::watchdog::Thresholds;
-use crate::agent::{github, slack};
+use crate::agent::{github, mcp, slack};
 use anyhow::{Result, ensure};
 use serde::Deserialize;
 use solos_agent_core::model::ChannelRef;
@@ -107,6 +107,11 @@ impl AgentConfig {
                         .and_then(|n| n.parse::<u64>().ok())
                         .is_some_and(|n| n > 0),
                 "watchdog.operator on github needs a repo (owner/name) and an issue number"
+            ),
+            mcp::SOURCE => ensure!(
+                address.get("operator").is_some_and(|o| mcp::valid_name(o))
+                    && address.get("thread").is_some_and(|t| mcp::valid_name(t)),
+                "watchdog.operator on mcp needs an operator and a thread"
             ),
             _ => ensure!(!address.is_empty(), "watchdog.operator has no address"),
         }

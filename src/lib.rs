@@ -21,6 +21,7 @@ pub mod harness;
 pub mod identity;
 pub mod kernel;
 pub mod ledger;
+pub mod mcp;
 pub mod modules;
 pub mod node;
 pub mod operator;

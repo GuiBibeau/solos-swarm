@@ -3,7 +3,8 @@
 //! left; the per-Ticket limit; jobs that die with their Assignment; who may
 //! see a job; `run_code` moving to the background; a job's end reaching the
 //! worker once, in its turn or as one Input after it; and `job_wait` cut
-//! short by new input. Each test skips without Linux, bwrap and prlimit.
+//! short by new input; and `GET /tools` on a host with `run_code`. Each
+//! test skips without Linux, bwrap and prlimit.
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -12,9 +13,10 @@ use solos_agent_core::model::{
     Actor, Addressed, AssignmentId, ChannelRef, InputBody, ThreadKey, TicketId, Trigger, TriggerId,
 };
 use solos_agent_store::SqliteStore;
+use solos_swarm::agent::broker::registry::{self, PrincipalKind};
 use solos_swarm::agent::broker::{
     self, Account, AgentBroker, BrokerParts, DecideTerms, Grant, ModelTerms, Principal,
-    WorkerParts, WorkerSeat,
+    ROUTER_TOOLS, WORKER_TOOLS, WorkerParts, WorkerSeat,
 };
 use solos_swarm::agent::jobs::JobLimits;
 use solos_swarm::agent::jsonl::{JsonlChannel, JsonlSource};
@@ -315,6 +317,45 @@ async fn until_gone(marker: &str) {
 
 fn new_marker() -> String {
     format!("job-{}", uuid::Uuid::new_v4().simple())
+}
+
+#[tokio::test]
+async fn get_tools_lists_run_code_and_the_job_tools_on_a_host_with_run_code_and_each_is_callable() {
+    if !sandbox() {
+        return;
+    }
+    let w = World::new("tools");
+    let (_seat, token) = w.worker("tk_a", "as_a");
+    let response = w
+        .client
+        .get("http://broker/tools")
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let listed: Value = response.json().await.unwrap();
+    assert_eq!(
+        listed["tools"],
+        serde_json::to_value(registry::tools(PrincipalKind::Worker)).unwrap(),
+        "every worker tool, from the registry"
+    );
+    let names: Vec<&str> = listed["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, WORKER_TOOLS);
+    assert_eq!(w.broker.worker_tools(), WORKER_TOOLS, "its grants");
+    for tool in ROUTER_TOOLS.iter().chain(&WORKER_TOOLS) {
+        let (status, reply) = w.post(tool, &token, json!({})).await;
+        assert_eq!(
+            status != 403,
+            names.contains(tool),
+            "GET /tools lists exactly what the worker may call: {tool} {status} {reply}"
+        );
+    }
 }
 
 #[tokio::test]

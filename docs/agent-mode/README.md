@@ -24,10 +24,11 @@ and its MIT-licensed prototype `deepseek-ai/dsh-superagent-prototype` (docs 000-
 | P8 GitHub and schedules | **Done.** `src/agent/github/`: `GithubSource` polls each listed repository's issues and pull requests, issue and review comments `since` a cursor, and its latest workflow runs, over REST (nothing exposed); `GithubChannel` comments on the issue or pull request. Configured as `kind: github` with a personal access token file that is deleted once read. An issue or pull request is the Thread `github:<owner>/<repo>#<number>`; its opening, each comment (`github:<owner>/<repo>:comment:<id>`) and each failed workflow run on a pull request (a bot Trigger on that pull request's Thread) are Triggers. A mention of the agent's login addresses it, `[bot]` accounts are bots, and the agent's own comments are dropped. Listings are conditional (`ETag`), rate limits are waited out, and the read position is an atomic file in the state directory that a restart resumes from without sending a Trigger twice. Each comment ends with a hidden marker naming its `MessageId`, so a crash between a post and its done mark does not post twice. `src/agent/schedule.rs`: `ScheduleSource` (`kind: schedule`) fires named slots, `every` an interval or `daily_at` a UTC time, as System Triggers `schedule:<name>:<slot start>`: a restart cannot fire a slot twice, and missed slots fire once. A schedule may name a `reply_to`. No new dependencies. Tests run against a fake GitHub and a clock the test moves, including one `agent serve` end to end. |
 | P3d Pi workers | **Done.** `src/agent/pi_executor.rs`: `PiExecutor` runs each `Plan::Session` Assignment as a keyless Pi worker session in bwrap, in its Ticket's directory under the state dir, with an optional prepare command run once per Ticket and at most `max_workers` sessions at once (`executor: {kind: pi, ...}`). The agent broker admits each worker as a `Worker` principal on its Ticket's account, so the Mandate budget caps every Assignment of the Ticket together, and serves `worker_report`, `worker_handback`, `run_code` and `fetch_url` (`SWARM_TOOLSET=worker`). A worker is prompted with its Assignment, then with new Inputs between turns; a quiet turn counts as `waiting`. A start ends what the last run left without a worker ("host restarted") and relaunches working Tickets with `recovery`, through the new `Engine::restart`. `run_code`'s mounts and scratch directory are configurable, with swarm runs' sandbox command pinned unchanged. `Plan::Swarm` reports `failed` until P5; background `run_code` jobs came with P3e. |
 | P6 Watchdog | **Done.** `src/agent/watchdog.rs`: a pure `assess(snapshot, now, thresholds)` over what the Store already holds, with no model: a Ticket waiting for a person (1h), a working Assignment with no Report (30m), an Effect with 3 failed attempts, an `unavailable` Decision in the last hour, an account at 80% of its cap, and a pause file held for 1h. Each alert id hashes its kind, its subject (with the problem's start) and a 6h bucket. With a `watchdog` section in agent.yaml, `agent serve` runs it every minute, tells the operator's conversation each new alert once through its Channel, and records it in `watchdog_alerts` (schema v3), so a restart tells nothing new. `retry_stalled` retries a stalled Assignment once per Ticket through the runtime. `solos-swarm agent status` reports Tickets, Decisions, Effects, spend, the pause and the current alerts from a read-only Store. Judging with a model whether a worker drifts from its goal is later. |
-| P3e Background jobs | **Done.** `src/agent/jobs.rs`: a worker with `run_code` also gets `job_start {code, timeout_s?}`, `job_wait {job, wait_s?}` and `job_stop {job}`. A job runs in its Ticket's `/work` under `run_code`'s sandbox and limits, returns its id at once and belongs to its Assignment: a stop, the Ticket's end, a dead session or a shutdown kills it, and a kill reaches every process of its sandbox, even in bwrap's first milliseconds. A `run_code` still running after `background_after_secs` (5) becomes a job when the Ticket has room; a short one returns exactly as before, and swarm runs keep their synchronous `run_code`. A job's end reaches the worker once: in a turn only its `job_wait` or `job_stop` takes it, and an end the turn left, or one that comes between turns, becomes a Note on the Ticket (`Fact::Note`, applied as `Engine::note`) that wakes the worker. No core change. |
+| P3e Background jobs | Done (#29). `src/agent/jobs.rs`: a worker with `run_code` also gets `job_start {code, timeout_s?}`, `job_wait {job, wait_s?}` and `job_stop {job}`. A job runs in its Ticket's `/work` under `run_code`'s sandbox and limits, returns its id at once and belongs to its Assignment: a stop, the Ticket's end, a dead session or a shutdown kills it, and a kill reaches every process of its sandbox, even in bwrap's first milliseconds. A `run_code` still running after `background_after_secs` (5) becomes a job when the Ticket has room; a short one returns exactly as before, and swarm runs keep their synchronous `run_code`. A job's end reaches the worker once: in a turn only its `job_wait` or `job_stop` takes it, and an end the turn left, or one that comes between turns, becomes a Note on the Ticket (`Fact::Note`, applied as `Engine::note`) that wakes the worker. No core change. |
 | P5 Swarm Tickets | Done (#28). `src/agent/swarm_executor.rs`: a `Plan::Swarm` Ticket runs one governed swarm per Assignment through `swarm::run_goal_until` on the Pi workers' harness, provider and credential (`executor.swarm`). Its Goal is rendered from a YAML template (`src/agent/goal_template.rs`, minijinja, every placeholder an escaped YAML literal) with the Ticket's title, scope, agent count and remaining budget, checked with `Goal::validate` at config load and at launch. The Goal's budget is the Mandate budget minus what the Ticket's account committed, and the run's spend is charged on that account (`SqliteStore::charge`, once per run) before its Report. At most `max_runs` swarms run at once (default 1). A Stop cancels a run through the new cancel input of `run_goal_until`, which `solos-swarm run` does not use, and the agent's pause holds running swarms. Completed reports `ready` with the findings, the spend and the artifact; stopped reports `failed`; drained reports `waiting`. A restart relaunches an interrupted swarm in a new run directory and charges the old one from its `state.json`. The Router's prompt says when a swarm pays for itself, and `router_decide` takes `goal_template`. |
+| P7a MCP server | **Done.** `solos-swarm mcp` (`src/mcp.rs`, `src/mcp/`) is a stdio Model Context Protocol server written by hand on `serde_json`: JSON-RPC 2.0, one message per line, with `initialize`, `ping`, `tools/list` and `tools/call`; notifications get no reply, an unknown method the standard error. With `--socket` and `--token-file` it offers one principal's tools through the agent broker: the token file is read once and deleted, `tools/list` is the broker's new `GET /tools` (the calling token's tools from a Rust registry, `src/agent/broker/registry.rs`, without `run_code` and the job tools where the host offers no `run_code`), a call is `POST /tool/{name}`, a refusal is an `isError` result carrying the broker's reason, and a 503 pause is waited out up to `--max-pause-wait-secs` (45) and then reported. With `--state-dir` and `--operator NAME` it offers an operator `agent_status` (the `agent status` report as JSON), `agent_request` (a Trigger from `mcp:NAME` through the new `kind: mcp` Source, an inbox in the state directory, so the Policy admits it or not as it would a Slack person) and `agent_replies` (what the `kind: mcp` Channel sent back on a thread). A fixture, `tests/fixtures/agent-tools.json`, holds the registry and the Pi extension's TypeBox schemas equal, from a Rust test and a Node test. No new dependencies. Setup in [MCP hosts](#mcp-hosts). |
 | P7b Claude Code workers | **Done.** A session Ticket can run on Claude Code under the same governance as a Pi worker. The agent broker serves an Anthropic Messages facade, `POST /v1/messages` (`src/agent/broker/messages.rs`, translation in `src/gateway/anthropic.rs`): the same tokens (bearer or `x-api-key`), accounts, holds, settlement, model contract and 503 pause as `/model`, through the same code, with `stream: true` answered as SSE framed from the settled reply. `ClaudeCodeHarness` (`src/harness/claude_code.rs`) runs the installed `claude` headless (`--print`, stream-json in and out, `--bare`) in bwrap with no network, a tmpfs home and the Ticket's work directory read-only; its built-in tools are off and its only tools are the broker's, through `solos-swarm mcp`. Its model URL is a loopback port of the sandbox's own network namespace that `solos-swarm bridge` pipes to the broker socket, with the session's token as its API key. `executor.harness: claude-code` makes it the default, and a Plan naming `pi` or `claude-code` picks one; the port keeps its static dispatch. Checked with Claude Code 2.1.231 in `agent serve`. No new dependencies. Setup in [Claude Code workers](#claude-code-workers). |
-| P7, P9, P10 | Planned, below. |
+| P9, P10 | Planned, below. |
 
 ## What "super-agent" means here
 
@@ -149,7 +150,7 @@ and external work leaves as `Effect`s. The shell ports are async and live in the
 | `Source` | `run(sink, facts)`, with people's commands (Slack buttons) as `Fact::Command`; later `context(trigger, part)` for bounded recall | `JsonlSource` (P3b), `SlackSource` (P4), `GithubSource` and `ScheduleSource` (P8) | new |
 | `Channel` | `send(OutboundMessage, SendOptions { repeat, approval }) -> Sent \| Gone`; shapes text per medium (short chat, PRs structured) | `JsonlChannel` (P3b), `SlackChannel` (P4), `GithubChannel` (P8) | `src/agent/jsonl.rs`, `src/agent/slack/`, `src/agent/github/` |
 | `Store` | agent-core `Repositories` plus the effect queue | in-memory (P0), SQLite `crates/agent-store` (P3a) | new |
-| `ToolSurface` | How a session calls tools: `/model` and `/tool/{name}` on the broker | Pi extension (`extensions/broker.ts`) | add an MCP facade, so any MCP harness gets the same tools |
+| `ToolSurface` | How a session calls tools: `GET /tools`, `/model` (or `/v1/messages`, P7b) and `/tool/{name}` on the broker | Pi extension (`extensions/broker.ts`); `solos-swarm mcp` (P7a), so any MCP harness gets the same tools | the tool schemas live in `src/agent/broker/registry.rs`; the extension's copy is tested against it |
 
 `SessionSpec` names a role (`router`, `worker`, `swarm-agent`, `coordinator`), grants, model, working directory,
 broker endpoint and token, and sandbox mounts. That one type replaces the `agent-NN`/`agent-00` conventions and
@@ -394,7 +395,36 @@ provider through the real broker. It runs on macOS too. Swarm mode is the first 
   streak, and Evals that keep expiring before they turn `unavailable`; a pause as an action; and operator DMs that
   answer "what is running and why" with the status report.
 
-**P7: more harnesses, both directions.** P7b done; setup in [Claude Code workers](#claude-code-workers).
+**P7: more harnesses, both directions.** P7a and P7b done; setup in [MCP hosts](#mcp-hosts) and
+[Claude Code workers](#claude-code-workers).
+- Done (P7a): one source of truth for the agent broker's tools. `src/agent/broker/registry.rs` holds each tool's
+  name, description and JSON Schema, keyed by principal kind, and the broker serves the calling token's tools at
+  `GET /tools`. A worker's are the tools it is granted (`AgentBroker::worker_tools`): without `run_code` and the job
+  tools where the host offers no `run_code`. The Pi extension keeps its own TypeBox copy;
+  `tests/fixtures/agent-tools.json` is held equal to the registry by a Rust test and to the extension by a Node test,
+  so neither can drift.
+- Done (P7a): `solos-swarm mcp --socket PATH --token-file FILE`, a stdio MCP server for one principal, written by hand
+  on `serde_json` (JSON-RPC 2.0, one message per line, no SDK). It answers `initialize` (the protocol version the host
+  asks for when it is one of 2025-11-25, 2025-06-18, 2025-03-26 and 2024-11-05, else the newest, and the `tools`
+  capability), `ping`, `tools/list` (from `GET /tools`) and `tools/call` (`POST /tool/{name}` with the bearer token);
+  notifications get no reply. Requests run concurrently, so a call that waits does not hold up a `ping`. A broker
+  refusal is a tool result with `isError: true` and the broker's reason as its text, so the model can correct the
+  call; a tool the token was not offered is JSON-RPC error -32602, an unknown method -32601. A 503 pause reply is
+  waited out as the Pi extension does (`retry_after_s`, 0.1-300 s), for at most `--max-pause-wait-secs` (45, inside
+  a host's tool timeout), and then reported as an error that says nothing was done. The agent broker refuses only
+  `/model` while paused, never a tool call, so the test answers 503 in front of the real broker; the handling is
+  there so a pause gate on tools needs no client change. The token file is read once and deleted, and the token is
+  never logged. Nothing mints a principal's token outside the process that admits it yet, so this direction is P7b's
+  seam.
+- Done (P7a): `solos-swarm mcp --state-dir DIR --operator NAME [--config agent.yaml]`, the host direction for a
+  person. `agent_status` returns the `agent status` report as JSON, read-only. `agent_request {text, thread?}` files a
+  Trigger of source `mcp` and actor `NAME` (the Policy's `mcp:NAME`), addressed directly, on the Thread
+  `mcp:NAME:<thread>`, into the inbox of a new `kind: mcp` Source (`DIR/mcp/inbox.jsonl`, created by `agent serve`, so a
+  request where no agent reads them is refused instead of lost). The Policy's allowlist decides, as for Slack people:
+  an operator not in `policy.people` is ignored at the gate. Replies go to a new `kind: mcp` Channel
+  (`DIR/mcp/outbox.jsonl`, the JSONL outbox), and `agent_replies {thread}` reads the operator's own thread from it. A
+  Watchdog operator can be `{source: mcp, address: {operator: NAME, thread: alerts}}`. Approvals still take Slack
+  buttons.
 - Done (P7b): an Anthropic Messages facade on the agent broker, `POST /v1/messages`. A request goes through the same
   `Call` as `/model` (the model limit, the pause before any hold, the contract, the overrun stop, a hold and a
   settlement on the token's account). `gateway::anthropic` translates each way, so swarm mode can reuse it: `system`
@@ -411,14 +441,16 @@ provider through the real broker. It runs on macOS too. Swarm mode is the first 
   `content_block_delta` (`text_delta` or `input_json_delta`) and a `content_block_stop` per block, `message_delta`
   and `message_stop`, written after the call settled. A refusal is an Anthropic error body with the broker's
   reason; a pause also keeps `paused` and `retry_after_s` and sets `Retry-After`; a settled reply that cannot be
-  translated is a 502 with `x-should-retry: false`, since a retry would pay again. Any other path is a
-  `not_found_error`, told on stderr.
+  translated is a 502 with `x-should-retry: false`, since a retry would pay again. `HEAD /api/hello`, Claude
+  Code's preconnect, gets 200; any other path is a `not_found_error`, told on stderr.
 - Done (P7b): `ClaudeCodeHarness`, the `claude-code` harness of `executor` (`harness: claude-code`, or a Plan that
   names it; `PiExecutor<H, C>` matches a `HarnessKind` where a session starts, and each arm runs the same generic turn
   loop on its harness's own `Session` type, so there is no boxing). `solos-swarm bridge` (hidden) binds the loopback
   port, runs `claude` on its own stdio and exits with it. The `result` frame ends a turn and an error `result` is
   `Rejected` with its text, as is a session whose `swarm` MCP server did not connect; a prompt is one stream-json user
   message.
+- Later: a Router on Claude Code, and a `harness` argument to `router_decide`, so the Router can pick a worker's
+  harness per Ticket.
 - Later: `CodexHarness`. Codex 0.145.0 refuses `wire_api = "chat"` ("no longer supported"), so it needs a Responses
   facade, `POST /v1/responses`, answered as its SSE events (`response.created`, `response.output_item.added`,
   `response.output_text.delta`, `response.function_call_arguments.delta`, `response.output_item.done`,
@@ -428,8 +460,8 @@ provider through the real broker. It runs on macOS too. Swarm mode is the first 
   before it dropped it) would instead need `/v1/chat/completions` with `stream: true` answered as
   `chat.completion.chunk` deltas and `data: [DONE]`, close to a pass-through since the upstream already speaks it.
   `DeepSeekHarnessHarness` follows the same pattern.
-- *They host solos-swarm.* An MCP server (`solos-swarm mcp`) exposes `swarm_run`, `ticket_*` and the ledger as tools,
-  so another harness's session can be the Router or call a governed swarm.
+- Later: `swarm_run`, `ticket_*` and the ledger as host tools, so another harness's session can call a governed
+  swarm.
 
 **P8: GitHub and schedules.** Done; setup in [GitHub token](#github-token).
 - Done: a polling Source (`kind: github`) for the listed repositories, not the notifications API, which only works
@@ -722,6 +754,72 @@ On Slack, `address` takes `channel` and, for a thread, `thread_ts`; on GitHub, `
 top-level Slack post cannot be searched for like a thread reply, so a crash between a post and its record there can
 post one alert twice. `solos-swarm agent status --state-dir DIR --config agent.yaml` shows what it would raise now.
 
+## MCP hosts
+
+`solos-swarm mcp` speaks the Model Context Protocol on stdin and stdout, so a host such as Claude Code or Codex
+starts it as a stdio server. For a person handing the agent work, give the agent an `mcp` Source and Channel and let
+the operator's name ask for work:
+
+```yaml
+policy:
+  people: [mcp:alice]                  # the operator name the MCP host runs with
+sources:
+  - kind: mcp                          # reads <state dir>/mcp/inbox.jsonl, created at start
+channels:
+  - kind: mcp                          # writes <state dir>/mcp/outbox.jsonl
+watchdog:                              # optional: alerts readable with agent_replies {thread: alerts}
+  operator: {source: mcp, address: {operator: alice, thread: alerts}}
+router: {kind: scripted}
+executor: {kind: scripted}
+budgets: {session_microusd: 500000}
+```
+
+Start `agent serve` once so it creates the inbox. Then, in Claude Code (`.mcp.json` in a project, or
+`claude mcp add solos-agent -- solos-swarm mcp --state-dir /srv/agent/state --operator alice`):
+
+```json
+{
+  "mcpServers": {
+    "solos-agent": {
+      "type": "stdio",
+      "command": "/usr/local/bin/solos-swarm",
+      "args": ["mcp", "--state-dir", "/srv/agent/state", "--operator", "alice",
+               "--config", "/srv/agent/agent.yaml"]
+    }
+  }
+}
+```
+
+And in Codex (`~/.codex/config.toml`, or `codex mcp add solos-agent -- solos-swarm mcp --state-dir ...`):
+
+```toml
+[mcp_servers.solos-agent]
+command = "/usr/local/bin/solos-swarm"
+args = ["mcp", "--state-dir", "/srv/agent/state", "--operator", "alice", "--config", "/srv/agent/agent.yaml"]
+```
+
+The host then has `agent_request`, `agent_replies` and `agent_status`. A request returns its thread; the
+acknowledgement, any question and the result arrive there, and a follow-up names the same thread. `--config` only
+adds the Router's cap, the Watchdog's thresholds and a pause set in agent.yaml to `agent_status`. Checked with
+Claude Code 2.1.231 (`claude mcp list` shows it connected) and Codex 0.145.0: both list the three tools and call
+`agent_request`.
+
+For a principal, the process that admitted it starts `solos-swarm mcp --socket <state dir>/broker.sock --token-file
+FILE` with a fresh token file, which is read and deleted at start; the host then lists and calls exactly that
+principal's tools. Here is a Router's exchange, one JSON-RPC message per line:
+
+```
+> {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"host","version":"1"}}}
+< {"id":1,"jsonrpc":"2.0","result":{"capabilities":{"tools":{"listChanged":false}},"instructions":"...","protocolVersion":"2025-06-18","serverInfo":{"name":"solos-swarm","version":"0.1.0"}}}
+> {"jsonrpc":"2.0","method":"notifications/initialized"}
+> {"jsonrpc":"2.0","id":2,"method":"tools/list"}
+< {"id":2,"jsonrpc":"2.0","result":{"tools":[{"description":"...","inputSchema":{...},"name":"router_decide"},{"description":"...","inputSchema":{...},"name":"router_read"}]}}
+> {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"router_read","arguments":{"id":"nope"}}}
+< {"id":3,"jsonrpc":"2.0","result":{"content":[{"text":"no trigger, thread or ticket nope","type":"text"}],"isError":true}}
+> {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"run_code","arguments":{}}}
+< {"error":{"code":-32602,"message":"Unknown tool: run_code"},"id":4,"jsonrpc":"2.0"}
+```
+
 ## Security model
 
 - Trigger text is data. It cannot change a permission, a budget or the Policy (the core has no path for it).
@@ -734,6 +832,10 @@ post one alert twice. `solos-swarm agent status --state-dir DIR --config agent.y
 - Workers stay keyless: the broker holds the model key, and P9 keeps tool credentials on the node. A swarm's
   agents are keyless too, behind the swarm's own broker, and the Goal they run is the operator's template: Trigger
   text reaches it only as escaped values, and its budget is what the Ticket has left.
+- `solos-swarm mcp --socket` adds no authority: the broker checks every call against the token's grants. With
+  `--state-dir`, the operator name is not authenticated beyond file access: whoever can run it with access to the
+  state directory can file requests under any name, as anyone who can write the state directory can already do
+  anything. Treat `mcp:` entries in `policy.people` as local operators.
 - The event-driven surface is larger than a batch run's. Router and workers keep the `bwrap` sandbox, workers get
   no network except through broker tools, and the Router gets no `run_code`.
 - A Claude Code worker holds its broker token, as a Pi worker does, and no provider key. Its built-in tools are off,

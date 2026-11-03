@@ -5,9 +5,11 @@
 //! either. Each token names a principal, and every model call is held and
 //! settled against the principal's account in the agent Store.
 
+pub mod registry;
+
 use super::AgentConfig;
 use super::config::ExecutorConfig;
-use super::jobs::{Host, JobLimits, Jobs, Refused};
+use super::jobs::{Host, JOB_TOOLS, JobLimits, Jobs, Refused};
 use super::ports::{Applied, Fact, FactSink};
 use crate::broker::{FETCH_TOTAL_BYTES, fetch, now_ms};
 use crate::code::CodeExecutor;
@@ -17,8 +19,9 @@ use axum::{
     Json,
     extract::{DefaultBodyLimit, Path as RoutePath, State},
     http::{HeaderMap, StatusCode},
-    routing::post,
+    routing::{get, post},
 };
+use registry::PrincipalKind;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use solos_agent_core::model::{
@@ -72,6 +75,13 @@ impl Principal {
         match self {
             Self::Router => &ROUTER_TOOLS,
             Self::Worker(_) => &WORKER_TOOLS,
+        }
+    }
+
+    pub fn kind(&self) -> PrincipalKind {
+        match self {
+            Self::Router => PrincipalKind::Router,
+            Self::Worker(_) => PrincipalKind::Worker,
         }
     }
 }
@@ -468,6 +478,17 @@ impl AgentBroker {
             .is_some_and(|parts| parts.code.is_some())
     }
 
+    /// What a worker may call on this host: the worker tools, less
+    /// `run_code` and the job tools, which run in its sandbox, where this
+    /// host offers no `run_code`. A worker's grants and its `GET /tools`.
+    pub fn worker_tools(&self) -> Vec<&'static str> {
+        let run_code = self.offers_run_code();
+        WORKER_TOOLS
+            .into_iter()
+            .filter(|tool| run_code || !(*tool == "run_code" || JOB_TOOLS.contains(tool)))
+            .collect()
+    }
+
     /// Refuse `token` from now on. A call already admitted finishes; a
     /// worker's background jobs are killed.
     pub fn revoke(&self, token: &str) {
@@ -537,9 +558,10 @@ impl AgentBroker {
         Ok(axum::Router::new()
             .route("/model", post(model))
             .route("/tool/{name}", post(tool))
+            .route("/tools", get(tools))
             .route("/session", post(session))
             .route("/v1/messages", post(messages::messages))
-            .route("/api/hello", axum::routing::get(messages::hello))
+            .route("/api/hello", get(messages::hello))
             .fallback(messages::unrouted)
             // Above the admitted input on purpose, as in swarm mode: a
             // session replays its whole conversation, so the wire body may
@@ -586,6 +608,23 @@ async fn session(State(broker): State<AgentBroker>, headers: HeaderMap) -> Reply
         Some(prompt) => Ok(Json(json!({"system_prompt": prompt}))),
         None => Err(refuse(StatusCode::NOT_FOUND, "no system prompt")),
     }
+}
+
+/// The calling principal's tools from the registry: a worker's without
+/// `run_code` and the job tools where this host offers no `run_code`, so an
+/// MCP host lists only what it can call.
+async fn tools(State(broker): State<AgentBroker>, headers: HeaderMap) -> Reply {
+    let grant = broker.authenticate(&headers)?;
+    let kind = grant.principal.kind();
+    let callable = match &grant.principal {
+        Principal::Router => ROUTER_TOOLS.to_vec(),
+        Principal::Worker(_) => broker.worker_tools(),
+    };
+    let offered: Vec<_> = registry::tools(kind)
+        .into_iter()
+        .filter(|tool| callable.contains(&tool.name))
+        .collect();
+    Ok(Json(json!({"principal": kind, "tools": offered})))
 }
 
 async fn model(
