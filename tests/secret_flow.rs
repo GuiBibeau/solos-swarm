@@ -6,7 +6,10 @@ const ALLOWED: [&str; 2] = ["src/vault.rs", "src/vault/"];
 
 const ACCESSORS: [&str; 3] = ["reveal", "reveal_into", "reveal_password"];
 
-const CALLERS: [(&str, &str); 1] = [("src/browse/session.rs", "reveal_password")];
+const CALLERS: [(&str, &str); 2] = [
+    ("src/agent/broker/secrets.rs", "reveal_into"),
+    ("src/browse/session.rs", "reveal_password"),
+];
 
 /// Each function outside the vault's tests that reads a value straight
 /// from `SecretValue::reveal`, by file.

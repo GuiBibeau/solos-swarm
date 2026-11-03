@@ -438,10 +438,6 @@ impl KeyHeader {
     /// The keyed request builder: the key's header, marked sensitive, goes
     /// on `request` when its own URL is one of the key's hosts, so each
     /// redirect hop is judged by where it goes.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "fetch_url's keyed requests are its first caller")
-    )]
     pub(crate) fn reveal_into(&self, request: &mut reqwest::Request) {
         if !self.admits(request.url()) {
             return;
@@ -569,6 +565,13 @@ impl Vault {
         Ok(contents.items.into_iter().map(|item| item.info).collect())
     }
 
+    /// The items a Ticket may use, without values.
+    pub fn catalog(&self, context: &UseContext) -> Result<Vec<ItemInfo>> {
+        let mut items = self.list()?;
+        items.retain(|item| policy::for_requester(item, &context.requester));
+        Ok(items)
+    }
+
     /// Admit `name` for a fill on a page whose origin is `page`, as the
     /// browser engine reports it, never as the model or the page says.
     pub fn admit_login(
@@ -669,6 +672,11 @@ impl SandboxView {
         Self {
             visible: SYSTEM_BINDS.iter().map(PathBuf::from).chain(more).collect(),
         }
+    }
+
+    pub fn and(mut self, more: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.visible.extend(more);
+        self
     }
 
     /// Refused: `path`, after its symlinks, is under a visible path.

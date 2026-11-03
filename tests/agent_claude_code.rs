@@ -181,6 +181,7 @@ fn serve(scratch: &Scratch, budget_microusd: u64) -> Served {
         workers: Some(WorkerParts {
             terms: terms(),
             code: None,
+            vault: None,
         }),
     })
     .unwrap();

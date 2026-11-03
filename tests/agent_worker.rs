@@ -18,6 +18,7 @@ use solos_swarm::agent::{
 use solos_swarm::gateway::{Dispatch, Provider};
 use solos_swarm::harness::scripted::{Call, ScriptedHarness, ScriptedSession};
 use solos_swarm::harness::{AgentHarness, Observation, PiHarness, Session, SessionSpec};
+use solos_swarm::vault::{SandboxView, Vault, VaultConfig};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -969,5 +970,55 @@ impl Provider for RealWorker {
                       "usage":{"prompt_tokens":100,"prompt_cache_hit_tokens":0,"completion_tokens":50}}),
             )
         })
+    }
+}
+
+#[tokio::test]
+async fn serve_refuses_a_vault_where_a_worker_sandbox_can_read_it() {
+    let scratch = Scratch::new("vault-view");
+    let pi_root = scratch.root.join("pi");
+    let node_root = scratch.root.join("runtime");
+    let node = node_root.join("bin").join("node");
+    std::fs::create_dir_all(&pi_root).unwrap();
+    std::fs::create_dir_all(node.parent().unwrap()).unwrap();
+    std::fs::write(&node, "").unwrap();
+    std::fs::write(scratch.root.join("triggers.jsonl"), "").unwrap();
+    let tickets = scratch.state().join(TICKETS_DIR);
+    let elsewhere = scratch.root.join("keys");
+    for (place, dir, refused) in [
+        ("every Ticket's directory", &tickets, true),
+        ("Pi's checkout", &pi_root, true),
+        ("node's install", &node_root, true),
+        ("where no sandbox binds", &elsewhere, false),
+    ] {
+        let vault = VaultConfig {
+            path: dir.join("vault.enc"),
+            key_file: dir.join("vault.key"),
+        };
+        if !refused {
+            Vault::init(&vault, &SandboxView::new([])).unwrap();
+        }
+        let mut config = scratch.config(false, "");
+        config.vault = Some(vault);
+        let host = PiHost {
+            harness: scripted(),
+            provider: Model::new(Box::new(|_| Vec::new())),
+            pi_root: pi_root.clone(),
+            node: node.clone(),
+        };
+        let served = tokio::time::timeout(
+            LIMIT,
+            serve_with(config, &scratch.state(), true, Some(host)),
+        )
+        .await
+        .expect("serve did not go idle");
+        match served {
+            Ok(_) => assert!(!refused, "a vault in {place} was opened"),
+            Err(err) => {
+                let why = format!("{err:#}");
+                assert!(refused, "a vault {place} was refused: {why}");
+                assert!(why.contains("which a sandbox can read"), "{place}: {why}");
+            }
+        }
     }
 }

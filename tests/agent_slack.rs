@@ -17,6 +17,10 @@ use solos_agent_core::model::{
 };
 use solos_agent_core::{AllowlistPolicy, Repositories};
 use solos_agent_store::SqliteStore;
+use solos_swarm::agent::broker::{
+    self as agent_broker, AgentBroker, BrokerParts, DecideTerms, ModelTerms, VaultParts,
+    WorkerParts, WorkerSeat,
+};
 use solos_swarm::agent::jsonl::JsonlSource;
 use solos_swarm::agent::ports::{
     Answer, Applied, BoxFuture, Channel, Delivered, Delivery, Executor, Fact, FactSink, Launch,
@@ -28,6 +32,11 @@ use solos_swarm::agent::slack::{
     SlackChannel, SlackSource, Token,
 };
 use solos_swarm::agent::{Adapters, RunOptions, Runtime, STORE_FILE, ServeOptions, Summary, serve};
+use solos_swarm::gateway::{Dispatch, PriceTable, Provider, Upstream};
+use solos_swarm::vault::{
+    Approval as ItemApproval, ItemKind, KeyScheme, NewItem, SandboxView, SecretValue, Vault,
+    VaultConfig,
+};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write;
 use std::net::SocketAddr;
@@ -1735,4 +1744,317 @@ budgets: {{session_microusd: {BUDGET}}}
     }
     assert_eq!(fake.slack().acks, ["e1"]);
     assert_settled(&scratch.store());
+}
+
+const PROBE_KEY: &str = "sk-Pr0be-k3y-value-42";
+
+struct NoModel;
+
+impl Provider for NoModel {
+    fn dispatch(&self, _: Value) -> Dispatch {
+        Box::pin(async { Err(anyhow::anyhow!("no model in this test")) })
+    }
+}
+
+#[derive(Default)]
+struct KeyedWorker {
+    launched: Mutex<Option<(TicketId, AssignmentId)>>,
+    delivered: Mutex<Vec<Delivered>>,
+}
+
+impl KeyedWorker {
+    fn verdicts(&self) -> Vec<bool> {
+        let handed = self.delivered.lock().unwrap();
+        handed
+            .iter()
+            .filter_map(|d| match &d.input.body {
+                InputBody::Secret { granted, .. } => Some(*granted),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn typed(&self) -> Vec<String> {
+        let handed = self.delivered.lock().unwrap();
+        handed
+            .iter()
+            .filter_map(|d| d.trigger.as_ref().map(|t| t.text.clone()))
+            .collect()
+    }
+}
+
+impl Executor for KeyedWorker {
+    fn launch(&self, launch: Launch, facts: FactSink) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            let started = Fact::Started {
+                ticket: launch.ticket.clone(),
+                assignment: launch.assignment.clone(),
+            };
+            facts.send(started).await?;
+            *self.launched.lock().unwrap() = Some((launch.ticket, launch.assignment));
+            Ok(())
+        })
+    }
+    fn deliver(&self, delivery: Delivery, _: FactSink) -> BoxFuture<'_, Result<()>> {
+        self.delivered.lock().unwrap().extend(delivery.inputs);
+        Box::pin(async { Ok(()) })
+    }
+    fn stop(&self, _: TicketId, _: AssignmentId, _: String) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+struct KeyedSite {
+    host: String,
+    seen: Arc<Mutex<Vec<Option<String>>>>,
+    task: JoinHandle<()>,
+}
+
+impl KeyedSite {
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+        let kept = seen.clone();
+        let app = axum::Router::new().fallback(move |headers: HeaderMap| {
+            let authorization = headers
+                .get(header::AUTHORIZATION)
+                .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned());
+            kept.lock().unwrap().push(authorization);
+            async { "ok" }
+        });
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        Self { host, seen, task }
+    }
+
+    fn seen(&self) -> Vec<Option<String>> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+impl Drop for KeyedSite {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+struct KeyedBroker {
+    broker: AgentBroker,
+    client: reqwest::Client,
+    url: String,
+    server: JoinHandle<()>,
+}
+
+impl KeyedBroker {
+    fn serve(scratch: &Scratch, runtime: &Runtime, site: &KeyedSite) -> Self {
+        let config = VaultConfig {
+            path: scratch.root.join("keys").join("vault.enc"),
+            key_file: scratch.root.join("keys").join("vault.key"),
+        };
+        let view = SandboxView::new([]);
+        Vault::init(&config, &view).unwrap();
+        let vault = Vault::open(&config, &view).unwrap();
+        let value = scratch.root.join("probe.value");
+        std::fs::write(&value, PROBE_KEY).unwrap();
+        let probe = NewItem {
+            name: "probe".parse().unwrap(),
+            kind: ItemKind::Key {
+                hosts: vec![site.host.parse().unwrap()],
+                header: "authorization".parse().unwrap(),
+                scheme: KeyScheme::Bearer,
+                about: "the probe API".into(),
+            },
+            users: ["slack:UALICE".to_owned()].into(),
+            approval: ItemApproval::FirstUse,
+            value: SecretValue::read_once(&value).unwrap(),
+        };
+        vault.add(probe, false).unwrap();
+        let state = scratch.root.join("state");
+        let parts = BrokerParts {
+            dir: state.clone(),
+            store: scratch.store(),
+            provider: Arc::new(NoModel),
+            facts: runtime.facts(),
+            decide: DecideTerms {
+                default_budget_microusd: BUDGET,
+                max_budget_microusd: None,
+                swarm: None,
+            },
+            workers: Some(WorkerParts {
+                terms: ModelTerms {
+                    upstream: Upstream::deepseek("deepseek-flash"),
+                    prices: PriceTable {
+                        input_microusd_per_million: 300_000,
+                        output_microusd_per_million: 1_200_000,
+                        cache_hit_microusd_per_million: None,
+                    },
+                    max_input_bytes: 65_536,
+                    max_output_tokens: 1_024,
+                    call_limit: None,
+                },
+                code: None,
+                vault: Some(VaultParts {
+                    vault,
+                    takes_approvals: true,
+                }),
+            }),
+        };
+        let broker = AgentBroker::new(parts).unwrap();
+        let (listener, socket) = agent_broker::bind(&state).unwrap();
+        let app = broker.router().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .unix_socket(socket)
+            .build()
+            .unwrap();
+        Self {
+            broker,
+            client,
+            url: format!("http://{}/v1/models", site.host),
+            server,
+        }
+    }
+
+    async fn admit_worker(&self, worker: &KeyedWorker) -> String {
+        let (ticket, assignment) = until_some("the ticket's launch", || {
+            worker.launched.lock().unwrap().clone()
+        })
+        .await;
+        let seat = WorkerSeat::new(ticket, assignment, PathBuf::from("/nowhere"), BUDGET);
+        self.broker
+            .admit_worker("worker".into(), seat, "You are a worker.".into())
+            .unwrap();
+        "worker".into()
+    }
+
+    async fn fetch(&self, token: &str) -> (u16, Value) {
+        let response = self
+            .client
+            .post("http://broker/tool/fetch_url")
+            .bearer_auth(token)
+            .json(&json!({"url": self.url, "key": "probe"}))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        (status, response.json().await.unwrap())
+    }
+}
+
+impl Drop for KeyedBroker {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+fn keyed_agent<'a>(fake: &Fake, scratch: &'a Scratch, worker: &Arc<KeyedWorker>) -> Agent<'a> {
+    Agent {
+        scratch,
+        source: fake.source(true),
+        channel: Some(fake.channel()),
+        executor: worker.clone(),
+        budget: BUDGET,
+        until_idle: false,
+    }
+}
+
+fn error(reply: &Value) -> &str {
+    reply["error"].as_str().unwrap_or_default()
+}
+
+#[tokio::test]
+async fn a_keyed_fetch_waits_for_a_click_on_allow_and_typed_allow_grants_nothing() {
+    let fake = Fake::start().await;
+    let scratch = Scratch::new("keyed-allow");
+    let site = KeyedSite::start().await;
+    let worker = Arc::new(KeyedWorker::default());
+    let runtime = keyed_agent(&fake, &scratch, &worker).runtime();
+    let keyed = KeyedBroker::serve(&scratch, &runtime, &site);
+
+    let driver = async {
+        let conn = fake.connection().await;
+        conn.send(event("e1", mention(THREAD, "UALICE", REQUEST)));
+        let token = keyed.admit_worker(&worker).await;
+        let (status, asked) = keyed.fetch(&token).await;
+        assert_eq!(status, 409, "{asked}");
+        assert_eq!(
+            error(&asked),
+            format!(
+                "A person must allow this ticket to send the API key probe to {} first; they \
+                 were asked in the thread. End your turn: their answer comes back as new input.",
+                site.host
+            )
+        );
+        let ask = fake.until_text(&format!("{REQUEST} wants to")).await;
+
+        let mut typed = message("C1", "700.000002", "UALICE", "allow");
+        typed["thread_ts"] = json!(THREAD);
+        conn.send(event("e2", typed));
+        until_some("the typed allow handed to the worker", || {
+            (!worker.typed().is_empty()).then_some(())
+        })
+        .await;
+        let (status, still) = keyed.fetch(&token).await;
+        assert_eq!(status, 409, "typed allow grants nothing: {still}");
+        assert!(
+            error(&still).starts_with("A person has not yet allowed this ticket"),
+            "{still}"
+        );
+        assert!(site.seen().is_empty(), "nothing left before the click");
+
+        click_on(&conn, &ask, true, ALICE, "e3").await;
+        until_some("alice's answer handed to the worker", || {
+            (!worker.verdicts().is_empty()).then_some(())
+        })
+        .await;
+        keyed.fetch(&token).await
+    };
+    let (_, (status, fetched)) = drive(runtime, driver).await;
+
+    assert_eq!((status, &fetched["body"]), (200, &json!("ok")), "{fetched}");
+    assert_eq!(worker.typed(), ["allow"]);
+    assert_eq!(
+        worker.verdicts(),
+        [true],
+        "the click reached the worker as an Input"
+    );
+    assert_eq!(
+        site.seen(),
+        [Some(format!("Bearer {PROBE_KEY}"))],
+        "the key left once, after the click"
+    );
+    assert!(!fetched.to_string().contains(PROBE_KEY));
+}
+
+#[tokio::test]
+async fn a_keyed_fetch_is_refused_once_its_first_use_is_denied() {
+    let fake = Fake::start().await;
+    let scratch = Scratch::new("keyed-deny");
+    let site = KeyedSite::start().await;
+    let worker = Arc::new(KeyedWorker::default());
+    let runtime = keyed_agent(&fake, &scratch, &worker).runtime();
+    let keyed = KeyedBroker::serve(&scratch, &runtime, &site);
+
+    let driver = async {
+        let conn = fake.connection().await;
+        conn.send(event("e1", mention(THREAD, "UALICE", REQUEST)));
+        let token = keyed.admit_worker(&worker).await;
+        let (status, asked) = keyed.fetch(&token).await;
+        assert_eq!(status, 409, "{asked}");
+        let ask = fake.until_text(&format!("{REQUEST} wants to")).await;
+        click_on(&conn, &ask, false, ALICE, "e2").await;
+        until_some("alice's answer handed to the worker", || {
+            (!worker.verdicts().is_empty()).then_some(())
+        })
+        .await;
+        keyed.fetch(&token).await
+    };
+    let (_, (status, refused)) = drive(runtime, driver).await;
+
+    assert_eq!(
+        (status, error(&refused)),
+        (403, "a person denied probe for this ticket")
+    );
+    assert_eq!(worker.verdicts(), [false]);
+    assert!(site.seen().is_empty(), "the key never left");
 }

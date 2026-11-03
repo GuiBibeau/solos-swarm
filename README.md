@@ -30,8 +30,9 @@ A Rust control plane, scheduler, and capability broker for governed agent swarms
 - **Agent mode (in progress)**: a long-lived agent for Slack, Discord, GitHub and schedules that runs each request on one
   worker or on a governed swarm, sharing this broker, ledger, harness and sandbox. The pure domain is
   `crates/agent-core`. Plan: [docs/agent-mode/README.md](docs/agent-mode/README.md).
-- **Vault and verifiable browser (designed, not yet built)**: a secrets vault and a browser whose steps are signed, for
-  agent mode. Design: [docs/agent-mode/vault-browser/rationale.md](docs/agent-mode/vault-browser/rationale.md).
+- **Vault and verifiable browser (in progress)**: a secrets vault and a browser whose steps are signed, for agent mode.
+  Workers already use vault API keys through `fetch_url` without seeing them. Design:
+  [docs/agent-mode/vault-browser/rationale.md](docs/agent-mode/vault-browser/rationale.md).
 
 See [CHANGELOG.md](CHANGELOG.md) for what changed and when.
 

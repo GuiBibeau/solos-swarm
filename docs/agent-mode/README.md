@@ -31,7 +31,7 @@ and its MIT-licensed prototype `deepseek-ai/dsh-superagent-prototype` (docs 000-
 | P9 Remote nodes | Done (#33). `src/remote/`: `solos-swarm node serve` is a daemon on a user's machine that dials the agent's node listener (`nodes:` in agent.yaml) over TLS 1.3, where each side pins the other's self-signed certificate from `node init` and `agent init-nodes`. A worker's `run_code` and background jobs on a Ticket bound to a node run in the node's own bwrap sandbox, through the same `CodeExecutor`, with the node's mounts, and come back as local `run_code`'s receipts. The new `ExecutionEnvironment` port (`src/agent/environment.rs`) picks this host or a node per Ticket. Core change: `Plan::Session` takes an optional `environment` (stored Plans read as before), which `router_decide` may name and `executor.environment` defaults. An offline node is a 503 tool error, and its Ticket's Launch waits on the effect runner's backoff until it connects. Node secrets stay on the node, reach the sandbox through its environment or `/secrets`, and are redacted from what it sends. Swarm runs unchanged. |
 | P10 Benchmark | Done (#34). `solos-swarm agent bench` (`src/agent/bench/`) reproduces the article's ablation. A seeded generator writes the Triggers file: chatter from allowed and unlisted people, CI and bot messages and follow-ups on request Threads, and about 20 addressed requests, each with its expected work in `meta.bench.work_ms`, at a Poisson or even rate. `executor: {kind: simulated}` (`src/agent/simulated.rs`) takes each request's time on a scaled clock and reports `ready`. The designs are agent.yaml: `super-agent` as it is, `no-pass-through` (`pass_through: false`, backed by the one core change, `Engine::set_pass_through`), and `serial` (one worker slot, and the Router waits while work runs: an approximation of one session with a subagent tool). Each run serves a fresh agent, feeds the stream at its arrival times and reads completion, Router decisions, Evals, model calls, tokens and spend from the Store into `report.json` and `report.md`. `--router scripted` is free; `--router pi` refuses to start without `--max-spend-usd`, prints an estimate, and caps every run's Router account. The free scripted run (default workload, seeds 1 to 3, `--time-factor 0.01`): completion p50 / p95 10.2 / 15.7 min for `super-agent` and for `no-pass-through`, whose Router decides 25% more often (177 against 142 a run), and 82.4 / 177.3 for `serial`, with no request unfinished. |
 | P11 Discord | Done (#35). `src/agent/discord/`: `DiscordSource` holds one Gateway v10 connection (an outbound WebSocket, nothing exposed) and `DiscordChannel` posts over REST, configured as `kind: discord` and read from a token file that is deleted once read. The Source dials the URL `GET /gateway/bot` names, heartbeats at Hello's interval with a random first beat and the last sequence number, identifies with the Guilds, Guild Messages, Direct Messages and Message Content intents, and treats a heartbeat with no ACK as a zombie. A dropped socket, op 7 and an invalid session with `d: true` resume the session on `resume_gateway_url`; a refused resume, `d: false` and close codes 4007 and 4009 identify again after 1 to 5 s. Five connections in a row that never became ready drop the session, and a spent limit on new sessions is waited out. Close codes 4004 and 4010 to 4014 end the run with the fix named, such as turning on Message Content Intent. A message from a listed guild or channel (or a thread of a listed channel) becomes a Trigger `discord:<channel>:<message>` by `discord:<user id>`, and a mention (of the bot or its managed role) or a pinging reply is addressed, a DM direct. The Thread is one snowflake, `discord:<id>`: a thread channel's id, or the message at the top of a reply chain, which the Source keeps for the agent's own posts too, so a reply to the agent's answer joins its request, and a Discord thread started from a message is the message's Thread. Posts are replies, at most 2,000 characters (a marker says what was cut), parse no mentions, and carry a `nonce` derived from their `MessageId` with `enforce_nonce`, so a retry cannot post twice. A 429 waits `retry_after`, a 5xx retries and another 4xx drops the message. An approval request carries Approve and Stop buttons; a click is an interaction the Source acknowledges at once and applies as the same `Fact::Command` Slack's buttons feed, for the policy to judge. No new dependency. Tests run against a fake Discord (HTTP and a Gateway that keeps each session's events for a resume). |
-| P12 Vault and verifiable browser | In progress. Designed in #36; built so far: PR 1, capabilities in the tool registry (#38), PR 2, the sealed envelope and the vault with its `solos-swarm vault` CLI (#43), and PR 5, the trail in the core and schema V4 (#39). Nothing calls the vault or writes a trail step yet. [`vault-browser/`](vault-browser/rationale.md) holds the design: a write-only vault of logins and API keys used only on the machine that holds them, keyed `fetch_url` with first-use approval in chat, and a Lightpanda browser per Assignment whose every step is recorded in the chain and signed with Ed25519 by the machine that ran it, checked by a planned `solos-swarm agent trail`. The PRs in [`prs.md`](vault-browser/prs.md) are the plan: 1 to 8 first, browsers on nodes and keys in the browser later. |
+| P12 Vault and verifiable browser | In progress. Designed in #36; built so far: PR 1, capabilities in the tool registry (#38), PR 2, the sealed envelope and the vault with its `solos-swarm vault` CLI (#43), PR 3, approvals of vault items in the core, Slack and Discord (#47), PR 4, keyed `fetch_url` and `vault_list` (#48), PR 5, the trail in the core and schema V4 (#39), and PR 6, the `browse` module (#46). A worker now uses an API key it never sees. `fetch_url {key}` writes `KeyUsed` to the chain, sends the key only to the key's hosts, on each redirect hop that stays there and through no proxy, scrubs every vault value from what comes back, and asks the item's owner in the thread before its first use on a Ticket. Setup is in [Vault and API keys](#vault-and-api-keys). Nothing writes a trail step yet. [`vault-browser/`](vault-browser/rationale.md) holds the design: a write-only vault of logins and API keys used only on the machine that holds them, keyed `fetch_url` with first-use approval in chat, and a Lightpanda browser per Assignment whose every step is recorded in the chain and signed with Ed25519 by the machine that ran it, checked by a planned `solos-swarm agent trail`. The PRs in [`prs.md`](vault-browser/prs.md) are the plan: 1 to 8 first, browsers on nodes and keys in the browser later. |
 
 ## Later steps
 
@@ -1165,6 +1165,74 @@ node's is its own. The connection is TLS 1.3 (ALPN
 `solos-node/1`) with each side's certificate pinned; it carries 4-byte length-prefixed JSON frames of at most 16
 MiB.
 
+## Vault and API keys
+
+A Pi or Claude Code worker can call an API with a key that its model never sees. The key lives in this host's
+vault, and the broker adds it to requests to the key's own hosts. The model gets the response back with every vault
+value replaced by `[vault:<name>]`. The executor must be `pi`.
+
+1. Say where the vault and its key file live, outside every sandbox's view:
+
+   ```yaml
+   # agent.yaml
+   vault: {path: /var/lib/solos/vault.enc, key_file: /var/lib/solos-keys/vault.key}
+   ```
+
+   `solos-swarm vault init` refuses `/usr`, `/etc`, `/lib`, `/lib64`, `run_code`'s mounts and its `uv_root`, and a
+   Claude Code worker's binaries. `agent serve` also refuses to start when either file is under the state
+   directory's `tickets/`, `--pi-root` or the install directory of `--node`.
+
+2. Make the vault once:
+
+   ```sh
+   solos-swarm vault init --config agent.yaml
+   ```
+
+3. Add a key, bound to its host and to the header that carries it. The value comes on stdin or from a file that is
+   deleted after it is read, never as an argument:
+
+   ```sh
+   solos-swarm vault add-key --config agent.yaml --name openai --host api.openai.com \
+       --header authorization --scheme bearer --about "OpenAI API for research tickets" \
+       --for slack:U024BE7LH --value-file /run/secrets/openai
+   solos-swarm vault list --config agent.yaml
+   ```
+
+   `--for` names whose Tickets may use the key, and they are the only people asked to approve it. Without it, any
+   requester's Ticket may use it, and the Policy's approvers answer. `--approval` is `first-use` (the default), so a
+   person allows the key once per Ticket, or `none` for unattended use, such as a schedule's. A first-use item
+   needs an agent that takes approvals, which means a Slack or Discord channel and a `slack:` or `discord:`
+   approver in the Policy. Without one, its use is refused. Change a value with `--replace`, and remove an item
+   with `vault remove`. A write while the agent serves counts from the next call.
+
+4. Restart `agent serve`. Workers now see `vault_list`, and their `fetch_url` takes `key`:
+
+   ```text
+   → vault_list {}
+   ← {"keys":[{"key":"openai","hosts":["api.openai.com"],"about":"OpenAI API for research tickets",
+      "where":"local","use":["fetch_url"],"approval":"needed"}], "logins":[], "note":"You never see these values. …"}
+   → fetch_url {"url":"https://api.openai.com/v1/models","key":"openai"}
+   ✗ 409 "A person must allow this ticket to send the API key openai to api.openai.com first; they were asked in
+          the thread. End your turn: their answer comes back as new input."
+   ```
+
+   The Ticket's thread gets one message, "Triage the papers wants to send the API key openai to api.openai.com for
+   the first time.", with **Allow for this ticket** and **Deny**. Only a click answers. Typing "allow" in the thread
+   reaches the worker as text and grants nothing. The answer comes back to the worker as new input, and its next
+   call goes through:
+
+   ```text
+   → fetch_url {"url":"https://api.openai.com/v1/models","key":"openai"}
+   ← {"final_url":"https://api.openai.com/v1/models","status":200,"headers":{…},"body":"{\"data\":[…]}", …}
+   ```
+
+The grant holds for the Ticket's life, across its Assignments, and so does a Deny. Each keyed call writes `KeyUsed`
+(the key, the method and the first URL) to the chain before the request leaves. The key goes on a redirect only
+when that hop's own URL is one of the key's hosts, never over plain http to a host other than loopback, and never
+through a proxy that `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY` names. The response headers, the body and any
+error text are scrubbed of every value in the vault, in each encoding the scrubber knows, before the model sees
+them.
+
 ## Security model
 
 - Trigger text is data. It cannot change a permission, a budget or the Policy (the core has no path for it).
@@ -1195,7 +1263,12 @@ MiB.
   inside that node's sandbox, with its mounts and its secrets: the values never leave the node, but a command can
   use them, such as an API call with a token. Per-node capability leases (the `mvp` `DispatchPermit` design) are a
   later step. Until then, connect only machines whose mounts and secrets you would hand to the agent host.
-- The vault of logins and API keys (write-only, used only on the machine that holds them) and the verifiable browser are designed in [`vault-browser/`](vault-browser/rationale.md) and not yet built.
+- A worker names a vault key and never sees its value. The broker sends the key only to the key's hosts, over
+  https or to loopback, never through an ambient proxy, and only after `KeyUsed` is on the chain. What comes back
+  is scrubbed of every vault value, which catches a value the server echoes in a known encoding but not one it
+  transforms any other way. A first use that needs a person waits for a click, never for text. The vault file and
+  its key are refused wherever a sandbox can read them. Vault logins and the verifiable browser have no worker tool yet. Their
+  design is in [`vault-browser/`](vault-browser/rationale.md).
 
 ## Open decisions
 

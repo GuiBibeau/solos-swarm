@@ -368,7 +368,7 @@ test("SWARM_TOOLSET=router registers only the Router tools, whatever the role an
 
 const workerNames = ["fetch_url", "run_code", "worker_handback", "worker_report"];
 const jobNames = ["job_start", "job_stop", "job_wait"];
-const allWorkerNames = [...workerNames, ...jobNames].sort();
+const allWorkerNames = [...workerNames, ...jobNames, "vault_list"].sort();
 
 test("SWARM_TOOLSET=worker registers the worker tools that SWARM_GRANTS names and blocks every other call", () => {
   const saved = { role: process.env.SWARM_ROLE, grants: process.env.SWARM_GRANTS, toolset: process.env.SWARM_TOOLSET };
@@ -541,6 +541,40 @@ test("the router and worker tool schemas match the Rust registry that GET /tools
   } finally {
     restore("SWARM_GRANTS", saved.grants);
     restore("SWARM_TOOLSET", saved.toolset);
+  }
+});
+
+test("swarm mode's fetch_url keeps its schema, with no key", () => {
+  const saved = { grants: process.env.SWARM_GRANTS, toolset: process.env.SWARM_TOOLSET, role: process.env.SWARM_ROLE };
+  const restore = (name: string, value: string | undefined) => { if (value === undefined) delete process.env[name]; else process.env[name] = value; };
+  try {
+    delete process.env.SWARM_GRANTS;
+    delete process.env.SWARM_TOOLSET;
+    delete process.env.SWARM_ROLE;
+    const declared: { name: string, description: string, input_schema: unknown }[] = [];
+    swarmBroker({
+      registerProvider() {}, registerTool(tool) { declared.push({ name: tool.name, description: tool.description, input_schema: tool.parameters }); }, on() {},
+    } as ExtensionAPI);
+    const fetchUrl = declared.find((tool) => tool.name === "fetch_url");
+    assert.deepEqual(JSON.parse(JSON.stringify(fetchUrl)), {
+      name: "fetch_url",
+      description: "Fetch one live http(s) URL through the broker; returns status, headers and bounded body. Your only network egress.",
+      input_schema: {
+        type: "object",
+        required: ["url"],
+        properties: {
+          url: { type: "string", minLength: 1, maxLength: 2048 },
+          method: { type: "string" },
+          headers: { type: "object", properties: {}, additionalProperties: true },
+          body: { type: "string" },
+          max_bytes: { type: "number" },
+        },
+      },
+    });
+  } finally {
+    restore("SWARM_GRANTS", saved.grants);
+    restore("SWARM_TOOLSET", saved.toolset);
+    restore("SWARM_ROLE", saved.role);
   }
 });
 

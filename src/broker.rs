@@ -1301,6 +1301,16 @@ fn bounded_headers(map: &reqwest::header::HeaderMap) -> (BTreeMap<String, String
 /// URL is reported: a worker that is bounced to a login page has to see that it
 /// was, rather than receiving a 200 from somewhere it never asked for.
 pub async fn fetch(client: &reqwest::Client, args: &Value) -> Result<Value> {
+    fetch_with(client, args, |_| {}).await
+}
+
+/// [`fetch`], where `hop` may change each request just before it is sent,
+/// the first and every redirect, judging it by that request's own URL.
+pub async fn fetch_with(
+    client: &reqwest::Client,
+    args: &Value,
+    hop: impl Fn(&mut reqwest::Request),
+) -> Result<Value> {
     let raw = args["url"].as_str().context("fetch url missing")?;
     let url = reqwest::Url::parse(raw)?;
     ensure!(
@@ -1338,7 +1348,9 @@ pub async fn fetch(client: &reqwest::Client, args: &Value) -> Result<Value> {
         if let Some(body) = args["body"].as_str().filter(|b| !b.is_empty()) {
             builder = builder.body(body.to_owned());
         }
-        let response = builder.send().await?;
+        let mut request = builder.build()?;
+        hop(&mut request);
+        let response = client.execute(request).await?;
         let status = response.status();
         if status.is_redirection()
             && let Some(location) = response

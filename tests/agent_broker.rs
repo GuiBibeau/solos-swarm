@@ -14,7 +14,7 @@ use solos_agent_store::{SpendState, SqliteStore};
 use solos_swarm::agent::broker::registry::{self, PrincipalKind};
 use solos_swarm::agent::broker::{
     self, Account, AgentBroker, BrokerParts, DecideTerms, Grant, ModelTerms, Principal,
-    ROUTER_TOOLS, WORKER_TOOLS, WorkerParts, WorkerSeat,
+    ROUTER_TOOLS, VaultParts, WORKER_TOOLS, WorkerParts, WorkerSeat,
 };
 use solos_swarm::agent::environment::{ExecutionEnvironment, Nodes, Offline, Work};
 use solos_swarm::agent::jobs::JobLimits;
@@ -26,6 +26,7 @@ use solos_swarm::agent::scripted::{ScriptedExecutor, ScriptedRouter};
 use solos_swarm::agent::{Adapters, AgentConfig, RunOptions, Runtime, STORE_FILE};
 use solos_swarm::code::{OutputBounds, Started};
 use solos_swarm::gateway::{Dispatch, PriceTable, Provider, Upstream, upstream_body};
+use solos_swarm::vault::{SandboxView, Vault, VaultConfig};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
@@ -345,7 +346,15 @@ fn serve_deciding(
     daily: u64,
     decide: DecideTerms,
 ) -> Served {
-    serve_on(scratch, provider, facts, daily, decide, Nodes::default())
+    serve_on(
+        scratch,
+        provider,
+        facts,
+        daily,
+        decide,
+        Nodes::default(),
+        None,
+    )
 }
 
 fn serve_on(
@@ -355,6 +364,7 @@ fn serve_on(
     daily: u64,
     decide: DecideTerms,
     nodes: Nodes,
+    vault: Option<VaultParts>,
 ) -> Served {
     let parts = BrokerParts {
         dir: scratch.state(),
@@ -365,6 +375,7 @@ fn serve_on(
         workers: Some(WorkerParts {
             terms: terms(),
             code: None,
+            vault,
         }),
     };
     let broker = AgentBroker::with_nodes(parts, JobLimits::default(), nodes).unwrap();
@@ -1298,7 +1309,7 @@ impl ExecutionEnvironment for Laptop {
 const HERE: &str = "worker-here";
 const THERE: &str = "worker-there";
 
-fn serve_with_a_node(scratch: &Scratch) -> (Runtime, Served) {
+fn serve_with_a_node_and_a_vault(scratch: &Scratch) -> (Runtime, Served) {
     let runtime = scratch.runtime(Arc::new(Holding::default()), true);
     let nodes = Nodes {
         default: None,
@@ -1307,6 +1318,16 @@ fn serve_with_a_node(scratch: &Scratch) -> (Runtime, Served) {
             Arc::new(Laptop) as Arc<dyn ExecutionEnvironment>,
         )]),
     };
+    let config = VaultConfig {
+        path: scratch.root.join("vault.enc"),
+        key_file: scratch.root.join("vault.key"),
+    };
+    let view = SandboxView::new([]);
+    Vault::init(&config, &view).unwrap();
+    let vault = VaultParts {
+        vault: Vault::open(&config, &view).unwrap(),
+        takes_approvals: false,
+    };
     let served = serve_on(
         scratch,
         Scripted::new(),
@@ -1314,6 +1335,7 @@ fn serve_with_a_node(scratch: &Scratch) -> (Runtime, Served) {
         1_000_000,
         TERMS,
         nodes,
+        Some(vault),
     );
     for (token, ticket, environment) in
         [(HERE, "tk_here", None), (THERE, "tk_there", Some("laptop"))]
@@ -1336,7 +1358,7 @@ fn serve_with_a_node(scratch: &Scratch) -> (Runtime, Served) {
 #[tokio::test]
 async fn a_seat_may_call_exactly_the_tools_it_is_offered() {
     let scratch = Scratch::new("offered");
-    let (_runtime, served) = serve_with_a_node(&scratch);
+    let (_runtime, served) = serve_with_a_node_and_a_vault(&scratch);
 
     for (token, environment) in [(HERE, None), (THERE, Some("laptop"))] {
         let offered = served.listed(token).await;
@@ -1365,7 +1387,12 @@ async fn a_seat_may_call_exactly_the_tools_it_is_offered() {
     );
     assert_eq!(
         served.listed(HERE).await,
-        ["worker_report", "worker_handback", "fetch_url"],
+        [
+            "worker_report",
+            "worker_handback",
+            "fetch_url",
+            "vault_list"
+        ],
         "this host has no run_code"
     );
 }
@@ -1373,7 +1400,7 @@ async fn a_seat_may_call_exactly_the_tools_it_is_offered() {
 #[tokio::test]
 async fn every_tool_has_a_handler() {
     let scratch = Scratch::new("handlers");
-    let (_runtime, served) = serve_with_a_node(&scratch);
+    let (_runtime, served) = serve_with_a_node_and_a_vault(&scratch);
 
     for (kind, token) in [
         (PrincipalKind::Router, TOKEN),

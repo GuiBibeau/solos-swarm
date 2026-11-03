@@ -99,23 +99,51 @@ pub fn key_admits(hosts: &[HostSpec], url: &Url) -> bool {
     Origin::of(url).is_ok_and(|origin| hosts.iter().any(|host| host.0 == origin.authority()))
 }
 
+/// Where a Ticket stands with an item it may use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Standing {
+    /// The item needs no person's approval.
+    None,
+    /// Its first use on the Ticket asks a person.
+    Needed,
+    /// A person was asked and has not answered.
+    Waiting,
+    Granted,
+    Denied,
+    /// It needs a person's approval, and this agent takes none.
+    NoApprover,
+}
+
+pub fn standing(item: &ItemInfo, context: &UseContext) -> Standing {
+    if item.approval == Approval::None {
+        return Standing::None;
+    }
+    match context.grants.get(&item.name) {
+        Some(GrantState::Granted) => Standing::Granted,
+        Some(GrantState::Denied) => Standing::Denied,
+        _ if !context.takes_approvals => Standing::NoApprover,
+        Some(GrantState::Waiting) => Standing::Waiting,
+        None => Standing::Needed,
+    }
+}
+
+pub fn for_requester(item: &ItemInfo, requester: &str) -> bool {
+    item.users.is_empty() || item.users.contains(requester)
+}
+
 pub fn use_rule(item: &ItemInfo, context: &UseContext) -> Admission<()> {
     let name = &item.name;
-    if !item.users.is_empty() && !item.users.contains(&context.requester) {
+    if !for_requester(item, &context.requester) {
         return Admission::Refused(format!("{name} is not for this ticket's requester"));
     }
-    if item.approval == Approval::None {
-        return Admission::Allowed(());
-    }
-    match context.grants.get(name) {
-        Some(GrantState::Granted) => Admission::Allowed(()),
-        Some(GrantState::Denied) => {
-            Admission::Refused(format!("a person denied {name} for this ticket"))
-        }
-        Some(GrantState::Waiting) | None if !context.takes_approvals => Admission::Refused(
-            format!("{name} needs a person's approval, and this agent takes none"),
-        ),
-        Some(GrantState::Waiting) | None => Admission::NeedsApproval {
+    match standing(item, context) {
+        Standing::None | Standing::Granted => Admission::Allowed(()),
+        Standing::Denied => Admission::Refused(format!("a person denied {name} for this ticket")),
+        Standing::NoApprover => Admission::Refused(format!(
+            "{name} needs a person's approval, and this agent takes none"
+        )),
+        Standing::Needed | Standing::Waiting => Admission::NeedsApproval {
             secret: format!("{}/{name}", context.environment),
             label: label(item),
             answerable_by: item.users.iter().cloned().collect(),

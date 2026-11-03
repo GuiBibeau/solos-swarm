@@ -258,7 +258,7 @@
     },
     {
       "name": "fetch_url",
-      "description": "Fetch one live http(s) URL through the broker; returns status, headers and bounded body. Your only network egress.",
+      "description": "Fetch one live http(s) URL through the broker; returns status, headers and bounded body. Your only network egress. With key, the broker adds that API key from vault_list to the request, and to each redirect that stays on the key's hosts. You never see its value: a copy in the response reads [vault:<key>].",
       "input_schema": {
         "type": "object",
         "required": [
@@ -283,8 +283,21 @@
           },
           "max_bytes": {
             "type": "number"
+          },
+          "key": {
+            "type": "string",
+            "minLength": 1,
+            "description": "An API key's name from vault_list, to authenticate this request."
           }
         }
+      }
+    },
+    {
+      "name": "vault_list",
+      "description": "List the API keys and logins this ticket may use: their names, hosts or sites, usernames, what each is for, and whether a person must approve its first use on this ticket. You never see their values; pass a key's name as fetch_url's key to send it to the key's own hosts.",
+      "input_schema": {
+        "type": "object",
+        "properties": {}
       }
     }
   ]
