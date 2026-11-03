@@ -106,6 +106,16 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   store's schema is v4 (a `trails` table, one row per Assignment), so an older build refuses the file instead of
   failing on an event it cannot read, and `Fact::{TrailAsk, TrailDone}` reach the Engine through the runtime. Nothing
   writes a step yet.
+- Agent mode, approvals of vault items (PR #36's design): a Ticket holds a grant per item (`SecretId`, `local/github-gui`;
+  `SecretGrant` Waiting, Granted or Denied), and `Engine::{ask_secret, answer_secret, use_key}` ask a person once per
+  Ticket, take only a click from the person the item names (or a Policy approver when it names none), and record a keyed
+  use before it leaves (`SecretAsked`, `SecretAnswered`, `KeyUsed`). The answer reaches the worker as
+  `InputBody::Secret`; typed "allow" is only a Trigger and grants nothing. A message now says what it asks
+  (`OutboundMessage.ask`, `Ask::{Budget, Secret}`) and the runtime keeps the ask only while it stands, so the budget
+  buttons no longer depend on matching attention text. Slack and Discord draw Allow and Deny for a vault item beside
+  Approve and Stop, and `Fact::{SecretAsk, KeyUsed}` reach the Engine through the runtime. The store's schema is v5 (no
+  new table), so an older build refuses a file that can hold grants; stored Tickets and messages read back unchanged.
+  Nothing asks yet.
 - `collect` leaves the per-run `code/` scratch directory on the host and writes `collect-manifest.json`; `--include-code` opts back in.
 - Docs: pause mode, self-update operations, dashboard tunnel, tournament runbook, replay status.
 
