@@ -26,7 +26,18 @@
 //!    Assignment nor the Ticket to be live); a step answered is the one that
 //!    waited, with the action asked; and only trail commands change a cursor.
 //!
-//! Also checked: a new Decision never reuses a recorded Decision's id.
+//! 8. Secret grants: a grant leaves Waiting at most once, to Granted or
+//!    Denied, and never changes or disappears after; a new one is Waiting.
+//! 9. Only `answer_secret` answers: every SecretAnswered follows a SecretAsked
+//!    of the same Ticket and secret, comes from a person the item names (or
+//!    an approver when it names none), and adds exactly one Secret Input.
+//! 10. A repeated `ask_secret` commits no event and no Effect; a first one
+//!     records one SecretAsked and one ask per Channel of the Ticket.
+//! 11. A KeyUsed names the Ticket's running Assignment and a secret that is
+//!     not Denied, within the bounds, and changes nothing else.
+//!
+//! Also checked: a new Decision never reuses a recorded Decision's id, and a
+//! message that asks stands: its Ticket still awaits that ask.
 //!
 //! A state invariant (4, 5) counts once, at the step that first breaks it for
 //! that Ticket or Thread. Each distinct (invariant, command) pair is shrunk to
@@ -34,20 +45,22 @@
 
 use solos_agent_core::ids::key;
 use solos_agent_core::model::{
-    Accept, Acknowledge, Actor, Addressed, Approval, AssignmentId, AssignmentState, ChannelRef,
-    DomainEvent, Effect, EvalId, InputBody, InputId, Plan, ReportIn, ReportStatus, ThreadKey,
-    Ticket, TicketId, Trigger, TriggerId, Verdict,
+    Accept, Acknowledge, Actor, Addressed, Approval, Ask, AssignmentId, AssignmentState,
+    ChannelRef, DomainEvent, Effect, EvalId, InputBody, InputId, MessageKind, Plan, ReportIn,
+    ReportStatus, SecretGrant, SecretId, ThreadKey, Ticket, TicketId, Trigger, TriggerId, Verdict,
 };
 use solos_agent_core::trail::{
-    ActText, CloseReason, Digest, PageAction, PageSeen, STEP_VERSION, Signature, SignedStep,
-    StepBody, StepOutcome, TrailAction, TrailKey, TrailOutcome,
+    ActText, CloseReason, Digest, MAX_URL_CHARS, PageAction, PageSeen, STEP_VERSION, Signature,
+    SignedStep, StepBody, StepOutcome, TrailAction, TrailKey, TrailOutcome,
 };
-use solos_agent_core::{AcceptMode, AllowlistPolicy, Engine, Error, MemoryRepositories};
+use solos_agent_core::{AcceptMode, AllowlistPolicy, Engine, Error, MemoryRepositories, Policy};
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 const THREADS: [&str; 3] = ["th1", "th2", "th3"];
+const SECRETS: [&str; 3] = ["local/github-gui", "local/openai", "laptop/gh"];
+const ROLLS: usize = 130;
 
 // ---------- randomness ----------
 
@@ -125,6 +138,9 @@ enum Cmd {
     Report(TicketRef, AssignmentRef, ReportIn),
     TrailAsk(TicketRef, AssignmentRef, TrailAction),
     TrailDone(TicketRef, AssignmentRef, Reply),
+    AskSecret(TicketRef, SecretId, String, Vec<String>),
+    AnswerSecret(TicketRef, SecretId, String, Actor, bool),
+    UseKey(TicketRef, AssignmentRef, SecretId, String, String),
     SetPolicy(AllowlistPolicy),
     Advance(u64),
 }
@@ -185,6 +201,9 @@ enum Op {
     Report(TicketId, AssignmentId, ReportIn),
     TrailAsk(TicketId, AssignmentId, TrailAction),
     TrailDone(TicketId, AssignmentId, u32, TrailOutcome),
+    AskSecret(TicketId, SecretId, String, Vec<String>),
+    AnswerSecret(TicketId, SecretId, String, Actor, bool),
+    UseKey(TicketId, AssignmentId, SecretId, String, String),
     SetPolicy(AllowlistPolicy),
     Advance(u64),
 }
@@ -207,6 +226,9 @@ impl Op {
             Op::Report(..) => "report",
             Op::TrailAsk(..) => "trail_ask",
             Op::TrailDone(..) => "trail_done",
+            Op::AskSecret(..) => "ask_secret",
+            Op::AnswerSecret(..) => "answer_secret",
+            Op::UseKey(..) => "use_key",
             Op::SetPolicy(_) => "set_policy",
             Op::Advance(_) => "advance_clock",
         }
@@ -310,6 +332,24 @@ fn resolve(w: &World, cmd: &Cmd) -> Op {
             let (n, outcome) = answer(*reply, &t, &a, n, &asked);
             Op::TrailDone(t, a, n, outcome)
         }
+        Cmd::AskSecret(t, secret, label, answerable_by) => Op::AskSecret(
+            ticket(t),
+            secret.clone(),
+            label.clone(),
+            answerable_by.clone(),
+        ),
+        Cmd::AnswerSecret(t, secret, source, by, allow) => Op::AnswerSecret(
+            ticket(t),
+            secret.clone(),
+            source.clone(),
+            by.clone(),
+            *allow,
+        ),
+        Cmd::UseKey(t, a, secret, method, url) => {
+            let t = ticket(t);
+            let a = assignment(&t, a);
+            Op::UseKey(t, a, secret.clone(), method.clone(), url.clone())
+        }
         Cmd::SetPolicy(p) => Op::SetPolicy(p.clone()),
         Cmd::Advance(ms) => Op::Advance(*ms),
     }
@@ -332,6 +372,13 @@ fn apply(w: &mut World, op: &Op) -> Result<String, Error> {
         Op::Report(t, a, r) => e.report(t, a, r.clone()).map(unit),
         Op::TrailAsk(t, a, action) => e.trail_ask(t, a, action.clone()).map(|n| n.to_string()),
         Op::TrailDone(t, a, n, outcome) => e.trail_done(t, a, *n, outcome.clone()).map(unit),
+        Op::AskSecret(t, secret, label, by) => e
+            .ask_secret(t, secret, label, by)
+            .map(|grant| format!("{grant:?}")),
+        Op::AnswerSecret(t, secret, source, by, allow) => e
+            .answer_secret(t, secret, source, by.clone(), *allow)
+            .map(unit),
+        Op::UseKey(t, a, secret, method, url) => e.use_key(t, a, secret, method, url).map(unit),
         Op::SetPolicy(p) => {
             e.set_policy(p.clone());
             Ok(String::new())
@@ -569,8 +616,47 @@ fn has_target(roll: usize, r: &MemoryRepositories) -> bool {
         84..=86 => any(&Ticket::has_live_assignment),
         92..=97 => any(&|t| latest_is(t, AssignmentState::Running)),
         98..=105 => r.trails.values().any(|c| c.pending.is_some()),
+        112..=117 => any(&|t| t.ended.is_none()),
+        118..=125 => any(&|t| t.ended.is_none() && !waiting_secrets(t).is_empty()),
+        126..=129 => any(&|t| latest_is(t, AssignmentState::Running)),
         _ => true,
     }
+}
+
+fn waiting_secrets(t: &Ticket) -> Vec<SecretId> {
+    t.secrets
+        .iter()
+        .filter(|(_, grant)| matches!(grant, SecretGrant::Waiting { .. }))
+        .map(|(secret, _)| secret.clone())
+        .collect()
+}
+
+fn gen_secret(rng: &mut Lcg) -> SecretId {
+    SecretId::try_from(rng.pick(&SECRETS).to_owned()).unwrap()
+}
+
+fn gen_answerable_by(rng: &mut Lcg) -> Vec<String> {
+    let names = |list: &[&str]| list.iter().map(|s| (*s).to_owned()).collect();
+    match rng.below(8) {
+        0 | 1 => Vec::new(),
+        2 | 3 => names(&["slack:alice"]),
+        4 => names(&["slack:bob"]),
+        5 => names(&["slack:alice", "slack:bob"]),
+        6 => names(&["slack:ci-bot", "slack:mallory"]),
+        _ => names(&["github:alice"]),
+    }
+}
+
+fn gen_clicker(rng: &mut Lcg) -> (String, Actor) {
+    let source = if rng.chance(85) { "slack" } else { "github" };
+    let by = match rng.below(20) {
+        0..=9 => Actor::person("alice"),
+        10..=13 => Actor::person("bob"),
+        14 | 15 => Actor::person("mallory"),
+        16 | 17 => Actor::bot("ci-bot"),
+        _ => Actor::system("schedule"),
+    };
+    (source.to_owned(), by)
 }
 
 fn trail_open(url: &str) -> TrailAction {
@@ -725,13 +811,13 @@ fn has_waiting_step(r: &MemoryRepositories, t: &Ticket) -> bool {
 }
 
 fn gen_cmd(rng: &mut Lcg, w: &mut World) -> Cmd {
-    let mut roll = rng.below(112);
+    let mut roll = rng.below(ROLLS);
     // Mostly re-roll a command with nothing to act on; keep some for the error paths.
     for _ in 0..3 {
         if has_target(roll, w.repos()) || rng.chance(30) {
             break;
         }
-        roll = rng.below(112);
+        roll = rng.below(ROLLS);
     }
     if roll < 22 {
         return Cmd::Receive(gen_trigger(rng, w));
@@ -878,7 +964,76 @@ fn gen_cmd(rng: &mut Lcg, w: &mut World) -> Cmd {
             };
             Cmd::TrailDone(t, a, gen_reply(rng))
         }
-        _ => Cmd::Advance(rng.pick(&[1, 1_000, 40_000, 130_000])),
+        106..=111 => Cmd::Advance(rng.pick(&[1, 1_000, 40_000, 130_000])),
+        112..=117 => {
+            let asked: Vec<(TicketId, SecretId)> = ticket_order(r)
+                .into_iter()
+                .filter_map(|id| r.tickets.get(&id).map(|t| (id, t)))
+                .filter(|(_, t)| t.ended.is_none())
+                .flat_map(|(id, t)| t.secrets.keys().map(move |s| (id.clone(), s.clone())))
+                .collect();
+            let (t, secret) = if !asked.is_empty() && rng.chance(35) {
+                let (id, secret) = rng.pick(&asked);
+                (ticket_ref(r, &id), secret)
+            } else {
+                (pick_ticket(rng, r, |t| t.ended.is_none()), gen_secret(rng))
+            };
+            let label = match rng.below(20) {
+                0 => String::new(),
+                1 => "  ".to_owned(),
+                _ => "sign in to https://github.com as gui".to_owned(),
+            };
+            Cmd::AskSecret(t, secret, label, gen_answerable_by(rng))
+        }
+        118..=125 => {
+            let t = pick_ticket(rng, r, |t| {
+                t.ended.is_none() && !waiting_secrets(t).is_empty()
+            });
+            let Op::Note(ticket) = resolve(w, &Cmd::Note(t.clone())) else {
+                unreachable!()
+            };
+            let waiting = r
+                .tickets
+                .get(&ticket)
+                .map(waiting_secrets)
+                .unwrap_or_default();
+            let secret = if !waiting.is_empty() && rng.chance(85) {
+                rng.pick(&waiting)
+            } else {
+                gen_secret(rng)
+            };
+            let (source, by) = gen_clicker(rng);
+            Cmd::AnswerSecret(t, secret, source, by, rng.chance(50))
+        }
+        _ => {
+            let t = pick_ticket(rng, r, |t| latest_is(t, AssignmentState::Running));
+            let Op::Note(ticket) = resolve(w, &Cmd::Note(t.clone())) else {
+                unreachable!()
+            };
+            let granted: Vec<SecretId> = r
+                .tickets
+                .get(&ticket)
+                .map(|t| t.secrets.keys().cloned().collect())
+                .unwrap_or_default();
+            let secret = if !granted.is_empty() && rng.chance(60) {
+                rng.pick(&granted)
+            } else {
+                gen_secret(rng)
+            };
+            let method = match rng.below(20) {
+                0..=14 => "GET",
+                15 | 16 => "POST",
+                17 => "get",
+                18 => "",
+                _ => "ABCDEFGHIJKLMNOPQ",
+            };
+            let url = match rng.below(20) {
+                0..=16 => "https://api.openai.com/v1/models".to_owned(),
+                17 | 18 => format!("https://example.com/{}", "a".repeat(MAX_URL_CHARS)),
+                _ => "é".repeat(MAX_URL_CHARS),
+            };
+            Cmd::UseKey(t, pick_assignment(rng), secret, method.to_owned(), url)
+        }
     }
 }
 
@@ -993,6 +1148,66 @@ fn describe(kind: &str) -> (&'static str, &'static str) {
         "7-trail-silent-change" => (
             "A cursor changed with no trail event",
             "only trail commands change a cursor",
+        ),
+        "8-grant-removed" => (
+            "A secret grant disappeared",
+            "a grant is kept for the Ticket's life",
+        ),
+        "8-grant-changed" => (
+            "A secret grant changed other than from Waiting to Granted or Denied",
+            "a grant leaves Waiting at most once and never changes after",
+        ),
+        "8-grant-new-not-waiting" => (
+            "A new secret grant did not start Waiting",
+            "a grant starts as Waiting, with the label and list it was asked with",
+        ),
+        "8-grant-without-event" => (
+            "A grant appeared or moved with no matching event",
+            "every new grant has a SecretAsked and every move a SecretAnswered",
+        ),
+        "9-answer-without-ask" => (
+            "A SecretAnswered has no Waiting ask before it",
+            "every SecretAnswered follows a SecretAsked of the same Ticket and secret, once",
+        ),
+        "9-answer-not-allowed" => (
+            "A secret was answered by someone the item does not name",
+            "only a person on the item's list, or an approver when it has none, answers",
+        ),
+        "9-answer-by-other-command" => (
+            "A SecretAnswered came from a command other than answer_secret",
+            "only answer_secret answers a secret",
+        ),
+        "9-answer-input" => (
+            "An answer did not add exactly one matching Secret Input",
+            "an answer adds one Input::Secret from a person, with its grant and verdict",
+        ),
+        "10-ask-repeated-committed" => (
+            "A repeated ask_secret committed an event or an Effect",
+            "an ask for an existing grant returns it and commits nothing",
+        ),
+        "10-ask-posts" => (
+            "A first ask_secret did not post one ask per Channel",
+            "one SecretAsked and one Attention ask per Channel of the Ticket",
+        ),
+        "11-key-used" => (
+            "A KeyUsed does not name the running Assignment and an allowed secret",
+            "a use is for the Ticket's running Assignment and a secret that is not Denied",
+        ),
+        "11-key-bounds" => (
+            "A KeyUsed holds a method or a url beyond its bounds",
+            "a method is 1 to 16 uppercase letters and a url at most MAX_URL_CHARS",
+        ),
+        "11-key-changed-state" => (
+            "A keyed use changed state or sent something",
+            "use_key records one event and changes nothing else",
+        ),
+        "2-send-ask-not-standing" => (
+            "A message asks something its Ticket no longer awaits",
+            "a message with an ask is committed with its Ticket awaiting that ask",
+        ),
+        "2-send-ask-not-attention" => (
+            "A message with an ask is not an Attention message",
+            "an ask is always an Attention message",
         ),
         "6-replay-differs" => (
             "Replaying a seed gives different state",
@@ -1109,6 +1324,7 @@ struct Checker {
     /// Every Input id a Deliver named so far, with the Assignment it went to.
     delivered: BTreeMap<InputId, AssignmentId>,
     state: BTreeMap<(&'static str, String), String>,
+    answered: BTreeSet<(TicketId, SecretId)>,
 }
 
 impl Checker {
@@ -1179,6 +1395,8 @@ impl Checker {
                 ));
             }
         }
+
+        self.secrets(w.engine.policy(), &op, &result, &before, after, &mut found);
 
         let mut trail_events = false;
         for event in fresh_events {
@@ -1285,6 +1503,275 @@ impl Checker {
             })
             .collect();
         (op, result, findings)
+    }
+}
+
+type Found = Vec<(&'static str, String)>;
+
+impl Checker {
+    fn secrets(
+        &mut self,
+        policy: &AllowlistPolicy,
+        op: &Op,
+        result: &Result<String, Error>,
+        before: &MemoryRepositories,
+        after: &MemoryRepositories,
+        found: &mut Found,
+    ) {
+        let fresh_events = &after.events[before.events.len().min(after.events.len())..];
+        let fresh_effects = &after.effects[before.effects.len().min(after.effects.len())..];
+        let grant = |r: &MemoryRepositories, t: &TicketId, s: &SecretId| {
+            r.tickets.get(t).and_then(|t| t.secrets.get(s)).cloned()
+        };
+        let mut moved = 0;
+        let mut created = 0;
+        for (id, now) in &after.tickets {
+            let was = before.tickets.get(id);
+            for (secret, new) in &now.secrets {
+                let old = was.and_then(|t| t.secrets.get(secret));
+                match old {
+                    None => {
+                        created += 1;
+                        if !matches!(new, SecretGrant::Waiting { .. }) {
+                            found.push((
+                                "8-grant-new-not-waiting",
+                                format!("{id} {secret} began as {new:?}"),
+                            ));
+                        }
+                    }
+                    Some(old) if old == new => {}
+                    Some(SecretGrant::Waiting { .. })
+                        if !matches!(new, SecretGrant::Waiting { .. }) =>
+                    {
+                        moved += 1;
+                    }
+                    Some(old) => found.push((
+                        "8-grant-changed",
+                        format!("{id} {secret} went from {old:?} to {new:?}"),
+                    )),
+                }
+            }
+            for secret in was.iter().flat_map(|t| t.secrets.keys()) {
+                if !now.secrets.contains_key(secret) {
+                    found.push(("8-grant-removed", format!("{id} {secret} is gone")));
+                }
+            }
+        }
+        let asked: Vec<(&TicketId, &SecretId)> = fresh_events
+            .iter()
+            .filter_map(|e| match &e.event {
+                DomainEvent::SecretAsked { ticket, secret } => Some((ticket, secret)),
+                _ => None,
+            })
+            .collect();
+        let answers: Vec<_> = fresh_events
+            .iter()
+            .filter_map(|e| match &e.event {
+                DomainEvent::SecretAnswered {
+                    ticket,
+                    secret,
+                    by,
+                    granted,
+                } => Some((ticket, secret, by, *granted)),
+                _ => None,
+            })
+            .collect();
+        if asked.len() != created || answers.len() != moved {
+            found.push((
+                "8-grant-without-event",
+                format!(
+                    "{created} new grants and {moved} answered ones, but {} asks and {} answers",
+                    asked.len(),
+                    answers.len()
+                ),
+            ));
+        }
+
+        let new_inputs = |t: &Ticket| -> Vec<(SecretId, bool, Actor, bool)> {
+            let seen = before.tickets.get(&t.id).map_or(0, |b| b.inputs.len());
+            t.inputs[seen..]
+                .iter()
+                .filter_map(|i| match &i.body {
+                    InputBody::Secret {
+                        secret,
+                        granted,
+                        by,
+                    } => Some((secret.clone(), *granted, by.clone(), i.from_allowed_person)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let secret_inputs: usize = after.tickets.values().map(|t| new_inputs(t).len()).sum();
+        if secret_inputs != answers.len() {
+            found.push((
+                "9-answer-input",
+                format!(
+                    "{} answers added {secret_inputs} Secret Inputs",
+                    answers.len()
+                ),
+            ));
+        }
+        for (ticket, secret, by, granted) in &answers {
+            let key = ((*ticket).clone(), (*secret).clone());
+            if !self.answered.insert(key.clone()) {
+                found.push((
+                    "9-answer-without-ask",
+                    format!("{ticket} {secret} was answered twice"),
+                ));
+            }
+            let asked_before = before.events.iter().any(|e| {
+                matches!(&e.event, DomainEvent::SecretAsked { ticket: t, secret: s } if t == *ticket && s == *secret)
+            });
+            let Some(SecretGrant::Waiting { answerable_by, .. }) = grant(before, ticket, secret)
+            else {
+                found.push((
+                    "9-answer-without-ask",
+                    format!("{ticket} {secret} did not wait before its answer"),
+                ));
+                continue;
+            };
+            if !asked_before {
+                found.push((
+                    "9-answer-without-ask",
+                    format!("{ticket} {secret} has no SecretAsked before its answer"),
+                ));
+            }
+            match op {
+                Op::AnswerSecret(t, s, source, actor, allow)
+                    if t == *ticket && s == *secret && actor == *by && allow == granted =>
+                {
+                    let named = if answerable_by.is_empty() {
+                        policy.may_approve(source, actor)
+                    } else {
+                        answerable_by.contains(&format!("{source}:{}", actor.id))
+                    };
+                    if !(actor.is_person() && named) {
+                        found.push((
+                            "9-answer-not-allowed",
+                            format!("{source}:{} answered {secret} on {ticket}", actor.id),
+                        ));
+                    }
+                }
+                _ => found.push((
+                    "9-answer-by-other-command",
+                    format!("{} answered {secret} on {ticket}", op.name()),
+                )),
+            }
+            let verdict_kept = match grant(after, ticket, secret) {
+                Some(SecretGrant::Granted { by: who, .. }) => *granted && who == **by,
+                Some(SecretGrant::Denied { by: who, .. }) => !*granted && who == **by,
+                _ => false,
+            };
+            let inputs = after
+                .tickets
+                .get(*ticket)
+                .map(&new_inputs)
+                .unwrap_or_default();
+            let matching = inputs
+                .iter()
+                .filter(|(s, g, b, person)| s == *secret && g == granted && b == *by && *person)
+                .count();
+            if !verdict_kept || matching != 1 {
+                found.push((
+                    "9-answer-input",
+                    format!(
+                        "{ticket} {secret}: grant {:?}, {matching} matching Inputs of {inputs:?}",
+                        grant(after, ticket, secret)
+                    ),
+                ));
+            }
+        }
+
+        for (ticket, secret) in &asked {
+            let channels = after.tickets.get(*ticket).map_or(0, |t| t.channels.len());
+            let posts = fresh_effects
+                .iter()
+                .filter(|e| matches!(e, Effect::Send(m) if m.ask == Some(Ask::Secret { secret: (*secret).clone() }) && m.ticket.as_ref() == Some(*ticket) && m.kind == MessageKind::Attention))
+                .count();
+            let others = fresh_effects
+                .iter()
+                .filter(|e| !matches!(e, Effect::Send(m) if m.ask.is_some()))
+                .count();
+            if posts != channels || others != 0 || !matches!(op, Op::AskSecret(..)) {
+                found.push((
+                    "10-ask-posts",
+                    format!("{ticket} {secret}: {posts} asks for {channels} Channels, {others} other Effects"),
+                ));
+            }
+        }
+        if let Op::AskSecret(t, s, ..) = op
+            && let Ok(shown) = result
+            && let Some(old) = grant(before, t, s)
+        {
+            let quiet = fresh_events.is_empty()
+                && fresh_effects.is_empty()
+                && before.tickets == after.tickets;
+            if !quiet || *shown != format!("{old:?}") {
+                found.push((
+                    "10-ask-repeated-committed",
+                    format!("{t} {s} was asked again and returned {shown}"),
+                ));
+            }
+        }
+
+        let used: Vec<_> = fresh_events
+            .iter()
+            .filter_map(|e| match &e.event {
+                DomainEvent::KeyUsed {
+                    ticket,
+                    assignment,
+                    secret,
+                    method,
+                    url,
+                } => Some((ticket, assignment, secret, method, url)),
+                _ => None,
+            })
+            .collect();
+        for (ticket, assignment, secret, method, url) in &used {
+            let open = before.tickets.get(*ticket).filter(|t| t.ended.is_none());
+            let running = open
+                .and_then(Ticket::running_assignment)
+                .is_some_and(|a| a.id == **assignment);
+            let denied = matches!(
+                grant(before, ticket, secret),
+                Some(SecretGrant::Denied { .. })
+            );
+            let by_use_key = matches!(op, Op::UseKey(t, a, s, m, u)
+                if t == *ticket && a == *assignment && s == *secret && m == *method && u == *url);
+            if !running || denied || !by_use_key {
+                found.push((
+                    "11-key-used",
+                    format!(
+                        "{} recorded {assignment} using {secret} on {ticket} (running {running}, denied {denied})",
+                        op.name()
+                    ),
+                ));
+            }
+            let bounded = (1..=16).contains(&method.len())
+                && method.bytes().all(|b| b.is_ascii_uppercase())
+                && url.chars().count() <= MAX_URL_CHARS;
+            if !bounded {
+                found.push((
+                    "11-key-bounds",
+                    format!(
+                        "{assignment} used {secret} with method {method:?} and {} url characters",
+                        url.chars().count()
+                    ),
+                ));
+            }
+            if before.tickets != after.tickets || !fresh_effects.is_empty() || used.len() != 1 {
+                found.push((
+                    "11-key-changed-state",
+                    format!("{assignment} used {secret}: tickets or effects changed"),
+                ));
+            }
+        }
+        if matches!(op, Op::UseKey(..)) && result.is_ok() && used.len() != 1 {
+            found.push((
+                "11-key-used",
+                format!("an accepted use_key recorded {} events", used.len()),
+            ));
+        }
     }
 }
 
@@ -1421,6 +1908,25 @@ fn check_effect(
                 && !r.tickets.contains_key(t)
             {
                 found.push(("2-send-missing-ticket", format!("Send {} names {t}", m.id)));
+            }
+            if let Some(ask) = &m.ask {
+                let stands = m
+                    .ticket
+                    .as_ref()
+                    .and_then(|t| r.tickets.get(t))
+                    .is_some_and(|t| t.awaits(ask));
+                if !stands {
+                    found.push((
+                        "2-send-ask-not-standing",
+                        format!("Send {} asks {ask:?} of {:?}", m.id, m.ticket),
+                    ));
+                }
+                if m.kind != MessageKind::Attention {
+                    found.push((
+                        "2-send-ask-not-attention",
+                        format!("Send {} asks {ask:?} as {:?}", m.id, m.kind),
+                    ));
+                }
             }
         }
     }
@@ -1690,6 +2196,17 @@ fn show(cmd: &Op) -> String {
             "trail_done {t} {a} #{n} signed #{} by {} {:?} -> {:?}",
             s.body.n, s.body.ticket, s.body.action, s.body.outcome
         ),
+        Op::AskSecret(t, secret, label, by) => {
+            format!("ask_secret {t} {secret} label={label:?} answerable_by={by:?}")
+        }
+        Op::AnswerSecret(t, secret, source, by, allow) => format!(
+            "answer_secret {t} {secret} by {source}:{} ({:?}) allow={allow}",
+            by.id, by.kind
+        ),
+        Op::UseKey(t, a, secret, method, url) => format!(
+            "use_key {t} {a} {secret} {method:?} ({} url characters)",
+            url.chars().count()
+        ),
         Op::SetPolicy(p) => format!("set_policy {}", show_policy(p)),
         Op::Advance(ms) => format!("advance_clock {ms}ms"),
     }
@@ -1816,7 +2333,13 @@ fn seeded_random_walk_keeps_atomicity_and_effect_integrity() {
     println!("{report}");
     assert!(hits.is_empty(), "{report}");
     if seeds * steps as u64 >= 2_000 {
-        for name in ["trail_ask", "trail_done"] {
+        for name in [
+            "trail_ask",
+            "trail_done",
+            "ask_secret",
+            "answer_secret",
+            "use_key",
+        ] {
             let ok = outcomes.get(name).map_or(0, |o| o.0);
             assert!(ok > 0, "{name} never succeeded\n{report}");
         }
