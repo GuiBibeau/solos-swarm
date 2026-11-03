@@ -124,6 +124,17 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   asks once in the thread and answers 409 until the click comes back as an Input. `vault_list` (only with a vault)
   lists the keys and logins a Ticket may use, without values, and where the Ticket stands with each. Swarm mode's
   `fetch_url` is unchanged.
+- Agent mode, the browser tools (PR #36's design): with `browser:` in agent.yaml, `agent serve` pins this host's trail
+  key, opens `Browsers` and a trail blob store under the state directory, and refuses to start when the key, the
+  blobs or the browser sockets sit where a sandbox can read them. Workers get `browser_open`, `browser_act`,
+  `browser_read` and, with a vault, `browser_login`. Each step is `TrailAsked` on the chain before the browser acts
+  and `TrailDone` after, with the step the browser signed, checked under the pinned key (`lost` when it does not
+  verify). Its snapshot, View and typed text are kept by digest, capped at 8 GiB and 256 MiB per Ticket, and the
+  model gets the View's exact bytes. An Assignment's steps run one at a time, every asked step is answered even when
+  the session hangs up, and the browser closes with a signed step when its Assignment ends, after `idle_secs`, or as
+  the agent stops, before the runtime does. A first use of a login or key is refused at once on a Ticket whose
+  channels cannot show the Allow and Deny buttons. The worker's system prompt and the Router's environment note tell
+  of the browser.
 - `collect` leaves the per-run `code/` scratch directory on the host and writes `collect-manifest.json`; `--include-code` opts back in.
 - Docs: pause mode, self-update operations, dashboard tunnel, tournament runbook, replay status.
 
