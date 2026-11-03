@@ -11,8 +11,9 @@ use axum::routing::{get, post};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use solos_agent_core::model::{
-    Actor, ActorKind, Addressed, Approval, AssignmentId, ChannelRef, Effect, EndedBy, MessageId,
-    MessageKind, OutboundMessage, ThreadKey, TicketId, TicketOutcome, Trigger, TriggerId,
+    Actor, ActorKind, Addressed, Approval, Ask, AssignmentId, ChannelRef, Effect, EndedBy,
+    MessageId, MessageKind, OutboundMessage, ThreadKey, TicketId, TicketOutcome, Trigger,
+    TriggerId,
 };
 use solos_agent_core::{AllowlistPolicy, Repositories};
 use solos_agent_store::SqliteStore;
@@ -836,7 +837,7 @@ async fn a_reply_is_escaped_shaped_for_chat_and_an_approval_request_has_buttons(
     let channel = fake.channel();
     let long = format!("<!channel> fixed & tested. {}", "word ".repeat(1_000));
     let approval = SendOptions {
-        approval: true,
+        ask: Some(Ask::Budget),
         ..SendOptions::default()
     };
     let sends = [
@@ -913,12 +914,12 @@ async fn a_repeat_looks_in_the_thread_first_and_posts_only_what_is_missing() {
         0,
         "a first attempt posts at once"
     );
-    channel.send(second(), repeat).await.unwrap();
+    channel.send(second(), repeat.clone()).await.unwrap();
     let calls = fake.slack().replies_calls;
     assert_eq!(calls, 1, "a repeat searches, and ms_2 was not there");
     for message in [first(), second()] {
         assert_eq!(
-            channel.send(message, repeat).await.unwrap(),
+            channel.send(message, repeat.clone()).await.unwrap(),
             SendOutcome::Sent
         );
     }

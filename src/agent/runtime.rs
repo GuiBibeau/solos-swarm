@@ -12,8 +12,8 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use solos_agent_core::ids::key;
 use solos_agent_core::model::{
-    Actor, Approval, AssignmentId, AssignmentState, Candidate, Effect, EvalId, Input, InputBody,
-    MessageId, MessageKind, Ms, OutboundMessage, Stage, Ticket, TicketId, Trigger,
+    Actor, AssignmentId, AssignmentState, Candidate, Effect, EvalId, Input, InputBody, MessageId,
+    MessageKind, Ms, OutboundMessage, Stage, Ticket, TicketId, Trigger,
 };
 use solos_agent_core::{AllowlistPolicy, Engine, Error, Intake, Policy, Repositories};
 use solos_agent_store::{EffectId, QueuedEffect, SqliteStore};
@@ -414,6 +414,29 @@ impl Runtime {
                     .trail_done(&ticket, &assignment, n, outcome)
                     .map(done),
             ),
+            Fact::SecretAsk {
+                ticket,
+                secret,
+                label,
+                answerable_by,
+            } => (
+                format!("secret ask of {secret} on {ticket}"),
+                self.engine
+                    .ask_secret(&ticket, &secret, &label, &answerable_by)
+                    .map(Applied::Secret),
+            ),
+            Fact::KeyUsed {
+                ticket,
+                assignment,
+                secret,
+                method,
+                url,
+            } => (
+                format!("keyed use of {secret} by {assignment} on {ticket}"),
+                self.engine
+                    .use_key(&ticket, &assignment, &secret, &method, &url)
+                    .map(done),
+            ),
             Fact::Retry {
                 ticket,
                 assignment,
@@ -495,7 +518,7 @@ impl Runtime {
         } = command;
         let who = by.name.clone().unwrap_or_else(|| by.id.clone());
         let policy = self.engine.policy();
-        let outcome = match order {
+        let outcome = match &order {
             Order::Approve if !policy.may_approve(&source, &by) => {
                 Err(format!("{who} is not allowed to approve budgets."))
             }
@@ -510,6 +533,14 @@ impl Runtime {
                 self.engine
                     .stop_ticket(&ticket, &format!("stopped by {who} on {source}")),
                 format!("Stopped by {who}."),
+            )?,
+            Order::Secret { secret, allow } => told(
+                self.engine
+                    .answer_secret(&ticket, secret, &source, by.clone(), *allow),
+                format!(
+                    "{} by {who}: {secret} for this ticket.",
+                    if *allow { "Allowed" } else { "Denied" }
+                ),
             )?,
         };
         let text = outcome.unwrap_or_else(|refused| {
@@ -668,17 +699,14 @@ impl Runtime {
                 reason,
             },
             Effect::Send(message) => {
-                // The Engine keeps the approval question as the Ticket's attention.
-                let approval = message.kind == MessageKind::Attention
-                    && message
+                let ask = message.ask.clone().filter(|ask| {
+                    message
                         .ticket
                         .as_ref()
                         .and_then(|id| store.ticket(id))
-                        .is_some_and(|t| {
-                            t.approval == Approval::Waiting
-                                && t.attention.as_deref() == Some(message.text.as_str())
-                        });
-                Job::Send(message, SendOptions { repeat, approval })
+                        .is_some_and(|t| t.awaits(ask))
+                });
+                Job::Send(message, SendOptions { repeat, ask })
             }
         })
     }

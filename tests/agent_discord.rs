@@ -7,8 +7,9 @@ use axum::routing::{get, post};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use solos_agent_core::model::{
-    Actor, ActorKind, Addressed, Approval, AssignmentId, ChannelRef, Effect, EndedBy, MessageId,
-    MessageKind, OutboundMessage, ThreadKey, TicketId, TicketOutcome, Trigger, TriggerId,
+    Actor, ActorKind, Addressed, Approval, Ask, AssignmentId, ChannelRef, Effect, EndedBy,
+    MessageId, MessageKind, OutboundMessage, ThreadKey, TicketId, TicketOutcome, Trigger,
+    TriggerId,
 };
 use solos_agent_core::{AllowlistPolicy, Repositories};
 use solos_agent_store::SqliteStore;
@@ -1882,7 +1883,7 @@ async fn a_reply_is_cut_to_discords_limit_and_an_approval_request_has_two_button
     let channel = fake.channel();
     let long = format!("@everyone fixed & tested. {}", "word ".repeat(1_000));
     let approval = SendOptions {
-        approval: true,
+        ask: Some(Ask::Budget),
         ..SendOptions::default()
     };
     let sends = [

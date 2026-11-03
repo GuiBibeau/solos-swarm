@@ -828,10 +828,7 @@ impl Watchdog {
         for row in self.store.unsent_alerts()? {
             // One recorded by an earlier run, or tried before, may have gone out.
             let repeat = !self.fresh.remove(&row.id);
-            let options = SendOptions {
-                repeat,
-                approval: false,
-            };
+            let options = SendOptions { repeat, ask: None };
             match self.channel.send(row.message, options).await {
                 Ok(outcome) => {
                     if outcome == SendOutcome::Gone {

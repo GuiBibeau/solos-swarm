@@ -2,11 +2,14 @@
 //! Slack does not deduplicate posts, so each carries its `MessageId` as
 //! metadata, and a repeat looks for it in the thread before posting again.
 
-use super::{APPROVE_ACTION, Answer, METADATA_EVENT, STOP_ACTION, SlackApi, gone};
+use super::{
+    ALLOW_SECRET_ACTION, APPROVE_ACTION, Answer, DENY_SECRET_ACTION, METADATA_EVENT, STOP_ACTION,
+    SecretClick, SlackApi, gone,
+};
 use crate::agent::ports::{BoxFuture, Channel, SendOptions, SendOutcome};
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
-use solos_agent_core::model::{MessageId, MessageKind, OutboundMessage, TicketId};
+use solos_agent_core::model::{Ask, MessageId, MessageKind, OutboundMessage, TicketId};
 use std::sync::Arc;
 
 /// Acknowledgements and questions stay short; results are cut well under
@@ -47,7 +50,7 @@ impl SlackChannel {
                 Found::Missing => {}
             }
         }
-        let body = body(&message, channel, thread, options.approval);
+        let body = body(&message, channel, thread, options.ask.as_ref());
         match self.api.post("chat.postMessage", None, Some(&body)).await? {
             Answer::Ok(_) => Ok(SendOutcome::Sent),
             Answer::Refused(code) if gone(&code) => {
@@ -110,7 +113,12 @@ impl Channel for SlackChannel {
     }
 }
 
-fn body(message: &OutboundMessage, channel: &str, thread: Option<&str>, approval: bool) -> Value {
+fn body(
+    message: &OutboundMessage,
+    channel: &str,
+    thread: Option<&str>,
+    ask: Option<&Ask>,
+) -> Value {
     let limit = match message.kind {
         MessageKind::Result => RESULT_CHARS,
         MessageKind::Acknowledgement | MessageKind::Attention => SHORT_CHARS,
@@ -129,34 +137,45 @@ fn body(message: &OutboundMessage, channel: &str, thread: Option<&str>, approval
     if let Some(thread) = thread {
         body["thread_ts"] = json!(thread);
     }
-    if approval && let Some(ticket) = &message.ticket {
-        body["blocks"] = buttons(&text, ticket);
+    if let (Some(ask), Some(ticket)) = (ask, &message.ticket) {
+        body["blocks"] = buttons(&text, ticket, ask);
     }
     body
 }
 
-/// The question, then Approve and Stop. Each click arrives on the socket as
-/// a `block_actions` envelope carrying the Ticket id.
-fn buttons(text: &str, ticket: &TicketId) -> Value {
-    let button = |label: &str, action: &str, style: &str| {
+fn buttons(text: &str, ticket: &TicketId, ask: &Ask) -> Value {
+    let (value, offered) = match ask {
+        Ask::Budget => (
+            ticket.to_string(),
+            [
+                ("Approve", APPROVE_ACTION, "primary"),
+                ("Stop", STOP_ACTION, "danger"),
+            ],
+        ),
+        Ask::Secret { secret } => (
+            serde_json::to_string(&SecretClick {
+                ticket: ticket.clone(),
+                secret: secret.clone(),
+            })
+            .expect("two strings serialize"),
+            [
+                ("Allow for this ticket", ALLOW_SECRET_ACTION, "primary"),
+                ("Deny", DENY_SECRET_ACTION, "danger"),
+            ],
+        ),
+    };
+    let elements = offered.map(|(label, action, style)| {
         json!({
             "type": "button",
             "action_id": action,
             "style": style,
             "text": { "type": "plain_text", "text": label },
-            "value": ticket,
+            "value": value,
         })
-    };
+    });
     json!([
         { "type": "section", "text": { "type": "mrkdwn", "text": text } },
-        {
-            "type": "actions",
-            "block_id": "solos_approval",
-            "elements": [
-                button("Approve", APPROVE_ACTION, "primary"),
-                button("Stop", STOP_ACTION, "danger"),
-            ],
-        },
+        { "type": "actions", "block_id": "solos_approval", "elements": elements },
     ])
 }
 

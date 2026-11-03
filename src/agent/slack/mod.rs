@@ -13,8 +13,9 @@ use super::ports::RetryAfter;
 use anyhow::{Context, Result, ensure};
 use reqwest::header::RETRY_AFTER;
 use reqwest::{RequestBuilder, StatusCode};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use solos_agent_core::model::{ChannelRef, ThreadKey};
+use solos_agent_core::model::{ChannelRef, SecretId, ThreadKey, TicketId};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -24,16 +25,27 @@ use zeroize::Zeroizing;
 /// The Source name Slack Triggers, replies and approvals carry.
 pub const SOURCE: &str = "slack";
 pub const DEFAULT_API_BASE: &str = "https://slack.com/api/";
-/// The Block Kit action ids of an approval request's buttons. Each button's
-/// value is the Ticket id.
+/// The Block Kit action ids of an approval request's buttons. A budget
+/// button's value is the Ticket id.
 pub const APPROVE_ACTION: &str = "solos_approve";
 pub const STOP_ACTION: &str = "solos_stop";
+/// The action ids of a vault item's Allow and Deny. Each button's value is a
+/// [`SecretClick`] as JSON.
+pub const ALLOW_SECRET_ACTION: &str = "solos_secret_allow";
+pub const DENY_SECRET_ACTION: &str = "solos_secret_deny";
 /// The message metadata type that marks what the agent posted; its payload's
 /// `message_id` is the `OutboundMessage` id.
 pub const METADATA_EVENT: &str = "solos_swarm_message";
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RETRY_AFTER: u64 = 3_600;
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecretClick {
+    ticket: TicketId,
+    secret: SecretId,
+}
 
 /// The Thread of a message and its replies.
 pub fn thread(channel: &str, thread_ts: &str) -> ThreadKey {
