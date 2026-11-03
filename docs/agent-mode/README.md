@@ -26,7 +26,8 @@ and its MIT-licensed prototype `deepseek-ai/dsh-superagent-prototype` (docs 000-
 | P6 Watchdog | **Done.** `src/agent/watchdog.rs`: a pure `assess(snapshot, now, thresholds)` over what the Store already holds, with no model: a Ticket waiting for a person (1h), a working Assignment with no Report (30m), an Effect with 3 failed attempts, an `unavailable` Decision in the last hour, an account at 80% of its cap, and a pause file held for 1h. Each alert id hashes its kind, its subject (with the problem's start) and a 6h bucket. With a `watchdog` section in agent.yaml, `agent serve` runs it every minute, tells the operator's conversation each new alert once through its Channel, and records it in `watchdog_alerts` (schema v3), so a restart tells nothing new. `retry_stalled` retries a stalled Assignment once per Ticket through the runtime. `solos-swarm agent status` reports Tickets, Decisions, Effects, spend, the pause and the current alerts from a read-only Store. Judging with a model whether a worker drifts from its goal is later. |
 | P3e Background jobs | **Done.** `src/agent/jobs.rs`: a worker with `run_code` also gets `job_start {code, timeout_s?}`, `job_wait {job, wait_s?}` and `job_stop {job}`. A job runs in its Ticket's `/work` under `run_code`'s sandbox and limits, returns its id at once and belongs to its Assignment: a stop, the Ticket's end, a dead session or a shutdown kills it, and a kill reaches every process of its sandbox, even in bwrap's first milliseconds. A `run_code` still running after `background_after_secs` (5) becomes a job when the Ticket has room; a short one returns exactly as before, and swarm runs keep their synchronous `run_code`. A job's end reaches the worker once: in a turn only its `job_wait` or `job_stop` takes it, and an end the turn left, or one that comes between turns, becomes a Note on the Ticket (`Fact::Note`, applied as `Engine::note`) that wakes the worker. No core change. |
 | P5 Swarm Tickets | Done (#28). `src/agent/swarm_executor.rs`: a `Plan::Swarm` Ticket runs one governed swarm per Assignment through `swarm::run_goal_until` on the Pi workers' harness, provider and credential (`executor.swarm`). Its Goal is rendered from a YAML template (`src/agent/goal_template.rs`, minijinja, every placeholder an escaped YAML literal) with the Ticket's title, scope, agent count and remaining budget, checked with `Goal::validate` at config load and at launch. The Goal's budget is the Mandate budget minus what the Ticket's account committed, and the run's spend is charged on that account (`SqliteStore::charge`, once per run) before its Report. At most `max_runs` swarms run at once (default 1). A Stop cancels a run through the new cancel input of `run_goal_until`, which `solos-swarm run` does not use, and the agent's pause holds running swarms. Completed reports `ready` with the findings, the spend and the artifact; stopped reports `failed`; drained reports `waiting`. A restart relaunches an interrupted swarm in a new run directory and charges the old one from its `state.json`. The Router's prompt says when a swarm pays for itself, and `router_decide` takes `goal_template`. |
-| P7, P9, P10 | Planned, below. |
+| P9 Remote nodes | **Done.** `src/remote/`: `solos-swarm node serve` is a daemon on a user's machine that dials the agent's node listener (`nodes:` in agent.yaml) over TLS 1.3, where each side pins the other's self-signed certificate from `node init` and `agent init-nodes`. A worker's `run_code` and background jobs on a Ticket bound to a node run in the node's own bwrap sandbox, through the same `CodeExecutor`, with the node's mounts, and come back as local `run_code`'s receipts. The new `ExecutionEnvironment` port (`src/agent/environment.rs`) picks this host or a node per Ticket. Core change: `Plan::Session` takes an optional `environment` (stored Plans read as before), which `router_decide` may name and `executor.environment` defaults. An offline node is a 503 tool error, and its Ticket's Launch waits on the effect runner's backoff until it connects. Node secrets stay on the node, reach the sandbox through its environment or `/secrets`, and are redacted from what it sends. Swarm runs unchanged. |
+| P7, P10 | Planned, below. |
 
 ## What "super-agent" means here
 
@@ -143,7 +144,7 @@ and external work leaves as `Effect`s. The shell ports are async and live in the
 | `AgentHarness` | `start(SessionSpec, events) -> Session`; `Session::{prompt, stop, join}`; events `TurnEnded`, `Rejected`, and an `Err` when a session's stream ends | `PiHarness`, `ScriptedHarness` | `src/harness.rs` (P1) |
 | `ModelGateway` | One broker, many accounts: `reserve(account, request)`, `settle(intent, usage)`; pause and peak gates | today's broker; the agent broker (P3c) | `broker.rs` `Store::reserve`/`settle`/`envelope`, `Intent`; shared since P3c in `src/gateway/`: `PriceTable` (was `Goal::cost`/`settled_cost`), `Receipt`, `admit_request`/`upstream_body`, `effective_control` |
 | `ModelUpstream` | `dispatch(body) -> receipt` | `OpenAiCompatible` | `broker::Provider` (1012); merged with `provider::Provider` (mvp) for llama.cpp |
-| `ExecutionEnvironment` | `run(code) -> receipt`; `start(code) -> job`, `wait(job)`, `stop(job)` | local `bwrap` | `code.rs` `CodeExecutor`. Since P2b the run path's `bwrap` lines (`PiHarness::command`, `run_code`, `doctor`) come from `src/bwrap.rs`; the frozen mvp's two (`sandbox.rs` in `prepare_process`, `wasi_worker.rs`) stay hand-built |
+| `ExecutionEnvironment` | `ready()`; `run_code(work, args)` and `job(work, code, timeout, bounds)` return a `Started` that reads, waits and stops (`src/agent/environment.rs`, P9) | local `bwrap` (`Local`), remote nodes (`RemoteNode`, P9) | `code.rs` `CodeExecutor`. Since P2b the run path's `bwrap` lines (`PiHarness::command`, `run_code`, `doctor`) come from `src/bwrap.rs`; the frozen mvp's two (`sandbox.rs` in `prepare_process`, `wasi_worker.rs`) stay hand-built |
 | `EventLog` | `append(kind, data) -> seq`; `verify()` | `events.jsonl` hash chain | `Store::record` (452), `broker_control::read_chain`/`load_image` |
 | `Source` | `run(sink, facts)`, with people's commands (Slack buttons) as `Fact::Command`; later `context(trigger, part)` for bounded recall | `JsonlSource` (P3b), `SlackSource` (P4), `GithubSource` and `ScheduleSource` (P8) | new |
 | `Channel` | `send(OutboundMessage, SendOptions { repeat, approval }) -> Sent \| Gone`; shapes text per medium (short chat, PRs structured) | `JsonlChannel` (P3b), `SlackChannel` (P4), `GithubChannel` (P8) | `src/agent/jsonl.rs`, `src/agent/slack/`, `src/agent/github/` |
@@ -436,10 +437,44 @@ provider through the real broker. It runs on macOS too. Swarm mode is the first 
 - Later: a pull request bound to its Ticket (with P3d's workers), pull request reviews themselves, check runs of other
   CI apps and commit statuses, and webhooks for lower latency.
 
-**P9: separate execution.** `solos-swarm node` is a daemon on a user's machine (BYOM) or a cloud box. It runs
-commands and holds no session state, and connects over the `mvp` QUIC mTLS transport (`cluster.rs`) with SPIFFE
-identities (`identity.rs`). `transport.rs` is the local mTLS socket transport. When an intermittently online node reconnects, the Tickets waiting for it resume.
-Credentials stay on the node and tools use them through scoped identities (`tool_identity.rs`), never in context.
+**P9: separate execution.** Done; setup in [Remote nodes](#remote-nodes).
+- Done: the `ExecutionEnvironment` port (`src/agent/environment.rs`): `run_code(work, args)` and `job(work, code,
+  timeout, bounds)` each return a `Started` that reads, waits and stops the same wherever it runs, and `ready()`
+  says whether the environment can take a command now. `Local` is today's `CodeExecutor`, unchanged; each
+  configured node is another. `jobs.rs` runs on the port instead of `CodeExecutor`, and the broker resolves a
+  worker's environment on each call.
+- Done: one small core change. `Plan::Session` gains `environment: Option<String>` with a serde default, so a Plan
+  stored without it reads as before and one with `None` writes the same bytes. The Router's `router_decide` may
+  name it on a session accept (refused for a swarm, and for a name that is neither `local` nor a configured node).
+  `executor.environment` is the default for a Plan that names none; its own default is `local`.
+- Done: `solos-swarm node serve --config node.yaml` (`src/remote/daemon.rs`). It dials out, so a machine behind NAT
+  works, and redials with a backoff from 1 s to 60 s. It runs `run`, `job_start`, `job_wait` and `job_stop` in its
+  own bwrap sandbox through the same `CodeExecutor` and builder, with the mounts of its own config, and answers with
+  `run_code`'s receipts. It holds no session state: a job lives on one connection, and a dropped connection stops
+  every job on it. Each Ticket's `/work` is a directory under its `work_root`, kept between commands.
+- Done: the agent's side (`src/remote/listener.rs`), a listener started by `agent serve` when agent.yaml has
+  `nodes`. A connection is admitted only with a certificate pinned in `nodes.allow`, and only under the name that
+  certificate is pinned for. The live-node table keeps one connection per node; a newer one replaces it. A command
+  starts as a job on the node, and a task on the agent relays its output (polled every 2 s) and its end into the
+  worker's `Started`. A call waits at most 30 s for its answer, the agent pings every 15 s, and 45 s of silence is
+  a lost node: every call waiting on it fails at once.
+- Done: offline and reconnect. A worker's `run_code` or job call on a Ticket whose node is offline is a 503 tool
+  error that says so. A Launch for such a Ticket fails with retry, so the effect runner's backoff (1 s doubling to
+  5 min) holds it until the node is back, and the Watchdog's failing-Effect signal tells the operator after 3
+  attempts. The first retry after the node reconnects launches it. The prepare command runs only for Tickets on
+  this host, since a node's `/work` is its own.
+- Done: bounds. Frames are a 4-byte length and JSON, at most 16 MiB; a larger one ends the connection before it
+  is read. A request too large for one frame is refused before it is sent. Output is bounded on the node as it is
+  locally, and again on the agent.
+- Done: secrets (`secrets:` in node.yaml), read from files on the node: variables, which reach the sandbox through
+  the environment bwrap inherits and never its argv, and files bound read-only at `/secrets/<name>`. Every exact
+  copy of a value is replaced by `[redacted <name>]` before output leaves the node, also when a value is printed
+  across two polls. The agent never sees a value.
+- Not harvested: the `mvp` QUIC transport and SPIFFE identities. One TLS connection per node with pinned
+  self-signed certificates needs no CA and no issuance service.
+- Later: per-node capability leases (the `mvp` `DispatchPermit` design) that bound what the agent may run on each
+  node, scoped tool credentials (`tool_identity.rs`) instead of raw secrets, an immediate retry when a node
+  reconnects instead of the next backoff step, and the live nodes in `agent status`.
 
 **P10: benchmark.** Reproduce the article's ablation:
 - Setup: a stream of about 300 chat and CI messages, about 20 work requests, and a work tool that only consumes
@@ -636,6 +671,79 @@ On Slack, `address` takes `channel` and, for a thread, `thread_ts`; on GitHub, `
 top-level Slack post cannot be searched for like a thread reply, so a crash between a post and its record there can
 post one alert twice. `solos-swarm agent status --state-dir DIR --config agent.yaml` shows what it would raise now.
 
+## Remote nodes
+
+A node is a machine that runs the commands of the Tickets bound to it: a laptop with a checkout, or a box with a
+dataset. The agent keeps every session; the node only executes and answers. It dials out to the agent, so it needs
+no open port.
+
+1. On the agent's host, make the agent's certificate and note its fingerprint:
+
+   ```sh
+   solos-swarm agent init-nodes --dir /srv/agent/node-tls
+   # wrote /srv/agent/node-tls/cert.pem and key.pem; pin this fingerprint in each node's agent.fingerprint:
+   # sha256:3f1c...
+   ```
+
+2. On the machine (Linux with `/usr/bin/bwrap` and `/usr/bin/prlimit`), make its certificate:
+
+   ```sh
+   solos-swarm node init --dir ~/.config/solos-node/tls
+   # sha256:9a07...
+   ```
+
+3. In agent.yaml, pin the node and say where sessions run by default (the executor must be `pi`):
+
+   ```yaml
+   nodes:
+     listen: 0.0.0.0:7443           # where nodes dial in
+     cert: node-tls/cert.pem        # relative to agent.yaml
+     key: node-tls/key.pem
+     allow:
+       laptop:
+         fingerprint: "sha256:9a07..."
+         about: "the solos-swarm checkout at /repo"    # the Router reads this
+   executor:
+     kind: pi
+     # ...
+     environment: local             # or laptop: where a session runs when the Router names nowhere
+   ```
+
+4. On the machine, write node.yaml, with its mounts and the secrets its commands may use:
+
+   ```yaml
+   name: laptop                     # its name in nodes.allow
+   agent:
+     address: agent.example.com:7443
+     fingerprint: "sha256:3f1c..."  # from agent init-nodes
+   cert: tls/cert.pem               # relative to node.yaml
+   key: tls/key.pem
+   work_root: /home/me/.local/state/solos-node/work   # each Ticket's /work is a directory here
+   sandbox:
+     mounts:                        # read-only, each one directory under /
+       - {target: /repo, source: /home/me/src/solos-swarm}
+       - {target: /data, source: /home/me/datasets/phoenix}
+     # uv_root, concurrency (4), memory_bytes (4 GiB), job_max_secs (86400), bwrap, prlimit
+   secrets:
+     env:                           # variables: the file's text without its trailing newline
+       GITHUB_TOKEN: secrets/github-token
+     files:                         # read-only at /secrets/<name>
+       aws: /home/me/.aws/credentials
+   ```
+
+   A secret is at least 8 bytes. It never goes to the agent: what a command prints is redacted on the node, by
+   exact match, so a value the command transforms (encodes, splits, reverses) is not caught, and neither is one
+   cut at the output limit.
+
+5. Run it, under systemd or in a terminal: `solos-swarm node serve --config node.yaml`. It dials the agent, says
+   which node it is, and serves until SIGINT or SIGTERM, dialing again whenever the connection ends.
+
+The Router names a node with `environment` on a session accept, or the Ticket gets `executor.environment`. While
+the node is offline, its Tickets' launches wait and retry, the Watchdog tells the operator about the failing
+Effect, and a running worker's `run_code` says the node is offline. The connection is TLS 1.3 (ALPN
+`solos-node/1`) with each side's certificate pinned; it carries 4-byte length-prefixed JSON frames of at most 16
+MiB.
+
 ## Security model
 
 - Trigger text is data. It cannot change a permission, a budget or the Policy (the core has no path for it).
@@ -650,8 +758,15 @@ post one alert twice. `solos-swarm agent status --state-dir DIR --config agent.y
   text reaches it only as escaped values, and its budget is what the Ticket has left.
 - The event-driven surface is larger than a batch run's. Router and workers keep the `bwrap` sandbox, workers get
   no network except through broker tools, and the Router gets no `run_code`.
-- Open: the article's own caveat applies. A compromised control plane could drive every connected node. P9
-  needs per-node capability leases (the `mvp` `DispatchPermit` design) before any node outside our own boxes joins.
+- Remote nodes: each side pins the other's certificate, with no CA, and the agent admits a node only under the
+  name its certificate is pinned for. A node opens no port and takes commands only on the connection it dialed.
+  Its commands run in its own `bwrap` sandbox with no network. Its secrets are read on the node, reach the
+  sandbox through bwrap's inherited environment (not its argv, which other local users can read) or as read-only
+  files, and are redacted from everything the node sends, by exact match.
+- Open: the article's own caveat applies. A compromised agent host can run any command on every connected node,
+  inside that node's sandbox, with its mounts and its secrets: the values never leave the node, but a command can
+  use them, such as an API call with a token. Per-node capability leases (the `mvp` `DispatchPermit` design) are a
+  later step. Until then, connect only machines whose mounts and secrets you would hand to the agent host.
 
 ## Open decisions
 

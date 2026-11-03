@@ -72,6 +72,11 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   their own lines). The research words in the swarm runtime are now optional Goal fields: `nudges`, one template
   per escalation stage, and `record_fields`, the Task fields a host-filed record reads. `Goal::validate` checks
   them, a Goal template can set them, and a Goal without them runs exactly as before.
+- Agent mode, P9: remote nodes (`src/remote/`, `src/agent/environment.rs`). `solos-swarm node serve` dials the
+  agent over TLS where each side pins the other's certificate (`node init`, `agent init-nodes`), and runs the
+  `run_code` and background jobs of the Tickets bound to it in its own bwrap sandbox, with its own mounts and
+  secrets that never leave it; `Plan::Session` gains an optional `environment` (stored Plans read as before), an
+  offline node holds its Tickets' launches until it connects, and swarm mode is unchanged.
 - `collect` leaves the per-run `code/` scratch directory on the host and writes `collect-manifest.json`; `--include-code` opts back in.
 - Docs: pause mode, self-update operations, dashboard tunnel, tournament runbook, replay status.
 
