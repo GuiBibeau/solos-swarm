@@ -204,6 +204,47 @@ enum AgentCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Check and replay what the agent's browsers did: the event chain, each
+    /// step's signature under the key trusted for the machine that ran it,
+    /// and every page and typed text the steps name. Reads the Store and the
+    /// trail's blobs and writes nothing, so it is safe while the agent
+    /// serves. Exits 1 on any problem.
+    Trail {
+        /// The agent's state directory.
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// agent.yaml: the local trail key (`browser.audit_key`) and where
+        /// the blobs are (`trail.path`).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// One Ticket, printed step by step.
+        #[arg(long)]
+        ticket: Option<String>,
+        /// With --ticket: print one step's blob, as stored, instead of the
+        /// trail.
+        #[arg(long, requires = "ticket")]
+        step: Option<u32>,
+        /// With --step: the Assignment, when more than one of the Ticket's
+        /// has that step.
+        #[arg(long, requires = "step")]
+        assignment: Option<String>,
+        /// With --step: `view`, the exact bytes the model got, or
+        /// `snapshot`, the page as captured.
+        #[arg(long, value_enum, default_value_t = solos_swarm::agent::trail::Shown::View, requires = "step")]
+        show: solos_swarm::agent::trail::Shown,
+        /// `<environment>=ed25519:<hex>`: verify that environment's steps
+        /// with this key instead of the config's. Repeatable. A verifier
+        /// that holds only public keys needs no config.
+        #[arg(long)]
+        trust: Vec<solos_swarm::agent::trail::Trusted>,
+        /// Print JSON instead of text.
+        #[arg(long, conflicts_with = "step")]
+        json: bool,
+        /// A step that was asked and never answered, or answered with no
+        /// signed step, is a problem, not a warning.
+        #[arg(long)]
+        strict: bool,
+    },
     /// Measure the agent on a generated stream of chat and CI messages with
     /// work requests among them, as DeepSeek's super-agent ablation did:
     /// each run serves a fresh agent with simulated work. Writes
@@ -701,6 +742,46 @@ async fn execute(command: Action) -> Result<()> {
             } else {
                 print!("{}", status::render(&report));
             }
+            Ok(())
+        }
+        Action::Agent {
+            command:
+                AgentCommand::Trail {
+                    state_dir,
+                    config,
+                    ticket,
+                    step,
+                    assignment,
+                    show,
+                    trust,
+                    json,
+                    strict,
+                },
+        } => {
+            use solos_agent_core::model::{AssignmentId, TicketId};
+            use solos_swarm::agent::{AgentConfig, trail};
+            let config = config.as_deref().map(AgentConfig::load).transpose()?;
+            let trust = trail::Trust::new(config.as_ref(), trust)?;
+            let blobs = config
+                .map(|config| config.trail)
+                .unwrap_or_default()
+                .root(&state_dir);
+            let ticket = ticket.map(TicketId::new);
+            let report = trail::verify(&state_dir, &blobs, &trust, ticket.as_ref(), strict)?;
+            if let Some(step) = step {
+                let assignment = assignment.map(AssignmentId::new);
+                let bytes = trail::shown(&report, &blobs, assignment.as_ref(), step, show)?;
+                std::io::Write::write_all(&mut std::io::stdout().lock(), &bytes)?;
+                for found in &report.problems {
+                    eprintln!("{found}");
+                }
+            } else if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", trail::render(&report, ticket.as_ref()));
+            }
+            let problems = report.problems.iter().filter(|found| found.fatal).count();
+            ensure!(report.ok, "the trail has problems ({problems})");
             Ok(())
         }
         Action::Agent {

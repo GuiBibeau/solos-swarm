@@ -2,6 +2,15 @@
 //! View its model got, and the text it typed, kept by digest so the chain
 //! holds only digests.
 
+mod check;
+mod replay;
+
+pub use check::{
+    AssignmentTrail, ChainHead, Found, Problem, SecretUse, Shown, Step, StepAt, Tally, TicketTrail,
+    TrailReport, Trust, Trusted, shown, verify,
+};
+pub use replay::render;
+
 use super::pi_executor::{dir_name, private_dir};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
