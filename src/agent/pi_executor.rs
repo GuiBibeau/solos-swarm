@@ -972,6 +972,7 @@ mod tests {
             assignment: AssignmentId::new(assignment),
             title: "Fix the flaky test".into(),
             scope: "Make tests/retry.rs pass ten times in a row.".into(),
+            origin: trigger("t0", Actor::person("alice"), "Fix the flaky test"),
             rules: Vec::new(),
             plan: Plan::Session { harness: None },
             budget_microusd: 500_000,

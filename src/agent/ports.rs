@@ -81,6 +81,8 @@ pub struct Launch {
     pub assignment: AssignmentId,
     pub title: String,
     pub scope: String,
+    /// The Trigger the Ticket was accepted from.
+    pub origin: Trigger,
     /// The proactive rules the Router matched, for inferred work.
     pub rules: Vec<String>,
     pub plan: Plan,

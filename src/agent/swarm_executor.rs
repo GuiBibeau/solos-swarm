@@ -810,6 +810,12 @@ mod tests {
             assignment: AssignmentId::new(assignment),
             title: "Map who cites the paper".into(),
             scope: "Find every paper that cites X.".into(),
+            origin: serde_json::from_value(json!({
+                "id": "t1", "source": "slack", "at_ms": 1_000,
+                "actor": {"id": "alice", "kind": "person"}, "addressed": "mention",
+                "text": "Who cites X?", "threads": ["T1"]
+            }))
+            .unwrap(),
             rules: Vec::new(),
             plan: Plan::Swarm {
                 agents,
