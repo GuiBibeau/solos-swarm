@@ -23,6 +23,7 @@ pub mod simulated;
 pub mod slack;
 pub mod status;
 pub mod swarm_executor;
+pub mod trail;
 pub mod utc;
 pub mod watchdog;
 
