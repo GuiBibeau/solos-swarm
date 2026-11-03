@@ -383,6 +383,27 @@ impl Runtime {
                 self.engine.note(&ticket, text).map(done),
             ),
             Fact::Command(command) => return self.command(command).map(|()| Ok(Applied::Done)),
+            Fact::TrailAsk {
+                ticket,
+                assignment,
+                action,
+            } => (
+                format!("trail step asked by {assignment} on {ticket}"),
+                self.engine
+                    .trail_ask(&ticket, &assignment, action)
+                    .map(|n| Applied::TrailAsked { n }),
+            ),
+            Fact::TrailDone {
+                ticket,
+                assignment,
+                n,
+                outcome,
+            } => (
+                format!("trail step {n} of {assignment} on {ticket}"),
+                self.engine
+                    .trail_done(&ticket, &assignment, n, outcome)
+                    .map(done),
+            ),
             Fact::Retry {
                 ticket,
                 assignment,

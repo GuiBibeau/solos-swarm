@@ -9,10 +9,15 @@ use solos_agent_core::model::{
     InputBody, MessageKind, OutboundMessage, ReportIn, ReportStatus, ThreadKey, TicketId,
     TicketOutcome, Trigger, TriggerId,
 };
+use solos_agent_core::trail::{
+    CloseReason, Digest, PageAction, PageSeen, STEP_VERSION, Signature, SignedStep, StepBody,
+    StepOutcome, TrailAction, TrailKey, TrailOutcome,
+};
 use solos_agent_store::SqliteStore;
 use solos_swarm::agent::jsonl::{JsonlChannel, JsonlSource};
 use solos_swarm::agent::ports::{
-    BoxFuture, Channel, Delivery, Executor, Fact, FactSink, Launch, SendOptions, SendOutcome,
+    Answer, Applied, BoxFuture, Channel, Delivery, Executor, Fact, FactSink, Launch, SendOptions,
+    SendOutcome,
 };
 use solos_swarm::agent::scripted::{ScriptedExecutor, ScriptedRouter};
 use solos_swarm::agent::{Adapters, RunOptions, Runtime, STORE_FILE, ServeOptions, Summary, serve};
@@ -621,6 +626,186 @@ async fn a_reply_to_a_source_with_no_channel_is_dropped_and_the_runtime_still_go
     let store = scratch.store();
     let ended = store.tickets().unwrap()[0].ended.clone();
     assert!(ended.is_some(), "the work itself still completed");
+}
+
+#[derive(Default)]
+struct Browses {
+    answers: Mutex<Vec<Answer>>,
+}
+
+impl Executor for Browses {
+    fn launch(&self, launch: Launch, facts: FactSink) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            let (ticket, assignment) = (launch.ticket, launch.assignment);
+            let started = Fact::Started {
+                ticket: ticket.clone(),
+                assignment: assignment.clone(),
+            };
+            facts.send(started).await?;
+
+            let open = TrailAction::Open {
+                url: "https://github.com/login".into(),
+                key: None,
+            };
+            let click = TrailAction::Act {
+                action: PageAction::Click,
+                element: Some(14),
+                text: None,
+            };
+            let close = TrailAction::Close {
+                reason: CloseReason::AssignmentEnded,
+            };
+            let signed = |n: u32, action: &TrailAction, outcome: StepOutcome| {
+                TrailOutcome::signed(SignedStep {
+                    body: StepBody {
+                        v: STEP_VERSION,
+                        ticket: ticket.clone(),
+                        assignment: assignment.clone(),
+                        n,
+                        environment: "local".into(),
+                        session: "7a3c0f9e12d45b60".into(),
+                        session_step: n - 1,
+                        at_ms: 1_000,
+                        provenance: None,
+                        action: action.clone(),
+                        outcome,
+                    },
+                    signer: TrailKey::try_from(format!("ed25519:{}", "9c".repeat(32))).unwrap(),
+                    signature: Signature::try_from("ab".repeat(64)).unwrap(),
+                })
+            };
+            let page = StepOutcome::Page(PageSeen {
+                url: "https://github.com/login".into(),
+                status: Some(200),
+                title: "Sign in".into(),
+                snapshot: Digest::of(b"snapshot"),
+                view: Digest::of(b"view"),
+                target: None,
+                filled: Vec::new(),
+                keyed: Vec::new(),
+            });
+            let closed = StepOutcome::Closed {
+                steps: 1,
+                reason: CloseReason::AssignmentEnded,
+            };
+            let ask = |action: &TrailAction| Fact::TrailAsk {
+                ticket: ticket.clone(),
+                assignment: assignment.clone(),
+                action: action.clone(),
+            };
+            let done = |n: u32, outcome: TrailOutcome| Fact::TrailDone {
+                ticket: ticket.clone(),
+                assignment: assignment.clone(),
+                n,
+                outcome,
+            };
+            let report = Fact::Report {
+                ticket: ticket.clone(),
+                assignment: assignment.clone(),
+                report: ReportIn {
+                    status: ReportStatus::Ready,
+                    text: "done".into(),
+                    question: None,
+                    spent_microusd: 0,
+                },
+            };
+
+            let facts_in_order = [
+                ask(&open),
+                ask(&click),
+                done(1, signed(1, &click, page.clone())),
+                done(1, signed(1, &open, page)),
+                report,
+                ask(&click),
+                ask(&close),
+                done(2, signed(2, &close, closed)),
+            ];
+            for fact in facts_in_order {
+                let answer = facts.ask(fact).await?;
+                self.answers.lock().unwrap().push(answer);
+            }
+            Ok(())
+        })
+    }
+    fn deliver(&self, _: Delivery, _: FactSink) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn stop(&self, _: TicketId, _: AssignmentId, _: String) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[tokio::test]
+async fn a_browser_step_is_recorded_before_and_after_it_runs_and_a_close_outlives_its_assignment() {
+    let scratch = Scratch::new("trail");
+    scratch.append(&[request("t-request", "T1", "Read my notifications")]);
+    let browses = Arc::new(Browses::default());
+
+    until_idle(scratch.runtime(false, browses.clone(), jsonl(&scratch))).await;
+
+    let answers = browses.answers.lock().unwrap().clone();
+    let [
+        asked,
+        second_ask,
+        wrong_done,
+        done,
+        reported,
+        late_ask,
+        close,
+        closed,
+    ] = &answers[..]
+    else {
+        panic!("{answers:?}")
+    };
+    assert_eq!(asked, &Ok(Applied::TrailAsked { n: 1 }));
+    assert!(
+        second_ask
+            .as_ref()
+            .is_err_and(|why| why.contains("still running")),
+        "{second_ask:?}"
+    );
+    assert!(
+        wrong_done
+            .as_ref()
+            .is_err_and(|why| why.contains("something other")),
+        "{wrong_done:?}"
+    );
+    assert_eq!(done, &Ok(Applied::Done));
+    assert_eq!(reported, &Ok(Applied::Done));
+    assert!(
+        late_ask
+            .as_ref()
+            .is_err_and(|why| why.contains("is not running")),
+        "{late_ask:?}"
+    );
+    assert_eq!(close, &Ok(Applied::TrailAsked { n: 2 }));
+    assert_eq!(closed, &Ok(Applied::Done));
+
+    let store = scratch.store();
+    let trail: Vec<String> = store
+        .events()
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| match e.event {
+            DomainEvent::TrailAsked { n, .. } => Some(format!("asked {n}")),
+            DomainEvent::TrailDone { n, .. } => Some(format!("done {n}")),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(trail, ["asked 1", "done 1", "asked 2", "done 2"]);
+    let ticket = &store.tickets().unwrap()[0];
+    let cursors = store.trails().unwrap();
+    let [cursor] = &cursors[..] else {
+        panic!("{cursors:?}")
+    };
+    assert_eq!(cursor.assignment, ticket.assignments[0].id);
+    assert_eq!(cursor.next, 3);
+    assert!(cursor.pending.is_none());
+    assert!(
+        ticket.ended.is_some(),
+        "the Close came after the Ticket ended"
+    );
+    assert_settled(&store);
 }
 
 /// Starts every Assignment, reports `status` on it if given, and keeps
