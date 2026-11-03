@@ -412,6 +412,7 @@ async fn settled(rx: &mut mpsc::Receiver<Observation>, required: &BTreeSet<Strin
                     done.insert(id);
                 }
             }
+            SessionEvent::OutputCut => {}
         }
     }
     Ok(())
@@ -455,6 +456,7 @@ async fn work(
                 anyhow::bail!("{who} RPC rejected command: {error}")
             }
             SessionEvent::TurnEnded => {}
+            SessionEvent::OutputCut => continue,
         }
         if !pending.contains(&who) {
             continue;

@@ -317,6 +317,7 @@ where
                     prices: *prices,
                     max_input_bytes: *max_input_bytes,
                     max_output_tokens: *max_output_tokens,
+                    call_limit: None,
                 };
                 Some(WorkerParts { terms, code })
             }
@@ -374,11 +375,11 @@ where
         };
         let router = match &config.router {
             RouterConfig::Scripted { .. } => None,
-            RouterConfig::Pi { .. } => {
+            RouterConfig::Pi { max_batch, .. } => {
                 let (spec, grant) = router_session(config, state_dir, &node, &pi_root)?;
                 broker.admit(spec.token.clone(), grant)?;
                 // Its first session starts with the first card, by which time the socket is bound.
-                Some(Arc::new(PiRouter::start(harness.clone(), spec)))
+                Some(Arc::new(PiRouter::start(harness.clone(), spec, *max_batch)))
             }
         };
         let executor = match (&config.executor, worker_model) {
@@ -469,6 +470,7 @@ fn router_session(
         prices,
         max_input_bytes,
         max_output_tokens,
+        max_batch: _,
         instructions,
         rules,
     } = &config.router
@@ -480,6 +482,7 @@ fn router_session(
         .router_daily_microusd
         .context("a pi router needs budgets.router_daily_microusd")?;
     let upstream = upstream_profile(provider, model)?;
+    let half_an_eval = Duration::from_millis(config.policy.eval_timeout_ms / 2);
     let dir = state_dir.join(ROUTER_DIR);
     private_dir(&dir)?;
     let settings = dir.join("pi-settings.json");
@@ -508,6 +511,7 @@ fn router_session(
             prices: *prices,
             max_input_bytes: *max_input_bytes,
             max_output_tokens: *max_output_tokens,
+            call_limit: Some(half_an_eval),
         },
         system_prompt: Some(
             pi_router::system_prompt(

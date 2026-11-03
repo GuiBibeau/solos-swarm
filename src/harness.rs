@@ -28,6 +28,10 @@ pub enum SessionEvent {
     TurnEnded,
     /// The harness refused a command; the text is its reason.
     Rejected(String),
+    /// A reply hit the model's output limit while it was asking for tool
+    /// calls, so none ran. The session asks the model again with the same
+    /// context, and keeps doing so until something stops it.
+    OutputCut,
 }
 
 /// One event, tagged with the id of the session that sent it.
@@ -288,12 +292,19 @@ impl Session for PiSession {
     }
 }
 
-/// The two Pi RPC frames a mode acts on. Everything else stays in the transcript only.
+/// The Pi RPC frames a mode acts on. Everything else stays in the transcript only.
 fn event(frame: &Value) -> Option<SessionEvent> {
     if frame["type"] == "response" && frame["success"] == false {
         Some(SessionEvent::Rejected(frame["error"].to_string()))
     } else if frame["type"] == "agent_settled" {
         Some(SessionEvent::TurnEnded)
+    } else if frame["type"] == "turn_end"
+        && frame["message"]["stopReason"] == "length"
+        && frame["message"]["content"]
+            .as_array()
+            .is_some_and(|parts| parts.iter().any(|part| part["type"] == "toolCall"))
+    {
+        Some(SessionEvent::OutputCut)
     } else {
         None
     }
@@ -460,7 +471,21 @@ mod tests {
     }
 
     #[test]
-    fn only_a_settled_agent_and_a_refused_command_become_events() {
+    fn only_a_settled_agent_a_refused_command_and_a_cut_off_call_become_events() {
+        let turn_end = |stop: &str, content: Value| json!({"type":"turn_end","message":{"role":"assistant","content":content,"stopReason":stop},"toolResults":[]});
+        let call = json!([{"type":"toolCall","id":"c1","name":"router_decide","arguments":{"eval":"ev_1"}}]);
+        let text = json!([{"type":"text","text":"Decided."}]);
+        assert_eq!(
+            event(&turn_end("length", call.clone())),
+            Some(SessionEvent::OutputCut)
+        );
+        assert_eq!(event(&turn_end("length", text.clone())), None);
+        assert_eq!(event(&turn_end("toolUse", call.clone())), None);
+        assert_eq!(event(&turn_end("stop", text)), None);
+        assert_eq!(
+            event(&json!({"type":"message_end","message":{"stopReason":"length","content":call}})),
+            None
+        );
         assert_eq!(
             event(&json!({"type":"agent_settled"})),
             Some(SessionEvent::TurnEnded)

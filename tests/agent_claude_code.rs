@@ -133,6 +133,7 @@ fn terms() -> ModelTerms {
         prices: PRICES,
         max_input_bytes: 65_536,
         max_output_tokens: MAX_OUTPUT,
+        call_limit: None,
     }
 }
 

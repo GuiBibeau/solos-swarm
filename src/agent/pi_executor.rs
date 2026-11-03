@@ -721,6 +721,7 @@ impl Turns<'_> {
                     Some((_, Ok(SessionEvent::Rejected(why)))) => {
                         return Ok(Some(format!("the session refused a prompt: {why}")));
                     }
+                    Some((_, Ok(SessionEvent::OutputCut))) => {}
                     Some((_, Err(err))) => return Ok(Some(format!("the session ended: {err:#}"))),
                     None => return Ok(Some("the session's events stopped".into())),
                 },
@@ -959,6 +960,7 @@ mod tests {
                 },
                 max_input_bytes: 65_536,
                 max_output_tokens: 1_024,
+                call_limit: None,
             };
             let parts = BrokerParts {
                 dir: dir.clone(),

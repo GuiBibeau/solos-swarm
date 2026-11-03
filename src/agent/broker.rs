@@ -37,6 +37,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 use tokio::net::UnixListener;
 
 /// The broker's socket in the state directory.
@@ -238,6 +239,9 @@ pub struct ModelTerms {
     pub prices: PriceTable,
     pub max_input_bytes: usize,
     pub max_output_tokens: u64,
+    /// The longest one call may take before it is dropped and its hold
+    /// released, or no limit beyond the transport's own.
+    pub call_limit: Option<Duration>,
 }
 
 /// What one token admits.
@@ -732,7 +736,8 @@ impl Call {
 
 /// Send one held call upstream and close its hold: settled at the receipt's
 /// cost, released if the provider failed, or charged at the hold if it
-/// answered with a receipt that cannot be read.
+/// answered with a receipt that cannot be read or did not answer within the
+/// grant's call limit, since the provider may still bill a request it got.
 async fn dispatch(
     broker: AgentBroker,
     grant: Arc<Grant>,
@@ -741,7 +746,23 @@ async fn dispatch(
     body: Value,
 ) -> Reply {
     let terms = &grant.terms;
-    let mut response = match broker.inner.provider.dispatch(body).await {
+    let sent = broker.inner.provider.dispatch(body);
+    let sent = match terms.call_limit {
+        None => sent.await,
+        Some(limit) => match tokio::time::timeout(limit, sent).await {
+            Ok(sent) => sent,
+            Err(_) => {
+                broker
+                    .store(move |store| store.charge_hold(id, now_ms()))
+                    .await
+                    .map_err(failed)?;
+                return Err(forbidden(format!(
+                    "the model call took longer than {limit:?}"
+                )));
+            }
+        },
+    };
+    let mut response = match sent {
         Ok(response) => response,
         Err(error) => {
             broker
