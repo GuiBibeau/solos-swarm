@@ -37,6 +37,7 @@ use tokio::{
     sync::{Semaphore, watch},
     task::JoinHandle,
 };
+use zeroize::Zeroizing;
 
 pub const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
 pub const MAX_TIMEOUT_SECONDS: u64 = 300;
@@ -113,7 +114,33 @@ pub struct CodeConfig {
     pub memory_bytes: u64,
     pub bwrap: PathBuf,
     pub prlimit: PathBuf,
+    /// Single files bound read-only at their targets after the mounts,
+    /// such as a node's secrets under `/secrets`.
+    pub files: Vec<Mount>,
+    /// Variables the sandbox gets through the environment bwrap inherits,
+    /// never its argv, which any local user can read in `/proc`.
+    pub env: Vec<(String, Secret)>,
 }
+
+/// A value the sandbox may see and nothing prints.
+#[derive(Clone)]
+pub struct Secret(Zeroizing<String>);
+
+impl Secret {
+    pub fn new(value: String) -> Self {
+        Self(Zeroizing::new(value))
+    }
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(..)")
+    }
+}
+
 impl CodeConfig {
     /// `mounts` and the default limits and binaries.
     pub fn new(scratch_root: PathBuf, mounts: Vec<Mount>) -> Self {
@@ -125,6 +152,8 @@ impl CodeConfig {
             memory_bytes: DEFAULT_MEMORY_BYTES,
             bwrap: PathBuf::from(DEFAULT_BWRAP),
             prlimit: PathBuf::from(DEFAULT_PRLIMIT),
+            files: Vec::new(),
+            env: Vec::new(),
         }
     }
     /// A swarm run's, from `SWARM_CODE_*`: the decoded dataset, the regimes
@@ -176,6 +205,8 @@ impl CodeConfig {
             memory_bytes,
             bwrap: env_path("SWARM_CODE_BWRAP", DEFAULT_BWRAP),
             prlimit: env_path("SWARM_CODE_PRLIMIT", DEFAULT_PRLIMIT),
+            files: Vec::new(),
+            env: Vec::new(),
         })
     }
 }
@@ -324,7 +355,7 @@ impl CodeExecutor {
         Self::from_config(CodeConfig::from_env(run_dir)?)
     }
     pub fn from_config(config: CodeConfig) -> Result<Self> {
-        for mount in &config.mounts {
+        for mount in config.mounts.iter().chain(&config.files) {
             ensure!(
                 mount.source.exists(),
                 "run_code mount source is missing: {}",
@@ -471,6 +502,12 @@ impl CodeExecutor {
     fn command(&self, scratch: &Path, code: &str) -> Command {
         let mut command = Command::new(&self.config.prlimit);
         command.env_clear();
+        command.envs(
+            self.config
+                .env
+                .iter()
+                .map(|(name, value)| (name, value.expose())),
+        );
         command
             .arg(format!("--as={}", self.config.memory_bytes))
             .arg(format!("--fsize={FILE_SIZE_BYTES}"))
@@ -509,9 +546,16 @@ impl CodeExecutor {
             // store. Bind the whole store at its real path so that link resolves.
             sandbox = parent_dirs(sandbox, root).ro_bind(root, root);
         }
+        for file in &self.config.files {
+            sandbox = parent_dirs(sandbox, &file.target).ro_bind(&file.source, &file.target);
+        }
+        sandbox = sandbox.chdir("/work");
+        // `command` cleared the environment bwrap inherits and put only
+        // `env` in it, so bwrap passes those on when it does not clear them.
+        if self.config.env.is_empty() {
+            sandbox = sandbox.clearenv();
+        }
         sandbox
-            .chdir("/work")
-            .clearenv()
             .setenv("PATH", "/venv/bin:/usr/local/bin:/usr/bin:/bin")
             .setenv("HOME", "/work")
             .setenv("TMPDIR", "/tmp")
@@ -796,6 +840,88 @@ impl Drop for Started {
     }
 }
 
+impl Started {
+    /// A request that runs elsewhere, such as on a remote node, whose
+    /// [`Feed`] brings in what it prints and how it ends. It reads, waits
+    /// and stops like one this host runs, under the same `bounds`.
+    pub fn fed(bounds: OutputBounds) -> (Self, Feed) {
+        let progress = Arc::new(Progress {
+            stdout: Mutex::new(Captured::new(bounds.stdout_bytes)),
+            stderr: Mutex::new(Captured::new(bounds.stderr_bytes)),
+            running: AtomicBool::new(false),
+        });
+        let (stop, stopping) = watch::channel(false);
+        let (ended, end) = watch::channel(None);
+        let started = Self {
+            progress: progress.clone(),
+            stop,
+            end,
+        };
+        let feed = Feed {
+            progress,
+            stopping,
+            ended,
+        };
+        (started, feed)
+    }
+}
+
+/// The far side of a [`Started::fed`] request.
+pub struct Feed {
+    progress: Arc<Progress>,
+    stopping: watch::Receiver<bool>,
+    ended: watch::Sender<Option<Ended>>,
+}
+
+impl Feed {
+    /// It holds a sandbox slot where it runs.
+    pub fn running(&self, running: bool) {
+        self.progress.running.store(running, Ordering::SeqCst);
+    }
+    /// Output it printed since the last push, kept as this host keeps its
+    /// own: past the bounds it is dropped until a read makes room.
+    pub fn push(&self, unread: &Unread) {
+        for (stream, text) in [
+            (Stream::Stdout, &unread.stdout),
+            (Stream::Stderr, &unread.stderr),
+        ] {
+            let mut captured = self.progress.of(stream);
+            captured.push(text.as_bytes());
+            captured.dropped |= unread.truncated;
+        }
+    }
+    /// A stop was asked for, or every handle on the request is gone.
+    pub async fn stopping(&mut self) {
+        stopped(&mut self.stopping).await;
+    }
+    /// Its end. A receipt's output is what the far side had not sent yet,
+    /// so it goes after what nobody read here, as [`finish_capture`] would
+    /// leave it.
+    pub fn end(self, ended: Ended) {
+        let ended = match ended {
+            Ended::Ran {
+                mut receipt,
+                stopped,
+            } => {
+                let mut truncated = receipt["truncated"] == true;
+                for (stream, name) in [(Stream::Stdout, "stdout"), (Stream::Stderr, "stderr")] {
+                    let (text, dropped) = {
+                        let mut captured = self.progress.of(stream);
+                        captured.push(receipt[name].as_str().unwrap_or_default().as_bytes());
+                        captured.drain(true)
+                    };
+                    receipt[name] = json!(text);
+                    truncated |= dropped;
+                }
+                receipt["truncated"] = json!(truncated);
+                Ended::Ran { receipt, stopped }
+            }
+            failed @ Ended::Failed(_) => failed,
+        };
+        self.ended.send_replace(Some(ended));
+    }
+}
+
 struct Progress {
     stdout: Mutex<Captured>,
     stderr: Mutex<Captured>,
@@ -808,6 +934,12 @@ impl Progress {
     }
     fn stderr(&self) -> MutexGuard<'_, Captured> {
         self.stderr.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    fn of(&self, stream: Stream) -> MutexGuard<'_, Captured> {
+        match stream {
+            Stream::Stdout => self.stdout(),
+            Stream::Stderr => self.stderr(),
+        }
     }
 }
 
@@ -1136,6 +1268,8 @@ mod tests {
             memory_bytes: DEFAULT_MEMORY_BYTES,
             bwrap: PathBuf::from("/usr/bin/bwrap"),
             prlimit: PathBuf::from("/usr/bin/prlimit"),
+            files: Vec::new(),
+            env: Vec::new(),
         }
     }
     /// An agent worker's: one configured mount, nothing else.
@@ -1387,6 +1521,95 @@ mod tests {
         assert_eq!(args, golden);
         assert_eq!(command.get_envs().count(), 0);
         assert!(format!("{command:?}").starts_with("env -i "), "{command:?}");
+    }
+    #[test]
+    fn secrets_reach_the_sandbox_through_its_environment_and_never_its_argv() {
+        let mut config = worker_config(Path::new("/nodes/work"));
+        config.files = vec![Mount {
+            target: PathBuf::from("/secrets/deploy"),
+            source: PathBuf::from("/home/me/.deploy"),
+        }];
+        config.env = vec![("API_TOKEN".into(), Secret::new("s3cr3t-token-value".into()))];
+        assert_eq!(format!("{:?}", config.env[0].1), "Secret(..)");
+        let command = executor(config).command(Path::new("/nodes/work/tk_1"), "echo ok");
+        let command = command.as_std();
+        let args: Vec<&str> = command
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+        assert!(!args.iter().any(|arg| arg.contains("s3cr3t")), "{args:?}");
+        assert!(
+            !args.contains(&"--clearenv"),
+            "bwrap keeps what it inherits"
+        );
+        let envs: Vec<_> = command.get_envs().collect();
+        assert_eq!(
+            envs,
+            [(
+                std::ffi::OsStr::new("API_TOKEN"),
+                Some(std::ffi::OsStr::new("s3cr3t-token-value"))
+            )]
+        );
+        let bind = [
+            "--dir",
+            "/secrets",
+            "--ro-bind",
+            "/home/me/.deploy",
+            "/secrets/deploy",
+        ];
+        assert!(args.windows(5).any(|window| window == bind), "{args:?}");
+        let plain = executor(worker_config(Path::new("/nodes/work")))
+            .command(Path::new("/nodes/work/tk_1"), "echo ok");
+        assert!(plain.as_std().get_args().any(|arg| arg == "--clearenv"));
+    }
+    #[tokio::test]
+    async fn a_fed_request_reads_and_ends_as_one_this_host_runs() {
+        let bounds = OutputBounds {
+            stdout_bytes: 8,
+            stderr_bytes: 8,
+        };
+        let (started, mut feed) = Started::fed(bounds);
+        assert!(!started.running() && started.ended().is_none());
+        feed.running(true);
+        feed.push(&Unread {
+            stdout: "one ".into(),
+            stderr: String::new(),
+            truncated: false,
+        });
+        assert!(started.running());
+        assert_eq!(started.read().stdout, "one ");
+        feed.push(&Unread {
+            stdout: "two three".into(),
+            stderr: "e".into(),
+            truncated: false,
+        });
+        started.stop();
+        tokio::time::timeout(Duration::from_secs(1), feed.stopping())
+            .await
+            .unwrap();
+        let receipt = json!({"exit_code": -1, "stdout": "!", "stderr": "", "timed_out": false,
+                             "duration_ms": 5, "truncated": false, "queue_wait_ms": 0});
+        feed.end(Ended::Ran {
+            receipt,
+            stopped: true,
+        });
+        let Some(Ended::Ran { receipt, stopped }) = started.wait(Duration::from_secs(1)).await
+        else {
+            panic!("no end")
+        };
+        assert!(stopped);
+        assert_eq!(
+            (
+                &receipt["stdout"],
+                &receipt["stderr"],
+                &receipt["truncated"]
+            ),
+            (&json!("two thre"), &json!("e"), &json!(true)),
+            "what nobody read, cut at its bound"
+        );
+        let (started, feed) = Started::fed(bounds);
+        drop(feed);
+        assert!(matches!(started.end().await, Ended::Failed(_)));
     }
     #[test]
     fn a_swarm_scratch_is_an_agent_id_and_a_worker_scratch_is_its_own_directory_under_the_root() {
