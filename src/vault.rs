@@ -416,10 +416,6 @@ pub struct LoginFill {
 }
 
 impl LoginFill {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "browse::session's fill is its first caller")
-    )]
     pub(crate) fn reveal_password(&self) -> &str {
         self.password.reveal()
     }

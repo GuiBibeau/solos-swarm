@@ -82,6 +82,11 @@ enum Action {
         #[command(subcommand)]
         command: VaultCommand,
     },
+    /// This machine's headless browser, whose every step it signs.
+    Browser {
+        #[command(subcommand)]
+        command: BrowserCommand,
+    },
     /// A Model Context Protocol server on stdin and stdout, for an MCP host
     /// such as Claude Code or Codex. With --socket and --token-file it offers
     /// one principal's tools through its broker; with --state-dir and
@@ -282,6 +287,17 @@ enum NodeCommand {
         /// certificate, sandbox mounts and secrets.
         #[arg(long)]
         config: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum BrowserCommand {
+    /// Write a new Ed25519 trail key, where no sandbox can read it, and
+    /// print its public half (`ed25519:<hex>`) to pin wherever the trail
+    /// is verified. An existing file is never replaced.
+    InitKey {
+        #[arg(long)]
+        out: PathBuf,
     },
 }
 
@@ -755,6 +771,10 @@ async fn execute(command: Action) -> Result<()> {
             "the agent's nodes.allow.<name>.fingerprint",
         ),
         Action::Vault { command } => vault_command(command),
+        Action::Browser {
+            command: BrowserCommand::InitKey { out },
+        } => solos_swarm::browse::TrailSigner::init(&out, &vault::SandboxView::new([]))
+            .map(|key| println!("{key}")),
         Action::Node {
             command: NodeCommand::Serve { config },
         } => {

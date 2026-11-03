@@ -6,6 +6,8 @@ const ALLOWED: [&str; 2] = ["src/vault.rs", "src/vault/"];
 
 const ACCESSORS: [&str; 3] = ["reveal", "reveal_into", "reveal_password"];
 
+const CALLERS: [(&str, &str); 1] = [("src/browse/session.rs", "reveal_password")];
+
 /// Each function outside the vault's tests that reads a value straight
 /// from `SecretValue::reveal`, by file.
 const READERS: [(&str, &str); 5] = [
@@ -41,6 +43,7 @@ fn every_accessor_that_yields_a_value_is_named_only_in_allowed_modules() {
     let mut readers = BTreeSet::new();
     let mut outside = Vec::new();
     let mut public = Vec::new();
+    let mut callers = BTreeSet::new();
     for path in files {
         let file = path
             .strip_prefix(root)
@@ -61,7 +64,10 @@ fn every_accessor_that_yields_a_value_is_named_only_in_allowed_modules() {
                 previous = word;
             }
             for word in words(line).filter(|word| word.starts_with("reveal")) {
-                if !allowed {
+                if CALLERS.contains(&(file.as_str(), word)) && !line.contains(&format!("fn {word}"))
+                {
+                    callers.insert((file.clone(), word.to_owned()));
+                } else if !allowed {
                     outside.push(format!("{at}: {word}"));
                 } else if line.contains(&format!("fn {word}")) {
                     defined.insert(word.to_owned());
@@ -77,8 +83,16 @@ fn every_accessor_that_yields_a_value_is_named_only_in_allowed_modules() {
     }
     assert!(
         outside.is_empty(),
-        "a value accessor is named outside {ALLOWED:?}:\n{}",
+        "a value accessor is named outside {ALLOWED:?} and {CALLERS:?}:\n{}",
         outside.join("\n")
+    );
+    assert_eq!(
+        callers,
+        CALLERS
+            .iter()
+            .map(|(file, accessor)| ((*file).to_owned(), (*accessor).to_owned()))
+            .collect::<BTreeSet<_>>(),
+        "an accessor's callers outside the vault changed; list them in CALLERS"
     );
     assert!(
         public.is_empty(),

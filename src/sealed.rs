@@ -32,38 +32,12 @@ impl std::fmt::Debug for Key {
 }
 
 impl Key {
-    /// An existing file is never replaced.
     pub fn create(path: &Path) -> Result<()> {
-        let mut key = Zeroizing::new([0u8; KEY_BYTES]);
-        getrandom::fill(&mut *key).map_err(|_| anyhow!("OS random source unavailable"))?;
-        private_file(path, &*key, false)
+        create_key_file(path)
     }
 
-    /// Refused: a missing file, a symlink, a file that group or others may
-    /// read or write, or one that is not 32 bytes.
     pub fn read(path: &Path) -> Result<Self> {
-        let shown = path.display();
-        ensure!(path.is_file(), "the key file {shown} is missing");
-        ensure!(
-            !fs::symlink_metadata(path)?.file_type().is_symlink(),
-            "the key file {shown} is a symlink"
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            ensure!(
-                fs::metadata(path)?.permissions().mode() & 0o077 == 0,
-                "the key file {shown} is open to group or others; chmod 600 it"
-            );
-        }
-        let bytes = Zeroizing::new(fs::read(path)?);
-        let mut key = Zeroizing::new([0u8; KEY_BYTES]);
-        ensure!(
-            bytes.len() == KEY_BYTES,
-            "the key file {shown} does not hold exactly {KEY_BYTES} bytes"
-        );
-        key.copy_from_slice(&bytes);
-        Ok(Self(key))
+        read_key_file(path).map(Self)
     }
 
     pub fn seal(&self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
@@ -108,6 +82,40 @@ impl Key {
     fn cipher(&self) -> Aes256Gcm {
         Aes256Gcm::new(aes_gcm::Key::<Aes256Gcm>::from_slice(&*self.0))
     }
+}
+
+/// 32 random bytes at `path`, mode 0600. An existing file is never replaced.
+pub fn create_key_file(path: &Path) -> Result<()> {
+    let mut key = Zeroizing::new([0u8; KEY_BYTES]);
+    getrandom::fill(&mut *key).map_err(|_| anyhow!("OS random source unavailable"))?;
+    private_file(path, &*key, false)
+}
+
+/// Refused: a missing file, a symlink, a file that group or others may read
+/// or write, or one that is not 32 bytes.
+pub fn read_key_file(path: &Path) -> Result<Zeroizing<[u8; KEY_BYTES]>> {
+    let shown = path.display();
+    ensure!(path.is_file(), "the key file {shown} is missing");
+    ensure!(
+        !fs::symlink_metadata(path)?.file_type().is_symlink(),
+        "the key file {shown} is a symlink"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        ensure!(
+            fs::metadata(path)?.permissions().mode() & 0o077 == 0,
+            "the key file {shown} is open to group or others; chmod 600 it"
+        );
+    }
+    let bytes = Zeroizing::new(fs::read(path)?);
+    let mut key = Zeroizing::new([0u8; KEY_BYTES]);
+    ensure!(
+        bytes.len() == KEY_BYTES,
+        "the key file {shown} does not hold exactly {KEY_BYTES} bytes"
+    );
+    key.copy_from_slice(&bytes);
+    Ok(key)
 }
 
 /// Write `bytes` to `path` with mode 0600, all or nothing: a temporary file

@@ -6,6 +6,7 @@ pub mod artifacts;
 pub mod audit;
 pub mod bridge;
 pub mod broker;
+pub mod browse;
 pub mod bwrap;
 pub mod cluster;
 pub mod code;

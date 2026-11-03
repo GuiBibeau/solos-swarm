@@ -26,6 +26,11 @@ impl Bwrap {
         self.arg("--unshare-all")
     }
 
+    /// `--share-net`, after `unshare_all`: the host's network namespace.
+    pub fn share_net(self) -> Self {
+        self.arg("--share-net")
+    }
+
     pub fn die_with_parent(self) -> Self {
         self.arg("--die-with-parent")
     }
@@ -223,6 +228,41 @@ mod tests {
             .exec("/usr/bin/true", Vec::<&str>::new());
         assert_eq!(text(&args), ["--unshare-all", "/usr/bin/true"]);
         assert_eq!(text(&Bwrap::new().exec("/bin/x", ["a"])), ["/bin/x", "a"]);
+    }
+
+    #[test]
+    fn share_net_gives_back_the_network_after_unshare_all() {
+        let args = Bwrap::new()
+            .unshare_all()
+            .share_net()
+            .exec("/lightpanda", ["serve"]);
+        assert_eq!(
+            text(&args),
+            ["--unshare-all", "--share-net", "/lightpanda", "serve"]
+        );
+    }
+
+    #[test]
+    fn only_the_browser_sandbox_shares_the_host_network() {
+        fn callers(dir: &Path, found: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    callers(&path, found);
+                } else if path.extension().is_some_and(|extension| extension == "rs")
+                    && std::fs::read_to_string(&path)
+                        .unwrap()
+                        .contains(".share_net()")
+                {
+                    found.push(path);
+                }
+            }
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut found = Vec::new();
+        callers(&root.join("src"), &mut found);
+        found.retain(|path| !path.ends_with("src/bwrap.rs"));
+        assert_eq!(found, [root.join("src/browse/lightpanda.rs")]);
     }
 
     #[test]
