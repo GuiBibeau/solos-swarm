@@ -7,7 +7,6 @@
 //! launch past that waits for a slot.
 
 use super::broker::{self, AgentBroker, WorkerSeat, clip};
-use super::jobs::JOB_TOOLS;
 use super::ports::{BoxFuture, Delivered, Delivery, Executor, Fact, FactSink, Launch};
 use super::swarm_executor::SwarmExecutor;
 use crate::broker::write_json;
@@ -294,13 +293,12 @@ where
 {
     pub fn new(parts: PiExecutorParts<H>) -> Result<Self> {
         ensure!(parts.max_workers > 0, "a pi executor needs a worker slot");
-        let mut grants: Vec<String> = ["worker_report", "worker_handback", "fetch_url"]
+        let grants = parts
+            .broker
+            .worker_tools()
+            .into_iter()
             .map(String::from)
-            .to_vec();
-        if parts.broker.offers_run_code() {
-            grants.push("run_code".into());
-            grants.extend(JOB_TOOLS.map(String::from));
-        }
+            .collect();
         private_dir(&parts.tickets_dir)?;
         Ok(Self {
             inner: Arc::new(Inner {

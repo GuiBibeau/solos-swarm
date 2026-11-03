@@ -9,7 +9,7 @@ pub mod registry;
 
 use super::AgentConfig;
 use super::config::ExecutorConfig;
-use super::jobs::{Host, JobLimits, Jobs, Refused};
+use super::jobs::{Host, JOB_TOOLS, JobLimits, Jobs, Refused};
 use super::ports::{Applied, Fact, FactSink};
 use crate::broker::{FETCH_TOTAL_BYTES, fetch, now_ms};
 use crate::code::CodeExecutor;
@@ -478,6 +478,17 @@ impl AgentBroker {
             .is_some_and(|parts| parts.code.is_some())
     }
 
+    /// What a worker may call on this host: the worker tools, less
+    /// `run_code` and the job tools, which run in its sandbox, where this
+    /// host offers no `run_code`. A worker's grants and its `GET /tools`.
+    pub fn worker_tools(&self) -> Vec<&'static str> {
+        let run_code = self.offers_run_code();
+        WORKER_TOOLS
+            .into_iter()
+            .filter(|tool| run_code || !(*tool == "run_code" || JOB_TOOLS.contains(tool)))
+            .collect()
+    }
+
     /// Refuse `token` from now on. A call already admitted finishes; a
     /// worker's background jobs are killed.
     pub fn revoke(&self, token: &str) {
@@ -596,15 +607,19 @@ async fn session(State(broker): State<AgentBroker>, headers: HeaderMap) -> Reply
     }
 }
 
-/// The calling principal's tools from the registry, without `run_code` where
-/// this host offers none, so an MCP host lists only what it can call.
+/// The calling principal's tools from the registry: a worker's without
+/// `run_code` and the job tools where this host offers no `run_code`, so an
+/// MCP host lists only what it can call.
 async fn tools(State(broker): State<AgentBroker>, headers: HeaderMap) -> Reply {
     let grant = broker.authenticate(&headers)?;
     let kind = grant.principal.kind();
+    let callable = match &grant.principal {
+        Principal::Router => ROUTER_TOOLS.to_vec(),
+        Principal::Worker(_) => broker.worker_tools(),
+    };
     let offered: Vec<_> = registry::tools(kind)
         .into_iter()
-        .filter(|tool| grant.principal.tools().contains(&tool.name))
-        .filter(|tool| tool.name != "run_code" || broker.offers_run_code())
+        .filter(|tool| callable.contains(&tool.name))
         .collect();
     Ok(Json(json!({"principal": kind, "tools": offered})))
 }

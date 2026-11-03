@@ -396,13 +396,23 @@ async fn a_router_and_a_worker_each_list_and_call_only_their_own_tools() {
     worker.initialize().await;
     assert!(!token_file.exists());
     let mut expected: Vec<String> = schemas(PrincipalKind::Worker).into_keys().collect();
-    expected.retain(|name| name != "run_code");
+    expected
+        .retain(|name| !["run_code", "job_start", "job_wait", "job_stop"].contains(&name.as_str()));
     let mut names = worker.names().await;
     names.sort();
     assert_eq!(
         names, expected,
-        "a worker sees worker tools only, and no run_code on this host"
+        "a worker sees worker tools only, and no run_code or job tools on this host"
     );
+    for absent in ["run_code", "job_start"] {
+        let reply = worker
+            .request(
+                "tools/call",
+                json!({"name": absent, "arguments": {"code": "true"}}),
+            )
+            .await;
+        assert_eq!(reply["error"]["code"], -32_602, "{absent}: {reply}");
+    }
     let (text, is_error) = worker
         .call(
             "worker_handback",
