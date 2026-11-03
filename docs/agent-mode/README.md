@@ -31,7 +31,7 @@ and its MIT-licensed prototype `deepseek-ai/dsh-superagent-prototype` (docs 000-
 | P9 Remote nodes | Done (#33). `src/remote/`: `solos-swarm node serve` is a daemon on a user's machine that dials the agent's node listener (`nodes:` in agent.yaml) over TLS 1.3, where each side pins the other's self-signed certificate from `node init` and `agent init-nodes`. A worker's `run_code` and background jobs on a Ticket bound to a node run in the node's own bwrap sandbox, through the same `CodeExecutor`, with the node's mounts, and come back as local `run_code`'s receipts. The new `ExecutionEnvironment` port (`src/agent/environment.rs`) picks this host or a node per Ticket. Core change: `Plan::Session` takes an optional `environment` (stored Plans read as before), which `router_decide` may name and `executor.environment` defaults. An offline node is a 503 tool error, and its Ticket's Launch waits on the effect runner's backoff until it connects. Node secrets stay on the node, reach the sandbox through its environment or `/secrets`, and are redacted from what it sends. Swarm runs unchanged. |
 | P10 Benchmark | Done (#34). `solos-swarm agent bench` (`src/agent/bench/`) reproduces the article's ablation. A seeded generator writes the Triggers file: chatter from allowed and unlisted people, CI and bot messages and follow-ups on request Threads, and about 20 addressed requests, each with its expected work in `meta.bench.work_ms`, at a Poisson or even rate. `executor: {kind: simulated}` (`src/agent/simulated.rs`) takes each request's time on a scaled clock and reports `ready`. The designs are agent.yaml: `super-agent` as it is, `no-pass-through` (`pass_through: false`, backed by the one core change, `Engine::set_pass_through`), and `serial` (one worker slot, and the Router waits while work runs: an approximation of one session with a subagent tool). Each run serves a fresh agent, feeds the stream at its arrival times and reads completion, Router decisions, Evals, model calls, tokens and spend from the Store into `report.json` and `report.md`. `--router scripted` is free; `--router pi` refuses to start without `--max-spend-usd`, prints an estimate, and caps every run's Router account. The free scripted run (default workload, seeds 1 to 3, `--time-factor 0.01`): completion p50 / p95 10.2 / 15.7 min for `super-agent` and for `no-pass-through`, whose Router decides 25% more often (177 against 142 a run), and 82.4 / 177.3 for `serial`, with no request unfinished. A live run with a DeepSeek V4.1 Flash Router follows the benchmark how-to's free-run table. |
 | P11 Discord | Done (#35). `src/agent/discord/`: `DiscordSource` holds one Gateway v10 connection (an outbound WebSocket, nothing exposed) and `DiscordChannel` posts over REST, configured as `kind: discord` and read from a token file that is deleted once read. The Source dials the URL `GET /gateway/bot` names, heartbeats at Hello's interval with a random first beat and the last sequence number, identifies with the Guilds, Guild Messages, Direct Messages and Message Content intents, and treats a heartbeat with no ACK as a zombie. A dropped socket, op 7 and an invalid session with `d: true` resume the session on `resume_gateway_url`; a refused resume, `d: false` and close codes 4007 and 4009 identify again after 1 to 5 s. Five connections in a row that never became ready drop the session, and a spent limit on new sessions is waited out. Close codes 4004 and 4010 to 4014 end the run with the fix named, such as turning on Message Content Intent. A message from a listed guild or channel (or a thread of a listed channel) becomes a Trigger `discord:<channel>:<message>` by `discord:<user id>`, and a mention (of the bot or its managed role) or a pinging reply is addressed, a DM direct. The Thread is one snowflake, `discord:<id>`: a thread channel's id, or the message at the top of a reply chain, which the Source keeps for the agent's own posts too, so a reply to the agent's answer joins its request, and a Discord thread started from a message is the message's Thread. Posts are replies, at most 2,000 characters (a marker says what was cut), parse no mentions, and carry a `nonce` derived from their `MessageId` with `enforce_nonce`, so a retry cannot post twice. A 429 waits `retry_after`, a 5xx retries and another 4xx drops the message. An approval request carries Approve and Stop buttons; a click is an interaction the Source acknowledges at once and applies as the same `Fact::Command` Slack's buttons feed, for the policy to judge. No new dependency. Tests run against a fake Discord (HTTP and a Gateway that keeps each session's events for a resume). |
-| P12 Vault and verifiable browser | In progress. Designed in #36; built so far: PR 1, capabilities in the tool registry (#38), PR 2, the sealed envelope and the vault with its `solos-swarm vault` CLI (#43), PR 3, approvals of vault items in the core, Slack and Discord (#47), PR 4, keyed `fetch_url` and `vault_list` (#48), PR 5, the trail in the core and schema V4 (#39), PR 6, the `browse` module (#46), and PR 7, the browser tools (#49). A worker now uses an API key it never sees. `fetch_url {key}` writes `KeyUsed` to the chain, sends the key only to the key's hosts, on each redirect hop that stays there and through no proxy, scrubs every vault value from what comes back, and asks the item's owner in the thread before its first use on a Ticket. A worker also browses with a headless Lightpanda on this host and signs in with a vault login it never sees. Each browser step is on the chain as asked before the browser acts, then answered with the step this host's trail key signed, and the page and the exact View the model got are blobs in the state directory. Setup is in [Vault and API keys](#vault-and-api-keys) and [Browser](#browser). `solos-swarm agent trail`, which checks a trail, is next (PR 8). [`vault-browser/`](vault-browser/rationale.md) holds the design: a write-only vault of logins and API keys used only on the machine that holds them, keyed `fetch_url` with first-use approval in chat, and a Lightpanda browser per Assignment whose every step is recorded in the chain and signed with Ed25519 by the machine that ran it, checked by a planned `solos-swarm agent trail`. The PRs in [`prs.md`](vault-browser/prs.md) are the plan: 1 to 8 first, browsers on nodes and keys in the browser later. |
+| P12 Vault and verifiable browser | Done: the first build. Designed in #36 and built in eight PRs: capabilities in the tool registry (#38), the sealed envelope and the vault with its `solos-swarm vault` CLI (#43), approvals of vault items in the core, Slack and Discord (#47), keyed `fetch_url` and `vault_list` (#48), the trail in the core and schema V4 (#39), the `browse` module (#46), the browser tools (#49), and `solos-swarm agent trail` (#51). A worker uses an API key it never sees. `fetch_url {key}` writes `KeyUsed` to the chain, sends the key only to the key's hosts, on each redirect hop that stays there and through no proxy, scrubs every vault value from what comes back, and asks the item's owner in the thread before its first use on a Ticket. A worker also browses with a headless Lightpanda on this host and signs in with a vault login it never sees. Each browser step is on the chain as asked before the browser acts, then answered with the step this host's trail key signed, and the page and the exact View the model got are blobs in the state directory. `solos-swarm agent trail` checks a trail with public keys only: the chain, each step's signature and answer, each browser session's order and close, and every blob. Setup is in [Vault and API keys](#vault-and-api-keys), [Browser](#browser) and [Check a trail](#check-a-trail). [`vault-browser/`](vault-browser/rationale.md) holds the design: a write-only vault of logins and API keys used only on the machine that holds them, keyed `fetch_url` with first-use approval in chat, and a Lightpanda browser per Assignment whose every step is recorded in the chain and signed with Ed25519 by the machine that ran it. The PRs in [`prs.md`](vault-browser/prs.md) are the plan: browsers on nodes and keys in the browser (PRs 9 and 10) come later. |
 
 ## Later steps
 
@@ -1338,6 +1338,58 @@ its Assignment ends, after `idle_secs`, or when the agent stops. A crash leaves 
 unanswered, which is what happened, and the restart starts a new browser. Cookies live only in the browser's memory,
 so after a retry or a restart the worker signs in again, with no new approval.
 
+### Check a trail
+
+`solos-swarm agent trail` checks the event chain and every browser step on it, then prints each Ticket's trail. It
+opens the Store read-only and writes nothing, so you can run it while the agent serves. It exits 1 on any problem.
+
+1. To replay one Ticket step by step, name it. With `--config`, the command trusts the public half of
+   `browser.audit_key` for this host's steps, and reads the blobs where `trail.path` says:
+
+   ```sh
+   solos-swarm agent trail --state-dir /var/lib/solos --config agent.yaml --ticket tk_426b5e800d1c8491
+   chain ok: 18 events, head 1724…4d
+   tk_426b5e800d1c8491  "Sign in to the site"
+     as_dff6d538f1425117, ended: ready
+      on local (ed25519:68ffb928…), session 516b2886…
+      n1  15:32:09  open https://site.example/login            200 https://site.example/login "Sign in"  view 59d2… snapshot ce7e…
+      n2  15:32:10  type 4 (5 characters) (textbox "Comment")  200 https://site.example/login "Sign in"  view 8ac1… snapshot 0639…
+      n3  15:32:10  login site-login → username, password      200 https://site.example/session "Signed in"  view 93d0… snapshot 40f0…
+      n4  15:32:10  back                                       200 https://site.example/login "Sign in"  view cb89… snapshot ce7e…
+      n5  15:32:10  close (assignment ended)                   closed, 5 steps
+     5 steps, 5 signatures ok, 8 blobs ok, 0 problems
+   ```
+
+   Each problem prints on its own line under its Ticket. A corrupt blob, for example, prints
+   `problem: step 1 of as_dff6d538f1425117: the blob sha256:59d2… is corrupt: its bytes hash to another digest`.
+   Without `--ticket`, the command prints one summary per Ticket. `--json` prints the whole report, with each
+   problem's `kind`, its step and whether it is fatal.
+
+2. To see the exact bytes the model got at a step, add `--step` with the step's number. Add `--show snapshot` to see
+   the page as the browser captured it instead. If more than one of the Ticket's Assignments has that step, name one
+   with `--assignment`.
+
+   ```sh
+   solos-swarm agent trail --state-dir /var/lib/solos --config agent.yaml --ticket tk_426b5e800d1c8491 --step 1
+   ```
+
+3. To check a trail on another machine, stop the agent and copy `agent.db` and `trail/` from its state directory.
+   Then pass each machine's public key with `--trust`. The verifier needs no config and no secret:
+
+   ```sh
+   solos-swarm agent trail --state-dir ./copy --trust local=ed25519:68ffb928…
+   ```
+
+Each signed step must verify under the key trusted for the machine that ran it, and must answer the step the core
+recorded as asked under its number. Each blob it names must be in the trail store and still hash to its digest. A
+browser session must count its steps from 0 with no gap, name its build on its first step, and end with a signed
+close once its Assignment ends. A broken chain and a gap in an Assignment's step numbers are problems too. Two
+findings are only warnings, because an honest agent records them. One is an Assignment's last step, asked and never
+answered, which a host that stops in the middle of a step leaves. The other is a step recorded as `lost`, which has
+the agent's word and no signature. `--strict` counts both as problems. An open browser whose Assignment still runs
+is neither. A step that fails a check is no evidence about its session, so one tampered step shows as one problem.
+Nothing anchors the chain's head outside `agent.db`, so a trail cut at a clean session boundary still checks clean.
+
 ## Security model
 
 - Trigger text is data. It cannot change a permission, a budget or the Policy (the core has no path for it).
@@ -1385,8 +1437,10 @@ so after a retry or a restart the worker signs in again, with no new approval.
   click answers.
 - Every browser step is asked on the chain before the browser acts and answered with the step signed by the machine
   that ran it, checked under the key pinned at start. An answer that does not verify is recorded as lost and never
-  shown. Open: nothing anchors the chain's head outside `agent.db`, so a trail can still be cut at a clean session
-  boundary without detection. The design is in [`vault-browser/`](vault-browser/rationale.md).
+  shown. `solos-swarm agent trail` checks the same trail later with public keys only, so a copy of `agent.db` and
+  `trail/` can be checked on any machine. Open: nothing anchors the chain's head outside `agent.db`, so a trail can
+  still be cut at a clean session boundary without detection. The design is in
+  [`vault-browser/`](vault-browser/rationale.md).
 
 ## Open decisions
 

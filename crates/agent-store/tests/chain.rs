@@ -104,6 +104,23 @@ fn verify_chain_names_a_tampered_row() {
 }
 
 #[test]
+fn verified_events_are_the_events_of_the_chain_verify_chain_finds() {
+    let (db, store) = chained(5);
+    let (chain, events) = store.verified_events().unwrap();
+    assert_eq!(chain, store.verify_chain().unwrap());
+    assert_eq!(events, (1..=5).map(expired).collect::<Vec<_>>());
+
+    unprotect(&db)
+        .execute(
+            "UPDATE events SET body = replace(body, 'ev4', 'ev9') WHERE seq = 4",
+            [],
+        )
+        .unwrap();
+    let err = store.verified_events().unwrap_err();
+    assert!(matches!(err, StoreError::Chain { seq: 4, .. }), "{err}");
+}
+
+#[test]
 fn rehashing_a_tampered_row_breaks_the_next_link() {
     let (db, store) = chained(5);
     let raw = unprotect(&db);

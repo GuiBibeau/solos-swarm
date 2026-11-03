@@ -2,6 +2,15 @@
 //! View its model got, and the text it typed, kept by digest so the chain
 //! holds only digests.
 
+mod check;
+mod replay;
+
+pub use check::{
+    AssignmentTrail, ChainHead, Found, Problem, SecretUse, Shown, Step, StepAt, Tally, TicketTrail,
+    TrailReport, Trust, Trusted, shown, verify,
+};
+pub use replay::render;
+
 use super::pi_executor::{dir_name, private_dir};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
@@ -35,6 +44,15 @@ impl Default for TrailStoreConfig {
             max_bytes: default_max_bytes(),
             ticket_max_bytes: default_ticket_max_bytes(),
         }
+    }
+}
+
+impl TrailStoreConfig {
+    /// `path`, or `<state>/trail`.
+    pub fn root(&self, state_dir: &Path) -> PathBuf {
+        self.path
+            .clone()
+            .unwrap_or_else(|| state_dir.join(super::TRAIL_DIR))
     }
 }
 
@@ -114,7 +132,7 @@ impl BlobStore {
     /// Keep `bytes` for `ticket`, once.
     pub fn put(&self, ticket: &TicketId, bytes: &[u8]) -> Result<Digest> {
         let digest = Digest::of(bytes);
-        let dir = self.root.join(dir_name(ticket.as_str())?);
+        let dir = ticket_dir(&self.root, ticket)?;
         let path = dir.join(digest.digits());
         let mut used = self.lock();
         self.held(&mut used, ticket)?;
@@ -141,15 +159,7 @@ impl BlobStore {
     }
 
     pub fn get(&self, ticket: &TicketId, digest: &Digest) -> Result<Option<Vec<u8>>> {
-        let path = self
-            .root
-            .join(dir_name(ticket.as_str())?)
-            .join(digest.digits());
-        match std::fs::read(&path) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(err).with_context(|| format!("cannot read {}", path.display())),
-        }
+        read_blob(&self.root, ticket, digest)
     }
 
     fn lock(&self) -> MutexGuard<'_, Used> {
@@ -160,10 +170,23 @@ impl BlobStore {
         if let Some(held) = used.tickets.get(ticket) {
             return Ok(*held);
         }
-        let dir = self.root.join(dir_name(ticket.as_str())?);
+        let dir = ticket_dir(&self.root, ticket)?;
         let held = if dir.is_dir() { size(&dir)? } else { 0 };
         used.tickets.insert(ticket.clone(), held);
         Ok(held)
+    }
+}
+
+fn ticket_dir(root: &Path, ticket: &TicketId) -> Result<PathBuf> {
+    Ok(root.join(dir_name(ticket.as_str())?))
+}
+
+fn read_blob(root: &Path, ticket: &TicketId, digest: &Digest) -> Result<Option<Vec<u8>>> {
+    let path = ticket_dir(root, ticket)?.join(digest.digits());
+    match std::fs::read(&path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("cannot read {}", path.display())),
     }
 }
 

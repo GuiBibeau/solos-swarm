@@ -2,14 +2,16 @@ use anyhow::Result;
 use axum::response::Html;
 use axum::routing::{get, post};
 use serde_json::{Value, json};
-use solos_agent_core::AllowlistPolicy;
 use solos_agent_core::model::{
-    Actor, Addressed, Ask, AssignmentId, ChannelRef, DomainEvent, Effect, InputBody, SecretGrant,
-    SecretId, ThreadKey, Ticket, TicketId, TicketOutcome, Trigger, TriggerId,
+    Actor, Addressed, Ask, AssignmentId, ChangeSet, ChannelRef, DomainEvent, Effect, Event,
+    InputBody, SecretGrant, SecretId, ThreadKey, Ticket, TicketId, TicketOutcome, Trigger,
+    TriggerId,
 };
 use solos_agent_core::trail::{
-    ActText, CloseReason, SignedStep, StepOutcome, TrailAction, TrailKey, TrailOutcome,
+    ActText, CloseReason, Digest, Pending, Signature, SignedStep, StepOutcome, TrailAction,
+    TrailKey, TrailOutcome, answers,
 };
+use solos_agent_core::{AllowlistPolicy, Repositories};
 use solos_agent_store::SqliteStore;
 use solos_swarm::agent::broker::browser::{self, BrowserParts, BrowserPlace, LocalBrowser};
 use solos_swarm::agent::broker::{
@@ -20,15 +22,19 @@ use solos_swarm::agent::ports::{
     BoxFuture, Channel, Command, Delivery, Executor, Fact, FactSink, Launch, Order,
 };
 use solos_swarm::agent::scripted::ScriptedRouter;
-use solos_swarm::agent::trail::{BlobStore, TrailStoreConfig};
-use solos_swarm::agent::{
-    Adapters, AgentConfig, BROWSER_DIR, PiHost, RunOptions, Runtime, STORE_FILE, Summary,
-    serve_with,
+use solos_swarm::agent::trail::{
+    BlobStore, Found, Problem, StepAt, TrailReport, TrailStoreConfig, Trust, Trusted, render,
+    verify,
 };
+use solos_swarm::agent::{
+    Adapters, AgentConfig, BROWSER_DIR, HOST_RESTARTED, PiHost, RunOptions, Runtime, STORE_FILE,
+    Summary, serve_with,
+};
+use solos_swarm::audit::CryptoSigner;
 use solos_swarm::browse::fake::{Element, FakeCdp, Form, Page};
 use solos_swarm::browse::{
-    Blob, BlobKind, BrowseCall, Browsed, BrowserConfig, Browsers, Launcher, TrailSigner,
-    verify_step,
+    Blob, BlobKind, BrowseCall, Browsed, BrowserConfig, Browsers, Launcher, TRAIL_DOMAIN,
+    TrailSigner, verify_step,
 };
 use solos_swarm::gateway::{Dispatch, PriceTable, Provider, Upstream};
 use solos_swarm::harness::scripted::{Call, ScriptedHarness};
@@ -848,6 +854,48 @@ async fn an_answer_that_does_not_verify_is_recorded_lost_and_never_shown() {
             "asked 2 close",
             "{how:?}: a browser that may be open is still closed"
         );
+
+        let state = w.root.join("state");
+        let events = SqliteStore::open_read_only(w.store_path())
+            .unwrap()
+            .events()
+            .unwrap();
+        let lost: Vec<Found> = events
+            .into_iter()
+            .filter_map(|event| match event.event {
+                DomainEvent::TrailDone {
+                    ticket,
+                    assignment,
+                    n,
+                    outcome: TrailOutcome::Lost { why },
+                } => Some(warning(Problem::Lost {
+                    at: StepAt {
+                        ticket,
+                        assignment,
+                        n,
+                    },
+                    why,
+                })),
+                _ => None,
+            })
+            .collect();
+        let trust = Trust::new(
+            None,
+            vec![Trusted {
+                environment: "local".to_owned(),
+                key: w.key.clone(),
+            }],
+        )
+        .unwrap();
+        let report = verify(&state, &state.join("trail"), &trust, None, false).unwrap();
+        assert!(!lost.is_empty(), "{how:?}");
+        assert_found(&report, lost, true);
+        assert!(
+            !verify(&state, &state.join("trail"), &trust, None, true)
+                .unwrap()
+                .ok,
+            "{how:?}: strict counts a lost answer"
+        );
     }
 }
 
@@ -992,6 +1040,26 @@ async fn a_login_waits_for_an_allow_click_and_the_retry_fills_it() {
         fills.contains(&PASSWORD.to_owned()),
         "the retry filled the password"
     );
+
+    let state = w.root.join("state");
+    let key = Trusted {
+        environment: "local".to_owned(),
+        key: w.key.clone(),
+    };
+    let trust = Trust::new(None, vec![key]).unwrap();
+    let report = verify(&state, &state.join("trail"), &trust, None, false).unwrap();
+    assert_found(&report, Vec::new(), true);
+    let replay = render(&report, Some(&w.ticket().id));
+    println!("{replay}");
+    let named = format!("local/{LOGIN}");
+    for line in [
+        format!("secrets: asked {named} "),
+        format!(" · allowed {named} by alice "),
+        format!("login {LOGIN}  "),
+        format!("needs approval of {named}"),
+    ] {
+        assert!(replay.contains(&line), "no {line:?} in\n{replay}");
+    }
 }
 
 #[tokio::test]
@@ -1313,31 +1381,33 @@ fn first_prompt(prompt: &str) -> bool {
     prompt.starts_with("Ticket ")
 }
 
+fn sign_in_script() -> Worker {
+    Box::new(|prompt| {
+        if !first_prompt(prompt) {
+            return Vec::new();
+        }
+        vec![
+            ("vault_list", json!({})),
+            ("browser_open", json!({"url": format!("{SITE}/login")})),
+            (
+                "browser_act",
+                json!({"action": "type", "element": 4, "text": "hello"}),
+            ),
+            ("browser_login", json!({"login": LOGIN})),
+            ("browser_act", json!({"action": "back"})),
+            (
+                "worker_report",
+                json!({"status": "ready", "text": "Signed in."}),
+            ),
+        ]
+    })
+}
+
 #[tokio::test]
 async fn a_worker_signs_in_through_its_tools_and_its_browser_closes_when_the_ticket_ends() {
     let agent = Agent::new("serve-login");
     agent.ask();
-    let summary = agent
-        .serve_until_idle(Box::new(|prompt| {
-            if !first_prompt(prompt) {
-                return Vec::new();
-            }
-            vec![
-                ("vault_list", json!({})),
-                ("browser_open", json!({"url": format!("{SITE}/login")})),
-                (
-                    "browser_act",
-                    json!({"action": "type", "element": 4, "text": "hello"}),
-                ),
-                ("browser_login", json!({"login": LOGIN})),
-                ("browser_act", json!({"action": "back"})),
-                (
-                    "worker_report",
-                    json!({"status": "ready", "text": "Signed in."}),
-                ),
-            ]
-        }))
-        .await;
+    let summary = agent.serve_until_idle(sign_in_script()).await;
 
     assert_eq!(summary.effects_pending, 0);
     let ticket = &agent.tickets()[0];
@@ -1644,4 +1714,950 @@ async fn a_real_lightpanda_signs_in_through_the_broker_tools() {
         posted.iter().any(|body| body.contains("username=gui")),
         "the site got the sign-in: {posted:?}"
     );
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn files(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_none_or(|extension| extension != "tmp"))
+        .collect()
+}
+
+fn fatal(problem: Problem) -> Found {
+    Found {
+        fatal: true,
+        problem,
+    }
+}
+
+fn warning(problem: Problem) -> Found {
+    Found {
+        fatal: false,
+        problem,
+    }
+}
+
+fn position(events: &[Event], wanted: impl Fn(&DomainEvent) -> bool) -> usize {
+    events
+        .iter()
+        .position(|event| wanted(&event.event))
+        .expect("the chain has no such event")
+}
+
+fn is_asked(n: u32) -> impl Fn(&DomainEvent) -> bool {
+    move |event| matches!(event, DomainEvent::TrailAsked { n: at, .. } if *at == n)
+}
+
+fn is_done(n: u32) -> impl Fn(&DomainEvent) -> bool {
+    move |event| matches!(event, DomainEvent::TrailDone { n: at, .. } if *at == n)
+}
+
+fn is_ended(event: &DomainEvent) -> bool {
+    matches!(event, DomainEvent::AssignmentEnded { .. })
+}
+
+fn without_step(events: &mut Vec<Event>, n: u32) {
+    events.retain(|event| !is_asked(n)(&event.event) && !is_done(n)(&event.event));
+}
+
+fn signed_mut(events: &mut [Event], n: u32) -> &mut SignedStep {
+    let at = position(events, is_done(n));
+    match &mut events[at].event {
+        DomainEvent::TrailDone {
+            outcome: TrailOutcome::Signed(step),
+            ..
+        } => step,
+        other => panic!("step {n} was not answered with a signed step: {other:?}"),
+    }
+}
+
+fn answer_mut(events: &mut [Event], n: u32) -> &mut TrailOutcome {
+    let at = position(events, is_done(n));
+    match &mut events[at].event {
+        DomainEvent::TrailDone { outcome, .. } => outcome,
+        other => panic!("{other:?} is no answer"),
+    }
+}
+
+struct Written {
+    agent: Agent,
+    ticket: TicketId,
+    assignment: AssignmentId,
+    events: Vec<Event>,
+    tickets: BTreeMap<TicketId, Ticket>,
+    steps: Vec<SignedStep>,
+    trust: Trust,
+}
+
+async fn written(name: &str) -> Written {
+    let agent = Agent::new(name);
+    agent.ask();
+    agent.serve_until_idle(sign_in_script()).await;
+    let store = SqliteStore::open_read_only(agent.store()).unwrap();
+    let events = store.events().unwrap();
+    let tickets = store
+        .tickets()
+        .unwrap()
+        .into_iter()
+        .map(|ticket| (ticket.id.clone(), ticket))
+        .collect();
+    let steps = signed(&trail(&agent.store()));
+    assert_eq!(steps.len(), 5, "the worker's script takes five steps");
+    let (ticket, assignment) = (
+        steps[0].body.ticket.clone(),
+        steps[0].body.assignment.clone(),
+    );
+    let trust = Trust::new(Some(&agent.config()), Vec::new()).unwrap();
+    Written {
+        agent,
+        ticket,
+        assignment,
+        events,
+        tickets,
+        steps,
+        trust,
+    }
+}
+
+struct Tampered {
+    state: PathBuf,
+}
+
+impl Tampered {
+    fn blobs(&self) -> PathBuf {
+        self.state.join("trail")
+    }
+
+    fn blob(&self, ticket: &TicketId, digest: &Digest) -> PathBuf {
+        self.blobs().join(ticket.as_str()).join(digest.digits())
+    }
+}
+
+impl Written {
+    fn forge(&self, name: &str, edit: impl FnOnce(&mut Vec<Event>)) -> Tampered {
+        let state = self.agent.root.join("copies").join(name);
+        std::fs::create_dir_all(&state).unwrap();
+        let mut events = self.events.clone();
+        edit(&mut events);
+        let mut store = SqliteStore::open(state.join(STORE_FILE)).unwrap();
+        store
+            .commit(ChangeSet {
+                tickets: self.tickets.clone(),
+                events,
+                ..ChangeSet::default()
+            })
+            .unwrap();
+        drop(store);
+        let from = self.agent.state().join("trail");
+        for dir in files(&from) {
+            let to = state.join("trail").join(dir.file_name().unwrap());
+            std::fs::create_dir_all(&to).unwrap();
+            for blob in files(&dir) {
+                std::fs::copy(&blob, to.join(blob.file_name().unwrap())).unwrap();
+            }
+        }
+        Tampered { state }
+    }
+
+    fn at(&self, n: u32) -> StepAt {
+        StepAt {
+            ticket: self.ticket.clone(),
+            assignment: self.assignment.clone(),
+            n,
+        }
+    }
+
+    fn check(&self, forged: &Tampered, strict: bool) -> TrailReport {
+        verify(&forged.state, &forged.blobs(), &self.trust, None, strict).unwrap()
+    }
+
+    fn step(&self, n: u32) -> &SignedStep {
+        &self.steps[n as usize - 1]
+    }
+
+    fn session(&self) -> String {
+        self.step(1).body.session.clone()
+    }
+
+    fn view(&self, n: u32) -> Digest {
+        page_seen(self.step(n)).view.clone()
+    }
+
+    fn typed(&self) -> Digest {
+        match &self.step(2).body.action {
+            TrailAction::Act {
+                text: Some(ActText::Typed { digest, .. }),
+                ..
+            } => digest.clone(),
+            other => panic!("step 2 typed nothing: {other:?}"),
+        }
+    }
+}
+
+#[track_caller]
+fn assert_found(report: &TrailReport, expected: Vec<Found>, ok: bool) {
+    assert_eq!(report.problems, expected);
+    assert_eq!(report.ok, ok, "ok");
+}
+
+#[tokio::test]
+async fn a_trail_the_browser_tools_wrote_checks_clean() {
+    let w = written("trail-clean").await;
+    let forged = w.forge("clean", |_| {});
+    let writing = forged.blobs().join(w.ticket.as_str()).join(".half.tmp");
+    std::fs::write(&writing, b"half a blob").unwrap();
+
+    let report = w.check(&forged, false);
+
+    assert_found(&report, Vec::new(), true);
+    let chain = report.chain.as_ref().unwrap();
+    assert_eq!(chain.events, w.events.len() as u64);
+    let ticket = &report.tickets[0];
+    assert_eq!(ticket.ticket, w.ticket);
+    assert_eq!(
+        ticket.title.as_deref(),
+        Some(w.tickets[&w.ticket].title.as_str())
+    );
+    let kept = files(&forged.blobs().join(w.ticket.as_str())).len();
+    assert_eq!(
+        (
+            ticket.tally.steps,
+            ticket.tally.signatures_ok,
+            ticket.tally.blobs_ok as usize
+        ),
+        (5, 5, kept),
+        "every step, signature and blob the store holds is counted once"
+    );
+    assert!(
+        writing.exists(),
+        "a blob the agent is still writing is left alone"
+    );
+    let DomainEvent::AssignmentEnded { reason, .. } =
+        &w.events[position(&w.events, is_ended)].event
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        ticket.assignments[0].ended.as_deref(),
+        Some(reason.as_str())
+    );
+}
+
+#[tokio::test]
+async fn a_flipped_byte_in_a_view_blob_is_corrupt_at_the_step_that_names_it() {
+    let w = written("trail-corrupt").await;
+    let forged = w.forge("corrupt", |_| {});
+    let path = forged.blob(&w.ticket, &w.view(1));
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[1] ^= 1;
+    std::fs::write(&path, bytes).unwrap();
+
+    let report = w.check(&forged, false);
+
+    let corrupt = Problem::BlobCorrupt {
+        at: w.at(1),
+        digest: w.view(1),
+    };
+    assert_found(&report, vec![fatal(corrupt)], false);
+    let kept = files(&forged.blobs().join(w.ticket.as_str())).len();
+    assert_eq!(
+        report.tickets[0].tally.blobs_ok as usize,
+        kept - 1,
+        "the corrupt blob is the one not counted"
+    );
+}
+
+#[tokio::test]
+async fn a_blob_two_steps_name_is_corrupt_once_at_the_first_of_them() {
+    let w = written("trail-shared").await;
+    let (first, again) = (page_seen(w.step(1)), page_seen(w.step(4)));
+    assert_eq!(
+        first.snapshot, again.snapshot,
+        "going back captures the first page again, which is the one blob"
+    );
+    let forged = w.forge("shared", |_| {});
+    let path = forged.blob(&w.ticket, &first.snapshot);
+    std::fs::write(&path, b"another page").unwrap();
+
+    let report = w.check(&forged, false);
+
+    let corrupt = Problem::BlobCorrupt {
+        at: w.at(1),
+        digest: first.snapshot.clone(),
+    };
+    assert_found(&report, vec![fatal(corrupt)], false);
+}
+
+#[tokio::test]
+async fn a_deleted_typed_text_blob_is_missing_at_the_step_that_typed_it() {
+    let w = written("trail-missing").await;
+    let forged = w.forge("missing", |_| {});
+    std::fs::remove_file(forged.blob(&w.ticket, &w.typed())).unwrap();
+
+    let report = w.check(&forged, false);
+
+    let missing = Problem::BlobMissing {
+        at: w.at(2),
+        digest: w.typed(),
+    };
+    assert_found(&report, vec![fatal(missing)], false);
+}
+
+#[tokio::test]
+async fn a_body_edited_in_a_rehashed_chain_has_a_bad_signature() {
+    let w = written("trail-edited").await;
+    let forged = w.forge("edited", |events| {
+        let StepOutcome::Page(page) = &mut signed_mut(events, 4).body.outcome else {
+            panic!("step 4 saw no page")
+        };
+        page.title.push_str(" (edited)");
+    });
+
+    let report = w.check(&forged, false);
+
+    assert!(report.chain.is_some(), "the edited chain was hashed again");
+    let bad = Problem::BadSignature { at: w.at(4) };
+    assert_found(&report, vec![fatal(bad)], false);
+}
+
+#[tokio::test]
+async fn a_step_signed_by_another_key_is_foreign() {
+    let w = written("trail-foreign").await;
+    let other = CryptoSigner::from_seed([7; 32]);
+    let forged = w.forge("foreign", |events| {
+        let step = signed_mut(events, 2);
+        let resigned = other.sign(TRAIL_DOMAIN, &step.body).unwrap();
+        step.signer = TrailKey::try_from(format!("ed25519:{}", hex(&resigned.signer))).unwrap();
+        step.signature = Signature::try_from(hex(&resigned.signature)).unwrap();
+    });
+
+    let report = w.check(&forged, false);
+
+    let foreign = Problem::Foreign {
+        at: w.at(2),
+        signer: TrailKey::try_from(format!("ed25519:{}", hex(&other.public_key()))).unwrap(),
+    };
+    assert_found(&report, vec![fatal(foreign)], false);
+}
+
+#[tokio::test]
+async fn a_dropped_answer_with_a_later_step_is_overtaken_and_fatal() {
+    let w = written("trail-dropped").await;
+    let forged = w.forge("dropped", |events| {
+        let at = position(events, is_done(3));
+        events.remove(at);
+    });
+
+    let report = w.check(&forged, false);
+
+    let overtaken = Problem::Overtaken { at: w.at(3), by: 4 };
+    assert_found(&report, vec![fatal(overtaken)], false);
+}
+
+#[tokio::test]
+async fn a_chain_cut_off_before_the_last_answer_warns_and_only_strict_fails_it() {
+    let w = written("trail-cut").await;
+    let forged = w.forge("cut", |events| {
+        let at = position(events, is_done(5));
+        events.truncate(at);
+    });
+    let unanswered = Problem::Unanswered { at: w.at(5) };
+
+    assert_found(
+        &w.check(&forged, false),
+        vec![warning(unanswered.clone())],
+        true,
+    );
+    assert_found(&w.check(&forged, true), vec![fatal(unanswered)], false);
+}
+
+#[tokio::test]
+async fn two_steps_answered_with_each_others_signed_bodies_mismatch_and_nothing_else() {
+    let w = written("trail-swapped").await;
+    let forged = w.forge("swapped", |events| {
+        let (two, three) = (answer_mut(events, 2).clone(), answer_mut(events, 3).clone());
+        *answer_mut(events, 2) = three;
+        *answer_mut(events, 3) = two;
+    });
+
+    let report = w.check(&forged, false);
+
+    let refused = |n: u32, body: u32| {
+        let asked = Pending {
+            n,
+            action: w.step(n).body.action.clone(),
+            asked_ms: 0,
+        };
+        let why = answers(&asked, &w.ticket, &w.assignment, w.step(body)).unwrap_err();
+        fatal(Problem::Mismatch { at: w.at(n), why })
+    };
+    assert_found(&report, vec![refused(2, 3), refused(3, 2)], false);
+}
+
+#[tokio::test]
+async fn a_removed_step_is_a_gap_in_the_numbers_and_in_the_signers_count() {
+    let w = written("trail-gap").await;
+    let forged = w.forge("gap", |events| without_step(events, 3));
+
+    let report = w.check(&forged, false);
+
+    let problems = vec![
+        fatal(Problem::StepGap {
+            at: w.at(4),
+            expected: 3,
+        }),
+        fatal(Problem::SessionGap {
+            at: w.at(4),
+            session: w.session(),
+            expected: 2,
+            found: 3,
+        }),
+    ];
+    assert_found(&report, problems, false);
+}
+
+#[tokio::test]
+async fn a_session_the_ended_assignment_never_closed_is_unclosed_at_its_last_step() {
+    let w = written("trail-unclosed").await;
+    assert!(
+        position(&w.events, is_ended) < position(&w.events, is_asked(5)),
+        "the chain ends the Assignment before the executor closes its browser"
+    );
+    let forged = w.forge("unclosed", |events| without_step(events, 5));
+
+    let report = w.check(&forged, false);
+
+    let unclosed = Problem::Unclosed {
+        at: w.at(4),
+        session: w.session(),
+    };
+    assert_found(&report, vec![fatal(unclosed)], false);
+}
+
+#[tokio::test]
+async fn a_browser_left_open_while_its_assignment_runs_is_live_not_unclosed() {
+    let w = written("trail-live-prefix").await;
+    assert!(
+        position(&w.events, is_done(4)) < position(&w.events, is_ended),
+        "the Assignment ends after the worker's last page step"
+    );
+    let forged = w.forge("running", |events| {
+        let at = position(events, is_ended);
+        events.truncate(at);
+    });
+
+    let report = w.check(&forged, true);
+
+    assert_found(&report, Vec::new(), true);
+    let assignment = &report.tickets[0].assignments[0];
+    assert_eq!((assignment.steps.len(), &assignment.ended), (4, &None));
+}
+
+#[tokio::test]
+async fn a_session_a_restarted_host_ended_without_a_close_is_not_unclosed() {
+    let w = written("trail-restarted").await;
+    let forged = w.forge("restarted", |events| {
+        without_step(events, 5);
+        let at = position(events, is_ended);
+        if let DomainEvent::AssignmentEnded { reason, .. } = &mut events[at].event {
+            *reason = HOST_RESTARTED.to_owned();
+        }
+    });
+
+    let report = w.check(&forged, false);
+
+    assert_found(&report, Vec::new(), true);
+    assert_eq!(report.tickets[0].tally.steps, 4);
+}
+
+#[tokio::test]
+async fn a_second_answer_to_one_step_is_unpaired() {
+    let w = written("trail-unpaired").await;
+    let forged = w.forge("unpaired", |events| {
+        let at = position(events, is_done(2));
+        events.insert(at + 1, events[at].clone());
+    });
+
+    let report = w.check(&forged, false);
+
+    assert_found(
+        &report,
+        vec![fatal(Problem::Unpaired { at: w.at(2) })],
+        false,
+    );
+}
+
+#[tokio::test]
+async fn an_event_edited_without_hashing_again_breaks_the_chain_and_nothing_after_it_is_read() {
+    let w = written("trail-broken").await;
+    let forged = w.forge("broken", |_| {});
+    let seq = position(&w.events, is_done(4)) as u64 + 1;
+    let title = page_seen(w.step(4)).title.clone();
+    let conn = rusqlite::Connection::open(forged.state.join(STORE_FILE)).unwrap();
+    conn.execute_batch("DROP TRIGGER events_no_update").unwrap();
+    let edited = conn
+        .execute(
+            "UPDATE events SET body = replace(body, ?1, ?2) WHERE seq = ?3",
+            rusqlite::params![
+                format!("\"title\":\"{title}\""),
+                "\"title\":\"edited\"",
+                seq
+            ],
+        )
+        .unwrap();
+    assert_eq!(edited, 1, "the edit reached one event");
+    drop(conn);
+
+    let report = w.check(&forged, false);
+
+    let broken = Problem::Chain {
+        seq,
+        reason: "does not match its hash".to_owned(),
+    };
+    assert_found(&report, vec![fatal(broken)], false);
+    assert!(report.chain.is_none() && report.tickets.is_empty());
+}
+
+#[tokio::test]
+async fn a_step_whose_environment_has_no_trusted_key_is_untrusted_once() {
+    let w = written("trail-untrusted").await;
+    let forged = w.forge("untrusted", |_| {});
+
+    let nobody = Trust::new(None, Vec::new()).unwrap();
+    let report = verify(&forged.state, &forged.blobs(), &nobody, None, false).unwrap();
+
+    let untrusted = Problem::Untrusted {
+        at: w.at(1),
+        environment: "local".to_owned(),
+    };
+    assert_found(&report, vec![fatal(untrusted)], false);
+    assert_eq!(report.tickets[0].tally.signatures_ok, 0);
+}
+
+fn trail_cli(args: &[&str]) -> std::process::Output {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_solos-swarm"))
+        .args(["agent", "trail"])
+        .args(args)
+        .output()
+        .unwrap();
+    println!("$ solos-swarm agent trail {}", args.join(" "));
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    if !output.stderr.is_empty() {
+        println!(
+            "[stderr] {}",
+            String::from_utf8_lossy(&output.stderr).trim_end()
+        );
+    }
+    println!("[exit {:?}]\n", output.status.code());
+    output
+}
+
+fn text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+fn path(path: &Path) -> &str {
+    path.to_str().unwrap()
+}
+
+#[tokio::test]
+async fn agent_trail_prints_a_clean_trail_step_by_step_and_exits_0() {
+    let w = written("trail-cli-clean").await;
+    let config = w.agent.root.join("agent.yaml");
+    let (state, ticket) = (w.agent.state(), w.ticket.as_str());
+
+    let output = trail_cli(&[
+        "--state-dir",
+        path(&state),
+        "--config",
+        path(&config),
+        "--ticket",
+        ticket,
+    ]);
+
+    assert!(output.status.success());
+    let out = text(&output.stdout);
+    assert!(
+        out.starts_with(&format!("chain ok: {} events, head ", w.events.len())),
+        "{out}"
+    );
+    assert!(out.contains(&w.tickets[&w.ticket].title), "{out}");
+    for n in 1..=5 {
+        let step = format!("n{n} ");
+        assert!(
+            out.lines().any(|line| line.trim_start().starts_with(&step)),
+            "no line for step {n}: {out}"
+        );
+    }
+    let kept = files(&state.join("trail").join(ticket)).len();
+    let tally = format!("5 steps, 5 signatures ok, {kept} blobs ok, 0 problems");
+    assert!(out.contains(&tally), "{out}");
+}
+
+#[tokio::test]
+async fn agent_trail_prints_json_and_the_exact_bytes_of_a_steps_blob() {
+    let w = written("trail-cli-json").await;
+    let config = w.agent.root.join("agent.yaml");
+    let (state, ticket) = (w.agent.state(), w.ticket.as_str());
+    let base = [
+        "--state-dir",
+        path(&state),
+        "--config",
+        path(&config),
+        "--ticket",
+        ticket,
+    ];
+
+    let json = trail_cli(&[&base[..], &["--json"]].concat());
+
+    assert!(json.status.success());
+    let report: Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["chain"]["events"], w.events.len());
+    assert_eq!(report["tickets"][0]["tally"]["steps"], 5);
+    assert_eq!(report["problems"], json!([]));
+
+    let view = trail_cli(&[&base[..], &["--step", "1", "--show", "view"]].concat());
+    let blob = state.join("trail").join(ticket).join(w.view(1).digits());
+    assert!(view.status.success());
+    assert_eq!(
+        view.stdout,
+        std::fs::read(blob).unwrap(),
+        "the exact bytes the model got"
+    );
+
+    let snapshot = trail_cli(&[&base[..], &["--step", "4", "--show", "snapshot"]].concat());
+    let blob = state
+        .join("trail")
+        .join(ticket)
+        .join(page_seen(w.step(4)).snapshot.digits());
+    assert_eq!(snapshot.stdout, std::fs::read(blob).unwrap());
+
+    let none = trail_cli(&[&base[..], &["--step", "9"]].concat());
+    assert_eq!(none.status.code(), Some(1));
+    assert!(text(&none.stderr).contains("has no step 9"));
+    let closed = trail_cli(&[&base[..], &["--step", "5"]].concat());
+    assert_eq!(closed.status.code(), Some(1));
+    assert!(text(&closed.stderr).contains("captured no page"));
+}
+
+#[tokio::test]
+async fn agent_trail_exits_1_on_a_problem_and_only_strict_fails_a_warning() {
+    let w = written("trail-cli-exit").await;
+    let config = w.agent.root.join("agent.yaml");
+    let corrupt = w.forge("corrupt", |_| {});
+    let blob = corrupt.blob(&w.ticket, &w.view(1));
+    let mut bytes = std::fs::read(&blob).unwrap();
+    bytes[1] ^= 1;
+    std::fs::write(&blob, bytes).unwrap();
+    let cut = w.forge("cut", |events| {
+        let at = position(events, is_done(5));
+        events.truncate(at);
+    });
+
+    let output = trail_cli(&[
+        "--state-dir",
+        path(&corrupt.state),
+        "--config",
+        path(&config),
+        "--ticket",
+        w.ticket.as_str(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        text(&output.stdout)
+            .lines()
+            .any(|line| line.starts_with("  problem: step 1 of ")),
+        "{}",
+        text(&output.stdout)
+    );
+    assert!(text(&output.stderr).contains("the trail has problems (1)"));
+
+    let args = ["--state-dir", path(&cut.state), "--config", path(&config)];
+    let lenient = trail_cli(&args);
+    assert!(lenient.status.success());
+    assert!(
+        text(&lenient.stdout)
+            .lines()
+            .any(|line| line.starts_with("  warning: step 5 of ")),
+        "{}",
+        text(&lenient.stdout)
+    );
+    let strict = trail_cli(&[&args[..], &["--strict"]].concat());
+    assert_eq!(strict.status.code(), Some(1));
+    assert!(text(&strict.stdout).contains("  problem: step 5 of "));
+}
+
+#[tokio::test]
+async fn a_verifier_that_holds_only_public_keys_checks_a_trail_without_the_seed() {
+    let w = written("trail-cli-public").await;
+    let key_file = w.agent.root.join("keys").join("trail.key");
+    let key = TrailSigner::load(&key_file, &SandboxView::new([]))
+        .unwrap()
+        .public();
+    let config = w.agent.root.join("agent.yaml");
+    let state = w.agent.state();
+    std::fs::remove_file(&key_file).unwrap();
+    let trusting = format!("local={key}");
+
+    let alone = trail_cli(&["--state-dir", path(&state), "--trust", &trusting]);
+    assert!(alone.status.success());
+    assert!(text(&alone.stdout).contains("5 steps, 5 signatures ok"));
+
+    let with_config = trail_cli(&[
+        "--state-dir",
+        path(&state),
+        "--config",
+        path(&config),
+        "--trust",
+        &trusting,
+    ]);
+    assert!(with_config.status.success());
+
+    let seedless = trail_cli(&["--state-dir", path(&state), "--config", path(&config)]);
+    assert_eq!(seedless.status.code(), Some(1));
+    assert!(text(&seedless.stderr).contains("browser.audit_key"));
+
+    let pinned = Trust::new(
+        None,
+        vec![Trusted {
+            environment: "local".to_owned(),
+            key,
+        }],
+    )
+    .unwrap();
+    let report = verify(&state, &state.join("trail"), &pinned, None, false).unwrap();
+    assert_found(&report, Vec::new(), true);
+}
+
+#[tokio::test]
+async fn a_store_file_of_schema_3_or_4_holding_no_browser_steps_reads_as_an_empty_trail() {
+    for version in [3, 4] {
+        let root = scratch(&format!("trail-v{version}"));
+        let state = root.join("state");
+        let file = state.join(STORE_FILE);
+        let mut store = SqliteStore::open(&file).unwrap();
+        let received = DomainEvent::TriggerReceived {
+            trigger: TriggerId::new("slack:t1"),
+            threads: Vec::new(),
+            reached: Vec::new(),
+            queued: false,
+        };
+        store
+            .commit(ChangeSet {
+                events: vec![Event {
+                    at_ms: 1_000,
+                    event: received,
+                }],
+                ..ChangeSet::default()
+            })
+            .unwrap();
+        drop(store);
+        let conn = rusqlite::Connection::open(&file).unwrap();
+        if version == 3 {
+            conn.execute_batch("DROP TABLE trails").unwrap();
+        }
+        conn.execute("DELETE FROM schema_version WHERE version > ?1", [version])
+            .unwrap();
+        drop(conn);
+        let old = SqliteStore::open_read_only(&file).unwrap();
+        assert_eq!(old.schema_version().unwrap(), version);
+        drop(old);
+
+        let report = verify(&state, &state.join("trail"), &Trust::default(), None, false).unwrap();
+        assert_found(&report, Vec::new(), true);
+        assert_eq!(report.chain.as_ref().unwrap().events, 1, "schema {version}");
+        assert!(report.tickets.is_empty(), "schema {version}");
+
+        let output = trail_cli(&["--state-dir", path(&state)]);
+        assert!(output.status.success(), "schema {version}");
+        let out = text(&output.stdout);
+        assert!(out.contains("chain ok: 1 event, head "), "schema {version}");
+        assert!(out.contains("no browser steps"), "schema {version}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+async fn serve_until_a_step_hangs<T: Send + 'static>(
+    agent: &Agent,
+    beside: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let _never = agent.fake.hold_on("Page.navigate");
+    let (config, state, store) = (agent.config(), agent.state(), agent.store());
+    let host = agent.host(Box::new(|prompt| {
+        if first_prompt(prompt) {
+            vec![
+                ("browser_read", json!({})),
+                ("browser_open", json!({"url": format!("{SITE}/login")})),
+            ]
+        } else {
+            Vec::new()
+        }
+    }));
+    let serving = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let found = runtime.block_on(async {
+            let besides = async {
+                until("the second step to hang", || {
+                    (lines(&trail(&store)).len() == 3).then_some(())
+                })
+                .await;
+                tokio::task::spawn_blocking(beside).await.unwrap()
+            };
+            tokio::select! {
+                ended = serve_with(config, &state, false, Some(host)) => {
+                    panic!("serve ended: {ended:?}")
+                }
+                found = besides => found,
+            }
+        });
+        runtime.shutdown_timeout(Duration::from_secs(5));
+        found
+    });
+    let found = tokio::task::spawn_blocking(move || serving.join().unwrap())
+        .await
+        .unwrap();
+    gone(&agent.fake, "the killed host's browser").await;
+    found
+}
+
+fn nth_ask(events: &[Event], n: u32, which: usize) -> (TicketId, AssignmentId) {
+    events
+        .iter()
+        .filter_map(|event| match &event.event {
+            DomainEvent::TrailAsked {
+                ticket,
+                assignment,
+                n: at,
+                ..
+            } if *at == n => Some((ticket.clone(), assignment.clone())),
+            _ => None,
+        })
+        .nth(which)
+        .expect("no such ask")
+}
+
+#[tokio::test]
+async fn a_step_still_running_beside_a_serving_agent_warns_and_its_open_browser_is_not_unclosed() {
+    let agent = Agent::new("trail-live");
+    agent.ask();
+    let trust = Trust::new(Some(&agent.config()), Vec::new()).unwrap();
+    let state = agent.state();
+
+    let (lenient, strict) = serve_until_a_step_hangs(&agent, move || {
+        let check = |strict| verify(&state, &state.join("trail"), &trust, None, strict).unwrap();
+        (check(false), check(true))
+    })
+    .await;
+
+    let events = SqliteStore::open_read_only(agent.store())
+        .unwrap()
+        .events()
+        .unwrap();
+    let (ticket, assignment) = nth_ask(&events, 2, 0);
+    let unanswered = Problem::Unanswered {
+        at: StepAt {
+            ticket,
+            assignment,
+            n: 2,
+        },
+    };
+    assert_found(&lenient, vec![warning(unanswered.clone())], true);
+    assert_found(&strict, vec![fatal(unanswered)], false);
+    assert_eq!(
+        lenient.tickets[0].assignments[0].ended, None,
+        "the Assignment is still running, so its open browser is a live one"
+    );
+}
+
+#[tokio::test]
+async fn a_ticket_a_crash_gave_two_assignments_replays_both_and_asks_which_a_step_is_of() {
+    let agent = Agent::new("trail-restart");
+    agent.ask();
+    serve_until_a_step_hangs(&agent, || ()).await;
+    agent
+        .serve_until_idle(Box::new(|prompt| {
+            if !prompt.contains("This ticket was worked on before") {
+                return Vec::new();
+            }
+            vec![
+                ("browser_open", json!({"url": format!("{SITE}/login")})),
+                (
+                    "worker_report",
+                    json!({"status": "ready", "text": "Opened again."}),
+                ),
+            ]
+        }))
+        .await;
+    let events = SqliteStore::open_read_only(agent.store())
+        .unwrap()
+        .events()
+        .unwrap();
+    let (ticket, crashed) = nth_ask(&events, 2, 0);
+    let (_, restarted) = nth_ask(&events, 1, 1);
+    assert_ne!(crashed, restarted);
+    let (state, config) = (agent.state(), agent.root.join("agent.yaml"));
+
+    let trust = Trust::new(Some(&agent.config()), Vec::new()).unwrap();
+    let report = verify(&state, &state.join("trail"), &trust, None, false).unwrap();
+
+    let lost = Problem::Unanswered {
+        at: StepAt {
+            ticket: ticket.clone(),
+            assignment: crashed.clone(),
+            n: 2,
+        },
+    };
+    assert_found(&report, vec![warning(lost)], true);
+    let assignments = &report.tickets[0].assignments;
+    let shape: Vec<_> = assignments
+        .iter()
+        .map(|each| (each.assignment.clone(), each.steps.len()))
+        .collect();
+    assert_eq!(shape, [(crashed.clone(), 2), (restarted.clone(), 2)]);
+    assert_eq!(
+        assignments[0].ended.as_deref(),
+        Some(HOST_RESTARTED),
+        "the restart ended the Assignment the dead host left running"
+    );
+
+    let base = [
+        "--state-dir",
+        path(&state),
+        "--config",
+        path(&config),
+        "--ticket",
+        ticket.as_str(),
+        "--step",
+        "1",
+    ];
+    let ambiguous = trail_cli(&base);
+    assert_eq!(ambiguous.status.code(), Some(1));
+    let why = text(&ambiguous.stderr);
+    assert!(why.contains("name one with --assignment"), "{why}");
+    assert!(
+        why.contains(crashed.as_str()) && why.contains(restarted.as_str()),
+        "{why}"
+    );
+    let named = trail_cli(&[&base[..], &["--assignment", restarted.as_str()]].concat());
+    let steps = signed(&trail(&agent.store()));
+    let opened = steps
+        .iter()
+        .find(|step| step.body.assignment == restarted && step.body.n == 1)
+        .unwrap();
+    let blob = state
+        .join("trail")
+        .join(ticket.as_str())
+        .join(page_seen(opened).view.digits());
+    assert!(named.status.success(), "a warning does not fail the check");
+    assert_eq!(named.stdout, std::fs::read(blob).unwrap());
 }

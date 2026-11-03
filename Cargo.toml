@@ -86,6 +86,9 @@ landlock = "=0.4.7"
 seccompiler = "=0.5.0"
 libc = "=0.2.190"
 
+[dev-dependencies]
+rusqlite = { version = "=0.41.1", default-features = false, features = ["bundled", "cache", "fallible_uint"] }
+
 [lints]
 workspace = true
 

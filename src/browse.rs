@@ -157,25 +157,48 @@ fn unhex(digits: &str) -> Vec<u8> {
         .collect()
 }
 
+/// Why a step's signature is not the trusted machine's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BadSignature {
+    Foreign { signer: TrailKey, trusted: TrailKey },
+    Invalid,
+}
+
+impl std::fmt::Display for BadSignature {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Foreign { signer, trusted } => write!(f, "signed by {signer}, not by {trusted}"),
+            Self::Invalid => f.write_str("the signature does not verify"),
+        }
+    }
+}
+
+/// Whether `step` was signed by `trusted`.
+pub fn verify_signature(step: &SignedStep, trusted: &TrailKey) -> Result<(), BadSignature> {
+    if step.signer != *trusted {
+        return Err(BadSignature::Foreign {
+            signer: step.signer.clone(),
+            trusted: trusted.clone(),
+        });
+    }
+    let key: [u8; 32] = unhex(trusted.digits())
+        .try_into()
+        .map_err(|_| BadSignature::Invalid)?;
+    Signed {
+        payload: &step.body,
+        signer: key,
+        signature: unhex(step.signature.as_str()),
+    }
+    .verify(TRAIL_DOMAIN, &key)
+    .map_err(|_| BadSignature::Invalid)
+}
+
 /// Check `browsed` as the answer to `call`: signed by `trusted`, answering
 /// the action that was asked, and carrying exactly the blobs its outcome
 /// names, each matching its digest.
 pub fn verify_step(call: &BrowseCall, browsed: &Browsed, trusted: &TrailKey) -> Result<(), String> {
     let step = &browsed.step;
-    if step.signer != *trusted {
-        return Err(format!("signed by {}, not by {trusted}", step.signer));
-    }
-    let key: [u8; 32] = unhex(trusted.digits())
-        .try_into()
-        .map_err(|_| "the trusted key is not 32 bytes".to_owned())?;
-    let signed = Signed {
-        payload: &step.body,
-        signer: key,
-        signature: unhex(step.signature.as_str()),
-    };
-    signed
-        .verify(TRAIL_DOMAIN, &key)
-        .map_err(|_| "the signature does not verify".to_owned())?;
+    verify_signature(step, trusted).map_err(|bad| bad.to_string())?;
     let asked = Pending {
         n: call.n,
         action: call.action.clone(),

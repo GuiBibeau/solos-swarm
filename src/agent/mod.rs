@@ -506,10 +506,7 @@ fn local_browsers(
     readable
         .hides(&runtime_dir)
         .context("browser.runtime_dir")?;
-    let blob_dir = match &config.trail.path {
-        Some(path) => path.clone(),
-        None => state_dir.join(TRAIL_DIR),
-    };
+    let blob_dir = config.trail.root(&state_dir);
     readable.hides(&blob_dir).context("trail.path")?;
     let blobs = trail::BlobStore::open(&blob_dir, &config.trail).context("trail")?;
     let browsers = Arc::new(
