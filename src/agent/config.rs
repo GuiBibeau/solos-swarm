@@ -15,6 +15,7 @@ use super::simulated::TimeFactor;
 use super::{discord, github, mcp, slack};
 use crate::code::{self, Mount};
 use crate::gateway::{PriceTable, upstream_profile};
+use crate::vault::{SandboxView, VaultConfig};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Deserializer};
 use solos_agent_core::AllowlistPolicy;
@@ -43,6 +44,8 @@ pub struct AgentConfig {
     /// `no-pass-through` design does.
     #[serde(default = "pass_through")]
     pub pass_through: bool,
+    #[serde(default)]
+    pub vault: Option<VaultConfig>,
 }
 
 fn pass_through() -> bool {
@@ -480,6 +483,9 @@ impl AgentConfig {
         if let Some(nodes) = &mut config.nodes {
             nodes.resolve(base);
         }
+        if let Some(vault) = &mut config.vault {
+            vault.resolve(base);
+        }
         if let ExecutorConfig::Pi {
             provider,
             swarm: Some(swarm),
@@ -492,6 +498,36 @@ impl AgentConfig {
             GoalTemplates::load(swarm, provider)?.check(config.budgets.session_microusd)?;
         }
         Ok(config)
+    }
+
+    pub fn sandbox_view(&self) -> SandboxView {
+        let ExecutorConfig::Pi {
+            run_code, claude, ..
+        } = &self.executor
+        else {
+            return SandboxView::new([]);
+        };
+        let run_code = run_code.iter().flat_map(|run_code| {
+            let mounts = run_code.mounts.iter().map(|mount| mount.source.clone());
+            mounts.chain(run_code.uv_root.clone())
+        });
+        let claude = claude.iter().flat_map(|claude| {
+            let node_root = claude.node.as_deref().map(|node| {
+                node.parent()
+                    .and_then(Path::parent)
+                    .unwrap_or(node)
+                    .to_owned()
+            });
+            let binary_dir = claude.binary.parent().unwrap_or(&claude.binary);
+            [
+                Some(binary_dir.to_owned()),
+                node_root,
+                claude.solos_swarm.clone(),
+            ]
+            .into_iter()
+            .flatten()
+        });
+        SandboxView::new(run_code.chain(claude))
     }
 
     pub fn validate(&self) -> Result<()> {

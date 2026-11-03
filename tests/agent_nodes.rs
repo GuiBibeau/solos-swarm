@@ -129,6 +129,7 @@ impl Pki {
             work_root: self.root.join(format!("{name}-work")),
             sandbox: sandbox_config,
             secrets: SecretsConfig::default(),
+            vault: None,
         }
     }
 }

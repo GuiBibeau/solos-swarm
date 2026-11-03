@@ -46,5 +46,6 @@ pub mod telemetry;
 pub mod tool_identity;
 pub mod tools;
 pub mod transport;
+pub mod vault;
 pub mod wasi_worker;
 pub mod witness;
