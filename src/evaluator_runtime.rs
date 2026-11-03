@@ -1083,7 +1083,7 @@ mod tests {
             std::env::temp_dir().join(format!("ss-eval-lease-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&directory).unwrap();
         let key = directory.join("key");
-        ArtifactStore::create_key(&key).unwrap();
+        crate::sealed::Key::create(&key).unwrap();
         let mut store = ArtifactStore::open(&directory.join("blobs"), &key).unwrap();
         let bytes = b"\0asm\x01\0\0\0";
         let info = store

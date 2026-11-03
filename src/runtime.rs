@@ -3305,7 +3305,7 @@ pub async fn serve_with_tools(path: &Path, tools: Arc<dyn ToolExecutor>) -> Resu
             !response_directory.exists() || fs::read_dir(&response_directory)?.next().is_none(),
             "existing response archive has lost its encryption key"
         );
-        crate::artifacts::ArtifactStore::create_key(&response_key)?;
+        crate::sealed::Key::create(&response_key)?;
     }
     let response_store = Arc::new(Mutex::new(crate::artifacts::ArtifactStore::open(
         &response_directory,
