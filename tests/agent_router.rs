@@ -261,6 +261,7 @@ budgets: {{session_microusd: 500000, router_daily_microusd: 1000000}}
             provider: judge,
             pi_root: pi_root.to_owned(),
             node: node.to_owned(),
+            browser: solos_swarm::browse::Launcher::Lightpanda,
         };
         let state = self.state();
         let serving = serve_with(config, &state, true, Some(host));

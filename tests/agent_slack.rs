@@ -1894,9 +1894,10 @@ impl KeyedBroker {
                 },
                 code: None,
                 vault: Some(VaultParts {
-                    vault,
-                    takes_approvals: true,
+                    vault: Arc::new(vault),
+                    asks_on: ["slack".to_owned()].into(),
                 }),
+                browser: None,
             }),
         };
         let broker = AgentBroker::new(parts).unwrap();

@@ -368,7 +368,8 @@ test("SWARM_TOOLSET=router registers only the Router tools, whatever the role an
 
 const workerNames = ["fetch_url", "run_code", "worker_handback", "worker_report"];
 const jobNames = ["job_start", "job_stop", "job_wait"];
-const allWorkerNames = [...workerNames, ...jobNames, "vault_list"].sort();
+const browserNames = ["browser_act", "browser_login", "browser_open", "browser_read"];
+const allWorkerNames = [...workerNames, ...jobNames, "vault_list", ...browserNames].sort();
 
 test("SWARM_TOOLSET=worker registers the worker tools that SWARM_GRANTS names and blocks every other call", () => {
   const saved = { role: process.env.SWARM_ROLE, grants: process.env.SWARM_GRANTS, toolset: process.env.SWARM_TOOLSET };
@@ -392,7 +393,7 @@ test("SWARM_TOOLSET=worker registers the worker tools that SWARM_GRANTS names an
     const narrowed = load();
     assert.deepEqual(narrowed.declared, ["fetch_url", "worker_handback", "worker_report"], "a host without run_code never advertises it");
     assert.ok(narrowed.events.includes("before_agent_start"), "a worker takes its system prompt from the broker");
-    for (const forged of ["run_code", ...jobNames, "router_decide", "claim_task", "submit_finding", "board_post"]) {
+    for (const forged of ["run_code", ...jobNames, ...browserNames, "router_decide", "claim_task", "submit_finding", "board_post"]) {
       assert.equal(narrowed.guard(forged)?.block, true, forged);
     }
     assert.equal(narrowed.guard("worker_report"), undefined);

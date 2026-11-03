@@ -1,19 +1,22 @@
 use super::registry::Cap;
-use super::{AgentBroker, Refusal, Reply, VaultParts, WorkerSeat, failed, forbidden, refuse};
+use super::{AgentBroker, Refusal, Reply, WorkerSeat, failed, forbidden, refuse};
 use crate::agent::environment::LOCAL;
 use crate::agent::ports::Fact;
 use crate::broker::fetch_with;
 use crate::vault::{Admission, GrantState, ItemKind, SecretName, UseContext, policy};
 use axum::{Json, http::StatusCode};
 use serde_json::{Value, json};
-use solos_agent_core::model::{SecretGrant, SecretId};
+use solos_agent_core::model::{SecretGrant, SecretId, Ticket};
+use std::collections::BTreeSet;
 
-const NOTE: &str = "You never see these values. Pass a key's name as fetch_url's key, and the \
-                    broker adds the key only to requests to its hosts. A copy of a value in a \
-                    response reads [vault:<name>]. approval is where this ticket stands: none \
-                    needs no person, needed asks a person at first use, waiting means one was \
-                    asked, granted or denied is their answer, and no_approver means nobody here \
-                    can answer, so the item cannot be used.";
+const NOTE: &str = "You never see these values. `use` names the tools that take each item. Pass \
+                    a key's name as fetch_url's key, and the broker adds the key only to \
+                    requests to its hosts. Pass a login's name to browser_login, and the browser \
+                    fills it only on the login's own site. A copy of a value in a response reads \
+                    [vault:<name>]. approval is where this ticket stands: none needs no person, \
+                    needed asks a person at first use, waiting means one was asked, granted or \
+                    denied is their answer, and no_approver means nobody can answer from this \
+                    ticket's channels, so the item cannot be used.";
 
 pub(super) async fn fetch(
     broker: &AgentBroker,
@@ -39,7 +42,7 @@ pub(super) async fn fetch(
                 "fetch_url's url is not an absolute URL",
             )
         })?;
-    let context = use_context(broker, seat, parts).await?;
+    let context = use_context(broker, seat).await?;
     let key = match parts
         .vault
         .admit_key(&name, &url, &context)
@@ -90,7 +93,13 @@ pub(super) async fn vault_list(broker: &AgentBroker, seat: &WorkerSeat) -> Reply
     let parts = broker
         .vault()
         .ok_or_else(|| failed("vault_list was admitted without a vault"))?;
-    let context = use_context(broker, seat, parts).await?;
+    let context = use_context(broker, seat).await?;
+    let offered = broker.worker_tools(seat.environment.as_deref());
+    let login_use: &[&str] = if offered.contains(&"browser_login") {
+        &["browser_login"]
+    } else {
+        &[]
+    };
     let (mut logins, mut keys) = (Vec::new(), Vec::new());
     for item in parts.vault.catalog(&context).map_err(failed)? {
         let approval = policy::standing(&item, &context);
@@ -105,7 +114,7 @@ pub(super) async fn vault_list(broker: &AgentBroker, seat: &WorkerSeat) -> Reply
                 "username": username,
                 "hint": hint,
                 "where": LOCAL,
-                "use": [],
+                "use": login_use,
                 "approval": approval,
             })),
             ItemKind::Key { hosts, about, .. } => keys.push(json!({
@@ -121,10 +130,9 @@ pub(super) async fn vault_list(broker: &AgentBroker, seat: &WorkerSeat) -> Reply
     Ok(Json(json!({"logins": logins, "keys": keys, "note": NOTE})))
 }
 
-async fn use_context(
+pub(super) async fn use_context(
     broker: &AgentBroker,
     seat: &WorkerSeat,
-    parts: &VaultParts,
 ) -> Result<UseContext, Refusal> {
     let id = seat.ticket.clone();
     let ticket = broker
@@ -146,16 +154,26 @@ async fn use_context(
             Some((name, state))
         })
         .collect();
+    let takes_approvals = broker
+        .vault()
+        .is_some_and(|parts| can_ask(&ticket, &parts.asks_on));
     let mandate = &ticket.mandate;
     Ok(UseContext {
         requester: format!("{}:{}", mandate.source, mandate.requester.id),
         environment: LOCAL.to_owned(),
         grants,
-        takes_approvals: parts.takes_approvals,
+        takes_approvals,
     })
 }
 
-async fn ask_first_use(
+fn can_ask(ticket: &Ticket, asks_on: &BTreeSet<String>) -> bool {
+    ticket
+        .channels
+        .iter()
+        .any(|channel| asks_on.contains(&channel.source))
+}
+
+pub(super) async fn ask_first_use(
     broker: &AgentBroker,
     seat: &WorkerSeat,
     secret: String,

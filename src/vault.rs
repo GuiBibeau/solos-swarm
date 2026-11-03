@@ -364,6 +364,7 @@ pub struct UseContext {
     /// Where this vault is: `local` or a node's name.
     pub environment: String,
     pub grants: BTreeMap<SecretName, GrantState>,
+    /// A Channel of this Ticket can show a person the Allow and Deny buttons.
     pub takes_approvals: bool,
 }
 

@@ -150,6 +150,7 @@ watchdog:
             provider: model,
             pi_root: self.root.clone(),
             node: self.root.join("node"),
+            browser: solos_swarm::browse::Launcher::Lightpanda,
         }
     }
     async fn serve_until_idle(&self, config: AgentConfig, model: Arc<Model>) {

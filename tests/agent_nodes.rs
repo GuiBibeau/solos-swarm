@@ -251,6 +251,7 @@ impl World {
                 terms: terms(),
                 code: local,
                 vault: None,
+                browser: None,
             }),
         };
         let nodes = Nodes {
@@ -1019,6 +1020,7 @@ async fn a_ticket_bound_to_an_offline_node_launches_once_it_connects() {
         provider: Arc::new(Model { calls }) as Arc<dyn Provider>,
         pi_root: root.clone(),
         node: root.join("node"),
+        browser: solos_swarm::browse::Launcher::Lightpanda,
     };
     let state = root.join("state");
     let serving = {

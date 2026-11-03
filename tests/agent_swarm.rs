@@ -206,6 +206,7 @@ impl Scratch {
             provider: model,
             pi_root: self.root.clone(),
             node: self.root.join("node"),
+            browser: solos_swarm::browse::Launcher::Lightpanda,
         }
     }
     async fn serve<H>(&self, config: AgentConfig, host: PiHost<H>) -> Summary
@@ -714,6 +715,7 @@ async fn real_pi_swarm_agents_run_a_swarm_ticket_in_bubblewrap() {
         provider: real.clone(),
         pi_root,
         node,
+        browser: solos_swarm::browse::Launcher::Lightpanda,
     };
 
     let summary = scratch.serve(scratch.config(""), host).await;
