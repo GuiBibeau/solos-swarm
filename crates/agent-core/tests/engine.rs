@@ -277,6 +277,67 @@ fn follow_ups_reach_the_ticket_without_an_eval_and_bots_are_context_only() {
 }
 
 #[test]
+fn without_pass_through_a_follow_up_reaches_the_ticket_and_the_router() {
+    let mut w = World::new(policy());
+    w.engine.set_pass_through(false);
+    let alice = || Actor::person("alice");
+    w.engine
+        .receive(slack("t0", alice(), Addressed::Mention, "th1", "do x"))
+        .unwrap();
+    w.engine
+        .receive(slack("t1", alice(), Addressed::Unaddressed, "th1", "and z"))
+        .unwrap();
+    let started = w.engine.evaluate_due().unwrap();
+    let [eval] = &started[..] else {
+        panic!("{started:?}")
+    };
+    w.engine.decide(eval, accept(session(), 1_000_000)).unwrap();
+    let [(ticket, assignment, _)] = &launched(&w.effects())[..] else {
+        panic!()
+    };
+    w.engine.assignment_started(ticket, assignment).unwrap();
+    w.effects();
+    let thread = w.engine.repos().threads[&ThreadKey::new("th1")].clone();
+    assert_eq!(
+        thread.queued,
+        [TriggerId::new("t1")],
+        "an adopted follow-up stays queued"
+    );
+
+    let intake = w
+        .engine
+        .receive(slack(
+            "t2",
+            alice(),
+            Addressed::Unaddressed,
+            "th1",
+            "also y",
+        ))
+        .unwrap();
+    assert_eq!(
+        intake,
+        Intake::Stored {
+            reached: vec![ticket.clone()],
+            queued: true
+        }
+    );
+    let effects = w.effects();
+    assert!(
+        matches!(&effects[..], [Effect::Deliver { inputs, .. }] if inputs.len() == 1),
+        "the follow-up reaches the worker: {effects:?}"
+    );
+    let next = w.engine.evaluate_due().unwrap();
+    assert_eq!(next.len(), 1, "the Router judges the follow-ups too");
+    let effects = w.effects();
+    let [Effect::Assess(candidate)] = &effects[..] else {
+        panic!("{effects:?}")
+    };
+    let ids: Vec<_> = candidate.triggers.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids, ["t1", "t2"]);
+    assert_eq!(candidate.tickets.len(), 1);
+}
+
+#[test]
 fn an_unlisted_person_never_reaches_the_router() {
     let mut w = World::new(policy());
     w.engine

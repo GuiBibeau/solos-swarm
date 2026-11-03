@@ -11,6 +11,7 @@ pub use watchdog::{OperatorConfig, ThresholdsConfig, WatchdogConfig};
 
 use super::goal_template::GoalTemplates;
 use super::jobs::{self, JobLimits};
+use super::simulated::TimeFactor;
 use super::{github, mcp, slack};
 use crate::code::{self, Mount};
 use crate::gateway::{PriceTable, upstream_profile};
@@ -37,6 +38,15 @@ pub struct AgentConfig {
     /// Remote nodes that run workers' commands. Without it, none connect.
     #[serde(default)]
     pub nodes: Option<NodesConfig>,
+    /// An allowed person's follow-up on a subscribed Thread goes only to its
+    /// Ticket. `false` also sends it to the Router, as `agent bench`'s
+    /// `no-pass-through` design does.
+    #[serde(default = "pass_through")]
+    pub pass_through: bool,
+}
+
+fn pass_through() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -120,7 +130,12 @@ impl ChannelConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RouterConfig {
-    Scripted {},
+    Scripted {
+        /// Ignore an explicit candidate on a Thread whose Ticket is still
+        /// open, as a follow-up that Ticket already has.
+        #[serde(default)]
+        ignore_follow_ups: bool,
+    },
     /// A long-lived Pi session, keyless and sandboxed, whose model calls go
     /// through the agent broker against the Router's daily cap.
     Pi {
@@ -155,6 +170,22 @@ fn default_max_output_tokens() -> u64 {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExecutorConfig {
     Scripted {},
+    /// Work that only takes time, for `agent bench`: each Assignment starts
+    /// when a slot is free and reports `ready` after its request's
+    /// `meta.bench.work_ms`, scaled by `time_factor`.
+    Simulated {
+        #[serde(default = "default_simulated_workers")]
+        max_workers: usize,
+        #[serde(default = "default_time_factor")]
+        time_factor: TimeFactor,
+        /// The work of a Ticket whose origin names none, in workload ms.
+        #[serde(default = "default_work_ms")]
+        default_work_ms: u64,
+        /// The Router takes no Candidate while work runs, as one session
+        /// that runs its subagent in its own turn.
+        #[serde(default)]
+        router_waits_for_work: bool,
+    },
     /// One keyless, sandboxed Pi worker session per Assignment, whose model
     /// calls go through the agent broker against its Ticket's budget.
     Pi {
@@ -315,6 +346,18 @@ fn default_max_workers() -> usize {
     2
 }
 
+fn default_simulated_workers() -> usize {
+    MAX_WORKERS
+}
+
+fn default_time_factor() -> TimeFactor {
+    TimeFactor::REAL_TIME
+}
+
+fn default_work_ms() -> u64 {
+    600_000
+}
+
 fn default_max_swarms() -> usize {
     1
 }
@@ -329,6 +372,8 @@ fn default_code_memory() -> u64 {
 
 /// The most workers one agent may run at once.
 const MAX_WORKERS: usize = 64;
+/// The longest simulated work.
+const DAY_MS: u64 = 86_400_000;
 /// The most swarms one agent may run at once.
 const MAX_SWARMS: usize = 8;
 
@@ -487,6 +532,21 @@ impl AgentConfig {
     }
 
     fn validate_executor(&self) -> Result<()> {
+        if let ExecutorConfig::Simulated {
+            max_workers,
+            default_work_ms,
+            ..
+        } = &self.executor
+        {
+            ensure!(
+                (1..=MAX_WORKERS).contains(max_workers),
+                "executor.max_workers must be 1..={MAX_WORKERS}"
+            );
+            ensure!(
+                (1..=DAY_MS).contains(default_work_ms),
+                "executor.default_work_ms must be 1..={DAY_MS}"
+            );
+        }
         let ExecutorConfig::Pi {
             provider,
             model,
@@ -1218,6 +1278,60 @@ budgets: {session_microusd: 500000}
         ] {
             assert_ne!(yaml, VALID, "{case}: the case did not change the config");
             assert!(parse(&yaml).is_err(), "{case}: accepted");
+        }
+    }
+
+    #[test]
+    fn the_bench_designs_load_and_their_limits_are_checked() {
+        let design = |router: &str, executor: &str| {
+            VALID
+                .replace("router: {kind: scripted}", router)
+                .replace("executor: {kind: scripted}", executor)
+        };
+        let serial = parse(&format!(
+            "{}pass_through: false\n",
+            design(
+                "router: {kind: scripted, ignore_follow_ups: true}",
+                "executor: {kind: simulated, max_workers: 1, time_factor: 0.01, \
+                 router_waits_for_work: true}",
+            )
+        ))
+        .unwrap();
+        assert!(!serial.pass_through);
+        assert_eq!(
+            serial.router,
+            RouterConfig::Scripted {
+                ignore_follow_ups: true
+            }
+        );
+        let ExecutorConfig::Simulated {
+            max_workers,
+            time_factor,
+            default_work_ms,
+            router_waits_for_work,
+        } = serial.executor
+        else {
+            panic!("{:?}", serial.executor)
+        };
+        assert_eq!((max_workers, default_work_ms), (1, 600_000));
+        assert_eq!(time_factor.wall(60_000), Duration::from_millis(600));
+        assert!(router_waits_for_work);
+        let defaults = parse(&design(
+            "router: {kind: scripted}",
+            "executor: {kind: simulated}",
+        ))
+        .unwrap();
+        assert!(defaults.pass_through, "pass-through is on unless refused");
+        for executor in [
+            "executor: {kind: simulated, max_workers: 0}",
+            "executor: {kind: simulated, max_workers: 65}",
+            "executor: {kind: simulated, time_factor: 0}",
+            "executor: {kind: simulated, time_factor: .nan}",
+            "executor: {kind: simulated, default_work_ms: 0}",
+            "executor: {kind: simulated, workers: 2}",
+        ] {
+            let yaml = design("router: {kind: scripted}", executor);
+            assert!(parse(&yaml).is_err(), "{executor}: accepted");
         }
     }
 

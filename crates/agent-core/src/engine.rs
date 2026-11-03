@@ -34,6 +34,7 @@ pub struct Engine<R, P, C> {
     repos: R,
     policy: P,
     clock: C,
+    pass_through: bool,
 }
 
 impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
@@ -42,7 +43,15 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
             repos,
             policy,
             clock,
+            pass_through: true,
         }
+    }
+    /// With pass-through off, an allowed person's follow-up on a subscribed
+    /// Thread still reaches its Tickets and is also queued for the Router,
+    /// as every other Trigger is. On by default; off is the benchmark's
+    /// ablation.
+    pub fn set_pass_through(&mut self, on: bool) {
+        self.pass_through = on;
     }
     pub fn repos(&self) -> &R {
         &self.repos
@@ -67,6 +76,7 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
             repos: &self.repos,
             changes: ChangeSet::default(),
             now: self.clock.now_ms(),
+            pass_through: self.pass_through,
         };
         let value = work(&mut tx, &self.policy)?;
         let Tx { changes, .. } = tx;
@@ -76,7 +86,8 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
 
     /// Store a Trigger once, fan it out to the Tickets subscribed to its
     /// Threads, and queue it for an Eval on its primary Thread unless it is a
-    /// person's message that reached a Ticket, which stays that Ticket's.
+    /// person's message that reached a Ticket, which stays that Ticket's
+    /// while pass-through is on.
     pub fn receive(&mut self, trigger: Trigger) -> Result<Intake, Error> {
         let mut threads: Vec<ThreadKey> = Vec::new();
         for key in &trigger.threads {
@@ -131,7 +142,7 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
                 }
                 tx.save_thread(thread);
             }
-            let queued = !owner || reached.is_empty();
+            let queued = !owner || reached.is_empty() || !tx.pass_through;
             if queued && let Some(mut thread) = tx.thread(&primary) {
                 thread.queued.push(trigger.id.clone());
                 tx.save_thread(thread);
@@ -501,6 +512,7 @@ struct Tx<'a, R> {
     repos: &'a R,
     changes: ChangeSet,
     now: Ms,
+    pass_through: bool,
 }
 
 impl<R: Repositories> Tx<'_, R> {
@@ -633,7 +645,8 @@ impl<R: Repositories> Tx<'_, R> {
 
     /// A Ticket accepted while Triggers on its Threads waited for an Eval
     /// gets them as if it had existed. An allowed person's follow-up leaves
-    /// the queue, unless a Ticket handed it back to be judged.
+    /// the queue, unless a Ticket handed it back to be judged or
+    /// pass-through is off.
     fn adopt_waiting(&mut self, ticket: &mut Ticket, policy: &impl Policy) {
         for key_ in ticket.threads.clone() {
             let Some(on) = self.thread(&key_) else {
@@ -656,7 +669,7 @@ impl<R: Repositories> Tx<'_, R> {
                 }
                 let owner =
                     queued && !waits.handed_back.contains(&id) && allowed_person(policy, &trigger);
-                if self.add_trigger_input(ticket, &id, owner) && owner {
+                if self.add_trigger_input(ticket, &id, owner) && owner && self.pass_through {
                     waits.queued.retain(|q| *q != id);
                     self.save_thread(waits);
                 }

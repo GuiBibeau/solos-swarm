@@ -3,6 +3,7 @@
 //! [`serve`] is the composition root, the one place that names concrete
 //! adapters.
 
+pub mod bench;
 pub mod broker;
 pub mod config;
 pub mod environment;
@@ -17,6 +18,7 @@ pub mod ports;
 pub mod runtime;
 pub mod schedule;
 pub mod scripted;
+pub mod simulated;
 pub mod slack;
 pub mod status;
 pub mod swarm_executor;
@@ -48,9 +50,11 @@ use ports::{Channel, Executor, Router, Source};
 use schedule::ScheduleSource;
 use scripted::{ScriptedExecutor, ScriptedRouter};
 use serde_json::json;
+use simulated::{SimulatedExecutor, SimulatedParts};
 use slack::{SlackApi, SlackChannel, SlackSource, Token};
 use solos_agent_store::SqliteStore;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -93,6 +97,17 @@ pub struct PiHost<H> {
 /// and the run ends when nothing is left to do; otherwise it serves until
 /// SIGINT or SIGTERM.
 pub async fn serve(config: &Path, state_dir: &Path, options: ServeOptions) -> Result<Summary> {
+    serve_until(config, state_dir, options, shutdown()).await
+}
+
+/// [`serve`] until `stop` resolves instead of a signal, as `agent bench`
+/// ends each run.
+pub async fn serve_until(
+    config: &Path,
+    state_dir: &Path,
+    options: ServeOptions,
+    stop: impl Future<Output = ()>,
+) -> Result<Summary> {
     let config = AgentConfig::load(config)?;
     let ServeOptions {
         until_idle,
@@ -122,7 +137,7 @@ pub async fn serve(config: &Path, state_dir: &Path, options: ServeOptions) -> Re
             })
         }
     };
-    serve_io(config, state_dir, until_idle, io, host).await
+    serve_io(config, state_dir, until_idle, io, host, stop).await
 }
 
 /// [`serve`] with the Pi sessions' harness and provider given, so tests can
@@ -139,7 +154,7 @@ where
     H::Session: Send + 'static,
 {
     let io = Io::open(&config, state_dir, !until_idle)?;
-    serve_io(config, state_dir, until_idle, io, host).await
+    serve_io(config, state_dir, until_idle, io, host, shutdown()).await
 }
 
 async fn serve_io<H>(
@@ -148,6 +163,7 @@ async fn serve_io<H>(
     until_idle: bool,
     io: Io,
     host: Option<PiHost<H>>,
+    stop: impl Future<Output = ()>,
 ) -> Result<Summary>
 where
     H: AgentHarness + Send + Sync + 'static,
@@ -171,13 +187,31 @@ where
             nodes.as_ref(),
         )?),
     };
-    let router: Arc<dyn Router> = match pi.as_ref().and_then(|pi| pi.router.clone()) {
+    let mut router: Arc<dyn Router> = match pi.as_ref().and_then(|pi| pi.router.clone()) {
         Some(router) => router,
-        None => Arc::new(ScriptedRouter::new(config.budgets.session_microusd)),
+        None => Arc::new(scripted_router(&config)),
     };
     let executor: Arc<dyn Executor> = match pi.as_ref().and_then(|pi| pi.executor.clone()) {
         Some(executor) => executor,
-        None => Arc::new(ScriptedExecutor),
+        None => match &config.executor {
+            ExecutorConfig::Simulated {
+                max_workers,
+                time_factor,
+                default_work_ms,
+                router_waits_for_work,
+            } => {
+                let simulated = SimulatedExecutor::new(SimulatedParts {
+                    max_workers: *max_workers,
+                    time_factor: *time_factor,
+                    default_work_ms: *default_work_ms,
+                })?;
+                if *router_waits_for_work {
+                    router = Arc::new(simulated.hold(router));
+                }
+                Arc::new(simulated)
+            }
+            _ => Arc::new(ScriptedExecutor),
+        },
     };
     let runtime_options = RunOptions {
         until_idle,
@@ -191,12 +225,13 @@ where
         runtime_options,
         (facts, inbound),
     )
-    .with_control_dir(state_dir);
+    .with_control_dir(state_dir)
+    .with_pass_through(config.pass_through);
     let served = match pi {
         Some(pi) => Some(pi.serve(state_dir)?),
         None => None,
     };
-    let summary = runtime.run(shutdown()).await;
+    let summary = runtime.run(stop).await;
     if let Some(watchdog) = watchdog {
         watchdog.stop().await;
     }
@@ -207,6 +242,16 @@ where
         nodes.stop().await;
     }
     summary
+}
+
+fn scripted_router(config: &AgentConfig) -> ScriptedRouter {
+    let ignore = matches!(
+        config.router,
+        RouterConfig::Scripted {
+            ignore_follow_ups: true
+        }
+    );
+    ScriptedRouter::new(config.budgets.session_microusd).ignoring_follow_ups(ignore)
 }
 
 fn private_dir(dir: &Path) -> Result<()> {
@@ -248,7 +293,7 @@ where
         let (pi_root, node) = (canonical(&pi_root)?, canonical(&node)?);
         let tickets_dir = canonical(state_dir)?.join(TICKETS_DIR);
         let workers = match &config.executor {
-            ExecutorConfig::Scripted {} => None,
+            ExecutorConfig::Scripted {} | ExecutorConfig::Simulated { .. } => None,
             ExecutorConfig::Pi {
                 provider,
                 model,
@@ -296,7 +341,7 @@ where
         let remote = environment::Nodes {
             default: match &config.executor {
                 ExecutorConfig::Pi { environment, .. } => environment.clone(),
-                ExecutorConfig::Scripted {} => None,
+                ExecutorConfig::Scripted {} | ExecutorConfig::Simulated { .. } => None,
             },
             nodes: nodes.map(Listener::environments).unwrap_or_default(),
         };
@@ -326,7 +371,7 @@ where
             _ => None,
         };
         let router = match &config.router {
-            RouterConfig::Scripted {} => None,
+            RouterConfig::Scripted { .. } => None,
             RouterConfig::Pi { .. } => {
                 let (spec, grant) = router_session(config, state_dir, &node, &pi_root)?;
                 broker.admit(spec.token.clone(), grant)?;

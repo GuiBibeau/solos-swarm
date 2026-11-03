@@ -192,6 +192,64 @@ enum AgentCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Measure the agent on a generated stream of chat and CI messages with
+    /// work requests among them, as DeepSeek's super-agent ablation did:
+    /// each run serves a fresh agent with simulated work. Writes
+    /// report.json and report.md into --out.
+    Bench {
+        /// A workload spec (YAML); every field it leaves out has its default.
+        #[arg(long)]
+        workload: Option<PathBuf>,
+        /// super-agent, no-pass-through or serial; several separated by
+        /// commas.
+        #[arg(long, value_delimiter = ',', required = true)]
+        design: Vec<solos_swarm::agent::bench::Design>,
+        /// Runs per design; run n uses the spec's seed plus n.
+        #[arg(long, default_value_t = 3)]
+        runs: usize,
+        /// A new or empty directory for the runs and the reports.
+        #[arg(long)]
+        out: PathBuf,
+        /// `scripted` measures scheduling only and spends nothing; `pi` calls
+        /// a real provider and needs --max-spend-usd.
+        #[arg(long, default_value = "scripted", value_parser = ["scripted", "pi"])]
+        router: String,
+        /// Wall time per workload time, instead of the spec's (0.01: a
+        /// workload minute lasts 0.6 s).
+        #[arg(long)]
+        time_factor: Option<f64>,
+        /// Stop a run after this many workload minutes.
+        #[arg(long)]
+        deadline_minutes: Option<f64>,
+        /// --router pi: an agent.yaml whose `router` section is the Pi Router.
+        #[arg(long)]
+        router_config: Option<PathBuf>,
+        /// --router pi: the checkout that holds `node_modules` and `extensions`.
+        #[arg(long)]
+        pi_root: Option<PathBuf>,
+        /// --router pi: the node binary.
+        #[arg(long)]
+        node: Option<PathBuf>,
+        /// --router pi: the model key. Read once and deleted.
+        #[arg(long)]
+        credential_file: Option<PathBuf>,
+        /// --router pi: the most the whole bench may spend, split evenly over
+        /// its runs. Required: a paid bench refuses to start without it.
+        #[arg(long)]
+        max_spend_usd: Option<f64>,
+    },
+    /// Write a bench workload's seeded Triggers file, in workload time from 0.
+    Workload {
+        /// A workload spec (YAML); the defaults otherwise.
+        #[arg(long)]
+        spec: Option<PathBuf>,
+        /// Instead of the spec's.
+        #[arg(long)]
+        seed: Option<u64>,
+        /// The Triggers file to write, one JSON value per line.
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Write the key and self-signed certificate the agent's node listener
     /// serves, and print the fingerprint each node's config pins.
     InitNodes {
@@ -411,6 +469,59 @@ async fn execute(command: Action) -> Result<()> {
             } else {
                 print!("{}", status::render(&report));
             }
+            Ok(())
+        }
+        Action::Agent {
+            command:
+                AgentCommand::Bench {
+                    workload,
+                    design,
+                    runs,
+                    out,
+                    router,
+                    time_factor,
+                    deadline_minutes,
+                    router_config,
+                    pi_root,
+                    node,
+                    credential_file,
+                    max_spend_usd,
+                },
+        } => {
+            use solos_swarm::agent::bench::{self, BenchArgs};
+            let options = BenchArgs {
+                workload,
+                designs: design,
+                runs,
+                out,
+                router,
+                time_factor,
+                deadline_minutes,
+                router_config,
+                pi_root,
+                node,
+                credential_file,
+                max_spend_usd,
+            }
+            .into_options()?;
+            let report = bench::run(options).await?;
+            print!("{}", report.markdown());
+            Ok(())
+        }
+        Action::Agent {
+            command: AgentCommand::Workload { spec, seed, out },
+        } => {
+            use solos_swarm::agent::bench::workload::{WorkloadSpec, generate};
+            let spec = match spec {
+                Some(path) => WorkloadSpec::load(&path)?,
+                None => WorkloadSpec::default(),
+            };
+            let workload = generate(&spec, seed.unwrap_or(spec.seed))?;
+            workload.write_jsonl(&out)?;
+            println!(
+                "{}",
+                json!({"triggers": workload.triggers.len(), "requests": workload.requests, "out": out})
+            );
             Ok(())
         }
         Action::Agent {

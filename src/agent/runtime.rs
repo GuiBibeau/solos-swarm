@@ -156,6 +156,13 @@ impl Runtime {
         self
     }
 
+    /// With `false`, an allowed person's follow-up on a subscribed Thread
+    /// also goes to the Router (see `Engine::set_pass_through`).
+    pub fn with_pass_through(mut self, on: bool) -> Self {
+        self.engine.set_pass_through(on);
+        self
+    }
+
     /// Where facts for this runtime go, before and while it runs.
     pub fn facts(&self) -> FactSink {
         self.facts.clone()
@@ -543,17 +550,21 @@ impl Runtime {
                     .iter()
                     .map(|input| self.delivered(input.clone()))
                     .collect::<Result<_>>()?;
-                Job::Launch(Launch {
+                let origin = store
+                    .trigger(&found.origin)
+                    .with_context(|| format!("no trigger {}", found.origin))?;
+                Job::Launch(Box::new(Launch {
                     ticket,
                     assignment,
                     title: found.title,
                     scope: found.mandate.scope,
+                    origin,
                     rules: found.mandate.rules,
                     plan,
                     budget_microusd,
                     recovery: recovery || repeat,
                     inputs,
-                })
+                }))
             }
             Effect::Deliver {
                 ticket,
@@ -766,7 +777,7 @@ fn backoff(options: &RunOptions, attempts: u32) -> Duration {
 
 enum Job {
     Assess(Candidate),
-    Launch(Launch),
+    Launch(Box<Launch>),
     Deliver(Delivery),
     Stop {
         ticket: TicketId,
@@ -786,7 +797,7 @@ impl Job {
                 Ok(())
             }
             Job::Assess(candidate) => shared.router.assess(candidate, facts).await,
-            Job::Launch(launch) => shared.executor.launch(launch, facts).await,
+            Job::Launch(launch) => shared.executor.launch(*launch, facts).await,
             Job::Deliver(delivery) => shared.executor.deliver(delivery, facts).await,
             Job::Stop {
                 ticket,

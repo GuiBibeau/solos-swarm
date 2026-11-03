@@ -48,7 +48,7 @@ impl AgentConfig {
     pub(super) fn validate_nodes(&self) -> Result<()> {
         let environment = match &self.executor {
             ExecutorConfig::Pi { environment, .. } => environment.as_deref(),
-            ExecutorConfig::Scripted {} => None,
+            ExecutorConfig::Scripted {} | ExecutorConfig::Simulated { .. } => None,
         };
         let Some(nodes) = &self.nodes else {
             ensure!(

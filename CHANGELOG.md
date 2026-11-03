@@ -87,6 +87,11 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   `run_code` and background jobs of the Tickets bound to it in its own bwrap sandbox, with its own mounts and
   secrets that never leave it; `Plan::Session` gains an optional `environment` (stored Plans read as before), an
   offline node holds its Tickets' launches until it connects, and swarm mode is unchanged.
+- Agent mode, P10: `solos-swarm agent bench` reproduces the super-agent article's ablation on a seeded stream of chat
+  and CI Triggers with work requests (`agent workload` writes one), simulated work (`executor: {kind: simulated}`)
+  and three designs (`super-agent`, `no-pass-through` through the new `pass_through: false` and
+  `Engine::set_pass_through`, and `serial`), writing `report.json` and `report.md`; `--router pi` refuses to start
+  without `--max-spend-usd` and caps each run's Router account.
 - `collect` leaves the per-run `code/` scratch directory on the host and writes `collect-manifest.json`; `--include-code` opts back in.
 - Docs: pause mode, self-update operations, dashboard tunnel, tournament runbook, replay status.
 

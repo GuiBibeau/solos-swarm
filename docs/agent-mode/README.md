@@ -16,20 +16,39 @@ and its MIT-licensed prototype `deepseek-ai/dsh-superagent-prototype` (docs 000-
 | P0 Core and plan | Done (#18). `crates/agent-core`: domain, ports, Engine, in-memory store, allowlist Policy, 91 tests and a seeded fuzzer. Most tests are regressions from the adversarial review and the swarm review of PR #18. Swarm mode untouched. |
 | P1 Harness seam | Done (#19). `src/harness.rs`: the `AgentHarness` port, `PiHarness` (the Pi launch moved out of `main.rs`, argv and env pinned by a golden test) and `harness::scripted::ScriptedHarness`. `run`, `work()`, `settled` and `rpc` use the port. A new end-to-end test runs `work()` with three scripted agents through the real broker, with no Pi, node or bwrap. Swarm runs unchanged. |
 | P2a `run_goal` | Done (#20). `src/swarm.rs`: `swarm::run_goal(GoalRun, harness, provider) -> GoalOutcome` holds the run machinery that was in `main.rs` (spawn loop, `work`, nudges, deadline, broker socket, shutdown, `cleanup.json` and `runtime-report.json`), moved unchanged. `run` keeps the CLI part: flags, credential, Goal file, upstream, validation, the Linux and deadline checks, `PiHarness` and the provider, the stdout line and the exit code. The end-to-end test now drives `run_goal` with `ScriptedHarness`, so it also covers the spawn loop, shutdown and the run's files. Swarm runs unchanged. |
-| P2b One bwrap builder, Goal words | **Done.** `src/bwrap.rs`: `Bwrap` has one typed method per bwrap flag the run path uses and `exec(program, args)`, and builds the Pi launch (`PiHarness::command`: swarm agents, agent mode's Router and workers), `run_code`'s sandbox (background jobs too) and `doctor`'s probe. The golden tests of the Pi launch and the swarm `run_code` command pass unedited, and a new one pins `doctor`'s probe. The frozen `mvp` sandboxes (`sandbox.rs`, `wasi_worker.rs`) keep their own lines. The research text of the nudges and the Task fields of a host-filed record are now optional Goal fields, `nudges` (one template per stage) and `record_fields`, whose defaults are the old values byte for byte; `Goal::validate` checks them and a Goal template can set them. This closes P2: P3b's design change settled the rest of its list. Swarm runs unchanged. |
+| P2b One bwrap builder, Goal words | Done (#30). `src/bwrap.rs`: `Bwrap` has one typed method per bwrap flag the run path uses and `exec(program, args)`, and builds the Pi launch (`PiHarness::command`: swarm agents, agent mode's Router and workers), `run_code`'s sandbox (background jobs too) and `doctor`'s probe. The golden tests of the Pi launch and the swarm `run_code` command pass unedited, and a new one pins `doctor`'s probe. The frozen `mvp` sandboxes (`sandbox.rs`, `wasi_worker.rs`) keep their own lines. The research text of the nudges and the Task fields of a host-filed record are now optional Goal fields, `nudges` (one template per stage) and `record_fields`, whose defaults are the old values byte for byte; `Goal::validate` checks them and a Goal template can set them. This closes P2: P3b's design change settled the rest of its list. Swarm runs unchanged. |
 | P3a SQLite Store | Done (#21). `crates/agent-store` (`solos-agent-store`): `SqliteStore` implements `Repositories` on one SQLite file (`rusqlite` 0.41.1 with bundled SQLite, WAL, `synchronous=FULL`, a versioned schema). Aggregates are JSON rows with index columns for active Threads, `thread_of_eval` and open Tickets. Each commit writes state, Effects and events in one transaction. The Effect queue lists due Effects oldest first and records done, or failed with an attempt count and a retry time; Sends to one Channel address keep commit order, and Launch, Deliver and Stop keep it per Ticket; every call is safe to repeat after a crash. The event log is hash-chained like `events.jsonl`, with `verify_chain()`. A seeded differential walk checks it against `MemoryRepositories` after every Engine command. |
 | P3b `agent serve` | Done (#22). `src/agent/`: the async shell ports `Source`, `Channel`, `Router` and `Executor`, a runtime with one task that owns the Engine on the SQLite Store, and `solos-swarm agent serve --config agent.yaml --state-dir DIR [--until-idle]`. The runtime stores Source Triggers, starts due Evals, hands each due Effect to its adapter, and marks it done or failed with exponential backoff. It applies adapter facts as `decide`, `assignment_started` and `report`, and holds every Effect while the Policy is paused. First adapters: `JsonlSource`, `JsonlChannel` (once per `MessageId`, safe after a crash), `ScriptedRouter` and `ScriptedExecutor`, so it runs with no model, Slack or sandbox. Tests cover a full run, a crash between a Launch and its done mark, a restart, retries, a pause and Thread context reaching the worker. |
-| P3c Pi Router | **Done.** The Router is a long-lived Pi session behind the same `Router` port (`src/agent/pi_router.rs`): each Candidate becomes a compact card, the cards queued between turns go into one prompt, and a session that dies restarts while the core's Eval expiry brings back what it left undecided. It runs keyless in bwrap and calls the agent broker (`src/agent/broker.rs`), which speaks the swarm broker's wire on a socket in the state dir, holds and settles each model call against the Router's daily cap in the store's new spend ledger (schema v2), refuses calls while the state dir is paused, and serves the Router's two tools, `router_decide` (the Engine's answer, or its refusal, goes back to the model) and `router_read`. The pricing, request contract, providers and pause gate both brokers use moved to `src/gateway/`, with swarm mode unchanged. |
+| P3c Pi Router | Done (#24). The Router is a long-lived Pi session behind the same `Router` port (`src/agent/pi_router.rs`): each Candidate becomes a compact card, the cards queued between turns go into one prompt, and a session that dies restarts while the core's Eval expiry brings back what it left undecided. It runs keyless in bwrap and calls the agent broker (`src/agent/broker.rs`), which speaks the swarm broker's wire on a socket in the state dir, holds and settles each model call against the Router's daily cap in the store's new spend ledger (schema v2), refuses calls while the state dir is paused, and serves the Router's two tools, `router_decide` (the Engine's answer, or its refusal, goes back to the model) and `router_read`. The pricing, request contract, providers and pause gate both brokers use moved to `src/gateway/`, with swarm mode unchanged. |
 | P4 Slack | Done (#23). `src/agent/slack/`: `SlackSource` (Socket Mode: an outbound WebSocket, nothing exposed) and `SlackChannel` (Web API), configured as `kind: slack` and read from token files that are deleted once read. Events from the listed channels become Triggers (`slack:<channel>:<ts>`, Thread `slack:<channel>:<thread_ts>`); the bot's own messages, other channels, edits and other events are dropped, and every envelope is acknowledged. The Source reconnects with backoff after a `disconnect` or an error. Replies go in the Trigger's thread, escaped, with acknowledgements and questions cut to 500 characters and results to 3,000 with a marker. Each post carries its `MessageId` as metadata; a repeated Send looks for it in the thread first, so a crash between a post and its done mark does not post twice. A deleted or archived conversation is `Gone`; rate limits and 5xx retry, after `Retry-After`. An approval request carries Approve and Stop buttons; a click is a `Fact::Command` the runtime applies as `approve` or `stop_ticket` and answers in the thread. A budget above `auto_approve_microusd` is now accepted when a Slack channel and a `slack:` approver are configured. New dependency: `tokio-tungstenite` 0.29.0 on the existing rustls. Tests run against a fake Slack, including one `agent serve` end to end. |
-| P8 GitHub and schedules | **Done.** `src/agent/github/`: `GithubSource` polls each listed repository's issues and pull requests, issue and review comments `since` a cursor, and its latest workflow runs, over REST (nothing exposed); `GithubChannel` comments on the issue or pull request. Configured as `kind: github` with a personal access token file that is deleted once read. An issue or pull request is the Thread `github:<owner>/<repo>#<number>`; its opening, each comment (`github:<owner>/<repo>:comment:<id>`) and each failed workflow run on a pull request (a bot Trigger on that pull request's Thread) are Triggers. A mention of the agent's login addresses it, `[bot]` accounts are bots, and the agent's own comments are dropped. Listings are conditional (`ETag`), rate limits are waited out, and the read position is an atomic file in the state directory that a restart resumes from without sending a Trigger twice. Each comment ends with a hidden marker naming its `MessageId`, so a crash between a post and its done mark does not post twice. `src/agent/schedule.rs`: `ScheduleSource` (`kind: schedule`) fires named slots, `every` an interval or `daily_at` a UTC time, as System Triggers `schedule:<name>:<slot start>`: a restart cannot fire a slot twice, and missed slots fire once. A schedule may name a `reply_to`. No new dependencies. Tests run against a fake GitHub and a clock the test moves, including one `agent serve` end to end. |
-| P3d Pi workers | **Done.** `src/agent/pi_executor.rs`: `PiExecutor` runs each `Plan::Session` Assignment as a keyless Pi worker session in bwrap, in its Ticket's directory under the state dir, with an optional prepare command run once per Ticket and at most `max_workers` sessions at once (`executor: {kind: pi, ...}`). The agent broker admits each worker as a `Worker` principal on its Ticket's account, so the Mandate budget caps every Assignment of the Ticket together, and serves `worker_report`, `worker_handback`, `run_code` and `fetch_url` (`SWARM_TOOLSET=worker`). A worker is prompted with its Assignment, then with new Inputs between turns; a quiet turn counts as `waiting`. A start ends what the last run left without a worker ("host restarted") and relaunches working Tickets with `recovery`, through the new `Engine::restart`. `run_code`'s mounts and scratch directory are configurable, with swarm runs' sandbox command pinned unchanged. `Plan::Swarm` reports `failed` until P5; background `run_code` jobs came with P3e. |
-| P6 Watchdog | **Done.** `src/agent/watchdog.rs`: a pure `assess(snapshot, now, thresholds)` over what the Store already holds, with no model: a Ticket waiting for a person (1h), a working Assignment with no Report (30m), an Effect with 3 failed attempts, an `unavailable` Decision in the last hour, an account at 80% of its cap, and a pause file held for 1h. Each alert id hashes its kind, its subject (with the problem's start) and a 6h bucket. With a `watchdog` section in agent.yaml, `agent serve` runs it every minute, tells the operator's conversation each new alert once through its Channel, and records it in `watchdog_alerts` (schema v3), so a restart tells nothing new. `retry_stalled` retries a stalled Assignment once per Ticket through the runtime. `solos-swarm agent status` reports Tickets, Decisions, Effects, spend, the pause and the current alerts from a read-only Store. Judging with a model whether a worker drifts from its goal is later. |
+| P8 GitHub and schedules | Done (#25). `src/agent/github/`: `GithubSource` polls each listed repository's issues and pull requests, issue and review comments `since` a cursor, and its latest workflow runs, over REST (nothing exposed); `GithubChannel` comments on the issue or pull request. Configured as `kind: github` with a personal access token file that is deleted once read. An issue or pull request is the Thread `github:<owner>/<repo>#<number>`; its opening, each comment (`github:<owner>/<repo>:comment:<id>`) and each failed workflow run on a pull request (a bot Trigger on that pull request's Thread) are Triggers. A mention of the agent's login addresses it, `[bot]` accounts are bots, and the agent's own comments are dropped. Listings are conditional (`ETag`), rate limits are waited out, and the read position is an atomic file in the state directory that a restart resumes from without sending a Trigger twice. Each comment ends with a hidden marker naming its `MessageId`, so a crash between a post and its done mark does not post twice. `src/agent/schedule.rs`: `ScheduleSource` (`kind: schedule`) fires named slots, `every` an interval or `daily_at` a UTC time, as System Triggers `schedule:<name>:<slot start>`: a restart cannot fire a slot twice, and missed slots fire once. A schedule may name a `reply_to`. No new dependencies. Tests run against a fake GitHub and a clock the test moves, including one `agent serve` end to end. |
+| P3d Pi workers | Done (#26). `src/agent/pi_executor.rs`: `PiExecutor` runs each `Plan::Session` Assignment as a keyless Pi worker session in bwrap, in its Ticket's directory under the state dir, with an optional prepare command run once per Ticket and at most `max_workers` sessions at once (`executor: {kind: pi, ...}`). The agent broker admits each worker as a `Worker` principal on its Ticket's account, so the Mandate budget caps every Assignment of the Ticket together, and serves `worker_report`, `worker_handback`, `run_code` and `fetch_url` (`SWARM_TOOLSET=worker`). A worker is prompted with its Assignment, then with new Inputs between turns; a quiet turn counts as `waiting`. A start ends what the last run left without a worker ("host restarted") and relaunches working Tickets with `recovery`, through the new `Engine::restart`. `run_code`'s mounts and scratch directory are configurable, with swarm runs' sandbox command pinned unchanged. `Plan::Swarm` reports `failed` until P5; background `run_code` jobs came with P3e. |
+| P6 Watchdog | Done (#27). `src/agent/watchdog.rs`: a pure `assess(snapshot, now, thresholds)` over what the Store already holds, with no model: a Ticket waiting for a person (1h), a working Assignment with no Report (30m), an Effect with 3 failed attempts, an `unavailable` Decision in the last hour, an account at 80% of its cap, and a pause file held for 1h. Each alert id hashes its kind, its subject (with the problem's start) and a 6h bucket. With a `watchdog` section in agent.yaml, `agent serve` runs it every minute, tells the operator's conversation each new alert once through its Channel, and records it in `watchdog_alerts` (schema v3), so a restart tells nothing new. `retry_stalled` retries a stalled Assignment once per Ticket through the runtime. `solos-swarm agent status` reports Tickets, Decisions, Effects, spend, the pause and the current alerts from a read-only Store. Judging with a model whether a worker drifts from its goal is later. |
 | P3e Background jobs | Done (#29). `src/agent/jobs.rs`: a worker with `run_code` also gets `job_start {code, timeout_s?}`, `job_wait {job, wait_s?}` and `job_stop {job}`. A job runs in its Ticket's `/work` under `run_code`'s sandbox and limits, returns its id at once and belongs to its Assignment: a stop, the Ticket's end, a dead session or a shutdown kills it, and a kill reaches every process of its sandbox, even in bwrap's first milliseconds. A `run_code` still running after `background_after_secs` (5) becomes a job when the Ticket has room; a short one returns exactly as before, and swarm runs keep their synchronous `run_code`. A job's end reaches the worker once: in a turn only its `job_wait` or `job_stop` takes it, and an end the turn left, or one that comes between turns, becomes a Note on the Ticket (`Fact::Note`, applied as `Engine::note`) that wakes the worker. No core change. |
 | P5 Swarm Tickets | Done (#28). `src/agent/swarm_executor.rs`: a `Plan::Swarm` Ticket runs one governed swarm per Assignment through `swarm::run_goal_until` on the Pi workers' harness, provider and credential (`executor.swarm`). Its Goal is rendered from a YAML template (`src/agent/goal_template.rs`, minijinja, every placeholder an escaped YAML literal) with the Ticket's title, scope, agent count and remaining budget, checked with `Goal::validate` at config load and at launch. The Goal's budget is the Mandate budget minus what the Ticket's account committed, and the run's spend is charged on that account (`SqliteStore::charge`, once per run) before its Report. At most `max_runs` swarms run at once (default 1). A Stop cancels a run through the new cancel input of `run_goal_until`, which `solos-swarm run` does not use, and the agent's pause holds running swarms. Completed reports `ready` with the findings, the spend and the artifact; stopped reports `failed`; drained reports `waiting`. A restart relaunches an interrupted swarm in a new run directory and charges the old one from its `state.json`. The Router's prompt says when a swarm pays for itself, and `router_decide` takes `goal_template`. |
 | P7a MCP server | Done (#31). `solos-swarm mcp` (`src/mcp.rs`, `src/mcp/`) is a stdio Model Context Protocol server written by hand on `serde_json`: JSON-RPC 2.0, one message per line, with `initialize`, `ping`, `tools/list` and `tools/call`; notifications get no reply, an unknown method the standard error. With `--socket` and `--token-file` it offers one principal's tools through the agent broker: the token file is read once and deleted, `tools/list` is the broker's new `GET /tools` (the calling token's tools from a Rust registry, `src/agent/broker/registry.rs`, without `run_code` and the job tools where the host offers no `run_code`), a call is `POST /tool/{name}`, a refusal is an `isError` result carrying the broker's reason, and a 503 pause is waited out up to `--max-pause-wait-secs` (45) and then reported. With `--state-dir` and `--operator NAME` it offers an operator `agent_status` (the `agent status` report as JSON), `agent_request` (a Trigger from `mcp:NAME` through the new `kind: mcp` Source, an inbox in the state directory, so the Policy admits it or not as it would a Slack person) and `agent_replies` (what the `kind: mcp` Channel sent back on a thread). A fixture, `tests/fixtures/agent-tools.json`, holds the registry and the Pi extension's TypeBox schemas equal, from a Rust test and a Node test. No new dependencies. Setup in [MCP hosts](#mcp-hosts). |
 | P7b Claude Code workers | Done (#32). A session Ticket can run on Claude Code under the same governance as a Pi worker. The agent broker serves an Anthropic Messages facade, `POST /v1/messages` (`src/agent/broker/messages.rs`, translation in `src/gateway/anthropic.rs`): the same tokens (bearer or `x-api-key`), accounts, holds, settlement, model contract and 503 pause as `/model`, through the same code, with `stream: true` answered as SSE framed from the settled reply. `ClaudeCodeHarness` (`src/harness/claude_code.rs`) runs the installed `claude` headless (`--print`, stream-json in and out, `--bare`) in bwrap with no network, a tmpfs home and the Ticket's work directory read-only; its built-in tools are off and its only tools are the broker's, through `solos-swarm mcp`. Its model URL is a loopback port of the sandbox's own network namespace that `solos-swarm bridge` pipes to the broker socket, with the session's token as its API key. `executor.harness: claude-code` makes it the default, and a Plan naming `pi` or `claude-code` picks one; the port keeps its static dispatch. Checked with Claude Code 2.1.231 in `agent serve`. No new dependencies. Setup in [Claude Code workers](#claude-code-workers). |
-| P9 Remote nodes | **Done.** `src/remote/`: `solos-swarm node serve` is a daemon on a user's machine that dials the agent's node listener (`nodes:` in agent.yaml) over TLS 1.3, where each side pins the other's self-signed certificate from `node init` and `agent init-nodes`. A worker's `run_code` and background jobs on a Ticket bound to a node run in the node's own bwrap sandbox, through the same `CodeExecutor`, with the node's mounts, and come back as local `run_code`'s receipts. The new `ExecutionEnvironment` port (`src/agent/environment.rs`) picks this host or a node per Ticket. Core change: `Plan::Session` takes an optional `environment` (stored Plans read as before), which `router_decide` may name and `executor.environment` defaults. An offline node is a 503 tool error, and its Ticket's Launch waits on the effect runner's backoff until it connects. Node secrets stay on the node, reach the sandbox through its environment or `/secrets`, and are redacted from what it sends. Swarm runs unchanged. |
-| P10 | Planned, below. |
+| P9 Remote nodes | Done (#33). `src/remote/`: `solos-swarm node serve` is a daemon on a user's machine that dials the agent's node listener (`nodes:` in agent.yaml) over TLS 1.3, where each side pins the other's self-signed certificate from `node init` and `agent init-nodes`. A worker's `run_code` and background jobs on a Ticket bound to a node run in the node's own bwrap sandbox, through the same `CodeExecutor`, with the node's mounts, and come back as local `run_code`'s receipts. The new `ExecutionEnvironment` port (`src/agent/environment.rs`) picks this host or a node per Ticket. Core change: `Plan::Session` takes an optional `environment` (stored Plans read as before), which `router_decide` may name and `executor.environment` defaults. An offline node is a 503 tool error, and its Ticket's Launch waits on the effect runner's backoff until it connects. Node secrets stay on the node, reach the sandbox through its environment or `/secrets`, and are redacted from what it sends. Swarm runs unchanged. |
+| P10 Benchmark | Done (#34). `solos-swarm agent bench` (`src/agent/bench/`) reproduces the article's ablation. A seeded generator writes the Triggers file: chatter from allowed and unlisted people, CI and bot messages and follow-ups on request Threads, and about 20 addressed requests, each with its expected work in `meta.bench.work_ms`, at a Poisson or even rate. `executor: {kind: simulated}` (`src/agent/simulated.rs`) takes each request's time on a scaled clock and reports `ready`. The designs are agent.yaml: `super-agent` as it is, `no-pass-through` (`pass_through: false`, backed by the one core change, `Engine::set_pass_through`), and `serial` (one worker slot, and the Router waits while work runs: an approximation of one session with a subagent tool). Each run serves a fresh agent, feeds the stream at its arrival times and reads completion, Router decisions, Evals, model calls, tokens and spend from the Store into `report.json` and `report.md`. `--router scripted` is free; `--router pi` refuses to start without `--max-spend-usd`, prints an estimate, and caps every run's Router account. The free scripted run (default workload, seeds 1 to 3, `--time-factor 0.01`): completion p50 / p95 10.2 / 15.7 min for `super-agent` and for `no-pass-through`, whose Router decides 25% more often (177 against 142 a run), and 82.4 / 177.3 for `serial`, with no request unfinished. |
+
+## Later steps
+
+What the phases below recorded as later, each with the phase that records it. None is scheduled.
+
+- P4: a per-channel admission table, and operator DMs that carry status and pause.
+- P5: new Input for a running swarm; today a follow-up waits for the Ticket's next Assignment.
+- P6: model-based drift judgement in the Watchdog, beyond a worker's silence.
+- P6: the provider outage streak and Evals that keep expiring as signals, a pause as an action, and status DMs.
+- P7: a Codex harness, which needs a Responses facade (`POST /v1/responses`) on the agent broker.
+- P7: the Router on Claude Code or another harness, and a `harness` argument to `router_decide`.
+- P7: `swarm_run`, `ticket_*` and the ledger as host tools, so another harness's session can call a swarm.
+- P7a: approvals over MCP; an MCP operator's budget approvals still take Slack buttons.
+- P8: pull-request review events, a pull request bound to its Ticket, other CI apps' checks, and webhooks.
+- P9 and the security model: per-node capability leases (the `mvp` `DispatchPermit` design).
+- P9: scoped tool credentials instead of raw node secrets, a retry as soon as a node reconnects, nodes in status.
+- P10: the live paid benchmark run, for tokens and dollars per design; the bench has run only scripted so far.
+- P10: the delegation-prompt variant, and judging whether the Router's decisions were right.
+- Ports: bounded recall through `Source::context(trigger, part)`.
 
 ## What "super-agent" means here
 
@@ -542,13 +561,138 @@ provider through the real broker. It runs on macOS too. Swarm mode is the first 
   node, scoped tool credentials (`tool_identity.rs`) instead of raw secrets, an immediate retry when a node
   reconnects instead of the next backoff step, and the live nodes in `agent status`.
 
-**P10: benchmark.** Reproduce the article's ablation:
-- Setup: a stream of about 300 chat and CI messages, about 20 work requests, and a work tool that only consumes
-  time.
-- Designs compared: our agent mode, agent mode without pass-through, and a single session with a subagent tool,
-  with a neutral and with a delegation prompt.
-- Metrics: completion p50/p95, Router decisions, cache-read tokens, dollars.
-- Target: within the article's shape (p50 about 12 min, p95 about 16 min on its workload), at a budget we report.
+**P10: benchmark.** Done; `solos-swarm agent bench` (`src/agent/bench/`). The article ran a stream of about 300
+group-chat and CI messages with about 20 work requests, simulated the coding work with a tool that only takes time,
+and ran each design five times:
+
+| Design | Completion p50 / p95 (min) | Cache-read tokens per run |
+|---|---|---|
+| Super-agent | 12.4 / 15.7 | 23.2M |
+| Super-agent without pass-through | 12.6 / 15.5 | 31.8M |
+| Single session with a subagent tool, neutral prompt | 20.4 / 29.5 | 6.1M |
+| Single session with a subagent tool, delegation prompt | 13.8 / 29.0 | 10.8M |
+
+Without pass-through completion stayed about the same, but the Router made about 30% more decisions and read about
+37% more cache tokens.
+
+- Done: the workload (`src/agent/bench/workload.rs`). A spec and a seed give one stream in every build (the
+  generator is SplitMix64, written out). Message times follow `per_minute`, as a Poisson stream or evenly. Requests
+  are addressed (`@agent ...`) by allowed people (`dev-N`), each on its own Thread, within the first `request_span`
+  of the stream, and each carries its expected work, drawn uniformly from `work_minutes`, as `meta.bench.work_ms`.
+  Follow-ups by a request's author and CI messages (from `ci-bot`, which is on `policy.bots`, or `deploy-bot`,
+  which is not) land on request Threads, 10 to 50% and 20 to 90% of the way through the request's expected work.
+  The rest is chatter from allowed people and from people not on the list (`guest-N`); only the latter mention
+  the agent, since an addressed message from an allowed person is a request. `solos-swarm agent workload [--spec
+  FILE] [--seed N] --out triggers.jsonl` writes one stream. A spec is YAML; these are the defaults:
+
+  ```yaml
+  seed: 1                 # run n (from 0) of every design uses seed + n
+  messages: 300           # every Trigger, requests included
+  requests: 20
+  follow_ups: 40
+  ci_messages: 40
+  per_minute: 5           # about an hour of stream
+  arrivals: poisson       # or even
+  work_minutes: {min: 6, max: 16}
+  people: 6               # on policy.people
+  outsiders: 6            # not on it
+  outsider_share: 0.5     # of the chatter
+  addressed_share: 0.2    # of the outsiders' chatter
+  reply_share: 0.5        # chatter that replies in one of the 5 latest chat Threads
+  unlisted_bot_share: 0.25
+  request_span: 0.8
+  time_factor: 0.016666666666666666   # a workload minute lasts a wall second
+  ```
+
+- Done: simulated work, `executor: {kind: simulated, max_workers, time_factor, default_work_ms,
+  router_waits_for_work}` (`src/agent/simulated.rs`). An Assignment starts when one of `max_workers` slots (64) is
+  free, reports started, sleeps its request's `work_ms` times `time_factor` and reports `ready`. It reads the work
+  from the Ticket's origin Trigger, which the runtime now hands every Executor as `Launch::origin`; a Ticket whose
+  origin names none works `default_work_ms` (10 minutes). Inputs are taken and ignored.
+- Done: the designs, each an agent.yaml the bench writes into the run's directory:
+  - `super-agent`: agent mode as it is, with 64 worker slots.
+  - `no-pass-through`: `pass_through: false` at the top of agent.yaml. An allowed person's follow-up on a
+    subscribed Thread still reaches its Ticket, and is also queued for the Router like every other Trigger; a new
+    Ticket that adopts queued Triggers leaves them queued too. This is the one core change, `Engine::set_pass_through`
+    (on by default), applied by `Runtime::with_pass_through`.
+  - `serial`: one worker slot, and `router_waits_for_work: true`, which holds each Candidate until no simulated
+    work runs (`HeldRouter`); the bench sets `policy.eval_timeout_ms` past the deadline so the held Evals do not
+    expire. It stands in for the single session with a subagent tool and is an approximation: that session decides
+    whether to delegate, and can keep reading while a subagent runs; here every request is delegated and nothing new
+    is read until the work returns. It is nearer the worst case of the neutral prompt, and the delegation prompt is
+    not modelled.
+  - With the scripted Router each design uses `router: {kind: scripted, ignore_follow_ups: true}`: an explicit
+    Candidate on a Thread whose Ticket is still open is ignored, so a follow-up that reaches the Router costs a
+    decision, not a second Ticket.
+- Done: `solos-swarm agent bench --design D[,D...] --out DIR [--runs N] [--workload spec.yaml] [--time-factor F]
+  [--deadline-minutes M] [--router scripted|pi]`. For each design and run it serves a fresh agent in this process
+  (`agent::serve_until`: a new state directory, Store, broker and sessions), copies `workload.jsonl` into the
+  Source's `triggers.jsonl` as each Trigger falls due on the scaled clock, with its wall time as `at_ms`, and stops
+  when every request has its result, the whole stream is in and no Thread waits for the Router; at the deadline
+  (by default the stream, then all its work end to end, then 30 minutes); or when the Router's next call would pass
+  the run's cap. Then it reads the run's Store.
+- Done: the paid guard. `--router pi` takes the `router` section of `--router-config agent.yaml` (a `kind: pi`
+  Router) and the usual `--pi-root`, `--node` and `--credential-file`. It refuses to start without
+  `--max-spend-usd`, before it reads the key. That sum is for the whole bench: each run gets an even share as
+  `budgets.router_daily_microusd`, so its broker refuses any call past it, and the bench stops the run once the
+  run's whole Router spend plus its largest hold so far would pass it, so a UTC midnight cannot reopen the cap. A
+  design whose run reached its cap skips its remaining runs. Before it starts it prints the caps and an estimate:
+  the Candidates each design sends the Router, two calls each, an input that grows with the session, 90% cache hits
+  when the prices name a cache-hit rate, and 200 output tokens a call. The workers are simulated, so the Router is
+  the only spender.
+- Later: the delegation-prompt variant, and judging whether the Router's decisions were right.
+
+The free run measures scheduling only: the scripted Router decides at once and costs nothing.
+
+```sh
+solos-swarm agent bench --design super-agent,no-pass-through,serial --runs 3 --time-factor 0.01 \
+  --out bench/scripted-$(date +%F)
+```
+
+At `--time-factor 0.01` a workload minute lasts 0.6 s, so a `super-agent` run takes about 35 s and a `serial` run,
+whose 20 requests work one after another, about 2 minutes. A paid run spends money, so it needs the operator's
+approval of the sum first:
+
+```sh
+solos-swarm agent bench --design super-agent,no-pass-through --runs 5 --router pi \
+  --router-config agent.yaml --pi-root ~/solos-swarm --node ~/.local/bin/node \
+  --credential-file /run/user/1000/router-key --max-spend-usd 5 --time-factor 1 \
+  --out bench/pi-$(date +%F)
+```
+
+With a model Router use `--time-factor 1`: its latency is real, so at a smaller factor each second it takes counts as
+`1 / factor` seconds of workload time. A run then lasts about as long as its stream, a little over an hour on the
+defaults.
+
+Reading `report.md`. The first table is the article's, one row per design; the second has one row per run.
+- Completion p50 / p95: workload minutes from a request's arrival (when the agent stored its Trigger) to the
+  `ready` Report that ended its Ticket, by nearest rank over every request of every run of the design. A request
+  with no result when its run stopped is counted in Unfinished and left out of the percentiles, so read the two
+  together.
+- Router decisions: accepts, ignores and stops on an Eval, each a Router turn's work. The gate's decisions
+  (unlisted people and bots) cost no model call and are in the run rows. Evals counts Evals started, so an expired
+  Eval counts again.
+- Model calls, tokens and spend come from the run's spend ledger, the Router's account and every Ticket's: 0 with
+  the scripted Router. Cache-read tokens are input tokens the provider reported as cache hits.
+- `report.json` has every request (arrival, expected work, completion, Ticket), each run's counts and its runtime
+  summary. Each run directory keeps `agent.yaml`, `workload.jsonl`, `triggers.jsonl` as fed, `outbox.jsonl` and
+  `state/agent.db`, which `solos-swarm agent status --state-dir` reads.
+
+The first free run, on remote-ai with the default workload, seeds 1 to 3 and `--time-factor 0.01` (about 10
+minutes of wall time for all nine runs):
+
+| Design | Completion p50 / p95 (min) | Router decisions per run | Evals per run | Unfinished |
+|---|---|---|---|---|
+| super-agent | 10.2 / 15.7 | 142 | 142 | 0 of 60 |
+| no-pass-through | 10.2 / 15.7 | 177 | 177 | 0 of 60 |
+| serial | 82.4 / 177.3 | 128 | 128 | 0 of 60 |
+
+`super-agent` lands on the article's shape (12.4 / 15.7) with a Router that takes no time. Without pass-through
+completion is the same to the decimal, since a scripted decision is instant, and the Router decides 25% more often
+(the article: about 30%). `serial` is far slower than the article's single session (20.4 / 29.5): 20 requests of 6
+to 16 minutes arrive within about 48 minutes, so done one after another the last waits about three hours. That is
+the bound of no delegation at all, not a measure of the article's baseline. It also decides less often, because the
+Triggers that queue on a Thread while the Router is held are judged in one Eval. Tokens and dollars need a paid run.
 
 ## Slack app setup
 
