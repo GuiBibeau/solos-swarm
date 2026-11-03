@@ -31,12 +31,13 @@ and its MIT-licensed prototype `deepseek-ai/dsh-superagent-prototype` (docs 000-
 | P9 Remote nodes | Done (#33). `src/remote/`: `solos-swarm node serve` is a daemon on a user's machine that dials the agent's node listener (`nodes:` in agent.yaml) over TLS 1.3, where each side pins the other's self-signed certificate from `node init` and `agent init-nodes`. A worker's `run_code` and background jobs on a Ticket bound to a node run in the node's own bwrap sandbox, through the same `CodeExecutor`, with the node's mounts, and come back as local `run_code`'s receipts. The new `ExecutionEnvironment` port (`src/agent/environment.rs`) picks this host or a node per Ticket. Core change: `Plan::Session` takes an optional `environment` (stored Plans read as before), which `router_decide` may name and `executor.environment` defaults. An offline node is a 503 tool error, and its Ticket's Launch waits on the effect runner's backoff until it connects. Node secrets stay on the node, reach the sandbox through its environment or `/secrets`, and are redacted from what it sends. Swarm runs unchanged. |
 | P10 Benchmark | Done (#34). `solos-swarm agent bench` (`src/agent/bench/`) reproduces the article's ablation. A seeded generator writes the Triggers file: chatter from allowed and unlisted people, CI and bot messages and follow-ups on request Threads, and about 20 addressed requests, each with its expected work in `meta.bench.work_ms`, at a Poisson or even rate. `executor: {kind: simulated}` (`src/agent/simulated.rs`) takes each request's time on a scaled clock and reports `ready`. The designs are agent.yaml: `super-agent` as it is, `no-pass-through` (`pass_through: false`, backed by the one core change, `Engine::set_pass_through`), and `serial` (one worker slot, and the Router waits while work runs: an approximation of one session with a subagent tool). Each run serves a fresh agent, feeds the stream at its arrival times and reads completion, Router decisions, Evals, model calls, tokens and spend from the Store into `report.json` and `report.md`. `--router scripted` is free; `--router pi` refuses to start without `--max-spend-usd`, prints an estimate, and caps every run's Router account. The free scripted run (default workload, seeds 1 to 3, `--time-factor 0.01`): completion p50 / p95 10.2 / 15.7 min for `super-agent` and for `no-pass-through`, whose Router decides 25% more often (177 against 142 a run), and 82.4 / 177.3 for `serial`, with no request unfinished. |
 | P11 Discord | Done (#35). `src/agent/discord/`: `DiscordSource` holds one Gateway v10 connection (an outbound WebSocket, nothing exposed) and `DiscordChannel` posts over REST, configured as `kind: discord` and read from a token file that is deleted once read. The Source dials the URL `GET /gateway/bot` names, heartbeats at Hello's interval with a random first beat and the last sequence number, identifies with the Guilds, Guild Messages, Direct Messages and Message Content intents, and treats a heartbeat with no ACK as a zombie. A dropped socket, op 7 and an invalid session with `d: true` resume the session on `resume_gateway_url`; a refused resume, `d: false` and close codes 4007 and 4009 identify again after 1 to 5 s. Five connections in a row that never became ready drop the session, and a spent limit on new sessions is waited out. Close codes 4004 and 4010 to 4014 end the run with the fix named, such as turning on Message Content Intent. A message from a listed guild or channel (or a thread of a listed channel) becomes a Trigger `discord:<channel>:<message>` by `discord:<user id>`, and a mention (of the bot or its managed role) or a pinging reply is addressed, a DM direct. The Thread is one snowflake, `discord:<id>`: a thread channel's id, or the message at the top of a reply chain, which the Source keeps for the agent's own posts too, so a reply to the agent's answer joins its request, and a Discord thread started from a message is the message's Thread. Posts are replies, at most 2,000 characters (a marker says what was cut), parse no mentions, and carry a `nonce` derived from their `MessageId` with `enforce_nonce`, so a retry cannot post twice. A 429 waits `retry_after`, a 5xx retries and another 4xx drops the message. An approval request carries Approve and Stop buttons; a click is an interaction the Source acknowledges at once and applies as the same `Fact::Command` Slack's buttons feed, for the policy to judge. No new dependency. Tests run against a fake Discord (HTTP and a Gateway that keeps each session's events for a resume). |
-| P12 Vault and verifiable browser | Designed (#36). [`vault-browser/`](vault-browser/rationale.md) holds the design: a write-only vault of logins and API keys used only on the machine that holds them, keyed `fetch_url` with first-use approval in chat, and a Lightpanda browser per Assignment whose every step is recorded in the chain and signed with Ed25519 by the machine that ran it, checked by `solos-swarm agent trail`. Built in the PRs listed in [`prs.md`](vault-browser/prs.md): 1 to 8 first, browsers on nodes and keys in the browser later. |
+| P12 Vault and verifiable browser | Designed (#36). [`vault-browser/`](vault-browser/rationale.md) holds the design: a write-only vault of logins and API keys used only on the machine that holds them, keyed `fetch_url` with first-use approval in chat, and a Lightpanda browser per Assignment whose every step is recorded in the chain and signed with Ed25519 by the machine that ran it, checked by a planned `solos-swarm agent trail`. Nothing is built yet. The PRs in [`prs.md`](vault-browser/prs.md) are the plan: 1 to 8 first, browsers on nodes and keys in the browser later. |
 
 ## Later steps
 
 What the phases below recorded as later, each with the phase that records it. None is scheduled.
 
+- P3c: `router_note`, and an outage pause in the agent broker.
 - P4: a per-channel admission table, and operator DMs that carry status and pause.
 - P5: new Input for a running swarm; today a follow-up waits for the Ticket's next Assignment.
 - P6: model-based drift judgement in the Watchdog, beyond a worker's silence.
@@ -147,7 +148,7 @@ flowchart TB
 
 ### Dependency rules
 
-- `crates/agent-core` imports nothing but `serde`, `serde_json` and `sha2`, and does no I/O. `tests/boundary.rs`
+- `crates/agent-core` imports nothing but `serde`, `serde_json` and `sha2`, and does no I/O. `crates/agent-core/tests/boundary.rs`
   checks the dependency list and every `std::` path in `src/` (grouped imports too) against an allowlist of pure
   modules. It is a source scan, not a proof.
 - The swarm core does not follow that rule: the pure parts of `broker.rs` (claims, envelopes, progress,
@@ -168,9 +169,9 @@ and external work leaves as `Effect`s. The shell ports are async and live in the
 |---|---|---|---|
 | `AgentHarness` | `start(SessionSpec, events) -> Session`; `Session::{prompt, stop, join}`; events `TurnEnded`, `Rejected`, and an `Err` when a session's stream ends | `PiHarness`, `ScriptedHarness`, `ClaudeCodeHarness` (P7b) | `src/harness.rs` (P1), `src/harness/claude_code.rs` |
 | `ModelGateway` | One broker, many accounts: `reserve(account, request)`, `settle(intent, usage)`; pause and peak gates | today's broker; the agent broker (P3c), with an Anthropic Messages facade (P7b) | `broker.rs` `Store::reserve`/`settle`/`envelope`, `Intent`; shared since P3c in `src/gateway/`: `PriceTable` (was `Goal::cost`/`settled_cost`), `Receipt`, `admit_request`/`upstream_body`, `effective_control` |
-| `ModelUpstream` | `dispatch(body) -> receipt` | `OpenAiCompatible` | `broker::Provider` (1012); merged with `provider::Provider` (mvp) for llama.cpp |
+| `ModelUpstream` | `dispatch(body) -> receipt` | `OpenAiCompatible` | `gateway::upstream::Provider` (`src/gateway/upstream.rs`); the frozen mvp keeps its own `provider::Provider` (`src/provider.rs`) |
 | `ExecutionEnvironment` | `ready()`; `run_code(work, args)` and `job(work, code, timeout, bounds)` return a `Started` that reads, waits and stops (`src/agent/environment.rs`, P9) | local `bwrap` (`Local`), remote nodes (`RemoteNode`, P9) | `code.rs` `CodeExecutor`. Since P2b the run path's `bwrap` lines (`PiHarness::command`, `run_code`, `doctor`) come from `src/bwrap.rs`; the frozen mvp's two (`sandbox.rs` in `prepare_process`, `wasi_worker.rs`) stay hand-built |
-| `EventLog` | `append(kind, data) -> seq`; `verify()` | `events.jsonl` hash chain | `Store::record` (452), `broker_control::read_chain`/`load_image` |
+| `EventLog` | `append(kind, data) -> seq`; `verify()` | `events.jsonl` hash chain | `Store::record` (`src/broker.rs`), `broker_control::read_chain`/`load_image` |
 | `Source` | `run(sink, facts)`, with people's commands (Slack and Discord buttons) as `Fact::Command`; later `context(trigger, part)` for bounded recall | `JsonlSource` (P3b), `SlackSource` (P4), `GithubSource` and `ScheduleSource` (P8), `DiscordSource` (P11) | new |
 | `Channel` | `send(OutboundMessage, SendOptions { repeat, approval }) -> Sent \| Gone`; shapes text per medium (short chat, PRs structured) | `JsonlChannel` (P3b), `SlackChannel` (P4), `GithubChannel` (P8), `DiscordChannel` (P11) | `src/agent/jsonl.rs`, `src/agent/slack/`, `src/agent/github/`, `src/agent/discord/` |
 | `Store` | agent-core `Repositories` plus the effect queue | in-memory (P0), SQLite `crates/agent-store` (P3a) | new |
@@ -198,7 +199,7 @@ broker endpoint and token, and sandbox mounts. That one type replaces the `agent
 Every phase is one or two PRs. Gate on all of them: CI green, swarm parity (the same event kinds and `state.json`
 schema for the external readers), and `solos-swarm smoke` passing.
 
-**P0: core and plan (this PR).** Workspace with `crates/agent-core`, ADR 0001, and this plan. The Engine covers:
+**P0: core and plan (#18).** Workspace with `crates/agent-core`, ADR 0001, and this plan. The Engine covers:
 - intake: idempotent, pass-through, multi-Thread;
 - Evals: one per Thread, batched by strength (weaker Triggers wait, unless a new Ticket adopts them), with
   gate-rejected Triggers kept out of the Router's view;
@@ -483,7 +484,7 @@ provider through the real broker. It runs on macOS too. Swarm mode is the first 
   and `codex exec --json` events mapped to `SessionEvent`. A harness on the older chat wire (OpenCode, or Codex
   before it dropped it) would instead need `/v1/chat/completions` with `stream: true` answered as
   `chat.completion.chunk` deltas and `data: [DONE]`, close to a pass-through since the upstream already speaks it.
-  `DeepSeekHarnessHarness` follows the same pattern.
+  A DeepSeek harness follows the same pattern.
 - Later: `swarm_run`, `ticket_*` and the ledger as host tools, so another harness's session can call a governed
   swarm.
 
@@ -1012,9 +1013,11 @@ watchdog:
     repeat: 6h                 # a problem that lasts is told again this often
 ```
 
-On Slack, `address` takes `channel` and, for a thread, `thread_ts`; on GitHub, `repo` and `number` (an issue). A
-top-level Slack post cannot be searched for like a thread reply, so a crash between a post and its record there can
-post one alert twice. `solos-swarm agent status --state-dir DIR --config agent.yaml` shows what it would raise now.
+On Slack, `address` takes `channel` and, for a thread, `thread_ts`; on Discord, `channel` (a channel or thread id); on
+GitHub, `repo` and `number` (an issue); on MCP, `operator` and `thread`. A top-level Slack post cannot be searched for
+like a thread reply, so a crash between a post and its record there can post one alert twice. A Discord post carries a
+`nonce`, which Discord checks for a few minutes, so a repeat soon after is not posted again.
+`solos-swarm agent status --state-dir DIR --config agent.yaml` shows what it would raise now.
 
 ## MCP hosts
 
@@ -1161,9 +1164,9 @@ MiB.
 
 - Trigger text is data. It cannot change a permission, a budget or the Policy (the core has no path for it).
   An approval is an adapter command, authenticated by the adapter, never text: a Slack button click arrives on
-  the socket the agent opened with its app token, and Slack names the user. A stop is either an adapter
-  command (`stop_ticket`, open to approvers and allowed people) or a Router `Verdict::Stop` on an Eval of explicit
-  strength.
+  the socket the agent opened with its app token, and Slack names the user. A Discord button click arrives on the
+  Gateway connection the agent opened, and Discord names the user. A stop is either an adapter command
+  (`stop_ticket`, open to approvers and allowed people) or a Router `Verdict::Stop` on an Eval of explicit strength.
 - Only explicit strength stops work; bots and CI can at most make inferred candidates, and those start nothing
   outside `auto` mode with a matching enabled rule.
 - Workers stay keyless: the broker holds the model key, and P9 keeps tool credentials on the node. A swarm's
@@ -1187,6 +1190,7 @@ MiB.
   inside that node's sandbox, with its mounts and its secrets: the values never leave the node, but a command can
   use them, such as an API call with a token. Per-node capability leases (the `mvp` `DispatchPermit` design) are a
   later step. Until then, connect only machines whose mounts and secrets you would hand to the agent host.
+- The vault of logins and API keys (write-only, used only on the machine that holds them) and the verifiable browser are designed in [`vault-browser/`](vault-browser/rationale.md) and not yet built.
 
 ## Open decisions
 
