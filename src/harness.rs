@@ -138,16 +138,7 @@ impl PiHarness {
             .unshare_all()
             .die_with_parent()
             .new_session()
-            .ro_bind("/usr", "/usr")
-            // Name resolution and CA material are a read-only binding rather than
-            // a borrowing from the host environment, so a clearenv worker still
-            // resolves and verifies a live target.
-            .ro_bind_try("/etc", "/etc")
-            // The loader directories are bound rather than symlinked: on a usr-merged
-            // host /lib is itself a symlink, so replacing it with one would hide the
-            // real libraries from a dynamically linked node and fail as ENOENT.
-            .ro_bind_try("/lib", "/lib")
-            .ro_bind_try("/lib64", "/lib64")
+            .system_binds()
             .proc("/proc")
             .dev("/dev")
             .tmpfs("/tmp")
