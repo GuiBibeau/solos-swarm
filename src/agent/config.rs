@@ -12,11 +12,11 @@ pub use watchdog::{OperatorConfig, ThresholdsConfig, WatchdogConfig};
 use super::goal_template::GoalTemplates;
 use super::jobs::{self, JobLimits};
 use super::simulated::TimeFactor;
-use super::{github, mcp, slack};
+use super::{discord, github, mcp, slack};
 use crate::code::{self, Mount};
 use crate::gateway::{PriceTable, upstream_profile};
 use anyhow::{Context, Result, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use solos_agent_core::AllowlistPolicy;
 use solos_agent_core::model::MicroUsd;
 use std::collections::{BTreeMap, BTreeSet};
@@ -66,6 +66,22 @@ pub enum SourceConfig {
         #[serde(default = "slack_api_base")]
         api_base: String,
     },
+    /// Discord over the Gateway; its Triggers name source `discord`. Only
+    /// events from `guilds` and `channels` enter, and so do those in a thread
+    /// of a listed channel. The token file is read once and deleted.
+    Discord {
+        /// Discord guild ids, as the developer-mode "Copy Server ID" gives.
+        #[serde(default, deserialize_with = "snowflakes")]
+        guilds: BTreeSet<String>,
+        /// Discord channel ids; a direct message's channel id can be listed
+        /// too.
+        #[serde(default, deserialize_with = "snowflakes")]
+        channels: BTreeSet<String>,
+        /// The bot token, which the `discord` channel uses too.
+        token_file: PathBuf,
+        #[serde(default = "discord_api_base")]
+        api_base: String,
+    },
     /// GitHub over REST polling; its Triggers name source `github`. Only
     /// the listed repositories are read. The token file is read once and
     /// deleted.
@@ -87,8 +103,43 @@ pub enum SourceConfig {
     Mcp {},
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Snowflake {
+    Text(String),
+    Number(u64),
+}
+
+impl From<Snowflake> for String {
+    fn from(id: Snowflake) -> Self {
+        match id {
+            Snowflake::Text(text) => text,
+            Snowflake::Number(number) => number.to_string(),
+        }
+    }
+}
+
+fn snowflakes<'de, D: Deserializer<'de>>(deserializer: D) -> Result<BTreeSet<String>, D::Error> {
+    let ids = Vec::<Snowflake>::deserialize(deserializer)?;
+    Ok(ids.into_iter().map(String::from).collect())
+}
+
+fn snowflake<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    Snowflake::deserialize(deserializer).map(String::from)
+}
+
+fn optional_snowflake<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    Ok(Option::<Snowflake>::deserialize(deserializer)?.map(String::from))
+}
+
 fn slack_api_base() -> String {
     slack::DEFAULT_API_BASE.to_owned()
+}
+
+fn discord_api_base() -> String {
+    discord::DEFAULT_API_BASE.to_owned()
 }
 
 fn github_api_base() -> String {
@@ -108,6 +159,9 @@ pub enum ChannelConfig {
     /// Posts in Slack threads with the bot token and API base of the
     /// `slack` Source. Serves replies to source `slack`.
     Slack {},
+    /// Posts in Discord with the bot token and API base of the `discord`
+    /// Source. Serves replies to source `discord`.
+    Discord {},
     /// Comments on issues and pull requests with the token and API base of
     /// the `github` Source. Serves replies to source `github`.
     Github {},
@@ -121,6 +175,7 @@ impl ChannelConfig {
         match self {
             Self::Jsonl { source, .. } => source,
             Self::Slack {} => slack::SOURCE,
+            Self::Discord {} => discord::SOURCE,
             Self::Github {} => github::SOURCE,
             Self::Mcp {} => mcp::SOURCE,
         }
@@ -408,14 +463,18 @@ impl AgentConfig {
                     *app_token_file = base.join(&*app_token_file);
                     *bot_token_file = base.join(&*bot_token_file);
                 }
-                SourceConfig::Github { token_file, .. } => *token_file = base.join(&*token_file),
+                SourceConfig::Discord { token_file, .. }
+                | SourceConfig::Github { token_file, .. } => *token_file = base.join(&*token_file),
                 SourceConfig::Schedule { .. } | SourceConfig::Mcp {} => {}
             }
         }
         for channel in &mut config.channels {
             match channel {
                 ChannelConfig::Jsonl { path, .. } => *path = base.join(&*path),
-                ChannelConfig::Slack {} | ChannelConfig::Github {} | ChannelConfig::Mcp {} => {}
+                ChannelConfig::Slack {}
+                | ChannelConfig::Discord {}
+                | ChannelConfig::Github {}
+                | ChannelConfig::Mcp {} => {}
             }
         }
         if let Some(nodes) = &mut config.nodes {
@@ -459,11 +518,11 @@ impl AgentConfig {
             slack_sources <= 1,
             "the agent config names two slack sources"
         );
-        let slack_channel = self.slack_channel();
         ensure!(
-            !slack_channel || slack_sources == 1,
+            !self.slack_channel() || slack_sources == 1,
             "the slack channel needs the slack source's bot token"
         );
+        self.validate_discord()?;
         self.validate_github()?;
         let mcp_sources = self
             .sources
@@ -490,12 +549,12 @@ impl AgentConfig {
             let gated = "budgets.session_microusd is above policy.auto_approve_microusd, so every \
                          Ticket waits for an approval";
             ensure!(
-                slack_channel,
-                "{gated}, and only the slack channel's buttons can take one"
+                self.slack_channel() || self.discord_channel(),
+                "{gated}, and only the slack and discord channels' buttons can take one"
             );
             ensure!(
-                self.slack_approver(),
-                "{gated}, and policy.approvers names nobody on slack"
+                self.takes_approvals(),
+                "{gated}, and policy.approvers names nobody on a source whose channel has buttons"
             );
         }
         if let RouterConfig::Pi {
@@ -678,10 +737,11 @@ impl AgentConfig {
     }
 
     /// Whether a person can approve a budget above
-    /// `policy.auto_approve_microusd`: only the slack channel's buttons take
-    /// approvals, from a `slack:` approver.
+    /// `policy.auto_approve_microusd`: only the slack and discord channels'
+    /// buttons take approvals, from an approver on the same source.
     pub fn takes_approvals(&self) -> bool {
-        self.slack_channel() && self.slack_approver()
+        (self.slack_channel() && self.approver_on(slack::SOURCE))
+            || (self.discord_channel() && self.approver_on(discord::SOURCE))
     }
 
     fn slack_channel(&self) -> bool {
@@ -690,11 +750,17 @@ impl AgentConfig {
             .any(|channel| matches!(channel, ChannelConfig::Slack {}))
     }
 
-    fn slack_approver(&self) -> bool {
+    pub(super) fn discord_channel(&self) -> bool {
+        self.channels
+            .iter()
+            .any(|channel| matches!(channel, ChannelConfig::Discord {}))
+    }
+
+    fn approver_on(&self, source: &str) -> bool {
         self.policy
             .approvers
             .iter()
-            .any(|who| who.starts_with("slack:"))
+            .any(|who| who.split_once(':').is_some_and(|(on, _)| on == source))
     }
 }
 
@@ -1447,6 +1513,107 @@ budgets: {session_microusd: 500000}
         ] {
             assert!(parse(&yaml).is_err(), "{case}: accepted\n{yaml}");
         }
+    }
+
+    const DISCORD: &str = "
+policy:
+  people: [discord:1300000000000000011]
+  approvers: [discord:1300000000000000011]
+sources:
+  - kind: discord
+    guilds: [1100000000000000001]
+    channels: [1200000000000000001]
+    token_file: secrets/discord
+channels:
+  - kind: discord
+router: {kind: scripted}
+executor: {kind: scripted}
+budgets: {session_microusd: 500000}
+";
+
+    #[test]
+    fn a_discord_config_loads_with_ids_written_as_numbers_and_the_token_file_beside_it() {
+        let dir = std::env::temp_dir().join(format!("agent-config-discord-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.yaml");
+        std::fs::write(&path, DISCORD).unwrap();
+        let config = AgentConfig::load(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            config.sources,
+            [SourceConfig::Discord {
+                guilds: ["1100000000000000001".to_owned()].into(),
+                channels: ["1200000000000000001".to_owned()].into(),
+                token_file: dir.join("secrets/discord"),
+                api_base: "https://discord.com/api/v10/".into(),
+            }]
+        );
+        assert_eq!(config.channels, [ChannelConfig::Discord {}]);
+        assert_eq!(config.channels[0].source(), "discord");
+        let quoted = DISCORD
+            .replace("[1100000000000000001]", "[\"1100000000000000001\"]")
+            .replace("[1200000000000000001]", "['1200000000000000001']");
+        assert_eq!(parse(&quoted).unwrap(), parse(DISCORD).unwrap());
+        let by_guild_only = DISCORD.replace("    channels: [1200000000000000001]\n", "");
+        parse(&by_guild_only).unwrap();
+    }
+
+    #[test]
+    fn discord_takes_approvals_so_a_gated_budget_needs_its_channel_and_an_approver() {
+        let gated = DISCORD.replace("session_microusd: 500000", "session_microusd: 50000000");
+        parse(&gated).unwrap();
+        assert!(parse(&gated).unwrap().takes_approvals());
+        let slack_approver = gated.replace(
+            "approvers: [discord:1300000000000000011]",
+            "approvers: [slack:U1]",
+        );
+        let no_channel = gated.replace("channels:\n  - kind: discord\n", "channels: []\n");
+        let typo = DISCORD.replace("token_file:", "token: x\n    token_file:");
+        let two = DISCORD.replace(
+            "sources:\n",
+            "sources:\n  - {kind: discord, channels: [1], token_file: t}\n",
+        );
+        let deaf = DISCORD.replace(
+            "    guilds: [1100000000000000001]\n    channels: [1200000000000000001]\n",
+            "",
+        );
+        let not_an_id = DISCORD.replace("[1200000000000000001]", "[general]");
+        let tokenless = DISCORD.replace(
+            "  - kind: discord\n    guilds: [1100000000000000001]\n    channels: \
+             [1200000000000000001]\n    token_file: secrets/discord",
+            "  - {kind: jsonl, path: triggers.jsonl}",
+        );
+        let not_http = DISCORD.replace(
+            "token_file: secrets/discord",
+            "token_file: t\n    api_base: wss://discord.com",
+        );
+        for (case, yaml) in [
+            ("a gated budget with a slack approver only", slack_approver),
+            ("a gated budget with no button channel", no_channel),
+            ("an unknown discord field", typo),
+            ("two discord sources", two),
+            ("no guild or channel", deaf),
+            ("a channel that is not an id", not_an_id),
+            ("a discord channel without a discord source", tokenless),
+            ("an api base that is not http", not_http),
+        ] {
+            assert_ne!(yaml, DISCORD, "{case}: the case did not change the config");
+            assert!(parse(&yaml).is_err(), "{case}: accepted\n{yaml}");
+        }
+    }
+
+    #[test]
+    fn approvals_need_an_approver_on_the_source_of_a_channel_with_buttons() {
+        let elsewhere = DISCORD.replace(
+            "approvers: [discord:1300000000000000011]",
+            "approvers: [slack:U1]",
+        );
+        assert!(!parse(&elsewhere).unwrap().takes_approvals());
+        let slack_channel_only = SLACK.replace(
+            "approvers: [slack:U1]",
+            "approvers: [discord:1300000000000000011]",
+        );
+        assert!(!parse(&slack_channel_only).unwrap().takes_approvals());
     }
 
     #[test]

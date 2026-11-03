@@ -6,6 +6,7 @@
 pub mod bench;
 pub mod broker;
 pub mod config;
+pub mod discord;
 pub mod environment;
 pub mod github;
 pub mod goal_template;
@@ -41,6 +42,7 @@ use broker::{
 use config::{
     ChannelConfig, ClaudeConfig, ExecutorConfig, RouterConfig, RunCodeConfig, SourceConfig,
 };
+use discord::{DiscordApi, DiscordChannel, DiscordSource};
 use github::{GithubApi, GithubChannel, GithubSource};
 use goal_template::GoalTemplates;
 use jsonl::{JsonlChannel, JsonlSource};
@@ -552,8 +554,8 @@ where
 }
 
 /// The Sources and Channels the config names, opened before anything else
-/// can fail, since opening them reads and deletes the Slack and GitHub token
-/// files.
+/// can fail, since opening them reads and deletes the Slack, Discord and
+/// GitHub token files.
 struct Io {
     sources: Vec<Box<dyn Source>>,
     channels: BTreeMap<String, Arc<dyn Channel>>,
@@ -565,6 +567,7 @@ impl Io {
     fn open(config: &AgentConfig, state_dir: &Path, follow: bool) -> Result<Self> {
         let mut sources: Vec<Box<dyn Source>> = Vec::new();
         let mut slack_api = None;
+        let mut discord_api = None;
         let mut github_api = None;
         for source in &config.sources {
             match source {
@@ -583,6 +586,19 @@ impl Io {
                     let slack = SlackSource::new(api.clone(), app?, channels.clone(), follow);
                     sources.push(Box::new(slack));
                     slack_api = Some(api);
+                }
+                SourceConfig::Discord {
+                    guilds,
+                    channels,
+                    token_file,
+                    api_base,
+                } => {
+                    let token = discord::Token::take(token_file)?;
+                    let api = Arc::new(DiscordApi::new(api_base, token)?);
+                    let discord =
+                        DiscordSource::new(api.clone(), guilds.clone(), channels.clone(), follow);
+                    sources.push(Box::new(discord));
+                    discord_api = Some(api);
                 }
                 SourceConfig::Github {
                     repos,
@@ -619,6 +635,11 @@ impl Io {
                     slack_api
                         .clone()
                         .context("the slack channel needs a slack source")?,
+                )),
+                ChannelConfig::Discord {} => Arc::new(DiscordChannel::new(
+                    discord_api
+                        .clone()
+                        .context("the discord channel needs a discord source")?,
                 )),
                 ChannelConfig::Github {} => Arc::new(GithubChannel::new(
                     github_api

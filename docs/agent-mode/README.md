@@ -1,6 +1,6 @@
 # Agent mode: plan
 
-solos-swarm gains a second mode: a long-lived agent that lives in Slack, GitHub and schedules, takes requests,
+solos-swarm gains a second mode: a long-lived agent that lives in Slack, Discord, GitHub and schedules, takes requests,
 notices work, runs it on isolated workers, and answers in the thread it came from. Swarm mode (`solos-swarm run`)
 stays, and it is also one way agent mode can execute a Ticket. Both modes build from one workspace into one binary,
 and run on the same broker, ledger, harness, sandbox and audit log. Decision record:
@@ -30,6 +30,7 @@ and its MIT-licensed prototype `deepseek-ai/dsh-superagent-prototype` (docs 000-
 | P7b Claude Code workers | Done (#32). A session Ticket can run on Claude Code under the same governance as a Pi worker. The agent broker serves an Anthropic Messages facade, `POST /v1/messages` (`src/agent/broker/messages.rs`, translation in `src/gateway/anthropic.rs`): the same tokens (bearer or `x-api-key`), accounts, holds, settlement, model contract and 503 pause as `/model`, through the same code, with `stream: true` answered as SSE framed from the settled reply. `ClaudeCodeHarness` (`src/harness/claude_code.rs`) runs the installed `claude` headless (`--print`, stream-json in and out, `--bare`) in bwrap with no network, a tmpfs home and the Ticket's work directory read-only; its built-in tools are off and its only tools are the broker's, through `solos-swarm mcp`. Its model URL is a loopback port of the sandbox's own network namespace that `solos-swarm bridge` pipes to the broker socket, with the session's token as its API key. `executor.harness: claude-code` makes it the default, and a Plan naming `pi` or `claude-code` picks one; the port keeps its static dispatch. Checked with Claude Code 2.1.231 in `agent serve`. No new dependencies. Setup in [Claude Code workers](#claude-code-workers). |
 | P9 Remote nodes | Done (#33). `src/remote/`: `solos-swarm node serve` is a daemon on a user's machine that dials the agent's node listener (`nodes:` in agent.yaml) over TLS 1.3, where each side pins the other's self-signed certificate from `node init` and `agent init-nodes`. A worker's `run_code` and background jobs on a Ticket bound to a node run in the node's own bwrap sandbox, through the same `CodeExecutor`, with the node's mounts, and come back as local `run_code`'s receipts. The new `ExecutionEnvironment` port (`src/agent/environment.rs`) picks this host or a node per Ticket. Core change: `Plan::Session` takes an optional `environment` (stored Plans read as before), which `router_decide` may name and `executor.environment` defaults. An offline node is a 503 tool error, and its Ticket's Launch waits on the effect runner's backoff until it connects. Node secrets stay on the node, reach the sandbox through its environment or `/secrets`, and are redacted from what it sends. Swarm runs unchanged. |
 | P10 Benchmark | Done (#34). `solos-swarm agent bench` (`src/agent/bench/`) reproduces the article's ablation. A seeded generator writes the Triggers file: chatter from allowed and unlisted people, CI and bot messages and follow-ups on request Threads, and about 20 addressed requests, each with its expected work in `meta.bench.work_ms`, at a Poisson or even rate. `executor: {kind: simulated}` (`src/agent/simulated.rs`) takes each request's time on a scaled clock and reports `ready`. The designs are agent.yaml: `super-agent` as it is, `no-pass-through` (`pass_through: false`, backed by the one core change, `Engine::set_pass_through`), and `serial` (one worker slot, and the Router waits while work runs: an approximation of one session with a subagent tool). Each run serves a fresh agent, feeds the stream at its arrival times and reads completion, Router decisions, Evals, model calls, tokens and spend from the Store into `report.json` and `report.md`. `--router scripted` is free; `--router pi` refuses to start without `--max-spend-usd`, prints an estimate, and caps every run's Router account. The free scripted run (default workload, seeds 1 to 3, `--time-factor 0.01`): completion p50 / p95 10.2 / 15.7 min for `super-agent` and for `no-pass-through`, whose Router decides 25% more often (177 against 142 a run), and 82.4 / 177.3 for `serial`, with no request unfinished. |
+| P11 Discord | Done (#35). `src/agent/discord/`: `DiscordSource` holds one Gateway v10 connection (an outbound WebSocket, nothing exposed) and `DiscordChannel` posts over REST, configured as `kind: discord` and read from a token file that is deleted once read. The Source dials the URL `GET /gateway/bot` names, heartbeats at Hello's interval with a random first beat and the last sequence number, identifies with the Guilds, Guild Messages, Direct Messages and Message Content intents, and treats a heartbeat with no ACK as a zombie. A dropped socket, op 7 and an invalid session with `d: true` resume the session on `resume_gateway_url`; a refused resume, `d: false` and close codes 4007 and 4009 identify again after 1 to 5 s. Five connections in a row that never became ready drop the session, and a spent limit on new sessions is waited out. Close codes 4004 and 4010 to 4014 end the run with the fix named, such as turning on Message Content Intent. A message from a listed guild or channel (or a thread of a listed channel) becomes a Trigger `discord:<channel>:<message>` by `discord:<user id>`, and a mention (of the bot or its managed role) or a pinging reply is addressed, a DM direct. The Thread is one snowflake, `discord:<id>`: a thread channel's id, or the message at the top of a reply chain, which the Source keeps for the agent's own posts too, so a reply to the agent's answer joins its request, and a Discord thread started from a message is the message's Thread. Posts are replies, at most 2,000 characters (a marker says what was cut), parse no mentions, and carry a `nonce` derived from their `MessageId` with `enforce_nonce`, so a retry cannot post twice. A 429 waits `retry_after`, a 5xx retries and another 4xx drops the message. An approval request carries Approve and Stop buttons; a click is an interaction the Source acknowledges at once and applies as the same `Fact::Command` Slack's buttons feed, for the policy to judge. No new dependency. Tests run against a fake Discord (HTTP and a Gateway that keeps each session's events for a resume). |
 
 ## Later steps
 
@@ -42,12 +43,13 @@ What the phases below recorded as later, each with the phase that records it. No
 - P7: a Codex harness, which needs a Responses facade (`POST /v1/responses`) on the agent broker.
 - P7: the Router on Claude Code or another harness, and a `harness` argument to `router_decide`.
 - P7: `swarm_run`, `ticket_*` and the ledger as host tools, so another harness's session can call a swarm.
-- P7a: approvals over MCP; an MCP operator's budget approvals still take Slack buttons.
+- P7a: approvals over MCP; an MCP operator's budget approvals still take Slack or Discord buttons.
 - P8: pull-request review events, a pull request bound to its Ticket, other CI apps' checks, and webhooks.
 - P9 and the security model: per-node capability leases (the `mvp` `DispatchPermit` design).
 - P9: scoped tool credentials instead of raw node secrets, a retry as soon as a node reconnects, nodes in status.
 - P10: the live paid benchmark run, for tokens and dollars per design; the bench has run only scripted so far.
 - P10: the delegation-prompt variant, and judging whether the Router's decisions were right.
+- P11: the live check against a real Discord application; backfilling the messages sent while the agent process was down (`GET /channels/{id}/messages`); a repeat that looks past the few minutes Discord keeps a `nonce`; sharding for a bot in more than 2,500 servers.
 - Ports: bounded recall through `Source::context(trigger, part)`.
 
 ## What "super-agent" means here
@@ -108,10 +110,11 @@ flowchart LR
 flowchart TB
   subgraph driving[Driving adapters]
     slack_in[Slack Socket Mode]
+    discord_in[Discord Gateway]
     gh_in[GitHub poll]
     sched[Schedule]
     cli[CLI and goal file]
-    op[Operator: control.json, Slack buttons, CLI]
+    op[Operator: control.json, Slack and Discord buttons, CLI]
     tools[Tool surface: Pi extension, MCP]
   end
   subgraph cores[Application cores, no I/O]
@@ -130,7 +133,7 @@ flowchart TB
     pi[Pi] & claude[Claude Code] & codex[Codex] & dsh[DeepSeek Harness]
     bwrap[local bwrap] & node[remote node, BYOM]
     files[jsonl chain, SQLite]
-    slack_out[Slack Web API] & gh_out[GitHub API]
+    slack_out[Slack Web API] & discord_out[Discord REST] & gh_out[GitHub API]
   end
   driving --> cores
   cores --> kernel
@@ -138,7 +141,7 @@ flowchart TB
   harness --> pi & claude & codex & dsh
   exec --> bwrap & node
   log --> files
-  chan --> slack_out & gh_out
+  chan --> slack_out & discord_out & gh_out
 ```
 
 ### Dependency rules
@@ -167,8 +170,8 @@ and external work leaves as `Effect`s. The shell ports are async and live in the
 | `ModelUpstream` | `dispatch(body) -> receipt` | `OpenAiCompatible` | `broker::Provider` (1012); merged with `provider::Provider` (mvp) for llama.cpp |
 | `ExecutionEnvironment` | `ready()`; `run_code(work, args)` and `job(work, code, timeout, bounds)` return a `Started` that reads, waits and stops (`src/agent/environment.rs`, P9) | local `bwrap` (`Local`), remote nodes (`RemoteNode`, P9) | `code.rs` `CodeExecutor`. Since P2b the run path's `bwrap` lines (`PiHarness::command`, `run_code`, `doctor`) come from `src/bwrap.rs`; the frozen mvp's two (`sandbox.rs` in `prepare_process`, `wasi_worker.rs`) stay hand-built |
 | `EventLog` | `append(kind, data) -> seq`; `verify()` | `events.jsonl` hash chain | `Store::record` (452), `broker_control::read_chain`/`load_image` |
-| `Source` | `run(sink, facts)`, with people's commands (Slack buttons) as `Fact::Command`; later `context(trigger, part)` for bounded recall | `JsonlSource` (P3b), `SlackSource` (P4), `GithubSource` and `ScheduleSource` (P8) | new |
-| `Channel` | `send(OutboundMessage, SendOptions { repeat, approval }) -> Sent \| Gone`; shapes text per medium (short chat, PRs structured) | `JsonlChannel` (P3b), `SlackChannel` (P4), `GithubChannel` (P8) | `src/agent/jsonl.rs`, `src/agent/slack/`, `src/agent/github/` |
+| `Source` | `run(sink, facts)`, with people's commands (Slack and Discord buttons) as `Fact::Command`; later `context(trigger, part)` for bounded recall | `JsonlSource` (P3b), `SlackSource` (P4), `GithubSource` and `ScheduleSource` (P8), `DiscordSource` (P11) | new |
+| `Channel` | `send(OutboundMessage, SendOptions { repeat, approval }) -> Sent \| Gone`; shapes text per medium (short chat, PRs structured) | `JsonlChannel` (P3b), `SlackChannel` (P4), `GithubChannel` (P8), `DiscordChannel` (P11) | `src/agent/jsonl.rs`, `src/agent/slack/`, `src/agent/github/`, `src/agent/discord/` |
 | `Store` | agent-core `Repositories` plus the effect queue | in-memory (P0), SQLite `crates/agent-store` (P3a) | new |
 | `ToolSurface` | How a session calls tools: `GET /tools`, `/model` (or `/v1/messages`, P7b) and `/tool/{name}` on the broker | Pi extension (`extensions/broker.ts`); `solos-swarm mcp` (P7a), so any MCP harness gets the same tools | the tool schemas live in `src/agent/broker/registry.rs`; the extension's copy is tested against it |
 
@@ -738,6 +741,80 @@ budgets: {session_microusd: 500000}
 Message metadata (`solos_swarm_message`, holding the agent's message id) is visible to members of the workspace;
 it carries nothing else.
 
+## Discord app setup
+
+The agent connects out to Discord's Gateway and posts over REST, so the host exposes nothing.
+
+1. Create an application at <https://discord.com/developers/applications> ("New Application").
+2. **Bot** page: turn on **Message Content Intent** under Privileged Gateway Intents. Without it Discord closes the
+   connection with code 4014 and `agent serve` exits with an error that names this setting. The agent needs no other
+   privileged intent. Select **Reset Token** and copy the token, which Discord shows once. It is the bot token.
+3. **Installation** (or **OAuth2**, URL Generator): install with the scope `bot` and the permissions View Channels,
+   Send Messages, Send Messages in Threads and Read Message History. As one invite URL, with the application's id:
+
+   ```
+   https://discord.com/oauth2/authorize?client_id=APPLICATION_ID&scope=bot&permissions=274877975552
+   ```
+
+   Open it and pick the server. A channel with permission overrides needs the same permissions for the bot's role.
+   Leave **Interactions Endpoint URL** empty (General Information page). With one set, Discord sends button clicks to
+   that URL, and the buttons do nothing here.
+4. Turn on Developer Mode (User Settings, Advanced) to copy ids: right-click a server and choose Copy Server ID, a
+   channel and choose Copy Channel ID, a person and choose Copy User ID. A direct message with the bot has a channel
+   id too, the last part of its address, `discord.com/channels/@me/<id>`.
+5. Write the bot token to a file readable only by the agent's user. Each start reads it and deletes it, so the token
+   lives only in the process; provide a fresh file for every start.
+
+```yaml
+policy:
+  people: [discord:333333333333333333]     # user ids who may ask for work
+  approvers: [discord:333333333333333333]  # who may approve a budget above the threshold
+  auto_approve_microusd: 2000000
+sources:
+  - kind: discord
+    guilds: [111111111111111111]           # every channel of these servers
+    channels: [222222222222222222]         # these channels, their threads, and DM channels
+    token_file: secrets/discord-token      # relative to this file
+    # api_base: https://discord.com/api/v10/  # the default; tests point it at a fake
+channels:
+  - kind: discord                          # replies with the discord source's bot token
+router: {kind: scripted}
+executor: {kind: scripted}
+budgets: {session_microusd: 500000}
+```
+
+Ids are numbers; write them unquoted or quoted. A message enters when its server is in `guilds`, its channel is in
+`channels`, or it is in a thread of a channel in `channels`. A direct message enters only when its channel id is in
+`channels`. Everything else is dropped before it reaches the Engine, and so are the bot's own messages.
+
+**Addressing.** A message that mentions the bot (`@name`, the role Discord makes for the bot, or a reply that pings
+it) or that arrives in a direct message is addressed to the agent. Anyone can post in a listed channel, and the Policy gate admits requests only from
+`policy.people`.
+
+**Threads.** A top-level message in a channel starts a Thread named after its message id, and the agent answers it
+as a reply. A reply to that answer, or to any message in the chain, joins the same Thread. A message inside a Discord
+thread belongs to the Thread of that thread's id, and a Discord thread started from a message is the same Thread as
+the message, because it has the message's id. After a restart the agent reads one level up a reply chain from what
+Discord attaches to the reply.
+
+**Replies and limits.**
+- A reply is cut at 2,000 characters, with a marker that says how much was cut; acknowledgements and questions are
+  cut at 500.
+- Replies parse no mentions, so text from a worker cannot ping `@everyone` or a person.
+- Each post carries a `nonce` made from the agent's message id, with `enforce_nonce`, so a retry returns the message
+  Discord already holds. Discord remembers a nonce for a few minutes only, so a retry that comes later, after a long
+  Discord outage or a slow restart, can post a message twice.
+- A dropped connection of a running agent resumes its session and misses no message. Messages sent while the agent
+  process is down are lost, because a new process starts a new session.
+
+**Approvals.** An approval request has Approve and Stop buttons. A click is a command the Policy judges by the
+clicker's user id, so only `policy.approvers` can approve and only approvers and `policy.people` can stop. Every click
+is acknowledged to Discord, allowed or not, and the outcome is posted as a reply.
+
+**When it will not start.** The error names the fix. Close code 4004, or a 401 from `GET /gateway/bot`, means Discord
+refused the token: reset it and write the new one to the token file. Code 4014 means Message Content Intent is off.
+Code 4011 means the bot is in too many servers for one connection, which the agent does not shard.
+
 ## GitHub token
 
 The agent polls GitHub with a token of its own account, so it can tell its comments from everyone else's
@@ -787,8 +864,10 @@ budgets: {session_microusd: 500000}
 ```
 
 A schedule's `reply_to` can also be `{kind: slack, channel: C0123OPS}`, or a thread with `thread_ts`, when a channel
-serves slack. Anyone who can comment on a listed repository reaches the Policy gate, which admits requests only from
-`policy.people`. The hidden marker in each comment holds the agent's message id and nothing else.
+serves slack. With a channel that serves discord it can be `{kind: discord, channel: "222222222222222222"}`, a channel or a
+thread's id, or a reply to a message with `message_id`, whose replies are then the Ticket's Thread. Anyone who can comment
+on a listed repository reaches the Policy gate, which admits requests only from `policy.people`. The hidden marker in each
+comment holds the agent's message id and nothing else.
 
 ## Claude Code workers
 

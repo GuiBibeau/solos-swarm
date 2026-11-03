@@ -304,8 +304,8 @@ impl SwarmTerms {
 
 impl DecideTerms {
     /// What `config` lets an accept name: above `policy.auto_approve_microusd`
-    /// only when Slack can take the approval its Ticket then waits for, and a
-    /// swarm only when `executor.swarm` runs one.
+    /// only when Slack or Discord can take the approval its Ticket then waits
+    /// for, and a swarm only when `executor.swarm` runs one.
     pub fn for_config(config: &AgentConfig) -> Self {
         let swarm = match &config.executor {
             ExecutorConfig::Pi {

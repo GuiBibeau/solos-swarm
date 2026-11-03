@@ -1,8 +1,8 @@
-//! The settings and checks of the `github` and `schedule` kinds.
+//! The settings and checks of the `discord`, `github` and `schedule` kinds.
 
 use super::{AgentConfig, ChannelConfig, SourceConfig};
 use crate::agent::schedule::Schedule;
-use crate::agent::{github, slack};
+use crate::agent::{discord, github, slack};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use solos_agent_core::model::{ChannelRef, Ms, ThreadKey};
@@ -92,6 +92,14 @@ pub enum ReplyTo {
         #[serde(default)]
         thread_ts: Option<String>,
     },
+    /// A Discord channel id, or a Discord thread's id; with `message_id`, a
+    /// reply to that message, whose replies are the Thread.
+    Discord {
+        #[serde(deserialize_with = "super::snowflake")]
+        channel: String,
+        #[serde(default, deserialize_with = "super::optional_snowflake")]
+        message_id: Option<String>,
+    },
     /// An issue or pull request.
     Github { repo: String, number: u64 },
 }
@@ -100,17 +108,22 @@ impl ReplyTo {
     pub fn channel(&self) -> ChannelRef {
         match self {
             Self::Slack { channel, thread_ts } => slack::reply_to(channel, thread_ts.as_deref()),
+            Self::Discord {
+                channel,
+                message_id,
+            } => discord::reply_to(channel, message_id.as_deref()),
             Self::Github { repo, number } => github::reply_to(repo, *number),
         }
     }
 
     /// The conversation's Thread, where an answer to a question arrives. A
-    /// new Slack message has none until it is posted.
+    /// new Slack or Discord message has none until it is posted.
     pub fn thread(&self) -> Option<ThreadKey> {
         match self {
             Self::Slack { channel, thread_ts } => {
                 thread_ts.as_deref().map(|ts| slack::thread(channel, ts))
             }
+            Self::Discord { message_id, .. } => message_id.as_deref().map(discord::thread),
             Self::Github { repo, number } => Some(github::thread(repo, *number)),
         }
     }
@@ -118,6 +131,7 @@ impl ReplyTo {
     fn source(&self) -> &str {
         match self {
             Self::Slack { .. } => slack::SOURCE,
+            Self::Discord { .. } => discord::SOURCE,
             Self::Github { .. } => github::SOURCE,
         }
     }
@@ -142,6 +156,47 @@ impl ScheduleConfig {
 }
 
 impl AgentConfig {
+    pub(super) fn validate_discord(&self) -> Result<()> {
+        let mut discord_sources = 0;
+        for source in &self.sources {
+            let SourceConfig::Discord {
+                guilds,
+                channels,
+                api_base,
+                ..
+            } = source
+            else {
+                continue;
+            };
+            discord_sources += 1;
+            ensure!(
+                !guilds.is_empty() || !channels.is_empty(),
+                "the discord source listens to no guild or channel"
+            );
+            for id in guilds.iter().chain(channels) {
+                ensure!(
+                    discord::valid_id(id),
+                    "discord id {id:?} is not a numeric id"
+                );
+            }
+            let url = reqwest::Url::parse(api_base)
+                .with_context(|| format!("invalid discord api_base {api_base}"))?;
+            ensure!(
+                matches!(url.scheme(), "https" | "http"),
+                "discord api_base {api_base} is not an http(s) URL"
+            );
+        }
+        ensure!(
+            discord_sources <= 1,
+            "the agent config names two discord sources"
+        );
+        ensure!(
+            !self.discord_channel() || discord_sources == 1,
+            "the discord channel needs the discord source's bot token"
+        );
+        Ok(())
+    }
+
     pub(super) fn validate_github(&self) -> Result<()> {
         let mut github_sources = 0;
         for source in &self.sources {
@@ -230,6 +285,14 @@ impl AgentConfig {
                         !channel.is_empty(),
                         "schedule {name} replies on slack but names no channel"
                     ),
+                    ReplyTo::Discord {
+                        channel,
+                        message_id,
+                    } => ensure!(
+                        discord::valid_id(channel)
+                            && message_id.as_deref().is_none_or(discord::valid_id),
+                        "schedule {name} replies on discord with an id that is not numeric"
+                    ),
                 }
                 ensure!(
                     served.contains(reply.source()),
@@ -245,7 +308,7 @@ impl AgentConfig {
 #[cfg(test)]
 mod tests {
     use super::super::{AgentConfig, ChannelConfig, SourceConfig};
-    use crate::agent::{github, utc};
+    use crate::agent::{discord, github, utc};
 
     fn parse(yaml: &str) -> anyhow::Result<AgentConfig> {
         let config: AgentConfig = serde_yaml::from_str(yaml)?;
@@ -308,6 +371,63 @@ budgets: {session_microusd: 500000}
         assert_eq!((standup.reply_to, standup.threads.len()), (None, 0));
         assert_eq!(config.channels, [ChannelConfig::Github {}]);
         assert_eq!(config.channels[0].source(), "github");
+    }
+
+    #[test]
+    fn a_schedule_replies_on_discord_in_a_channel_or_to_a_message_and_checks_its_ids() {
+        let discord = GITHUB
+            .replace(
+                "{kind: github, repo: acme/widgets, number: 1}",
+                "{kind: discord, channel: 1200000000000000001, message_id: 1700000000000000001}",
+            )
+            .replace(
+                "  - kind: github\nrouter",
+                "  - kind: github\n  - {kind: jsonl, source: discord, path: o}\nrouter",
+            );
+        let config = parse(&discord).unwrap();
+        let SourceConfig::Schedule { schedules } = &config.sources[1] else {
+            panic!("{:?}", config.sources[1])
+        };
+        let triage = schedules[0].schedule().unwrap();
+        assert_eq!(
+            triage.reply_to,
+            Some(discord::reply_to(
+                "1200000000000000001",
+                Some("1700000000000000001")
+            ))
+        );
+        assert_eq!(triage.threads, [discord::thread("1700000000000000001")]);
+        let in_a_channel = discord.replace(", message_id: 1700000000000000001", "");
+        let config = parse(&in_a_channel).unwrap();
+        let SourceConfig::Schedule { schedules } = &config.sources[1] else {
+            panic!("{:?}", config.sources[1])
+        };
+        let triage = schedules[0].schedule().unwrap();
+        assert_eq!(
+            triage.reply_to,
+            Some(discord::reply_to("1200000000000000001", None))
+        );
+        assert!(
+            triage.threads.is_empty(),
+            "a new message has no Thread until it is posted"
+        );
+        for (case, yaml) in [
+            (
+                "a channel that is not an id",
+                discord.replace("channel: 1200000000000000001", "channel: ops"),
+            ),
+            (
+                "a message that is not an id",
+                discord.replace("message_id: 1700000000000000001", "message_id: last"),
+            ),
+            (
+                "a reply no channel serves",
+                discord.replace("source: discord", "source: other"),
+            ),
+        ] {
+            assert_ne!(yaml, discord, "{case}: the case did not change the config");
+            assert!(parse(&yaml).is_err(), "{case}: accepted\n{yaml}");
+        }
     }
 
     #[test]

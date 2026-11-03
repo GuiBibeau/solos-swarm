@@ -31,6 +31,7 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   WebSocket, every envelope acknowledged, reconnect with backoff) and a Web API Channel that replies in the thread,
   never posts a message twice after a crash, and offers Approve and Stop buttons that the runtime applies as
   `approve` and `stop_ticket`; `tokio-tungstenite` 0.29.0 on the existing rustls.
+- Agent mode, P11: Discord (`src/agent/discord/`, `kind: discord` source and channel). A Gateway v10 Source (outbound WebSocket, heartbeats with zombie detection, resume after a drop, op 7 or a resumable invalid session, fresh identify when the session is gone, fatal close codes that name the fix such as Message Content Intent) and a REST Channel that replies to the message, never posts a message twice within Discord's nonce window, and offers Approve and Stop buttons that feed the same commands Slack's do. A thread is one id, a message or a Discord thread. No new dependencies.
 - Agent mode, P3c: a Pi Router. `router: {kind: pi, ...}` in `agent.yaml` and `agent serve --pi-root --node
   --credential-file` run the Router as one long-lived, keyless, bwrap-sandboxed Pi session that judges batched
   Candidate cards through `router_decide` and `router_read` on a new agent broker (`src/agent/broker.rs`). The
