@@ -55,6 +55,24 @@ impl SqliteStore {
     /// of sequence, does not link to its predecessor, or does not hash to its
     /// stored hash is the error.
     pub fn verify_chain(&self) -> Result<Chain, StoreError> {
+        self.walk_chain(|_| Ok(()))
+    }
+
+    /// [`Self::verify_chain`] and the events it verified, from one read, so
+    /// an event appended meanwhile is in neither.
+    pub fn verified_events(&self) -> Result<(Chain, Vec<Event>), StoreError> {
+        let mut events = Vec::new();
+        let chain = self.walk_chain(|body| {
+            events.push(serde_json::from_str(body)?);
+            Ok(())
+        })?;
+        Ok((chain, events))
+    }
+
+    fn walk_chain(
+        &self,
+        mut each: impl FnMut(&str) -> Result<(), StoreError>,
+    ) -> Result<Chain, StoreError> {
         let mut stmt = self
             .conn
             .prepare("SELECT seq, body, prev_hash, hash FROM events ORDER BY seq")?;
@@ -78,6 +96,7 @@ impl SqliteStore {
             if digest(&prev_hash, &body) != hash {
                 return Err(broken("does not match its hash"));
             }
+            each(&body)?;
             chain.len = seq;
             chain.head = hash;
         }
