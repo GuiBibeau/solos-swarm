@@ -135,6 +135,16 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   the agent stops, before the runtime does. A first use of a login or key is refused at once on a Ticket whose
   channels cannot show the Allow and Deny buttons. The worker's system prompt and the Router's environment note tell
   of the browser.
+- Agent mode, `solos-swarm agent trail` (PR #36's design, the last PR of its first build): it opens the Store
+  read-only, checks the event chain, then walks each Ticket's browser steps from the events, so a schema 3 or 4 file
+  reads too. Each signed step must verify under the key trusted for its environment (the public half of
+  `browser.audit_key`, or `--trust <environment>=ed25519:<hex>`, so a verifier elsewhere needs no secret), answer the
+  step asked under its number, and name blobs that are in the trail store and still hash to their digests. Each
+  browser session must count its steps with no gap, name its build on its first step, and end with a signed close
+  once its Assignment ends. It prints each step's time, action, result, URL, status, title and digests.
+  `--step N --show view` prints the exact bytes the model got, and `--json` prints the report. It exits 1 on any
+  problem. An Assignment's last step asked and never answered, and a lost answer, are warnings that `--strict`
+  counts too. `browse::verify_signature` is the signature half of `verify_step`, which now calls it.
 - `collect` leaves the per-run `code/` scratch directory on the host and writes `collect-manifest.json`; `--include-code` opts back in.
 - Docs: pause mode, self-update operations, dashboard tunnel, tournament runbook, replay status.
 
