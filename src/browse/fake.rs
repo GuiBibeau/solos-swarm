@@ -13,6 +13,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -121,6 +122,8 @@ struct Shared {
     fills: Vec<Fill>,
     crash_on: Option<&'static str>,
     move_on: Option<Move>,
+    hold_on: Option<(&'static str, Arc<Notify>)>,
+    connections: usize,
 }
 
 fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
@@ -180,6 +183,20 @@ impl FakeCdp {
         lock(&self.shared).crash_on = Some(method);
     }
 
+    /// The next time `method` arrives, answer it only once the returned
+    /// `Notify` is notified, as a slow page does. A browser that hangs up
+    /// meanwhile ends the connection.
+    pub fn hold_on(&self, method: &'static str) -> Arc<Notify> {
+        let held = Arc::new(Notify::new());
+        lock(&self.shared).hold_on = Some((method, Arc::clone(&held)));
+        held
+    }
+
+    /// Connections open now: one for each browser that has not ended.
+    pub fn connections(&self) -> usize {
+        lock(&self.shared).connections
+    }
+
     /// When `method` arrives after `skip` more of it, move the tab to
     /// `url` before answering, as a page that navigates on its own does.
     pub fn move_on(&self, method: &'static str, skip: usize, url: &str) {
@@ -197,7 +214,17 @@ struct Move {
     url: String,
 }
 
+struct Connected(Arc<Mutex<Shared>>);
+
+impl Drop for Connected {
+    fn drop(&mut self) {
+        lock(&self.0).connections -= 1;
+    }
+}
+
 async fn serve(stream: UnixStream, shared: Arc<Mutex<Shared>>) {
+    lock(&shared).connections += 1;
+    let _connected = Connected(Arc::clone(&shared));
     let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
         return;
     };
@@ -211,9 +238,13 @@ async fn serve(stream: UnixStream, shared: Arc<Mutex<Shared>>) {
         };
         let method = request["method"].as_str().unwrap_or_default().to_owned();
         let mut out = Outbox::default();
-        let reply = {
+        let (reply, held) = {
             let mut shared = lock(&shared);
             shared.methods.push(method.clone());
+            let held = shared
+                .hold_on
+                .take_if(|(on, _)| *on == method)
+                .map(|(_, held)| held);
             if shared.crash_on == Some(method.as_str()) {
                 shared.crash_on = None;
                 return;
@@ -232,15 +263,22 @@ async fn serve(stream: UnixStream, shared: Arc<Mutex<Shared>>) {
                     }
                 }
             }
-            match tab.answer(&method, &request["params"], &mut shared, &mut out) {
+            let reply = match tab.answer(&method, &request["params"], &mut shared, &mut out) {
                 Ok(result) => {
                     json!({"id": request["id"], "result": result, "sessionId": request["sessionId"]})
                 }
                 Err(message) => {
                     json!({"id": request["id"], "error": {"code": -32601, "message": message}})
                 }
-            }
+            };
+            (reply, held)
         };
+        if let Some(held) = held {
+            tokio::select! {
+                () = held.notified() => {}
+                _ = socket.next() => return,
+            }
+        }
         let messages = out.before.into_iter().chain([reply]).chain(out.after);
         for message in messages {
             if socket
