@@ -569,6 +569,13 @@ impl Vault {
         Ok(contents.items.into_iter().map(|item| item.info).collect())
     }
 
+    /// The items a Ticket may use, without values.
+    pub fn catalog(&self, context: &UseContext) -> Result<Vec<ItemInfo>> {
+        let mut items = self.list()?;
+        items.retain(|item| policy::for_requester(item, &context.requester));
+        Ok(items)
+    }
+
     /// Admit `name` for a fill on a page whose origin is `page`, as the
     /// browser engine reports it, never as the model or the page says.
     pub fn admit_login(

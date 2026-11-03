@@ -431,14 +431,7 @@ impl Browsers {
 }
 
 fn catalog(vault: Option<&Vault>, context: &UseContext) -> Result<Vec<ItemInfo>> {
-    let Some(vault) = vault else {
-        return Ok(Vec::new());
-    };
-    Ok(vault
-        .list()?
-        .into_iter()
-        .filter(|item| item.users.is_empty() || item.users.contains(&context.requester))
-        .collect())
+    vault.map_or_else(|| Ok(Vec::new()), |vault| vault.catalog(context))
 }
 
 fn typed_text(call: &BrowseCall) -> Result<(), String> {
