@@ -745,7 +745,14 @@ async fn dispatch(
     body: Value,
 ) -> Reply {
     let terms = &grant.terms;
-    let mut response = match broker.inner.provider.dispatch(body).await {
+    let sent = broker.inner.provider.dispatch(body);
+    let sent = match terms.call_limit {
+        None => sent.await,
+        Some(limit) => tokio::time::timeout(limit, sent)
+            .await
+            .unwrap_or_else(|_| Err(anyhow!("the model call took longer than {limit:?}"))),
+    };
+    let mut response = match sent {
         Ok(response) => response,
         Err(error) => {
             broker

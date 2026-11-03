@@ -674,7 +674,6 @@ async fn router_decide_becomes_the_engines_decision_and_a_refused_one_is_a_tool_
     assert_eq!(store.tickets().unwrap()[0].title, "Summarise the incident");
 }
 
-/// The Candidates the Router has been sent, once there are `count` of them.
 async fn candidates(router: &Holding, count: usize) -> Vec<Candidate> {
     loop {
         let sent = router.candidates.lock().unwrap().clone();
@@ -763,7 +762,7 @@ async fn a_router_that_replays_an_expired_eval_finds_the_open_one_for_its_thread
             }
             assert_eq!(status, 409, "{answer}");
             let why = answer["error"].as_str().unwrap();
-            eval = open_on(why, stale.thread.as_str())
+            eval = open_eval_on_thread(why, stale.thread.as_str())
                 .unwrap_or_else(|| panic!("the refusal names no open eval on the thread: {why}"));
             assert!(asked < 3, "still refused after {asked} calls: {why}");
         };
@@ -775,8 +774,7 @@ async fn a_router_that_replays_an_expired_eval_finds_the_open_one_for_its_thread
     .await;
 }
 
-/// The eval a refusal lists as open on `thread`, reading `id (thread key)` entries.
-fn open_on(refusal: &str, thread: &str) -> Option<String> {
+fn open_eval_on_thread(refusal: &str, thread: &str) -> Option<String> {
     let listed = refusal.split("Evals open now: ").nth(1)?;
     let listed = listed.split(". ").next()?;
     listed.split(", ").find_map(|entry| {

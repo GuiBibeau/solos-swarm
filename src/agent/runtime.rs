@@ -12,8 +12,8 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use solos_agent_core::ids::key;
 use solos_agent_core::model::{
-    Actor, Approval, AssignmentId, AssignmentState, Candidate, Effect, Input, InputBody, MessageId,
-    MessageKind, Ms, OutboundMessage, Stage, Ticket, TicketId, Trigger,
+    Actor, Approval, AssignmentId, AssignmentState, Candidate, Effect, EvalId, Input, InputBody,
+    MessageId, MessageKind, Ms, OutboundMessage, Stage, Ticket, TicketId, Trigger,
 };
 use solos_agent_core::{AllowlistPolicy, Engine, Error, Intake, Policy, Repositories};
 use solos_agent_store::{EffectId, QueuedEffect, SqliteStore};
@@ -336,12 +336,22 @@ impl Runtime {
         let done = |()| Applied::Done;
         let (what, result) = match fact {
             Fact::Verdict { eval, verdict } => {
-                let decided = self.engine.decide(&eval, verdict).map(|id| {
-                    self.engine
-                        .repos()
-                        .decision(&id)
-                        .map_or(Applied::Done, Applied::Decision)
-                });
+                let decided = self
+                    .engine
+                    .decide(&eval, verdict)
+                    .map(|id| {
+                        self.engine
+                            .repos()
+                            .decision(&id)
+                            .map_or(Applied::Done, Applied::Decision)
+                    })
+                    .map_err(|err| match err {
+                        Error::Missing {
+                            kind: "running eval",
+                            ..
+                        } => Error::Refused(self.refusal_with_open_evals_by_thread(&eval)),
+                        err => err,
+                    });
                 (format!("verdict on {eval}"), decided)
             }
             Fact::Started { ticket, assignment } => (
@@ -421,6 +431,42 @@ impl Runtime {
                 Ok(Err(err.to_string()))
             }
         }
+    }
+
+    fn refusal_with_open_evals_by_thread(&self, eval: &EvalId) -> String {
+        const LISTED: usize = 10;
+        let repos = self.engine.repos();
+        let mut open: Vec<String> = repos
+            .active_threads()
+            .into_iter()
+            .filter_map(|key| {
+                let running = repos.thread(&key)?.eval?;
+                Some(format!("{} (thread {key})", running.id))
+            })
+            .collect();
+        open.sort();
+        let next = if open.is_empty() {
+            "No eval is open now. End your turn: the next prompt carries any new candidates."
+                .to_owned()
+        } else {
+            let more = open.len().saturating_sub(LISTED);
+            open.truncate(LISTED);
+            let more = if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            };
+            format!(
+                "Evals open now: {}{more}. Decide one only if its card was sent to you. The \
+                 other cards come in the next prompt, so end your turn once the open evals \
+                 you hold are decided.",
+                open.join(", ")
+            )
+        };
+        format!(
+            "{eval} is closed: it expired or was already decided, so it cannot be decided. \
+             Do not retry it. {next}"
+        )
     }
 
     /// The Watchdog's retry, unless the Assignment moved on since it looked.
