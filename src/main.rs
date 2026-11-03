@@ -49,6 +49,17 @@ enum Action {
         #[arg(last = true)]
         args: Vec<String>,
     },
+    /// Inside a harness's sandbox: serve a loopback TCP port as a pipe to the
+    /// broker's Unix socket while the program after `--` runs, and exit with it.
+    #[command(hide = true)]
+    Bridge {
+        #[arg(long)]
+        listen: std::net::SocketAddr,
+        #[arg(long)]
+        socket: PathBuf,
+        #[arg(last = true, required = true)]
+        program: Vec<OsString>,
+    },
     Mvp {
         #[command(subcommand)]
         command: mvp::MvpCommand,
@@ -161,6 +172,20 @@ fn consume_credential(path: &Path) -> Result<Zeroizing<String>> {
     Ok(Zeroizing::new(raw.trim().to_owned()))
 }
 
+/// `bridge`: exit with the program's status, as if it ran alone.
+async fn bridge(
+    listen: std::net::SocketAddr,
+    socket: PathBuf,
+    program: Vec<OsString>,
+) -> Result<()> {
+    let (program, args) = program
+        .split_first()
+        .context("the bridge names no program")?;
+    let bridge = solos_swarm::bridge::Bridge::bind(listen, socket).await?;
+    let status = bridge.run(program, args).await?;
+    std::process::exit(status.code().unwrap_or(1))
+}
+
 /// One legacy preview run: a frozen Goal, the pinned Pi tree and one credential.
 struct RunOptions {
     config: PathBuf,
@@ -247,6 +272,16 @@ fn main() {
             let policy = serde_json::from_slice(&fs::read(policy)?)?;
             solos_swarm::sandbox::enter_process(&policy, &node, &args)
         })(),
+        // One thread: it only pipes bytes, inside every harness sandbox.
+        Action::Bridge {
+            listen,
+            socket,
+            program,
+        } => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("runtime startup failed")
+            .and_then(|runtime| runtime.block_on(bridge(listen, socket, program))),
         command => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -260,7 +295,7 @@ fn main() {
 }
 async fn execute(command: Action) -> Result<()> {
     match command {
-        Action::WasiWorker { .. } | Action::SandboxEnter { .. } => {
+        Action::WasiWorker { .. } | Action::SandboxEnter { .. } | Action::Bridge { .. } => {
             anyhow::bail!("guard must enter before async runtime")
         }
         Action::Mvp { command } => mvp::execute(command).await,
