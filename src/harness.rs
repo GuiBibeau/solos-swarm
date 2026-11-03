@@ -130,6 +130,12 @@ const RPC_LINE_LIMIT: usize = 16_777_216;
 const STDERR_LINE_LIMIT: usize = 65_536;
 const STDERR_LIMIT: usize = 1_048_576;
 
+/// What a sandbox binds of the node binary at `node`: its install root,
+/// so node_modules beside it resolve under the same prefix.
+pub fn node_root(node: &Path) -> &Path {
+    node.parent().and_then(Path::parent).unwrap_or(node)
+}
+
 /// Pi in RPC mode inside bubblewrap.
 pub struct PiHarness;
 
@@ -149,13 +155,7 @@ impl PiHarness {
             .tmpfs("/work")
             .dir("/work/config")
             .dir("/runtime")
-            // `node` is the binary path; its install root is what gets bound, so the
-            // worker can exec an absolute binary path and still resolve node_modules
-            // beside it under the same /runtime/node prefix.
-            .ro_bind(
-                node.parent().and_then(Path::parent).unwrap_or(node),
-                "/runtime/node",
-            )
+            .ro_bind(node_root(node), "/runtime/node")
             .ro_bind(spec.pi_root.join("node_modules"), "/runtime/node_modules")
             .ro_bind(spec.pi_root.join("extensions"), "/runtime/extensions")
             .ro_bind(&spec.broker_socket, "/broker.sock")

@@ -522,12 +522,10 @@ impl AgentConfig {
             mounts.chain(run_code.uv_root.clone())
         });
         let claude = claude.iter().flat_map(|claude| {
-            let node_root = claude.node.as_deref().map(|node| {
-                node.parent()
-                    .and_then(Path::parent)
-                    .unwrap_or(node)
-                    .to_owned()
-            });
+            let node_root = claude
+                .node
+                .as_deref()
+                .map(|node| crate::harness::node_root(node).to_owned());
             let binary_dir = claude.binary.parent().unwrap_or(&claude.binary);
             [
                 Some(binary_dir.to_owned()),

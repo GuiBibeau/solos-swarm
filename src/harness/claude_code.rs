@@ -15,7 +15,7 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -87,7 +87,7 @@ impl ClaudeCodeHarness {
                 program.push(format!("{NODE}/bin/node"));
                 program.push(format!("{CLAUDE}/{name}"));
                 sandbox
-                    .ro_bind(node.parent().and_then(Path::parent).unwrap_or(node), NODE)
+                    .ro_bind(super::node_root(node), NODE)
                     .ro_bind(self.binary.parent().unwrap_or(&self.binary), CLAUDE)
             }
         };
@@ -344,6 +344,7 @@ fn event(frame: &Value) -> Option<SessionEvent> {
 mod tests {
     use super::*;
     use crate::harness::Role;
+    use std::path::Path;
 
     fn spec(run_dir: &Path) -> SessionSpec {
         SessionSpec {
