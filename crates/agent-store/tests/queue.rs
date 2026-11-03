@@ -14,6 +14,7 @@ fn send(id: &str, thread: &str) -> Effect {
         kind: MessageKind::Result,
         text: format!("message {id}"),
         ticket: None,
+        ask: None,
     })
 }
 

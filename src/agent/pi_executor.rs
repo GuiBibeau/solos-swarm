@@ -121,6 +121,17 @@ fn input_lines(out: &mut String, delivered: &Delivered) {
         (InputBody::Approved { by }, _) => {
             let _ = write!(out, "\n- the budget was approved by {}", by.id);
         }
+        (
+            InputBody::Secret {
+                secret,
+                granted,
+                by,
+            },
+            _,
+        ) => {
+            let verdict = if *granted { "allowed" } else { "denied" };
+            let _ = write!(out, "\n- {} {verdict} {secret} for this ticket", by.id);
+        }
     }
 }
 
@@ -814,8 +825,8 @@ mod tests {
     use crate::harness::{AgentHarness, Observation, Session, SessionEvent, SessionSpec};
     use serde_json::Value;
     use solos_agent_core::model::{
-        Actor, Addressed, AssignmentId, Input, InputBody, InputId, Plan, ReportStatus, ThreadKey,
-        TicketId, Trigger, TriggerId,
+        Actor, Addressed, AssignmentId, Input, InputBody, InputId, Plan, ReportStatus, SecretId,
+        ThreadKey, TicketId, Trigger, TriggerId,
     };
     use solos_agent_store::SqliteStore;
     use std::collections::BTreeMap;
@@ -1128,6 +1139,34 @@ mod tests {
         assert!(
             more.starts_with("New input on ticket tk_1, oldest first:\n- trigger t2"),
             "{more}"
+        );
+    }
+
+    #[test]
+    fn an_answer_on_a_vault_item_reaches_the_worker_as_one_line() {
+        let answer = |seq: u64, granted: bool| Delivered {
+            input: Input {
+                id: InputId::new(format!("in_{seq}")),
+                seq,
+                body: InputBody::Secret {
+                    secret: SecretId::try_from("local/github-gui".to_owned()).unwrap(),
+                    granted,
+                    by: Actor::person("U024BE7LH"),
+                },
+                from_allowed_person: true,
+                at_ms: 1_000,
+                sent_to: None,
+            },
+            trigger: None,
+        };
+        let text = delivery_text(&TicketId::new("tk_1"), &[answer(1, true), answer(2, false)]);
+        assert!(
+            text.starts_with(
+                "New input on ticket tk_1, oldest first:\n\
+                 - U024BE7LH allowed local/github-gui for this ticket\n\
+                 - U024BE7LH denied local/github-gui for this ticket\n\n"
+            ),
+            "{text}"
         );
     }
 

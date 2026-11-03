@@ -800,6 +800,7 @@ impl Watchdog {
                     kind: MessageKind::Attention,
                     text,
                     ticket: alert.ticket,
+                    ask: None,
                 },
                 sent_ms: None,
             };
@@ -965,6 +966,7 @@ mod tests {
             inputs: Vec::new(),
             assignments: Vec::new(),
             approval: Approval::NotNeeded,
+            secrets: BTreeMap::new(),
             attention: None,
             ended: None,
             created_ms,
@@ -1222,6 +1224,7 @@ mod tests {
                 kind: MessageKind::Result,
                 text: "done".into(),
                 ticket: Some(TicketId::new("tk1")),
+                ask: None,
             }),
             attempts,
             due_ms: T0,

@@ -590,6 +590,7 @@ fn outbound(id: &str, kind: MessageKind, channel: &str, text: &str) -> OutboundM
         kind,
         text: text.into(),
         ticket: Some(TicketId::new("tk_1")),
+        ask: None,
     }
 }
 

@@ -447,6 +447,11 @@ fn delivered_bodies(w: &World, t: &TicketId, eff: &[Effect]) -> Vec<Vec<String>>
                             InputBody::Trigger { trigger } => trigger.to_string(),
                             InputBody::Note { text } => format!("note:{text}"),
                             InputBody::Approved { by } => format!("approved:{}", by.id),
+                            InputBody::Secret {
+                                secret,
+                                granted,
+                                by,
+                            } => format!("secret:{secret}:{granted}:{}", by.id),
                         }
                     })
                     .collect(),

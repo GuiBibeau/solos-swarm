@@ -525,6 +525,7 @@ impl Runtime {
             kind: MessageKind::Acknowledgement,
             text,
             ticket: Some(ticket),
+            ask: None,
         });
         Ok(())
     }

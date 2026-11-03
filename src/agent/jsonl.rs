@@ -223,6 +223,7 @@ mod tests {
             kind: MessageKind::Result,
             text: format!("message {id}"),
             ticket: None,
+            ask: None,
         }
     }
 
