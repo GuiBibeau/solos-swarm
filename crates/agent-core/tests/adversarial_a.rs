@@ -5,6 +5,7 @@ use solos_agent_core::model::{
     DecisionId, Effect, EvalId, Plan, ReportIn, ReportStatus, Stage, Strength, Thread, ThreadKey,
     Ticket, TicketId, Trigger, TriggerId, Verdict,
 };
+use solos_agent_core::trail::TrailCursor;
 use solos_agent_core::{AllowlistPolicy, Engine, Error, MemoryRepositories, Repositories};
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -30,6 +31,9 @@ impl Repositories for Flaky {
     }
     fn decision(&self, id: &DecisionId) -> Option<Decision> {
         self.inner.decision(id)
+    }
+    fn trail(&self, assignment: &AssignmentId) -> Option<TrailCursor> {
+        self.inner.trail(assignment)
     }
     fn active_threads(&self) -> Vec<ThreadKey> {
         self.inner.active_threads()

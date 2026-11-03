@@ -1,3 +1,4 @@
+use crate::trail::{TrailAction, TrailCursor, TrailOutcome};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -645,6 +646,19 @@ pub enum DomainEvent {
         trigger: TriggerId,
         reason: String,
     },
+    /// Written before the browser acts, so an action never goes unrecorded.
+    TrailAsked {
+        ticket: TicketId,
+        assignment: AssignmentId,
+        n: u32,
+        action: TrailAction,
+    },
+    TrailDone {
+        ticket: TicketId,
+        assignment: AssignmentId,
+        n: u32,
+        outcome: TrailOutcome,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -662,6 +676,7 @@ pub struct ChangeSet {
     pub threads: BTreeMap<ThreadKey, Thread>,
     pub tickets: BTreeMap<TicketId, Ticket>,
     pub decisions: Vec<Decision>,
+    pub trails: BTreeMap<AssignmentId, TrailCursor>,
     pub effects: Vec<Effect>,
     pub events: Vec<Event>,
 }

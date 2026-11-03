@@ -15,13 +15,16 @@
 mod common;
 
 use common::{
-    MemEngine, SqlEngine, TempDb, clock, first_difference, memory_contents, port_view,
-    sqlite_contents,
+    MemEngine, SqlEngine, TempDb, clock, first_difference, memory_contents, page_seen, port_view,
+    signed_step, sqlite_contents,
 };
 use solos_agent_core::model::{
     Accept, Acknowledge, Actor, Addressed, Approval, AssignmentId, AssignmentState, ChannelRef,
     Effect, EvalId, InputBody, Plan, ReportIn, ReportStatus, ThreadKey, Ticket, TicketId, Trigger,
     TriggerId, Verdict,
+};
+use solos_agent_core::trail::{
+    ActText, CloseReason, Digest, MAX_URL_CHARS, PageAction, StepOutcome, TrailAction, TrailOutcome,
 };
 use solos_agent_core::{
     AcceptMode, AllowlistPolicy, Engine, Error, MemoryRepositories, Repositories,
@@ -35,7 +38,7 @@ use std::time::Instant;
 const THREADS: [&str; 3] = ["th1", "th2", "th3"];
 
 /// Every public Engine command, by the name `Op::name` gives it.
-const COMMANDS: [&str; 14] = [
+const COMMANDS: [&str; 16] = [
     "receive",
     "evaluate_due",
     "decide(accept)",
@@ -50,6 +53,8 @@ const COMMANDS: [&str; 14] = [
     "assignment_ended",
     "restart",
     "report",
+    "trail_ask",
+    "trail_done",
 ];
 
 struct Lcg(u64);
@@ -93,6 +98,8 @@ enum Op {
     Ended(TicketId, AssignmentId),
     Restart(TicketId, AssignmentId),
     Report(TicketId, AssignmentId, ReportIn),
+    TrailAsk(TicketId, AssignmentId, TrailAction),
+    TrailDone(TicketId, AssignmentId, u32, TrailOutcome),
     SetPolicy(AllowlistPolicy),
     Advance(u64),
     /// SQLite only: the effect runner takes up to this many due Effects.
@@ -118,6 +125,8 @@ impl Op {
             Op::Ended(..) => "assignment_ended",
             Op::Restart(..) => "restart",
             Op::Report(..) => "report",
+            Op::TrailAsk(..) => "trail_ask",
+            Op::TrailDone(..) => "trail_done",
             Op::SetPolicy(_) => "set_policy",
             Op::Advance(_) => "advance_clock",
             Op::RunEffects(_) => "run_effects",
@@ -145,6 +154,8 @@ fn apply<R: Repositories>(
         Op::Ended(t, a) => e.assignment_ended(t, a, "process exited").map(unit),
         Op::Restart(t, a) => e.restart(t, a, "host restarted").map(|a| format!("{a:?}")),
         Op::Report(t, a, r) => e.report(t, a, r.clone()).map(unit),
+        Op::TrailAsk(t, a, action) => e.trail_ask(t, a, action.clone()).map(|n| n.to_string()),
+        Op::TrailDone(t, a, n, outcome) => e.trail_done(t, a, *n, outcome.clone()).map(unit),
         Op::SetPolicy(p) => {
             e.set_policy(p.clone());
             Ok(String::new())
@@ -369,9 +380,146 @@ fn gen_decide(rng: &mut Lcg, r: &MemoryRepositories) -> Op {
     Op::Decide(eval, verdict)
 }
 
+fn gen_action(rng: &mut Lcg) -> TrailAction {
+    match rng.below(20) {
+        0..=5 => TrailAction::Open {
+            url: if rng.chance(5) {
+                format!("https://example.com/{}", "a".repeat(MAX_URL_CHARS))
+            } else {
+                format!("https://example.com/{}", rng.below(4))
+            },
+            key: rng.chance(20).then(|| "openai".to_owned()),
+        },
+        6..=11 => TrailAction::Act {
+            action: rng.pick(&[
+                PageAction::Click,
+                PageAction::Type,
+                PageAction::Select,
+                PageAction::Press,
+                PageAction::Scroll,
+                PageAction::Back,
+            ]),
+            element: rng.chance(80).then(|| rng.below(30) as u32),
+            text: match rng.below(3) {
+                0 => None,
+                1 => Some(ActText::Named {
+                    text: "é".repeat(rng.pick(&[3, 100, 101])),
+                }),
+                _ => Some(ActText::Typed {
+                    digest: Digest::of(b"typed"),
+                    chars: 5,
+                }),
+            },
+        },
+        12..=13 => TrailAction::Login {
+            login: "github-gui".into(),
+            username_element: rng.chance(50).then_some(1),
+            password_element: rng.chance(50).then_some(2),
+            submit: rng.chance(70),
+        },
+        14..=15 => TrailAction::Read {
+            part: rng.chance(50).then_some(2),
+            element: rng.chance(50).then_some(9),
+        },
+        _ => TrailAction::Close {
+            reason: rng.pick(&[
+                CloseReason::AssignmentEnded,
+                CloseReason::Idle,
+                CloseReason::Shutdown,
+            ]),
+        },
+    }
+}
+
+fn gen_outcome(
+    rng: &mut Lcg,
+    ticket: &TicketId,
+    assignment: &AssignmentId,
+    n: u32,
+    asked: &TrailAction,
+) -> TrailOutcome {
+    let honest = match asked {
+        TrailAction::Close { reason } => StepOutcome::Closed {
+            steps: 3,
+            reason: *reason,
+        },
+        _ => page_seen(),
+    };
+    let step = |n, action: &TrailAction, outcome| {
+        TrailOutcome::signed(signed_step(ticket, assignment, n, action.clone(), outcome))
+    };
+    match rng.below(100) {
+        0..=59 => step(n, asked, honest),
+        60..=69 => TrailOutcome::Lost {
+            why: "the node went away".into(),
+        },
+        70..=74 => {
+            let other = TrailAction::Open {
+                url: "https://evil.example".into(),
+                key: None,
+            };
+            step(n, &other, honest)
+        }
+        75..=79 => step(n + 1, asked, honest),
+        80..=84 => step(
+            n,
+            asked,
+            StepOutcome::Closed {
+                steps: 1,
+                reason: CloseReason::Crashed,
+            },
+        ),
+        85..=89 => step(
+            n,
+            asked,
+            StepOutcome::Closed {
+                steps: 1,
+                reason: CloseReason::Idle,
+            },
+        ),
+        90..=94 => step(
+            n,
+            asked,
+            StepOutcome::Refused {
+                why: "not on the login's site".into(),
+            },
+        ),
+        _ => {
+            let TrailOutcome::Signed(mut signed) = step(n, asked, honest) else {
+                unreachable!()
+            };
+            signed.body.v += 1;
+            TrailOutcome::Signed(signed)
+        }
+    }
+}
+
+fn gen_trail_done(rng: &mut Lcg, r: &MemoryRepositories) -> Op {
+    let waiting: Vec<_> = r
+        .trails
+        .values()
+        .filter_map(|c| c.pending.as_ref().map(|p| (c, p)))
+        .collect();
+    if !waiting.is_empty() && rng.chance(85) {
+        let (cursor, pending) = waiting[rng.below(waiting.len())];
+        let n = match rng.below(10) {
+            0 => pending.n + 1,
+            1 => pending.n.saturating_sub(1),
+            _ => pending.n,
+        };
+        let outcome = gen_outcome(rng, &cursor.ticket, &cursor.assignment, n, &pending.action);
+        return Op::TrailDone(cursor.ticket.clone(), cursor.assignment.clone(), n, outcome);
+    }
+    let ticket = pick_ticket(rng, r, |_| true);
+    let assignment = pick_assignment(rng, r, &ticket);
+    let asked = gen_action(rng);
+    let outcome = gen_outcome(rng, &ticket, &assignment, 1, &asked);
+    Op::TrailDone(ticket, assignment, 1, outcome)
+}
+
 fn gen_op(rng: &mut Lcg, w: &mut Walk) -> Op {
     let r = w.mem.repos();
-    match rng.below(100) {
+    match rng.below(112) {
         0..=19 => Op::Receive(gen_trigger(rng, r, &mut w.fresh, w.now.get())),
         20..=29 => Op::EvaluateDue,
         30..=41 => gen_decide(rng, r),
@@ -442,6 +590,12 @@ fn gen_op(rng: &mut Lcg, w: &mut Walk) -> Op {
         79..=82 => Op::SetPolicy(mutate_policy(rng, w.mem.policy())),
         83..=89 => Op::Advance(rng.pick(&[1, 1_000, 40_000, 130_000])),
         90..=96 => Op::RunEffects(1 + rng.below(4)),
+        97..=102 => {
+            let t = pick_ticket(rng, r, |t| latest_is(t, AssignmentState::Running));
+            let a = pick_assignment(rng, r, &t);
+            Op::TrailAsk(t, a, gen_action(rng))
+        }
+        103..=108 => gen_trail_done(rng, r),
         _ if w.db.is_some() => Op::Reopen,
         _ => Op::EvaluateDue,
     }
@@ -559,6 +713,16 @@ impl Walk {
             TicketId::new("tk_missing")
         };
         assert_eq!(m.ticket(&ticket), s.ticket(&ticket), "{at}: {ticket}");
+        let assignment = if !a.trails.is_empty() && p.chance(80) {
+            p.pick(&a.trails).assignment
+        } else {
+            AssignmentId::new("as_missing")
+        };
+        assert_eq!(
+            m.trail(&assignment),
+            s.trail(&assignment),
+            "{at}: {assignment}"
+        );
         if !a.decisions.is_empty() {
             let decision = p.pick(&a.decisions);
             assert_eq!(s.decision(&decision.id).as_ref(), Some(&decision), "{at}");

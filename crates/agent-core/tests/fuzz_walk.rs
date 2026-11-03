@@ -21,6 +21,11 @@
 //! 6. Replaying a seed gives byte-identical state (`Debug` of
 //!    `MemoryRepositories`) and identical command results.
 //!
+//! 7. The trail: a step asked gets the Assignment's next number and only
+//!    when nothing waits and the Assignment runs (a Close needs neither the
+//!    Assignment nor the Ticket to be live); a step answered is the one that
+//!    waited, with the action asked; and only trail commands change a cursor.
+//!
 //! Also checked: a new Decision never reuses a recorded Decision's id.
 //!
 //! A state invariant (4, 5) counts once, at the step that first breaks it for
@@ -32,6 +37,10 @@ use solos_agent_core::model::{
     Accept, Acknowledge, Actor, Addressed, Approval, AssignmentId, AssignmentState, ChannelRef,
     DomainEvent, Effect, EvalId, InputBody, InputId, Plan, ReportIn, ReportStatus, ThreadKey,
     Ticket, TicketId, Trigger, TriggerId, Verdict,
+};
+use solos_agent_core::trail::{
+    ActText, CloseReason, Digest, PageAction, PageSeen, STEP_VERSION, Signature, SignedStep,
+    StepBody, StepOutcome, TrailAction, TrailKey, TrailOutcome,
 };
 use solos_agent_core::{AcceptMode, AllowlistPolicy, Engine, Error, MemoryRepositories};
 use std::cell::Cell;
@@ -114,8 +123,22 @@ enum Cmd {
     Started(TicketRef, AssignmentRef),
     Ended(TicketRef, AssignmentRef),
     Report(TicketRef, AssignmentRef, ReportIn),
+    TrailAsk(TicketRef, AssignmentRef, TrailAction),
+    TrailDone(TicketRef, AssignmentRef, Reply),
     SetPolicy(AllowlistPolicy),
     Advance(u64),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Reply {
+    Faithful,
+    Lost,
+    OtherAction,
+    NumberInBody,
+    NumberInCommand,
+    Crashed,
+    ClosedWithoutAsking,
+    OtherTicket,
 }
 
 #[derive(Clone, Debug)]
@@ -135,6 +158,7 @@ enum TicketRef {
 enum AssignmentRef {
     Latest,
     First,
+    WithPendingStep,
     Id(AssignmentId),
 }
 
@@ -159,6 +183,8 @@ enum Op {
     Started(TicketId, AssignmentId),
     Ended(TicketId, AssignmentId),
     Report(TicketId, AssignmentId, ReportIn),
+    TrailAsk(TicketId, AssignmentId, TrailAction),
+    TrailDone(TicketId, AssignmentId, u32, TrailOutcome),
     SetPolicy(AllowlistPolicy),
     Advance(u64),
 }
@@ -179,6 +205,8 @@ impl Op {
             Op::Started(..) => "assignment_started",
             Op::Ended(..) => "assignment_ended",
             Op::Report(..) => "report",
+            Op::TrailAsk(..) => "trail_ask",
+            Op::TrailDone(..) => "trail_done",
             Op::SetPolicy(_) => "set_policy",
             Op::Advance(_) => "advance_clock",
         }
@@ -212,6 +240,11 @@ fn resolve(w: &World, cmd: &Cmd) -> Op {
         let found = match a {
             AssignmentRef::Latest => ticket.and_then(|t| t.assignments.last()),
             AssignmentRef::First => ticket.and_then(|t| t.assignments.first()),
+            AssignmentRef::WithPendingStep => ticket.and_then(|t| {
+                t.assignments
+                    .iter()
+                    .find(|a| r.trails.get(&a.id).is_some_and(|c| c.pending.is_some()))
+            }),
             AssignmentRef::Id(id) => return id.clone(),
         };
         found
@@ -263,6 +296,20 @@ fn resolve(w: &World, cmd: &Cmd) -> Op {
             let a = assignment(&t, a);
             Op::Report(t, a, report.clone())
         }
+        Cmd::TrailAsk(t, a, action) => {
+            let t = ticket(t);
+            let a = assignment(&t, a);
+            Op::TrailAsk(t, a, action.clone())
+        }
+        Cmd::TrailDone(t, a, reply) => {
+            let t = ticket(t);
+            let a = assignment(&t, a);
+            let waiting = r.trails.get(&a).and_then(|c| c.pending.clone());
+            let (n, asked) =
+                waiting.map_or((1, trail_open("https://example.com/")), |p| (p.n, p.action));
+            let (n, outcome) = answer(*reply, &t, &a, n, &asked);
+            Op::TrailDone(t, a, n, outcome)
+        }
         Cmd::SetPolicy(p) => Op::SetPolicy(p.clone()),
         Cmd::Advance(ms) => Op::Advance(*ms),
     }
@@ -283,6 +330,8 @@ fn apply(w: &mut World, op: &Op) -> Result<String, Error> {
         Op::Started(t, a) => e.assignment_started(t, a).map(unit),
         Op::Ended(t, a) => e.assignment_ended(t, a, "process exited").map(unit),
         Op::Report(t, a, r) => e.report(t, a, r.clone()).map(unit),
+        Op::TrailAsk(t, a, action) => e.trail_ask(t, a, action.clone()).map(|n| n.to_string()),
+        Op::TrailDone(t, a, n, outcome) => e.trail_done(t, a, *n, outcome.clone()).map(unit),
         Op::SetPolicy(p) => {
             e.set_policy(p.clone());
             Ok(String::new())
@@ -518,18 +567,171 @@ fn has_target(roll: usize, r: &MemoryRepositories) -> bool {
         68..=77 => any(&|t| t.ended.is_none()),
         78..=83 => any(&|t| !owned_triggers(t).is_empty()),
         84..=86 => any(&Ticket::has_live_assignment),
+        92..=97 => any(&|t| latest_is(t, AssignmentState::Running)),
+        98..=105 => r.trails.values().any(|c| c.pending.is_some()),
         _ => true,
     }
 }
 
+fn trail_open(url: &str) -> TrailAction {
+    TrailAction::Open {
+        url: url.into(),
+        key: None,
+    }
+}
+
+fn trail_page() -> StepOutcome {
+    StepOutcome::Page(PageSeen {
+        url: "https://example.com/".into(),
+        status: Some(200),
+        title: "Example".into(),
+        snapshot: Digest::of(b"snapshot"),
+        view: Digest::of(b"view"),
+        target: None,
+        filled: Vec::new(),
+        keyed: Vec::new(),
+    })
+}
+
+fn gen_action(rng: &mut Lcg) -> TrailAction {
+    match rng.below(20) {
+        0..=5 => trail_open(&format!("https://example.com/{}", rng.below(4))),
+        6..=11 => TrailAction::Act {
+            action: rng.pick(&[
+                PageAction::Click,
+                PageAction::Type,
+                PageAction::Select,
+                PageAction::Press,
+                PageAction::Scroll,
+                PageAction::Back,
+            ]),
+            element: rng.chance(80).then(|| rng.below(30) as u32),
+            text: match rng.below(3) {
+                0 => None,
+                1 => Some(ActText::Named {
+                    text: "Next".into(),
+                }),
+                _ => Some(ActText::Typed {
+                    digest: Digest::of(b"typed"),
+                    chars: 5,
+                }),
+            },
+        },
+        12..=13 => TrailAction::Login {
+            login: "github-gui".into(),
+            username_element: None,
+            password_element: None,
+            submit: rng.chance(70),
+        },
+        14..=15 => TrailAction::Read {
+            part: rng.chance(50).then_some(2),
+            element: None,
+        },
+        _ => TrailAction::Close {
+            reason: rng.pick(&[
+                CloseReason::AssignmentEnded,
+                CloseReason::Idle,
+                CloseReason::Shutdown,
+            ]),
+        },
+    }
+}
+
+fn gen_reply(rng: &mut Lcg) -> Reply {
+    match rng.below(100) {
+        0..=54 => Reply::Faithful,
+        55..=64 => Reply::Lost,
+        65..=71 => Reply::OtherAction,
+        72..=78 => Reply::NumberInBody,
+        79..=85 => Reply::NumberInCommand,
+        86..=91 => Reply::Crashed,
+        92..=95 => Reply::ClosedWithoutAsking,
+        _ => Reply::OtherTicket,
+    }
+}
+
+fn answer(
+    reply: Reply,
+    ticket: &TicketId,
+    assignment: &AssignmentId,
+    n: u32,
+    asked: &TrailAction,
+) -> (u32, TrailOutcome) {
+    let honest = match asked {
+        TrailAction::Close { reason } => StepOutcome::Closed {
+            steps: 3,
+            reason: *reason,
+        },
+        _ => trail_page(),
+    };
+    let signed = |ticket: &TicketId, n: u32, action: &TrailAction, outcome: StepOutcome| {
+        TrailOutcome::signed(SignedStep {
+            body: StepBody {
+                v: STEP_VERSION,
+                ticket: ticket.clone(),
+                assignment: assignment.clone(),
+                n,
+                environment: "local".into(),
+                session: "7a3c0f9e12d45b60".into(),
+                session_step: n.saturating_sub(1),
+                at_ms: 1_000,
+                provenance: None,
+                action: action.clone(),
+                outcome,
+            },
+            signer: TrailKey::try_from(format!("ed25519:{}", "9c".repeat(32))).unwrap(),
+            signature: Signature::try_from("ab".repeat(64)).unwrap(),
+        })
+    };
+    match reply {
+        Reply::Faithful => (n, signed(ticket, n, asked, honest)),
+        Reply::Lost => (
+            n,
+            TrailOutcome::Lost {
+                why: "the node went away".into(),
+            },
+        ),
+        Reply::OtherAction => {
+            let other = trail_open("https://evil.example/");
+            (n, signed(ticket, n, &other, honest))
+        }
+        Reply::NumberInBody => (n, signed(ticket, n + 1, asked, honest)),
+        Reply::NumberInCommand => (n + 1, signed(ticket, n, asked, honest)),
+        Reply::Crashed => {
+            let crashed = StepOutcome::Closed {
+                steps: 1,
+                reason: CloseReason::Crashed,
+            };
+            (n, signed(ticket, n, asked, crashed))
+        }
+        Reply::ClosedWithoutAsking => {
+            let idle = StepOutcome::Closed {
+                steps: 1,
+                reason: CloseReason::Idle,
+            };
+            (n, signed(ticket, n, asked, idle))
+        }
+        Reply::OtherTicket => {
+            let other = TicketId::new("tk_other");
+            (n, signed(&other, n, asked, honest))
+        }
+    }
+}
+
+fn has_waiting_step(r: &MemoryRepositories, t: &Ticket) -> bool {
+    t.assignments
+        .iter()
+        .any(|a| r.trails.get(&a.id).is_some_and(|c| c.pending.is_some()))
+}
+
 fn gen_cmd(rng: &mut Lcg, w: &mut World) -> Cmd {
-    let mut roll = rng.below(100);
+    let mut roll = rng.below(112);
     // Mostly re-roll a command with nothing to act on; keep some for the error paths.
     for _ in 0..3 {
         if has_target(roll, w.repos()) || rng.chance(30) {
             break;
         }
-        roll = rng.below(100);
+        roll = rng.below(112);
     }
     if roll < 22 {
         return Cmd::Receive(gen_trigger(rng, w));
@@ -662,6 +864,20 @@ fn gen_cmd(rng: &mut Lcg, w: &mut World) -> Cmd {
             pick_assignment(rng),
         ),
         87..=91 => Cmd::SetPolicy(mutate_policy(rng, w.engine.policy())),
+        92..=97 => Cmd::TrailAsk(
+            pick_ticket(rng, r, |t| latest_is(t, AssignmentState::Running)),
+            pick_assignment(rng),
+            gen_action(rng),
+        ),
+        98..=105 => {
+            let t = pick_ticket(rng, r, |t| has_waiting_step(r, t));
+            let a = match rng.below(100) {
+                0..=84 => AssignmentRef::WithPendingStep,
+                85..=94 => AssignmentRef::Latest,
+                _ => AssignmentRef::First,
+            };
+            Cmd::TrailDone(t, a, gen_reply(rng))
+        }
         _ => Cmd::Advance(rng.pick(&[1, 1_000, 40_000, 130_000])),
     }
 }
@@ -749,6 +965,34 @@ fn describe(kind: &str) -> (&'static str, &'static str) {
         "5-eval-batch-repeats-trigger" => (
             "A running Eval names the same Trigger twice",
             "Eval.triggers holds each Trigger id at most once",
+        ),
+        "7-trail-numbering" => (
+            "A trail step was numbered out of order, or asked while another waited",
+            "a step gets the Assignment's next number, and only when none waits",
+        ),
+        "7-trail-not-running" => (
+            "A trail step was asked by an Assignment that was not running",
+            "only the Ticket's running Assignment asks a step, except a Close",
+        ),
+        "7-trail-cursor" => (
+            "A cursor does not hold the step just asked",
+            "the cursor's next is n + 1 and its pending step is n with the asked action",
+        ),
+        "7-trail-done-unpaired" => (
+            "A trail answer names a step that did not wait",
+            "an answer pairs with the step that waited",
+        ),
+        "7-trail-done-mismatch" => (
+            "A signed step answered an action other than the one asked",
+            "a signed step's action equals the action asked",
+        ),
+        "7-trail-done-left-pending" => (
+            "A step still waits after its answer",
+            "an answer clears the pending step",
+        ),
+        "7-trail-silent-change" => (
+            "A cursor changed with no trail event",
+            "only trail commands change a cursor",
         ),
         "6-replay-differs" => (
             "Replaying a seed gives different state",
@@ -890,6 +1134,9 @@ impl Checker {
             if before.decisions != after.decisions {
                 changed.push("decisions");
             }
+            if before.trails != after.trails {
+                changed.push("trails");
+            }
             if before.effects != after.effects {
                 changed.push("effects");
             }
@@ -931,6 +1178,93 @@ impl Checker {
                     ),
                 ));
             }
+        }
+
+        let mut trail_events = false;
+        for event in fresh_events {
+            match &event.event {
+                DomainEvent::TrailAsked {
+                    ticket,
+                    assignment,
+                    n,
+                    action,
+                } => {
+                    trail_events = true;
+                    let was = before.trails.get(assignment);
+                    if *n != was.map_or(1, |c| c.next) || was.is_some_and(|c| c.pending.is_some()) {
+                        found.push((
+                            "7-trail-numbering",
+                            format!("{assignment} was handed step {n} after {was:?}"),
+                        ));
+                    }
+                    let running = before
+                        .tickets
+                        .get(ticket)
+                        .and_then(Ticket::running_assignment)
+                        .is_some_and(|a| a.id == *assignment);
+                    if !running && !matches!(action, TrailAction::Close { .. }) {
+                        found.push((
+                            "7-trail-not-running",
+                            format!("{assignment} was asked to {action:?} while not running"),
+                        ));
+                    }
+                    let kept = after
+                        .trails
+                        .get(assignment)
+                        .map(|c| (c.next, c.pending.as_ref().map(|p| (p.n, &p.action))));
+                    if kept != Some((n + 1, Some((*n, action)))) {
+                        found.push((
+                            "7-trail-cursor",
+                            format!("{assignment} holds {kept:?} after asking step {n}"),
+                        ));
+                    }
+                }
+                DomainEvent::TrailDone {
+                    assignment,
+                    n,
+                    outcome,
+                    ..
+                } => {
+                    trail_events = true;
+                    let waiting = before
+                        .trails
+                        .get(assignment)
+                        .and_then(|c| c.pending.as_ref())
+                        .filter(|p| p.n == *n);
+                    match (waiting, outcome) {
+                        (None, _) => found.push((
+                            "7-trail-done-unpaired",
+                            format!("{assignment} answered step {n}, which did not wait"),
+                        )),
+                        (Some(p), TrailOutcome::Signed(s)) if s.body.action != p.action => found
+                            .push((
+                                "7-trail-done-mismatch",
+                                format!(
+                                    "{assignment} step {n} did {:?}, not {:?}",
+                                    s.body.action, p.action
+                                ),
+                            )),
+                        _ => {}
+                    }
+                    if after
+                        .trails
+                        .get(assignment)
+                        .is_none_or(|c| c.pending.is_some())
+                    {
+                        found.push((
+                            "7-trail-done-left-pending",
+                            format!("{assignment} still waits after step {n} was answered"),
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !trail_events && before.trails != after.trails {
+            found.push((
+                "7-trail-silent-change",
+                "a cursor changed with no trail event".into(),
+            ));
         }
 
         // 4 and 5. State invariants, counted when they first break.
@@ -1348,6 +1682,14 @@ fn show(cmd: &Op) -> String {
             "report {t} {a} {:?} question={:?} spent={}",
             r.status, r.question, r.spent_microusd
         ),
+        Op::TrailAsk(t, a, action) => format!("trail_ask {t} {a} {action:?}"),
+        Op::TrailDone(t, a, n, TrailOutcome::Lost { .. }) => {
+            format!("trail_done {t} {a} #{n} lost")
+        }
+        Op::TrailDone(t, a, n, TrailOutcome::Signed(s)) => format!(
+            "trail_done {t} {a} #{n} signed #{} by {} {:?} -> {:?}",
+            s.body.n, s.body.ticket, s.body.action, s.body.outcome
+        ),
         Op::SetPolicy(p) => format!("set_policy {}", show_policy(p)),
         Op::Advance(ms) => format!("advance_clock {ms}ms"),
     }
@@ -1473,4 +1815,10 @@ fn seeded_random_walk_keeps_atomicity_and_effect_integrity() {
     }
     println!("{report}");
     assert!(hits.is_empty(), "{report}");
+    if seeds * steps as u64 >= 2_000 {
+        for name in ["trail_ask", "trail_done"] {
+            let ok = outcomes.get(name).map_or(0, |o| o.0);
+            assert!(ok > 0, "{name} never succeeded\n{report}");
+        }
+    }
 }

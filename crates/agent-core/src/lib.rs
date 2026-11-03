@@ -11,6 +11,7 @@ pub mod memory;
 pub mod model;
 pub mod policy;
 pub mod ports;
+pub mod trail;
 
 pub use engine::{Engine, Intake, MAX_EXPIRED_EVALS, MAX_SWARM_AGENTS};
 pub use memory::MemoryRepositories;

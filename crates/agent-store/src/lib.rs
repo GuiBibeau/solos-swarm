@@ -22,9 +22,10 @@ pub use watchdog::AlertRow;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::de::DeserializeOwned;
 use solos_agent_core::model::{
-    ChangeSet, Decision, DecisionId, EvalId, Ms, Thread, ThreadKey, Ticket, TicketId, Trigger,
-    TriggerId,
+    AssignmentId, ChangeSet, Decision, DecisionId, EvalId, Ms, Thread, ThreadKey, Ticket, TicketId,
+    Trigger, TriggerId,
 };
+use solos_agent_core::trail::TrailCursor;
 use solos_agent_core::{Error, Repositories};
 use std::cell::Cell;
 use std::path::Path;
@@ -110,6 +111,11 @@ impl SqliteStore {
     /// Every Decision, by id.
     pub fn decisions(&self) -> Result<Vec<Decision>, StoreError> {
         self.bodies("SELECT body FROM decisions ORDER BY id")
+    }
+
+    /// Every Assignment's trail position, by Assignment.
+    pub fn trails(&self) -> Result<Vec<TrailCursor>, StoreError> {
+        self.bodies("SELECT body FROM trails ORDER BY assignment")
     }
 
     /// Decisions recorded at or after `since_ms`, newest first, at most
@@ -243,6 +249,17 @@ impl SqliteStore {
                     serde_json::to_string(decision)?
                 ])?;
             }
+            let mut put = tx.prepare_cached(
+                "INSERT INTO trails (assignment, ticket, body) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (assignment) DO UPDATE SET body = excluded.body",
+            )?;
+            for (assignment, cursor) in &changes.trails {
+                put.execute(params![
+                    assignment.as_str(),
+                    cursor.ticket.as_str(),
+                    serde_json::to_string(cursor)?
+                ])?;
+            }
             queue::append(&tx, &changes.effects)?;
             chain::append(&tx, &changes.events)?;
         }
@@ -265,6 +282,12 @@ impl Repositories for SqliteStore {
     }
     fn decision(&self, id: &DecisionId) -> Option<Decision> {
         self.port(self.body("SELECT body FROM decisions WHERE id = ?1", id.as_str()))
+    }
+    fn trail(&self, assignment: &AssignmentId) -> Option<TrailCursor> {
+        self.port(self.body(
+            "SELECT body FROM trails WHERE assignment = ?1",
+            assignment.as_str(),
+        ))
     }
     fn active_threads(&self) -> Vec<ThreadKey> {
         self.port(self.thread_keys("SELECT key FROM threads WHERE active = 1 ORDER BY key", &[]))

@@ -12,6 +12,7 @@ use crate::model::{
     TicketId, TicketOutcome, TicketSummary, Trigger, TriggerId, Verdict,
 };
 use crate::ports::{Clock, Error, Gate, Policy, Repositories};
+use crate::trail::{self, TrailAction, TrailCursor, TrailOutcome};
 use std::collections::BTreeSet;
 
 /// The third consecutive expired Eval on a Thread records `unavailable`.
@@ -431,6 +432,88 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
             Ok(())
         })
     }
+
+    /// Record that `assignment` is about to act, before it acts, and return
+    /// the step's number. Only the Ticket's running Assignment may act, but a
+    /// session that outlives its Assignment is still closed: `Close` is
+    /// admitted whatever the Assignment's or the Ticket's state, once a step
+    /// has been asked.
+    pub fn trail_ask(
+        &mut self,
+        ticket: &TicketId,
+        assignment: &AssignmentId,
+        action: TrailAction,
+    ) -> Result<u32, Error> {
+        self.run(|tx, _| {
+            action.check().map_err(Error::Invalid)?;
+            let t = tx.require_ticket(ticket)?;
+            let mut cursor = tx
+                .trail(assignment)
+                .unwrap_or_else(|| TrailCursor::new(ticket.clone(), assignment.clone()));
+            if cursor.ticket != *ticket {
+                return Err(Error::Invalid(format!(
+                    "{assignment} belongs to {}, not {ticket}",
+                    cursor.ticket
+                )));
+            }
+            match &action {
+                TrailAction::Close { .. } if cursor.next == 1 => {
+                    return Err(Error::Refused(format!("{assignment} has nothing to close")));
+                }
+                TrailAction::Close { .. } => {}
+                _ if t.running_assignment().is_none_or(|a| a.id != *assignment) => {
+                    return Err(Error::Refused(format!("{assignment} is not running")));
+                }
+                _ => {}
+            }
+            let n = cursor.ask(action.clone(), tx.now).map_err(Error::Refused)?;
+            tx.event(DomainEvent::TrailAsked {
+                ticket: ticket.clone(),
+                assignment: assignment.clone(),
+                n,
+                action,
+            });
+            tx.save_trail(cursor);
+            Ok(n)
+        })
+    }
+
+    /// Record how step `n` ended. The Assignment's or the Ticket's state now
+    /// does not matter: the action happened, so it is recorded. A signed step
+    /// that does not answer the action asked is refused and the step stays
+    /// pending, so the caller can record it as lost instead.
+    pub fn trail_done(
+        &mut self,
+        ticket: &TicketId,
+        assignment: &AssignmentId,
+        n: u32,
+        outcome: TrailOutcome,
+    ) -> Result<(), Error> {
+        self.run(|tx, _| {
+            let mut cursor = tx.trail(assignment).ok_or_else(|| Error::Missing {
+                kind: "trail",
+                id: assignment.to_string(),
+            })?;
+            if cursor.ticket != *ticket {
+                return Err(Error::Invalid(format!(
+                    "{assignment} belongs to {}, not {ticket}",
+                    cursor.ticket
+                )));
+            }
+            let pending = cursor.answer(n).map_err(Error::Refused)?;
+            if let TrailOutcome::Signed(step) = &outcome {
+                trail::answers(&pending, ticket, assignment, step).map_err(Error::Invalid)?;
+            }
+            tx.event(DomainEvent::TrailDone {
+                ticket: ticket.clone(),
+                assignment: assignment.clone(),
+                n,
+                outcome: outcome.bounded(),
+            });
+            tx.save_trail(cursor);
+            Ok(())
+        })
+    }
 }
 
 /// Only a person the Policy admits explicitly owns a follow-up: a resume
@@ -550,6 +633,18 @@ impl<R: Repositories> Tx<'_, R> {
             return Err(Error::Refused(format!("{id} has ended")));
         }
         Ok(ticket)
+    }
+    fn trail(&self, assignment: &AssignmentId) -> Option<TrailCursor> {
+        self.changes
+            .trails
+            .get(assignment)
+            .cloned()
+            .or_else(|| self.repos.trail(assignment))
+    }
+    fn save_trail(&mut self, cursor: TrailCursor) {
+        self.changes
+            .trails
+            .insert(cursor.assignment.clone(), cursor);
     }
     fn save_thread(&mut self, thread: Thread) {
         self.changes.threads.insert(thread.key.clone(), thread);

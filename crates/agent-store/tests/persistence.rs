@@ -7,6 +7,7 @@ use common::{
 use solos_agent_core::model::{
     Actor, AssignmentId, EvalId, Plan, ReportIn, ReportStatus, Stage, TicketId, Verdict,
 };
+use solos_agent_core::trail::{TrailAction, TrailOutcome};
 use solos_agent_core::{AllowlistPolicy, Engine, Error, Intake, MemoryRepositories, Repositories};
 use solos_agent_store::SqliteStore;
 use std::cell::Cell;
@@ -56,6 +57,20 @@ fn script<R: Repositories>(e: &mut AnyEngine<R>, now: &Cell<u64>) -> EvalId {
     e.assignment_started(&first, &assignment).unwrap();
     e.report(&first, &assignment, report(ReportStatus::Progress, None))
         .unwrap();
+    let open = TrailAction::Open {
+        url: "https://github.com/login".into(),
+        key: None,
+    };
+    let n = e.trail_ask(&first, &assignment, open).unwrap();
+    let lost = TrailOutcome::Lost {
+        why: "the node went away".into(),
+    };
+    e.trail_done(&first, &assignment, n, lost).unwrap();
+    let read = TrailAction::Read {
+        part: None,
+        element: None,
+    };
+    e.trail_ask(&first, &assignment, read).unwrap();
     let question = report(ReportStatus::Waiting, Some("which branch?"));
     e.report(&first, &assignment, question).unwrap();
     now.set(now.get() + 5_000);
@@ -120,6 +135,12 @@ fn state_survives_closing_and_reopening_the_file() {
         "two accepts and a gate rejection"
     );
     assert!(!before.effects.is_empty() && !before.events.is_empty());
+    assert_eq!(
+        before.trails.iter().map(|c| c.next).collect::<Vec<_>>(),
+        [3],
+        "one Assignment asked two steps"
+    );
+    assert!(before.trails[0].pending.is_some(), "the second still waits");
     let view = port_view(sql.repos(), &before.threads);
     assert!(view.contains("th3"), "{view}");
     let queue = sql.repos().effects().unwrap();
@@ -137,7 +158,7 @@ fn state_survives_closing_and_reopening_the_file() {
     assert_eq!(store.effects().unwrap(), queue);
     assert_eq!(store.open_tickets().unwrap(), open);
     assert_eq!(store.verify_chain().unwrap(), chain);
-    assert_eq!(store.schema_version().unwrap(), 3);
+    assert_eq!(store.schema_version().unwrap(), 4);
     for t in &before.triggers {
         assert_eq!(store.trigger(&t.id).as_ref(), Some(t));
     }
@@ -149,6 +170,9 @@ fn state_survives_closing_and_reopening_the_file() {
     }
     for d in &before.decisions {
         assert_eq!(store.decision(&d.id).as_ref(), Some(d));
+    }
+    for c in &before.trails {
+        assert_eq!(store.trail(&c.assignment).as_ref(), Some(c));
     }
 
     // The reopened store carries on: the Eval left running is found and decided.
@@ -248,7 +272,7 @@ fn a_file_store_uses_wal_and_migrates_once() {
     let db = TempDb::new("wal");
     drop(SqliteStore::open(&db.path).unwrap());
     let store = SqliteStore::open(&db.path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 3);
+    assert_eq!(store.schema_version().unwrap(), 4);
     let raw = db.raw();
     let mode: String = raw
         .query_row("PRAGMA journal_mode", [], |row| row.get(0))
@@ -257,5 +281,5 @@ fn a_file_store_uses_wal_and_migrates_once() {
     let rows: u32 = raw
         .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(rows, 3, "one row per migration");
+    assert_eq!(rows, 4, "one row per migration");
 }
