@@ -284,6 +284,7 @@ These amend the sketch files. Each comes from the cross-judge's defect list or f
 | 8 | Socket paths are checked for length and for `:`, which Lightpanda refuses in `--unix-socket`. | `04_browse.rs::lightpanda::command` |
 | 9 | Approval buttons render on every chat Channel that renders budget buttons today: Slack and Discord. | `08_approvals.rs` |
 | 10 | Trail blobs are not pruned in v1, so a missing blob is always a problem in `agent trail`. Retention is an open question. | `07_trail_cli.rs` |
+| 11 | The scrubber also matches each value markdown-escaped (a backslash before each ASCII punctuation character). The real Lightpanda 1.0.2 escapes page text that way in `LP.getMarkdown`, so a page that echoes a filled password comes back as `pw\-Probe\-7f3a9c`, which no other encoding matches. Lightpanda itself masks password inputs as `*****` in its structured outputs, and `DOM.getOuterHTML` writes no typed value: page-echoed text is the leak left to scrub. See [lightpanda-probe.md](lightpanda-probe.md). | `02_vault.rs::scrubber` |
 
 ## Scope of the first build
 
