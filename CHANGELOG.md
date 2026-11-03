@@ -99,6 +99,13 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   `GET /tools` and the refusal in `/tool` all read the registry, which replaces `job_host`'s own check. The three
   sandbox builders bind `bwrap::SYSTEM_BINDS`. No change in behavior: every tool-list test and golden argv test
   passes unedited.
+- Agent mode, the trail (first step of the verifiable browser, PR #36's design): `agent-core` gains `trail`
+  (`TrailAction`, `StepBody`, `SignedStep` and the `Digest`, `TrailKey` and `Signature` hex newtypes, with no crypto
+  type) and `Engine::{trail_ask, trail_done}`, which write `TrailAsked` before a browser acts and `TrailDone` after,
+  one pending step per Assignment, numbered by the core; a `Close` is admitted after its Assignment or Ticket ends. The
+  store's schema is v4 (a `trails` table, one row per Assignment), so an older build refuses the file instead of
+  failing on an event it cannot read, and `Fact::{TrailAsk, TrailDone}` reach the Engine through the runtime. Nothing
+  writes a step yet.
 - `collect` leaves the per-run `code/` scratch directory on the host and writes `collect-manifest.json`; `--include-code` opts back in.
 - Docs: pause mode, self-update operations, dashboard tunnel, tournament runbook, replay status.
 

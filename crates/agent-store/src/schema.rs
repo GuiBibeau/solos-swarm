@@ -1,7 +1,7 @@
 use crate::StoreError;
 use rusqlite::{Connection, TransactionBehavior};
 
-pub(crate) const LATEST: u32 = 3;
+pub(crate) const LATEST: u32 = 4;
 
 /// Aggregates are JSON in `body`; the other columns index the port's queries.
 const V1: &str = "
@@ -100,8 +100,19 @@ CREATE INDEX IF NOT EXISTS watchdog_unsent ON watchdog_alerts (raised_ms) WHERE 
 CREATE INDEX IF NOT EXISTS watchdog_retries ON watchdog_alerts (ticket) WHERE retry = 1;
 ";
 
+/// A file that holds trail events is also one an older build refuses to open,
+/// instead of failing on an event it cannot read.
+const V4: &str = "
+CREATE TABLE IF NOT EXISTS trails (
+    assignment TEXT PRIMARY KEY NOT NULL,
+    ticket TEXT NOT NULL,
+    body TEXT NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS trails_ticket ON trails (ticket);
+";
+
 /// Migration `n` is `MIGRATIONS[n - 1]`.
-const MIGRATIONS: [&str; LATEST as usize] = [V1, V2, V3];
+const MIGRATIONS: [&str; LATEST as usize] = [V1, V2, V3, V4];
 
 /// Applies the migrations the file lacks. The write lock makes a second
 /// process that opens the file at the same time wait, then find nothing to do.
@@ -138,7 +149,7 @@ pub(crate) fn version(conn: &Connection) -> Result<u32, StoreError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LATEST, V1, V2, V3, migrate, version};
+    use super::{LATEST, V1, V2, V3, V4, migrate, version};
     use rusqlite::Connection;
 
     #[test]
@@ -155,6 +166,7 @@ mod tests {
         conn.execute_batch(V1).unwrap();
         conn.execute_batch(V2).unwrap();
         conn.execute_batch(V3).unwrap();
+        conn.execute_batch(V4).unwrap();
     }
 
     #[test]
@@ -185,6 +197,53 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM watchdog_alerts", [], |row| row.get(0))
             .unwrap();
         assert_eq!(alerts, 0);
+        let trails: u32 = conn
+            .query_row("SELECT COUNT(*) FROM trails", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(trails, 0);
+    }
+
+    #[test]
+    fn a_v3_file_gains_trails_and_keeps_its_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY NOT NULL) STRICT;",
+        )
+        .unwrap();
+        for (version, sql) in [(1, V1), (2, V2), (3, V3)] {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_version (version) VALUES (?1)",
+                [version],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO tickets (id, open, body) VALUES ('tk1', 1, '{}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO watchdog_alerts (id, kind, subject, raised_ms, message)
+             VALUES ('wd1', 'stalled', 'tk1', 5, 'stalled')",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.prepare("SELECT 1 FROM trails").is_err(),
+            "a V3 file has no trails table"
+        );
+
+        migrate(&mut conn).unwrap();
+
+        assert_eq!(version(&conn).unwrap(), LATEST);
+        let table = |sql: &str| -> String { conn.query_row(sql, [], |row| row.get(0)).unwrap() };
+        assert_eq!(table("SELECT body FROM tickets WHERE id = 'tk1'"), "{}");
+        assert_eq!(table("SELECT id FROM watchdog_alerts"), "wd1");
+        let trails: u32 = conn
+            .query_row("SELECT COUNT(*) FROM trails", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(trails, 0);
     }
 
     #[test]

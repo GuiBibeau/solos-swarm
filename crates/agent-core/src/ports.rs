@@ -1,7 +1,8 @@
 use crate::model::{
-    Actor, ChangeSet, Decision, DecisionId, EvalId, Mandate, MicroUsd, Ms, Thread, ThreadKey,
-    Ticket, TicketId, Trigger, TriggerId,
+    Actor, AssignmentId, ChangeSet, Decision, DecisionId, EvalId, Mandate, MicroUsd, Ms, Thread,
+    ThreadKey, Ticket, TicketId, Trigger, TriggerId,
 };
+use crate::trail::TrailCursor;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -29,6 +30,7 @@ pub trait Repositories {
     fn thread(&self, key: &ThreadKey) -> Option<Thread>;
     fn ticket(&self, id: &TicketId) -> Option<Ticket>;
     fn decision(&self, id: &DecisionId) -> Option<Decision>;
+    fn trail(&self, assignment: &AssignmentId) -> Option<TrailCursor>;
     /// Threads with queued Triggers or an Eval in progress.
     fn active_threads(&self) -> Vec<ThreadKey>;
     /// The Thread whose running Eval has this id.

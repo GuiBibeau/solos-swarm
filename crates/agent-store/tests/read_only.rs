@@ -45,7 +45,7 @@ fn a_read_only_store_reads_everything_and_writes_nothing() {
     let before = std::fs::read(&db.path).unwrap();
 
     let store = SqliteStore::open_read_only(&db.path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 3);
+    assert_eq!(store.schema_version().unwrap(), 4);
     assert_eq!(store.open_tickets().unwrap().len(), 2);
     assert!(!store.pending_effects().unwrap().is_empty());
     let refused = store.mark_alert_sent("wd_x", 1).unwrap_err();
@@ -59,6 +59,38 @@ fn a_read_only_store_reads_everything_and_writes_nothing() {
     let missing = db.path.with_file_name("missing.db");
     assert!(SqliteStore::open_read_only(&missing).is_err());
     assert!(!missing.exists(), "a read-only open creates no file");
+}
+
+#[test]
+fn a_file_from_a_newer_build_is_refused_and_this_build_writes_the_version_older_ones_refuse() {
+    let db = TempDb::new("older-binary");
+    populate(&db);
+    let known = SqliteStore::open_read_only(&db.path)
+        .unwrap()
+        .schema_version()
+        .unwrap();
+    assert_eq!(known, 4, "a build that knows only 3 refuses this file");
+
+    db.raw()
+        .execute(
+            "INSERT INTO schema_version (version) VALUES (?1)",
+            [known + 1],
+        )
+        .unwrap();
+    let before = std::fs::read(&db.path).unwrap();
+    let found = known + 1;
+    let read_only = SqliteStore::open_read_only(&db.path).err().unwrap();
+    assert_eq!(
+        std::fs::read(&db.path).unwrap(),
+        before,
+        "nothing was written"
+    );
+    for refused in [read_only, SqliteStore::open(&db.path).err().unwrap()] {
+        assert!(
+            matches!(&refused, StoreError::Schema { found: f, known: k } if *f == found && *k == known),
+            "{refused}"
+        );
+    }
 }
 
 #[test]

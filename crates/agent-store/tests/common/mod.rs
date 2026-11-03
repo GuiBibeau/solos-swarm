@@ -1,8 +1,12 @@
 #![allow(dead_code)]
 
 use solos_agent_core::model::{
-    Accept, Acknowledge, Actor, Addressed, ChannelRef, Decision, Effect, Event, Plan, Thread,
-    ThreadKey, Ticket, Trigger, TriggerId, Verdict,
+    Accept, Acknowledge, Actor, Addressed, AssignmentId, ChannelRef, Decision, Effect, Event, Plan,
+    Thread, ThreadKey, Ticket, TicketId, Trigger, TriggerId, Verdict,
+};
+use solos_agent_core::trail::{
+    Digest, PageSeen, STEP_VERSION, Signature, SignedStep, StepBody, StepOutcome, TrailAction,
+    TrailCursor, TrailKey,
 };
 use solos_agent_core::{AllowlistPolicy, Engine, MemoryRepositories, Repositories};
 use solos_agent_store::SqliteStore;
@@ -64,6 +68,7 @@ pub struct Contents {
     pub threads: Vec<Thread>,
     pub tickets: Vec<Ticket>,
     pub decisions: Vec<Decision>,
+    pub trails: Vec<TrailCursor>,
     pub effects: Vec<Effect>,
     pub events: Vec<Event>,
 }
@@ -74,6 +79,7 @@ pub fn sqlite_contents(s: &SqliteStore) -> Contents {
         threads: s.threads().unwrap(),
         tickets: s.tickets().unwrap(),
         decisions: s.decisions().unwrap(),
+        trails: s.trails().unwrap(),
         effects: s.effects().unwrap().into_iter().map(|q| q.effect).collect(),
         events: s.events().unwrap(),
     }
@@ -85,6 +91,7 @@ pub fn memory_contents(m: &MemoryRepositories) -> Contents {
         threads: m.threads.values().cloned().collect(),
         tickets: m.tickets.values().cloned().collect(),
         decisions: m.decisions.values().cloned().collect(),
+        trails: m.trails.values().cloned().collect(),
         effects: m.effects.clone(),
         events: m.events.clone(),
     }
@@ -103,6 +110,7 @@ pub fn first_difference(a: &Contents, b: &Contents) -> Option<String> {
         .or_else(|| list("threads", &a.threads, &b.threads))
         .or_else(|| list("tickets", &a.tickets, &b.tickets))
         .or_else(|| list("decisions", &a.decisions, &b.decisions))
+        .or_else(|| list("trails", &a.trails, &b.trails))
         .or_else(|| list("effects", &a.effects, &b.effects))
         .or_else(|| list("events", &a.events, &b.events))
 }
@@ -115,6 +123,45 @@ pub fn port_view(r: &impl Repositories, threads: &[Thread]) -> String {
         .map(|e| (e.id.clone(), r.thread_of_eval(&e.id)))
         .collect();
     format!("active {:?}; evals {evals:?}", r.active_threads())
+}
+
+pub fn page_seen() -> StepOutcome {
+    StepOutcome::Page(PageSeen {
+        url: "https://example.com/".into(),
+        status: Some(200),
+        title: "Example".into(),
+        snapshot: Digest::of(b"snapshot"),
+        view: Digest::of(b"view"),
+        target: None,
+        filled: Vec::new(),
+        keyed: Vec::new(),
+    })
+}
+
+pub fn signed_step(
+    ticket: &TicketId,
+    assignment: &AssignmentId,
+    n: u32,
+    action: TrailAction,
+    outcome: StepOutcome,
+) -> SignedStep {
+    SignedStep {
+        body: StepBody {
+            v: STEP_VERSION,
+            ticket: ticket.clone(),
+            assignment: assignment.clone(),
+            n,
+            environment: "local".into(),
+            session: "7a3c0f9e12d45b60".into(),
+            session_step: n.saturating_sub(1),
+            at_ms: 1_000,
+            provenance: None,
+            action,
+            outcome,
+        },
+        signer: TrailKey::try_from(format!("ed25519:{}", "9c".repeat(32))).unwrap(),
+        signature: Signature::try_from("ab".repeat(64)).unwrap(),
+    }
 }
 
 pub fn policy() -> AllowlistPolicy {

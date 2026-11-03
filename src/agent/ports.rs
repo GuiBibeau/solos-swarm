@@ -8,6 +8,7 @@ use solos_agent_core::model::{
     Actor, AssignmentId, Candidate, ChannelRef, Decision, EvalId, Input, MicroUsd, OutboundMessage,
     Plan, ReportIn, TicketId, Trigger, TriggerId, Verdict,
 };
+use solos_agent_core::trail::{TrailAction, TrailOutcome};
 use solos_agent_store::EffectId;
 use std::time::Duration;
 use std::{future::Future, pin::Pin};
@@ -163,6 +164,19 @@ pub enum Fact {
         text: String,
     },
     Command(Command),
+    /// A worker's browser is about to act. Asked, so the answer carries the
+    /// step's number, and the browser acts only after the commit.
+    TrailAsk {
+        ticket: TicketId,
+        assignment: AssignmentId,
+        action: TrailAction,
+    },
+    TrailDone {
+        ticket: TicketId,
+        assignment: AssignmentId,
+        n: u32,
+        outcome: TrailOutcome,
+    },
     /// The Watchdog retries a stalled Assignment, unless it has moved on
     /// since it had `reports` Reports.
     Retry {
@@ -205,6 +219,9 @@ pub enum Applied {
     /// when it was handed back before or already went to its own Eval.
     HandedBack {
         queued: bool,
+    },
+    TrailAsked {
+        n: u32,
     },
     Done,
 }
