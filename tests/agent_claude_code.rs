@@ -1,23 +1,29 @@
 //! The agent broker's Anthropic Messages facade over HTTP on its Unix
 //! socket, with a scripted provider: a worker's calls held and settled on
 //! its Ticket's account, the pause, the budget and the contract, as
-//! `/model` has them.
+//! `/model` has them. The ignored test runs the installed Claude Code as a
+//! worker through `ClaudeCodeHarness` in bwrap, in `agent serve`, and needs
+//! `SOLOS_CLAUDE`.
 
 use serde_json::{Value, json};
-use solos_agent_core::model::{AssignmentId, TicketId};
+use solos_agent_core::model::{AssignmentId, MessageKind, OutboundMessage, TicketId};
 use solos_agent_store::SqliteStore;
 use solos_swarm::agent::broker::{
     self, Account, AgentBroker, BrokerParts, DecideTerms, Grant, ModelTerms, Principal,
     WorkerParts, WorkerSeat,
 };
 use solos_swarm::agent::scripted::{ScriptedExecutor, ScriptedRouter};
-use solos_swarm::agent::{Adapters, RunOptions, Runtime, STORE_FILE};
+use solos_swarm::agent::{
+    Adapters, AgentConfig, PiHost, RunOptions, Runtime, STORE_FILE, TICKETS_DIR, serve_with,
+};
 use solos_swarm::gateway::anthropic::Chat;
 use solos_swarm::gateway::{Dispatch, PriceTable, Provider, Upstream};
+use solos_swarm::harness::PiHarness;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 const MODEL: &str = "deepseek-flash";
 const MAX_OUTPUT: u64 = 2_048;
@@ -476,4 +482,176 @@ async fn what_the_contract_refuses_is_refused_as_a_messages_client_reads_it() {
     assert_eq!(body["error"]["type"], "not_found_error");
     let hello = served.client.head("http://broker/api/hello").send().await;
     assert_eq!(hello.unwrap().status(), 200, "Claude Code's preconnect");
+}
+
+/// The upstream of the real run: a prompt gets a `progress` report, its tool
+/// result a `ready` one, and anything after a closing line.
+struct Reporter {
+    bodies: Mutex<Vec<Value>>,
+}
+
+impl Provider for Reporter {
+    fn dispatch(&self, body: Value) -> Dispatch {
+        let n = {
+            let mut bodies = self.bodies.lock().unwrap();
+            bodies.push(body.clone());
+            bodies.len()
+        };
+        let results = body["messages"].as_array().map_or(0, |messages| {
+            messages.iter().filter(|m| m["role"] == "tool").count()
+        });
+        let report = match results {
+            0 => Some(json!({"status": "progress", "text": "Saying hello"})),
+            1 => Some(json!({"status": "ready", "text": "Done: hello from Claude Code"})),
+            _ => None,
+        };
+        let (message, finish) = if let Some(report) = report {
+            let call = json!({"id": format!("call-{n}"), "type": "function", "function": {
+                "name": "mcp__swarm__worker_report", "arguments": report.to_string()}});
+            (
+                json!({"role": "assistant", "content": null, "tool_calls": [call]}),
+                "tool_calls",
+            )
+        } else {
+            (json!({"role": "assistant", "content": "Reported."}), "stop")
+        };
+        Box::pin(async move {
+            Ok(json!({
+                "id": format!("receipt-{n}"),
+                "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+                "usage": {"prompt_tokens": 1180, "prompt_cache_hit_tokens": 1024, "completion_tokens": 32},
+            }))
+        })
+    }
+}
+
+/// `SOLOS_CLAUDE=$(readlink -f ~/.local/bin/claude) cargo test --test
+/// agent_claude_code -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "needs Linux, bwrap and an installed Claude Code"]
+async fn a_real_claude_code_worker_reports_ready_through_the_facade() {
+    let claude = PathBuf::from(std::env::var_os("SOLOS_CLAUDE").expect("SOLOS_CLAUDE"));
+    let scratch = Scratch::new("real");
+    std::fs::write(scratch.root.join("node"), "").unwrap();
+    let line = json!({"id": "t-ask", "source": "slack", "at_ms": 1_793_613_600_000u64,
+        "actor": {"id": "alice", "kind": "person"}, "addressed": "mention",
+        "text": "Say hello from Claude Code", "threads": ["T1"],
+        "reply_to": [{"source": "slack", "address": {"thread_ts": "T1"}}]});
+    std::fs::write(scratch.root.join("triggers.jsonl"), format!("{line}\n")).unwrap();
+    let yaml = format!(
+        "policy:\n  people: [slack:alice]\n\
+         sources:\n  - {{kind: jsonl, path: triggers.jsonl}}\n\
+         channels:\n  - {{kind: jsonl, source: slack, path: outbox.jsonl}}\n\
+         router: {{kind: scripted}}\n\
+         executor:\n  kind: pi\n  provider: deepseek\n  model: {MODEL}\n  \
+         prices: {{input_microusd_per_million: 300000, output_microusd_per_million: 1200000, \
+         cache_hit_microusd_per_million: 6000}}\n  max_output_tokens: {MAX_OUTPUT}\n  \
+         harness: claude-code\n  claude: {{binary: {}, solos_swarm: {}}}\n\
+         budgets: {{session_microusd: 500000}}\n",
+        claude.display(),
+        env!("CARGO_BIN_EXE_solos-swarm"),
+    );
+    let path = scratch.root.join("agent.yaml");
+    std::fs::write(&path, yaml).unwrap();
+    let config = AgentConfig::load(&path).unwrap();
+    let reporter = Arc::new(Reporter {
+        bodies: Mutex::new(Vec::new()),
+    });
+    let host = PiHost {
+        harness: PiHarness,
+        provider: reporter.clone(),
+        pi_root: scratch.root.clone(),
+        node: scratch.root.join("node"),
+    };
+
+    let state = scratch.state();
+    let serving = serve_with(config, &state, true, Some(host));
+    let summary = tokio::time::timeout(Duration::from_secs(180), serving)
+        .await
+        .expect("serve did not go idle")
+        .unwrap();
+
+    eprintln!("summary: {}", json!(summary));
+    let sent: Vec<OutboundMessage> = std::fs::read_to_string(scratch.root.join("outbox.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let kinds: Vec<MessageKind> = sent.iter().map(|m| m.kind).collect();
+    assert_eq!(kinds, [MessageKind::Acknowledgement, MessageKind::Result]);
+    assert_eq!(sent[1].text, "Done: hello from Claude Code");
+
+    let store = scratch.store();
+    let ticket = &store.tickets().unwrap()[0];
+    let bodies = reporter.bodies.lock().unwrap().clone();
+    assert_eq!(
+        store
+            .committed(&format!("ticket:{}", ticket.id), 0)
+            .unwrap(),
+        COST * bodies.len() as u64,
+        "every model call settled on the Ticket's account"
+    );
+    let mut tools: Vec<&str> = bodies[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect();
+    tools.sort_unstable();
+    assert_eq!(
+        tools,
+        [
+            "mcp__swarm__fetch_url",
+            "mcp__swarm__worker_handback",
+            "mcp__swarm__worker_report"
+        ],
+        "only the broker's tools"
+    );
+    let system = bodies[0]["messages"][0]["content"].as_str().unwrap();
+    assert!(
+        system.contains("You are a worker of a long-running agent"),
+        "{system}"
+    );
+    assert!(bodies.len() >= 2, "the progress report's result came back");
+    let result = bodies[1]["messages"].as_array().unwrap().last().unwrap();
+    assert_eq!(result["role"], "tool");
+    let recorded: Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        (&recorded["recorded"], &recorded["status"]),
+        (&json!(true), &json!("progress")),
+        "the broker's answer, through the MCP server and Claude Code"
+    );
+
+    let dir = scratch.state().join(TICKETS_DIR).join(ticket.id.as_str());
+    let assignment = &ticket.assignments[0].id;
+    let transcript =
+        std::fs::read_to_string(dir.join(format!("{assignment}.claude.jsonl"))).unwrap();
+    let frames: Vec<Value> = transcript
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let init = frames
+        .iter()
+        .find(|frame| frame["subtype"] == "init")
+        .expect("no init");
+    eprintln!(
+        "Claude Code {} ran with tools {} and MCP servers {}",
+        init["claude_code_version"], init["tools"], init["mcp_servers"]
+    );
+    let kinds: Vec<String> = frames
+        .iter()
+        .map(|frame| {
+            let kind = frame["type"].as_str().unwrap_or("?");
+            match frame["subtype"].as_str() {
+                Some(subtype) => format!("{kind}/{subtype}"),
+                None => kind.to_owned(),
+            }
+        })
+        .collect();
+    eprintln!("transcript: {kinds:?}");
+    eprintln!("model calls: {}", bodies.len());
+    assert!(
+        !dir.join(format!("{assignment}.token")).exists(),
+        "the token file is gone with the session"
+    );
 }
