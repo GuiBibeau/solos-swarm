@@ -1,5 +1,8 @@
 use super::gateway::{self, Closing, Fatal, Frame, op};
-use super::{APPROVE_ACTION, DiscordApi, SOURCE, STOP_ACTION, TokenRefused, reply_to, thread};
+use super::{
+    ALLOW_SECRET_ACTION, APPROVE_ACTION, DENY_SECRET_ACTION, DiscordApi, SOURCE, STOP_ACTION,
+    TokenRefused, reply_to, thread,
+};
 use crate::agent::ports::{
     BoxFuture, Command, Fact, FactSink, Order, RetryAfter, Source, TriggerSink,
 };
@@ -10,7 +13,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use solos_agent_core::model::{
-    Actor, ActorKind, Addressed, ChannelRef, Ms, TicketId, Trigger, TriggerId,
+    Actor, ActorKind, Addressed, ChannelRef, Ms, SecretId, TicketId, Trigger, TriggerId,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -333,10 +336,16 @@ impl World {
             return None;
         }
         let custom_id = click.data.as_ref()?.custom_id.as_deref()?;
-        let (action, ticket) = custom_id.split_once(':')?;
-        let order = match action {
-            APPROVE_ACTION => Order::Approve,
-            STOP_ACTION => Order::Stop,
+        let (action, rest) = custom_id.split_once(':')?;
+        let (order, ticket) = match action {
+            APPROVE_ACTION => (Order::Approve, rest),
+            STOP_ACTION => (Order::Stop, rest),
+            ALLOW_SECRET_ACTION | DENY_SECRET_ACTION => {
+                let (ticket, secret) = rest.split_once(':')?;
+                let secret = SecretId::try_from(secret.to_owned()).ok()?;
+                let allow = action == ALLOW_SECRET_ACTION;
+                (Order::Secret { secret, allow }, ticket)
+            }
             _ => return None,
         };
         if ticket.is_empty() {
