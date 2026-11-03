@@ -78,7 +78,7 @@ A child task capability $C_{\text{child}}$ and budget $B_{\text{child}}$ must sa
 | Tier | Runtime | Workload |
 |---|---|---|
 | `W` | `wasmtime` (`49.0.4`) with fuel and memory caps | Deterministic parsers and compute tools |
-| `P` | `bwrap` + read-only SquashFS + Landlock v3 + seccomp + cgroups v2 | Pi worker processes (`extensions/broker-tools.mjs`) |
+| `P` | `bwrap` + read-only SquashFS + Landlock v3 + seccomp + cgroups v2 | Pi worker processes (`extensions/broker.ts`) |
 | `G` | `runsc` (gVisor) user-space kernel | Containerized CLI tools without KVM |
 | `V` | Firecracker / KVM microVM | Untrusted native binaries |
 
@@ -92,9 +92,10 @@ All amounts use integer micro-USD (`1 USD = 1,000,000 micro-USD`).
 ```mermaid
 stateDiagram-v2
     [*] --> Reserved : Reserve(max_cost)
-    Reserved --> Settled : Settle(receipt_cost)
     Reserved --> Released : Release (undispatched)
-    Reserved --> Unknown : Drop after dispatch
+    Reserved --> Dispatched : mark_dispatched
+    Dispatched --> Settled : Settle(receipt_cost)
+    Dispatched --> Unknown : Drop after dispatch
     Unknown --> Settled : Operator reconcile
     Unknown --> Released : Zero-effect proof
 ```
@@ -125,8 +126,8 @@ Prompt assembly (`src/planner.rs`, `src/context.rs`) measures fixed contract tok
 
 | Subsystem | Mechanism | Verification |
 |---|---|---|
-| Audit log (`src/audit.rs`) | RFC 6962 SHA-256 Merkle tree | Ed25519 `solos-swarm:tree-head:v1` |
-| Witness (`src/witness.rs`) | Append-only consistency check | Ed25519 `solos-swarm:witness-receipt:v1` |
+| Audit log (`src/audit.rs`) | RFC 6962 SHA-256 Merkle tree | Ed25519, signature domain `audit-tree-head` |
+| Witness (`src/witness.rs`) | Append-only consistency check | Ed25519, signature domain `audit-witness-receipt` |
 | Evaluator (`src/evaluator.rs`) | Separate Unix UID (`995`), `0700` bundle dir | Splits `search` from one-shot `final_holdout` |
 
 
@@ -139,7 +140,7 @@ Prompt assembly (`src/planner.rs`, `src/context.rs`) measures fixed contract tok
 | `src/security.rs`, `src/identity.rs` | RBAC, ABAC, capability attenuation, SPIFFE, OIDC |
 | `src/operator.rs` | `/v1/operator/*` challenge-response gateway |
 | `src/ledger.rs`, `src/quota.rs` | Micro-USD reserve/settle ledger and rate quotas |
-| `src/scheduler.rs`, `src/placement.rs` | Gang placement (`PACK`, `SPREAD`) and envelopes |
+| `src/scheduler.rs`, `src/placement.rs` | Gang placement (`Pack`, `StrictPack`, `Spread`, `StrictSpread`) and envelopes |
 | `src/delegation.rs`, `src/planner.rs` | Child task attenuation and context packing |
 | `src/context.rs`, `src/provider.rs` | Verified tokenizers and OpenAI/SSE adapter |
 | `src/sandbox.rs`, `src/wasi_worker.rs` | Tier `P` Linux isolation and Tier `W` Wasmtime |

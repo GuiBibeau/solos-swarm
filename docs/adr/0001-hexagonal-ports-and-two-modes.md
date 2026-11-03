@@ -13,10 +13,10 @@ ships GitHub and Feishu Sources; Slack and schedules are ours to add),
 isolated Worker sessions per task, two-stage event filtering, Thread subscriptions with pass-through, async tools,
 separate compute, state and execution, and a Watchdog.
 
-The live `run` path is about 5k lines (`src/main.rs`, `src/broker.rs`, `src/broker_control.rs`, `src/code.rs`,
-`src/progress.rs`). It hard-wires Pi (a free `sandbox()` function returning a `bwrap` `Command`), one hosted
-OpenAI-compatible upstream (`provider_for` always builds `OpenAiCompatible` behind the existing `broker::Provider`
-trait), a Goal-shaped `Store` that holds the event log, the ledger and the
+The live `run` path is about 6k lines (`src/main.rs`, `src/broker.rs`, `src/broker_control.rs`, `src/code.rs`,
+`src/progress.rs`). It hard-wires Pi (the Pi launch in `src/harness.rs`, with its `bwrap` argv built by `src/bwrap.rs`),
+one hosted OpenAI-compatible upstream (`provider_for` always builds `OpenAiCompatible` behind the existing `Provider`
+trait in `src/gateway/upstream.rs`), a Goal-shaped `Store` that holds the event log, the ledger and the
 swarm's task board together, and `agent-NN` identities. The `mvp` cluster path (about 55k lines) has its own copies
 of the provider trait, broker, Pi launcher, extension and ledger. `run` uses it only for
 `provider::completion_usage`.
