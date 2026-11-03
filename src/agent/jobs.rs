@@ -25,8 +25,6 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
-/// The tools a worker with `run_code` also gets.
-pub const JOB_TOOLS: [&str; 3] = ["job_start", "job_wait", "job_stop"];
 pub const DEFAULT_WAIT_SECS: u64 = 30;
 /// A worker in `job_wait` reads no new input, so a wait stays short.
 pub const MAX_WAIT_SECS: u64 = 120;

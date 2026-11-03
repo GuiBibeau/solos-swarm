@@ -10,7 +10,7 @@ pub mod registry;
 use super::AgentConfig;
 use super::config::ExecutorConfig;
 use super::environment::{Environments, Nodes};
-use super::jobs::{Host, JOB_TOOLS, JobLimits, Jobs, Refused};
+use super::jobs::{Host, JobLimits, Jobs, Refused};
 use super::ports::{Applied, Fact, FactSink};
 use crate::broker::{FETCH_TOTAL_BYTES, fetch, now_ms};
 use crate::code::CodeExecutor;
@@ -22,7 +22,8 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
-use registry::PrincipalKind;
+use registry::{Caps, PrincipalKind};
+pub use registry::{ROUTER_TOOLS, WORKER_TOOLS};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use solos_agent_core::model::{
@@ -40,19 +41,6 @@ use tokio::net::UnixListener;
 
 /// The broker's socket in the state directory.
 pub const SOCKET_FILE: &str = "broker.sock";
-/// What the Router's sessions may call. No `run_code`, no `fetch_url`.
-pub const ROUTER_TOOLS: [&str; 2] = ["router_decide", "router_read"];
-/// What a worker's sessions may call. `run_code` and the job tools need the
-/// worker's environment to offer `run_code`.
-pub const WORKER_TOOLS: [&str; 7] = [
-    "worker_report",
-    "worker_handback",
-    "run_code",
-    "job_start",
-    "job_wait",
-    "job_stop",
-    "fetch_url",
-];
 const DAY_MS: Ms = 86_400_000;
 /// `sockaddr_un.sun_path` is 108 bytes, with a trailing NUL.
 const SUN_PATH_LIMIT: usize = 108;
@@ -499,11 +487,21 @@ impl AgentBroker {
     /// environment's sandbox, where it offers no `run_code`. A worker's
     /// grants and its `GET /tools`.
     pub fn worker_tools(&self, environment: Option<&str>) -> Vec<&'static str> {
-        let run_code = self.inner.environments.offers_run_code(environment);
-        WORKER_TOOLS
-            .into_iter()
-            .filter(|tool| run_code || !(*tool == "run_code" || JOB_TOOLS.contains(tool)))
-            .collect()
+        let have = self.inner.environments.capabilities(environment);
+        registry::offered(PrincipalKind::Worker, have)
+    }
+
+    fn unmet_need(&self, principal: &Principal, name: &str) -> Option<String> {
+        let environments = &self.inner.environments;
+        let (named, have) = match principal {
+            Principal::Router => (None, Caps::NONE),
+            Principal::Worker(seat) => {
+                let named = seat.environment.as_deref();
+                (named, environments.capabilities(named))
+            }
+        };
+        let missing = registry::unmet(principal.kind(), name, have)?;
+        Some(environments.why_lacks(named, missing))
     }
 
     /// Refuse `token` from now on. A call already admitted finishes; a
@@ -792,6 +790,9 @@ async fn tool(
     let grant = broker.authenticate(&headers)?;
     if !grant.principal.tools().contains(&name.as_str()) {
         return Err(forbidden("tool outside admitted grants"));
+    }
+    if let Some(why) = broker.unmet_need(&grant.principal, &name) {
+        return Err(forbidden(why));
     }
     match (&grant.principal, name.as_str()) {
         (Principal::Router, "router_decide") => decide(&broker, args).await,
@@ -1114,8 +1115,9 @@ fn job_host<'a>(
         .inner
         .environments
         .get(seat.environment.as_deref())
-        .map_err(forbidden)?
-        .ok_or_else(|| forbidden("run_code is not available on this host"))?;
+        .ok()
+        .flatten()
+        .ok_or_else(|| failed("a tool that needs run_code was admitted without it"))?;
     Ok(Host {
         environment: environment.as_ref(),
         limits: broker.inner.jobs,

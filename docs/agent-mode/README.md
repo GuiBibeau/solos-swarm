@@ -422,9 +422,12 @@ provider through the real broker. It runs on macOS too. Swarm mode is the first 
 **P7: more harnesses, both directions.** P7a and P7b done; setup in [MCP hosts](#mcp-hosts) and
 [Claude Code workers](#claude-code-workers).
 - Done (P7a): one source of truth for the agent broker's tools. `src/agent/broker/registry.rs` holds each tool's
-  name, description and JSON Schema, keyed by principal kind, and the broker serves the calling token's tools at
-  `GET /tools`. A worker's are the tools it is granted (`AgentBroker::worker_tools`): without `run_code` and the job
-  tools where the host offers no `run_code`. The Pi extension keeps its own TypeBox copy;
+  name, description, JSON Schema and `needs`, keyed by principal kind, and the broker serves the calling token's
+  tools at `GET /tools`. `needs` is the set of capabilities (`run_code`, `browser`, `vault`) a seat must have for the
+  tool to exist, and `ROUTER_TOOLS` and `WORKER_TOOLS` are derived from the registry. A worker's are the tools it is
+  granted (`AgentBroker::worker_tools`): without `run_code` and the job tools where the host offers no `run_code`.
+  A call to a tool the seat lacks the capabilities for is refused in `/tool` from the same `needs`. The Pi
+  extension keeps its own TypeBox copy;
   `tests/fixtures/agent-tools.json` is held equal to the registry by a Rust test and to the extension by a Node test,
   so neither can drift.
 - Done (P7a): `solos-swarm mcp --socket PATH --token-file FILE`, a stdio MCP server for one principal, written by hand
