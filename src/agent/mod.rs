@@ -35,9 +35,11 @@ use crate::gateway::{Provider, provider_for, upstream_profile};
 use crate::harness::claude_code::ClaudeCodeHarness;
 use crate::harness::{AgentHarness, PiHarness, Role, SessionSpec};
 use crate::remote::Listener;
+use crate::vault::Vault;
 use anyhow::{Context, Result, bail, ensure};
 use broker::{
-    AgentBroker, BrokerParts, DecideTerms, Grant, ModelTerms, Principal, ROUTER_TOOLS, WorkerParts,
+    AgentBroker, BrokerParts, DecideTerms, Grant, ModelTerms, Principal, ROUTER_TOOLS, VaultParts,
+    WorkerParts,
 };
 use config::{
     ChannelConfig, ClaudeConfig, ExecutorConfig, RouterConfig, RunCodeConfig, SourceConfig,
@@ -319,7 +321,21 @@ where
                     max_output_tokens: *max_output_tokens,
                     call_limit: None,
                 };
-                Some(WorkerParts { terms, code })
+                let vault = match &config.vault {
+                    None => None,
+                    Some(vault) => {
+                        let view = config.sandbox_view().and([
+                            tickets_dir.clone(),
+                            crate::harness::node_root(&node).to_owned(),
+                            pi_root.clone(),
+                        ]);
+                        Some(VaultParts {
+                            vault: Vault::open(vault, &view).context("vault")?,
+                            takes_approvals: config.takes_approvals(),
+                        })
+                    }
+                };
+                Some(WorkerParts { terms, code, vault })
             }
         };
         let worker_model = workers

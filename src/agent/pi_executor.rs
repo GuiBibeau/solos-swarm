@@ -813,9 +813,7 @@ mod tests {
     use super::{
         PREPARED, PiExecutor, PiExecutorParts, QUIET_TURN, WORK_DIR, assignment_text, delivery_text,
     };
-    use crate::agent::broker::{
-        AgentBroker, BrokerParts, DecideTerms, ModelTerms, WORKER_TOOLS, WorkerParts,
-    };
+    use crate::agent::broker::{AgentBroker, BrokerParts, DecideTerms, ModelTerms, WorkerParts};
     use crate::agent::config::HarnessKind;
     use crate::agent::environment::{ExecutionEnvironment, Nodes, Offline, Work};
     use crate::agent::jobs::JobLimits;
@@ -983,7 +981,11 @@ mod tests {
                     max_budget_microusd: None,
                     swarm: None,
                 },
-                workers: Some(WorkerParts { terms, code: None }),
+                workers: Some(WorkerParts {
+                    terms,
+                    code: None,
+                    vault: None,
+                }),
             };
             let broker = AgentBroker::with_nodes(parts, JobLimits::default(), nodes).unwrap();
             let (fake, claude) = (Fake::default(), Fake::default());
@@ -1472,7 +1474,15 @@ mod tests {
         assert!(started(&w.fact().await, "as_c"));
         assert_eq!(
             w.claude.grants("as_a"),
-            WORKER_TOOLS,
+            [
+                "worker_report",
+                "worker_handback",
+                "run_code",
+                "job_start",
+                "job_wait",
+                "job_stop",
+                "fetch_url"
+            ],
             "run_code on the node"
         );
         assert_eq!(

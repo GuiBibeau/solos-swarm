@@ -61,6 +61,10 @@ impl Caps {
         Self(bits)
     }
 
+    pub const fn with(self, cap: Cap) -> Self {
+        Self(self.0 | cap.bit())
+    }
+
     pub fn lacks(self, needs: Self) -> Option<Cap> {
         Cap::ALL
             .into_iter()
@@ -181,8 +185,20 @@ const WORKER: &[Tool] = &[
         name: "fetch_url",
         needs: Caps::NONE,
         description: "Fetch one live http(s) URL through the broker; returns status, headers and \
-                      bounded body. Your only network egress.",
+                      bounded body. Your only network egress. With key, the broker adds that API \
+                      key from vault_list to the request, and to each redirect that stays on the \
+                      key's hosts. You never see its value: a copy in the response reads \
+                      [vault:<key>].",
         input_schema: fetch_url,
+    },
+    Tool {
+        name: "vault_list",
+        needs: Caps::of(&[Cap::Vault]),
+        description: "List the API keys and logins this ticket may use: their names, hosts or \
+                      sites, usernames, what each is for, and whether a person must approve its \
+                      first use on this ticket. You never see their values; pass a key's name as \
+                      fetch_url's key to send it to the key's own hosts.",
+        input_schema: vault_list,
     },
 ];
 
@@ -383,8 +399,13 @@ fn fetch_url() -> Value {
             "headers": {"type": "object", "properties": {}, "additionalProperties": true},
             "body": {"type": "string"},
             "max_bytes": {"type": "number"},
+            "key": required_string("An API key's name from vault_list, to authenticate this request."),
         },
     })
+}
+
+fn vault_list() -> Value {
+    json!({"type": "object", "properties": {}})
 }
 
 #[cfg(test)]
@@ -444,15 +465,40 @@ mod tests {
     fn only_a_seat_with_run_code_is_offered_run_code_and_the_job_tools() {
         let run_code = Caps::of(&[Cap::RunCode]);
         let everything_else = Caps::of(&[Cap::Browser, Cap::Vault]);
-        assert_eq!(offered(PrincipalKind::Worker, run_code), WORKER_TOOLS);
+        assert_eq!(
+            offered(PrincipalKind::Worker, Caps::of(&Cap::ALL)),
+            WORKER_TOOLS
+        );
+        assert_eq!(
+            offered(PrincipalKind::Worker, run_code),
+            [
+                "worker_report",
+                "worker_handback",
+                "run_code",
+                "job_start",
+                "job_wait",
+                "job_stop",
+                "fetch_url"
+            ]
+        );
         assert_eq!(
             offered(PrincipalKind::Worker, Caps::NONE),
             ["worker_report", "worker_handback", "fetch_url"]
         );
         assert_eq!(
             offered(PrincipalKind::Worker, everything_else),
-            offered(PrincipalKind::Worker, Caps::NONE),
+            [
+                "worker_report",
+                "worker_handback",
+                "fetch_url",
+                "vault_list"
+            ],
             "a browser and a vault do not stand in for run_code"
+        );
+        assert_eq!(
+            offered(PrincipalKind::Worker, Caps::NONE.with(Cap::Vault)),
+            offered(PrincipalKind::Worker, everything_else),
+            "vault_list needs only the vault"
         );
         for have in every_seat() {
             assert_eq!(offered(PrincipalKind::Router, have), ROUTER_TOOLS);

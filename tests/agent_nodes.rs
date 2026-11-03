@@ -15,7 +15,7 @@ use solos_agent_core::model::{AssignmentId, Effect, Stage, TicketId, TicketOutco
 use solos_agent_store::SqliteStore;
 use solos_swarm::agent::broker::{
     Account, AgentBroker, BrokerParts, DecideTerms, Grant, ModelTerms, Principal, SOCKET_FILE,
-    WORKER_TOOLS, WorkerParts, WorkerSeat,
+    WorkerParts, WorkerSeat,
 };
 use solos_swarm::agent::config::{AllowedNode, NodesConfig};
 use solos_swarm::agent::environment::{ExecutionEnvironment, Nodes, Work};
@@ -250,6 +250,7 @@ impl World {
             workers: Some(WorkerParts {
                 terms: terms(),
                 code: local,
+                vault: None,
             }),
         };
         let nodes = Nodes {
@@ -565,7 +566,16 @@ async fn a_claude_code_workers_tools_list_and_run_on_its_node() {
             .map(|tool| tool["name"].as_str().unwrap().to_owned())
             .collect()
     };
-    assert_eq!(w.broker.worker_tools(Some("laptop")), WORKER_TOOLS);
+    let on_the_node = [
+        "worker_report",
+        "worker_handback",
+        "run_code",
+        "job_start",
+        "job_wait",
+        "job_stop",
+        "fetch_url",
+    ];
+    assert_eq!(w.broker.worker_tools(Some("laptop")), on_the_node);
     let listed = through_mcp(&w, &here, &[]).await;
     assert_eq!(
         names(&listed[0]),
@@ -581,7 +591,7 @@ async fn a_claude_code_workers_tools_list_and_run_on_its_node() {
         Vec::new()
     };
     let answers = through_mcp(&w, &there, &calls).await;
-    assert_eq!(names(&answers[0]), WORKER_TOOLS, "run_code on the node");
+    assert_eq!(names(&answers[0]), on_the_node, "run_code on the node");
     if sandbox() {
         let text = |answer: &Value| -> Value {
             assert_eq!(answer["isError"], false, "{answer}");

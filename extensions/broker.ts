@@ -35,7 +35,7 @@ const ROUTER_TOOLS = [
   },
 ];
 
-const FETCH_URL = { name: "fetch_url", description: "Fetch one live http(s) URL through the broker; returns status, headers and bounded body. Your only network egress.", parameters: Type.Object({ url: Type.String({ minLength: 1, maxLength: 2048 }), method: Type.Optional(Type.String()), headers: Type.Optional(Type.Object({}, { additionalProperties: true })), body: Type.Optional(Type.String()), max_bytes: Type.Optional(Type.Number()) }) };
+const SWARM_FETCH_URL = { name: "fetch_url", description: "Fetch one live http(s) URL through the broker; returns status, headers and bounded body. Your only network egress.", parameters: Type.Object({ url: Type.String({ minLength: 1, maxLength: 2048 }), method: Type.Optional(Type.String()), headers: Type.Optional(Type.Object({}, { additionalProperties: true })), body: Type.Optional(Type.String()), max_bytes: Type.Optional(Type.Number()) }) };
 
 // Agent mode's worker: one Ticket. It reports instead of talking to people; SWARM_GRANTS narrows the set.
 const WORKER_TOOLS = [
@@ -78,7 +78,23 @@ const WORKER_TOOLS = [
     description: "Kill a job and return its end with what it printed that you had not read.",
     parameters: Type.Object({ job: Type.String({ minLength: 1 }) }),
   },
-  FETCH_URL,
+  {
+    name: "fetch_url",
+    description: "Fetch one live http(s) URL through the broker; returns status, headers and bounded body. Your only network egress. With key, the broker adds that API key from vault_list to the request, and to each redirect that stays on the key's hosts. You never see its value: a copy in the response reads [vault:<key>].",
+    parameters: Type.Object({
+      url: Type.String({ minLength: 1, maxLength: 2048 }),
+      method: Type.Optional(Type.String()),
+      headers: Type.Optional(Type.Object({}, { additionalProperties: true })),
+      body: Type.Optional(Type.String()),
+      max_bytes: Type.Optional(Type.Number()),
+      key: Type.Optional(Type.String({ minLength: 1, description: "An API key's name from vault_list, to authenticate this request." })),
+    }),
+  },
+  {
+    name: "vault_list",
+    description: "List the API keys and logins this ticket may use: their names, hosts or sites, usernames, what each is for, and whether a person must approve its first use on this ticket. You never see their values; pass a key's name as fetch_url's key to send it to the key's own hosts.",
+    parameters: Type.Object({}),
+  },
 ];
 
 function granted(name: string): boolean {
@@ -189,7 +205,7 @@ export default function swarmBroker(pi: ExtensionAPI) {
     { name: "submit_finding", description: "Submit your claimed task's structured result exactly as the Goal's worker prompt defines it. Immutable once accepted.", parameters: Type.Object({ task_id: Type.String(), result: Type.Object({}, { additionalProperties: true }) }) },
     { name: "read_findings", description: "Coordinator only: read completed findings from every worker.", parameters: Type.Object({}) },
     { name: "submit_artifact", description: "Coordinator only: submit the combined artifact exactly as the Goal's synthesis prompt defines it.", parameters: Type.Object({ artifact: Type.Object({}, { additionalProperties: true }) }) },
-    FETCH_URL,
+    SWARM_FETCH_URL,
     { name: "run_code", description: "Run one bash command in an isolated, CPU-only, offline Linux sandbox. The working directory and only writable path is /work. Read-only: /dataset (decoded Parquet), /regimes (source checkout), /venv (Python environment; use /venv/bin/python). No network, broker socket, host home, GPU, or credentials. Files are written into /work before the command. Returns bounded {exit_code,stdout,stderr,timed_out,duration_ms,truncated}. timeout_seconds is 1-300 (default 120).", parameters: Type.Object({ code: Type.String({ minLength: 1 }), files: Type.Optional(Type.Object({}, { additionalProperties: Type.String() })), timeout_seconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 300 })), stdin: Type.Optional(Type.String()) }) },
   ].filter((tool) => (process.env.SWARM_ROLE === "coordinator" || !["read_findings", "submit_artifact"].includes(tool.name))
     && granted(tool.name));

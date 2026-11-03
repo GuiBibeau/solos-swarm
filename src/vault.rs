@@ -438,10 +438,6 @@ impl KeyHeader {
     /// The keyed request builder: the key's header, marked sensitive, goes
     /// on `request` when its own URL is one of the key's hosts, so each
     /// redirect hop is judged by where it goes.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "fetch_url's keyed requests are its first caller")
-    )]
     pub(crate) fn reveal_into(&self, request: &mut reqwest::Request) {
         if !self.admits(request.url()) {
             return;
@@ -676,6 +672,11 @@ impl SandboxView {
         Self {
             visible: SYSTEM_BINDS.iter().map(PathBuf::from).chain(more).collect(),
         }
+    }
+
+    pub fn and(mut self, more: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.visible.extend(more);
+        self
     }
 
     /// Refused: `path`, after its symlinks, is under a visible path.

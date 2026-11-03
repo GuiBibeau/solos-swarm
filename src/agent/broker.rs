@@ -6,6 +6,7 @@
 //! settled against the principal's account in the agent Store.
 
 pub mod registry;
+mod secrets;
 
 use super::AgentConfig;
 use super::config::ExecutorConfig;
@@ -15,6 +16,7 @@ use super::ports::{Applied, Fact, FactSink};
 use crate::broker::{FETCH_TOTAL_BYTES, fetch, now_ms};
 use crate::code::CodeExecutor;
 use crate::gateway::{self, PriceTable, Provider, Receipt, Upstream};
+use crate::vault::Vault;
 use anyhow::{Context, Result, anyhow, ensure};
 use axum::{
     Json,
@@ -22,7 +24,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
-use registry::{Caps, PrincipalKind};
+use registry::{Cap, Caps, PrincipalKind};
 pub use registry::{ROUTER_TOOLS, WORKER_TOOLS};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -331,11 +333,18 @@ pub struct BrokerParts {
     pub workers: Option<WorkerParts>,
 }
 
-/// Every worker's model and its `run_code`.
 pub struct WorkerParts {
     pub terms: ModelTerms,
     /// `None`: this host offers workers no `run_code`.
     pub code: Option<Arc<CodeExecutor>>,
+    /// `None`: no `vault_list`, and `fetch_url` takes no key.
+    pub vault: Option<VaultParts>,
+}
+
+pub struct VaultParts {
+    pub vault: Vault,
+    /// A Channel here can ask a person to approve an item's first use.
+    pub takes_approvals: bool,
 }
 
 #[derive(Clone)]
@@ -352,6 +361,7 @@ struct Inner {
     workers: Option<WorkerParts>,
     /// `fetch_url`'s egress, apart from the provider's transport.
     client: reqwest::Client,
+    keyed: reqwest::Client,
     grants: RwLock<BTreeMap<String, Arc<Grant>>>,
     /// A settlement above its hold means the ledger no longer bounds spend,
     /// so every later model call is refused.
@@ -441,6 +451,11 @@ impl AgentBroker {
                 environments: Environments::new(local, nodes),
                 workers,
                 client: crate::swarm::http_client()?,
+                keyed: reqwest::Client::builder()
+                    .no_proxy()
+                    .connect_timeout(Duration::from_secs(10))
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()?,
                 grants: RwLock::new(BTreeMap::new()),
                 overrun: AtomicBool::new(false),
                 jobs,
@@ -487,25 +502,35 @@ impl AgentBroker {
     }
 
     /// What a worker whose Plan names `environment` may call: the worker
-    /// tools, less `run_code` and the job tools, which run in that
-    /// environment's sandbox, where it offers no `run_code`. A worker's
-    /// grants and its `GET /tools`.
+    /// tools, less `run_code` and the job tools where that environment
+    /// offers no `run_code`, and less `vault_list` where this host has no
+    /// vault. A worker's grants and its `GET /tools`.
     pub fn worker_tools(&self, environment: Option<&str>) -> Vec<&'static str> {
+        registry::offered(PrincipalKind::Worker, self.capabilities(environment))
+    }
+
+    fn capabilities(&self, environment: Option<&str>) -> Caps {
         let have = self.inner.environments.capabilities(environment);
-        registry::offered(PrincipalKind::Worker, have)
+        match self.vault() {
+            Some(_) => have.with(Cap::Vault),
+            None => have,
+        }
+    }
+
+    fn vault(&self) -> Option<&VaultParts> {
+        self.inner.workers.as_ref()?.vault.as_ref()
     }
 
     fn unmet_need(&self, principal: &Principal, name: &str) -> Option<String> {
-        let environments = &self.inner.environments;
         let (named, have) = match principal {
             Principal::Router => (None, Caps::NONE),
             Principal::Worker(seat) => {
                 let named = seat.environment.as_deref();
-                (named, environments.capabilities(named))
+                (named, self.capabilities(named))
             }
         };
         let missing = registry::unmet(principal.kind(), name, have)?;
-        Some(environments.why_lacks(named, missing))
+        Some(self.inner.environments.why_lacks(named, missing))
     }
 
     /// Refuse `token` from now on. A call already admitted finishes; a
@@ -834,6 +859,7 @@ async fn tool(
             seat.jobs.stop(args).await.map(Json).map_err(refused)
         }
         (Principal::Worker(seat), "fetch_url") => fetch_url(&broker, seat, args).await,
+        (Principal::Worker(seat), "vault_list") => secrets::vault_list(&broker, seat).await,
         _ => Err(forbidden("unknown tool")),
     }
 }
@@ -1160,16 +1186,23 @@ fn refused(refusal: Refused) -> Refusal {
 
 /// `fetch_url` with swarm mode's limits: each call's bounds in `fetch`, and
 /// a read budget across the Assignment's calls.
-async fn fetch_url(broker: &AgentBroker, seat: &Arc<WorkerSeat>, args: Value) -> Reply {
+async fn fetch_url(broker: &AgentBroker, seat: &Arc<WorkerSeat>, mut args: Value) -> Reply {
     if seat.fetched_bytes.load(Ordering::SeqCst) >= FETCH_TOTAL_BYTES {
         return Err(forbidden(format!(
             "read budget exhausted after {} MiB; stop fetching and report what you have with worker_report",
             FETCH_TOTAL_BYTES / (1024 * 1024)
         )));
     }
-    let response = fetch(&broker.inner.client, &args)
-        .await
-        .map_err(|err| refuse(StatusCode::BAD_GATEWAY, format!("{err:#}")))?;
+    let key = args
+        .as_object_mut()
+        .and_then(|args| args.remove("key"))
+        .filter(|key| !key.is_null());
+    let response = match key {
+        None => fetch(&broker.inner.client, &args)
+            .await
+            .map_err(|err| refuse(StatusCode::BAD_GATEWAY, format!("{err:#}")))?,
+        Some(key) => secrets::fetch(broker, seat, key, &args).await?,
+    };
     let bytes = response["body_bytes"].as_u64().unwrap_or(0);
     seat.fetched_bytes.fetch_add(bytes, Ordering::SeqCst);
     Ok(Json(response))
