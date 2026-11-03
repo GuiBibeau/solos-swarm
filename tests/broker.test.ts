@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -518,6 +519,27 @@ test("the worker tool set runs code, sees a refused report as a tool error, and 
     child.kill("SIGKILL");
     await new Promise<void>((done) => server.close(() => done()));
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("the router and worker tool schemas match the Rust registry that GET /tools and solos-swarm mcp serve", () => {
+  const saved = { grants: process.env.SWARM_GRANTS, toolset: process.env.SWARM_TOOLSET };
+  const restore = (name: string, value: string | undefined) => { if (value === undefined) delete process.env[name]; else process.env[name] = value; };
+  // The Rust test agent_tool_registry_matches_its_fixture holds the registry to the same file.
+  const registry = JSON.parse(readFileSync(resolve("tests/fixtures/agent-tools.json"), "utf8"));
+  try {
+    delete process.env.SWARM_GRANTS;
+    for (const toolset of ["router", "worker"]) {
+      process.env.SWARM_TOOLSET = toolset;
+      const declared: unknown[] = [];
+      swarmBroker({
+        registerProvider() {}, registerTool(tool) { declared.push({ name: tool.name, description: tool.description, input_schema: tool.parameters }); }, on() {},
+      } as ExtensionAPI);
+      assert.deepEqual(JSON.parse(JSON.stringify(declared)), registry[toolset], toolset);
+    }
+  } finally {
+    restore("SWARM_GRANTS", saved.grants);
+    restore("SWARM_TOOLSET", saved.toolset);
   }
 });
 

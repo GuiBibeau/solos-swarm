@@ -9,7 +9,7 @@ pub use watchdog::{OperatorConfig, ThresholdsConfig, WatchdogConfig};
 
 use super::goal_template::GoalTemplates;
 use super::jobs::{self, JobLimits};
-use super::{github, slack};
+use super::{github, mcp, slack};
 use crate::code::{self, Mount};
 use crate::gateway::{PriceTable, upstream_profile};
 use anyhow::{Context, Result, ensure};
@@ -67,6 +67,9 @@ pub enum SourceConfig {
     },
     /// Named schedules that fire as System Triggers of source `schedule`.
     Schedule { schedules: Vec<ScheduleConfig> },
+    /// Requests that operators file with `solos-swarm mcp --state-dir`, as
+    /// Triggers of source `mcp`, from an inbox in the state directory.
+    Mcp {},
 }
 
 fn slack_api_base() -> String {
@@ -93,6 +96,9 @@ pub enum ChannelConfig {
     /// Comments on issues and pull requests with the token and API base of
     /// the `github` Source. Serves replies to source `github`.
     Github {},
+    /// Appends replies to an outbox in the state directory, which
+    /// `solos-swarm mcp --state-dir` reads. Serves replies to source `mcp`.
+    Mcp {},
 }
 
 impl ChannelConfig {
@@ -101,6 +107,7 @@ impl ChannelConfig {
             Self::Jsonl { source, .. } => source,
             Self::Slack {} => slack::SOURCE,
             Self::Github {} => github::SOURCE,
+            Self::Mcp {} => mcp::SOURCE,
         }
     }
 }
@@ -306,13 +313,13 @@ impl AgentConfig {
                     *bot_token_file = base.join(&*bot_token_file);
                 }
                 SourceConfig::Github { token_file, .. } => *token_file = base.join(&*token_file),
-                SourceConfig::Schedule { .. } => {}
+                SourceConfig::Schedule { .. } | SourceConfig::Mcp {} => {}
             }
         }
         for channel in &mut config.channels {
             match channel {
                 ChannelConfig::Jsonl { path, .. } => *path = base.join(&*path),
-                ChannelConfig::Slack {} | ChannelConfig::Github {} => {}
+                ChannelConfig::Slack {} | ChannelConfig::Github {} | ChannelConfig::Mcp {} => {}
             }
         }
         if let ExecutorConfig::Pi {
@@ -359,6 +366,20 @@ impl AgentConfig {
             "the slack channel needs the slack source's bot token"
         );
         self.validate_github()?;
+        let mcp_sources = self
+            .sources
+            .iter()
+            .filter(|source| matches!(source, SourceConfig::Mcp {}))
+            .count();
+        ensure!(mcp_sources <= 1, "the agent config names two mcp sources");
+        ensure!(
+            mcp_sources == 0
+                || self
+                    .channels
+                    .iter()
+                    .any(|channel| matches!(channel, ChannelConfig::Mcp {})),
+            "the mcp source needs the mcp channel, or nobody hears back"
+        );
         self.validate_schedules(&served)?;
         self.validate_watchdog(&served)?;
         ensure!(
@@ -1061,6 +1082,54 @@ budgets: {session_microusd: 500000}
         ] {
             assert_ne!(yaml, VALID, "{case}: the case did not change the config");
             assert!(parse(&yaml).is_err(), "{case}: accepted");
+        }
+    }
+
+    #[test]
+    fn an_mcp_source_needs_the_mcp_channel_and_an_mcp_operator_needs_a_thread() {
+        let mcp = VALID
+            .replace(
+                "  - kind: jsonl\n    path: triggers.jsonl",
+                "  - kind: jsonl\n    path: triggers.jsonl\n  - kind: mcp",
+            )
+            .replace("channels:\n", "channels:\n  - kind: mcp\n");
+        let config = parse(&mcp).unwrap();
+        assert_eq!(config.sources[1], SourceConfig::Mcp {});
+        assert_eq!(config.channels[0].source(), "mcp");
+        let watched = format!(
+            "{mcp}watchdog:\n  operator: {{source: mcp, address: {{operator: ops, thread: alerts}}}}\n"
+        );
+        parse(&watched).unwrap();
+        for (case, yaml) in [
+            (
+                "no mcp channel",
+                mcp.replace("  - kind: mcp\n  - kind: jsonl", "  - kind: jsonl"),
+            ),
+            (
+                "a jsonl channel for mcp",
+                mcp.replace(
+                    "  - kind: mcp\n  - kind: jsonl",
+                    "  - {kind: jsonl, source: mcp, path: o}\n  - kind: jsonl",
+                ),
+            ),
+            (
+                "two mcp sources",
+                mcp.replace(
+                    "  - kind: mcp\nchannels",
+                    "  - kind: mcp\n  - kind: mcp\nchannels",
+                ),
+            ),
+            (
+                "an mcp operator with no thread",
+                watched.replace(", thread: alerts", ""),
+            ),
+            (
+                "an mcp operator with a colon",
+                watched.replace("operator: ops", "operator: 'o:ps'"),
+            ),
+        ] {
+            assert_ne!(yaml, mcp, "{case}: the case did not change the config");
+            assert!(parse(&yaml).is_err(), "{case}: accepted\n{yaml}");
         }
     }
 

@@ -72,6 +72,11 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   their own lines). The research words in the swarm runtime are now optional Goal fields: `nudges`, one template
   per escalation stage, and `record_fields`, the Task fields a host-filed record reads. `Goal::validate` checks
   them, a Goal template can set them, and a Goal without them runs exactly as before.
+- Agent mode, P7a: `solos-swarm mcp`, a hand-written stdio MCP server. `--socket --token-file` offers one principal's
+  broker tools (the broker's new `GET /tools`, from a Rust tool registry the Pi extension's schemas are tested
+  against), with refusals as `isError` results and pauses waited out; `--state-dir --operator` offers `agent_status`,
+  `agent_request` (a Trigger from `mcp:<operator>` through the new `kind: mcp` Source) and `agent_replies` (the
+  `kind: mcp` Channel's outbox).
 - `collect` leaves the per-run `code/` scratch directory on the host and writes `collect-manifest.json`; `--include-code` opts back in.
 - Docs: pause mode, self-update operations, dashboard tunnel, tournament runbook, replay status.
 
