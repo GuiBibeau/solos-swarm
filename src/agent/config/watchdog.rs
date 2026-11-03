@@ -3,7 +3,7 @@
 
 use super::{AgentConfig, Interval};
 use crate::agent::watchdog::Thresholds;
-use crate::agent::{github, mcp, slack};
+use crate::agent::{discord, github, mcp, slack};
 use anyhow::{Result, ensure};
 use serde::Deserialize;
 use solos_agent_core::model::ChannelRef;
@@ -27,7 +27,9 @@ pub struct WatchdogConfig {
 
 /// A conversation the operator reads, as a reply address: for Slack
 /// `{source: slack, address: {channel: D0123}}`, with `thread_ts` for a
-/// thread; for GitHub `{source: github, address: {repo: o/r, number: "7"}}`.
+/// thread; for Discord `{source: discord, address: {channel: "123"}}`, with
+/// `message_id` to reply to a message; for GitHub
+/// `{source: github, address: {repo: o/r, number: "7"}}`.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperatorConfig {
@@ -97,6 +99,12 @@ impl AgentConfig {
             slack::SOURCE => ensure!(
                 named("channel"),
                 "watchdog.operator on slack names no channel"
+            ),
+            discord::SOURCE => ensure!(
+                address
+                    .get("channel")
+                    .is_some_and(|id| discord::valid_id(id)),
+                "watchdog.operator on discord needs a channel id"
             ),
             github::SOURCE => ensure!(
                 address
@@ -239,6 +247,13 @@ budgets: {session_microusd: 500000}
                 "a share above the cap",
                 with(
                     "  operator: {source: ops, address: {channel: D1}}\n  thresholds: {spend_percent: 101}\n",
+                ),
+            ),
+            (
+                "a discord operator whose channel is not an id",
+                format!(
+                    "{}watchdog:\n  operator: {{source: discord, address: {{channel: general}}}}\n",
+                    slack_base.replace("source: ops", "source: discord")
                 ),
             ),
             (
