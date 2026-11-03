@@ -5,8 +5,8 @@
 
 use anyhow::{Result, anyhow};
 use solos_agent_core::model::{
-    Actor, AssignmentId, Candidate, ChannelRef, Decision, EvalId, Input, MicroUsd, OutboundMessage,
-    Plan, ReportIn, TicketId, Trigger, TriggerId, Verdict,
+    Actor, Ask, AssignmentId, Candidate, ChannelRef, Decision, EvalId, Input, MicroUsd,
+    OutboundMessage, Plan, ReportIn, SecretGrant, SecretId, TicketId, Trigger, TriggerId, Verdict,
 };
 use solos_agent_core::trail::{TrailAction, TrailOutcome};
 use solos_agent_store::EffectId;
@@ -36,14 +36,15 @@ pub enum SendOutcome {
 }
 
 /// What the runtime knows about a message beyond its content.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SendOptions {
     /// An earlier attempt may have sent it: one failed, or a crash ended the
     /// last run before the message was marked sent.
     pub repeat: bool,
-    /// It asks a person to approve its Ticket's budget, so a Channel with
-    /// buttons offers Approve and Stop.
-    pub approval: bool,
+    /// What a Channel with buttons offers for the message, filtered by the
+    /// runtime to the asks that still stand, so a Send retried after the
+    /// answer posts a plain message. Channels without buttons ignore it.
+    pub ask: Option<Ask>,
 }
 
 pub trait Channel: Send + Sync {
@@ -177,6 +178,26 @@ pub enum Fact {
         n: u32,
         outcome: TrailOutcome,
     },
+    /// A worker's tool needs a person to allow a vault item for the Ticket.
+    /// Asked, so the answer says whether the item waits, is allowed or was
+    /// denied; asking again changes nothing and posts nothing.
+    SecretAsk {
+        ticket: TicketId,
+        secret: SecretId,
+        /// From the item's metadata, never model or page text.
+        label: String,
+        /// `source:id`s that may answer; empty: the Policy's approvers.
+        answerable_by: Vec<String>,
+    },
+    /// A keyed request is about to leave. Asked, so it leaves only after the
+    /// commit.
+    KeyUsed {
+        ticket: TicketId,
+        assignment: AssignmentId,
+        secret: SecretId,
+        method: String,
+        url: String,
+    },
     /// The Watchdog retries a stalled Assignment, unless it has moved on
     /// since it had `reports` Reports.
     Retry {
@@ -202,12 +223,14 @@ pub struct Command {
     pub reply_to: ChannelRef,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Order {
     /// Approve the Ticket's budget, so its work launches.
     Approve,
     /// Stop the Ticket for good.
     Stop,
+    /// Allow or deny one vault item for the Ticket.
+    Secret { secret: SecretId, allow: bool },
 }
 
 /// What the Engine did with an asked fact.
@@ -223,6 +246,8 @@ pub enum Applied {
     TrailAsked {
         n: u32,
     },
+    /// The grant for a vault item after an ask: waiting, or already answered.
+    Secret(SecretGrant),
     Done,
 }
 

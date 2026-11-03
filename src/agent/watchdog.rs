@@ -800,6 +800,7 @@ impl Watchdog {
                     kind: MessageKind::Attention,
                     text,
                     ticket: alert.ticket,
+                    ask: None,
                 },
                 sent_ms: None,
             };
@@ -827,10 +828,7 @@ impl Watchdog {
         for row in self.store.unsent_alerts()? {
             // One recorded by an earlier run, or tried before, may have gone out.
             let repeat = !self.fresh.remove(&row.id);
-            let options = SendOptions {
-                repeat,
-                approval: false,
-            };
+            let options = SendOptions { repeat, ask: None };
             match self.channel.send(row.message, options).await {
                 Ok(outcome) => {
                     if outcome == SendOutcome::Gone {
@@ -965,6 +963,7 @@ mod tests {
             inputs: Vec::new(),
             assignments: Vec::new(),
             approval: Approval::NotNeeded,
+            secrets: BTreeMap::new(),
             attention: None,
             ended: None,
             created_ms,
@@ -1222,6 +1221,7 @@ mod tests {
                 kind: MessageKind::Result,
                 text: "done".into(),
                 ticket: Some(TicketId::new("tk1")),
+                ask: None,
             }),
             attempts,
             due_ms: T0,

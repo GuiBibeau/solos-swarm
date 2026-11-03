@@ -12,8 +12,8 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use solos_agent_core::ids::key;
 use solos_agent_core::model::{
-    Actor, Approval, AssignmentId, AssignmentState, Candidate, Effect, EvalId, Input, InputBody,
-    MessageId, MessageKind, Ms, OutboundMessage, Stage, Ticket, TicketId, Trigger,
+    Actor, AssignmentId, AssignmentState, Candidate, Effect, EvalId, Input, InputBody, MessageId,
+    MessageKind, Ms, OutboundMessage, Stage, Ticket, TicketId, Trigger,
 };
 use solos_agent_core::{AllowlistPolicy, Engine, Error, Intake, Policy, Repositories};
 use solos_agent_store::{EffectId, QueuedEffect, SqliteStore};
@@ -414,6 +414,29 @@ impl Runtime {
                     .trail_done(&ticket, &assignment, n, outcome)
                     .map(done),
             ),
+            Fact::SecretAsk {
+                ticket,
+                secret,
+                label,
+                answerable_by,
+            } => (
+                format!("secret ask of {secret} on {ticket}"),
+                self.engine
+                    .ask_secret(&ticket, &secret, &label, &answerable_by)
+                    .map(Applied::Secret),
+            ),
+            Fact::KeyUsed {
+                ticket,
+                assignment,
+                secret,
+                method,
+                url,
+            } => (
+                format!("keyed use of {secret} by {assignment} on {ticket}"),
+                self.engine
+                    .use_key(&ticket, &assignment, &secret, &method, &url)
+                    .map(done),
+            ),
             Fact::Retry {
                 ticket,
                 assignment,
@@ -495,7 +518,7 @@ impl Runtime {
         } = command;
         let who = by.name.clone().unwrap_or_else(|| by.id.clone());
         let policy = self.engine.policy();
-        let outcome = match order {
+        let outcome = match &order {
             Order::Approve if !policy.may_approve(&source, &by) => {
                 Err(format!("{who} is not allowed to approve budgets."))
             }
@@ -511,6 +534,14 @@ impl Runtime {
                     .stop_ticket(&ticket, &format!("stopped by {who} on {source}")),
                 format!("Stopped by {who}."),
             )?,
+            Order::Secret { secret, allow } => told(
+                self.engine
+                    .answer_secret(&ticket, secret, &source, by.clone(), *allow),
+                format!(
+                    "{} by {who}: {secret} for this ticket.",
+                    if *allow { "Allowed" } else { "Denied" }
+                ),
+            )?,
         };
         let text = outcome.unwrap_or_else(|refused| {
             eprintln!(
@@ -525,6 +556,7 @@ impl Runtime {
             kind: MessageKind::Acknowledgement,
             text,
             ticket: Some(ticket),
+            ask: None,
         });
         Ok(())
     }
@@ -667,17 +699,14 @@ impl Runtime {
                 reason,
             },
             Effect::Send(message) => {
-                // The Engine keeps the approval question as the Ticket's attention.
-                let approval = message.kind == MessageKind::Attention
-                    && message
+                let ask = message.ask.clone().filter(|ask| {
+                    message
                         .ticket
                         .as_ref()
                         .and_then(|id| store.ticket(id))
-                        .is_some_and(|t| {
-                            t.approval == Approval::Waiting
-                                && t.attention.as_deref() == Some(message.text.as_str())
-                        });
-                Job::Send(message, SendOptions { repeat, approval })
+                        .is_some_and(|t| t.awaits(ask))
+                });
+                Job::Send(message, SendOptions { repeat, ask })
             }
         })
     }
@@ -889,8 +918,123 @@ impl Job {
 
 #[cfg(test)]
 mod tests {
-    use super::{RunOptions, backoff};
+    use super::{Adapters, Job, RunOptions, Runtime, backoff};
+    use crate::agent::scripted::{ScriptedExecutor, ScriptedRouter};
+    use solos_agent_core::model::{
+        Accept, Acknowledge, Actor, Addressed, Ask, ChannelRef, Effect, Plan, SecretId, ThreadKey,
+        TicketId, Trigger, TriggerId, Verdict,
+    };
+    use solos_agent_core::{AllowlistPolicy, Repositories};
+    use solos_agent_store::SqliteStore;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
     use std::time::Duration;
+
+    fn runtime_with_a_ticket(budget_microusd: u64) -> (Runtime, TicketId) {
+        let policy = AllowlistPolicy {
+            people: ["slack:alice".to_owned()].into(),
+            approvers: ["slack:alice".to_owned()].into(),
+            auto_approve_microusd: 1_000_000,
+            ..AllowlistPolicy::default()
+        };
+        let adapters = Adapters {
+            sources: Vec::new(),
+            channels: BTreeMap::new(),
+            router: Arc::new(ScriptedRouter::new(budget_microusd)),
+            executor: Arc::new(ScriptedExecutor),
+        };
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut runtime = Runtime::new(store, policy, adapters, RunOptions::default());
+        runtime
+            .engine
+            .receive(Trigger {
+                id: TriggerId::new("t1"),
+                source: "slack".into(),
+                at_ms: 1_000,
+                actor: Actor::person("alice"),
+                addressed: Addressed::Mention,
+                text: "triage my notifications".into(),
+                threads: vec![ThreadKey::new("th1")],
+                reply_to: vec![ChannelRef {
+                    source: "slack".into(),
+                    address: BTreeMap::from([("channel".to_owned(), "C1".to_owned())]),
+                }],
+                meta: serde_json::Value::Null,
+            })
+            .unwrap();
+        let eval = runtime.engine.evaluate_due().unwrap().remove(0);
+        let accept = Verdict::Accept(Accept {
+            title: "Triage".into(),
+            scope: "triage".into(),
+            reason: "alice asked".into(),
+            plan: Plan::Session {
+                harness: None,
+                environment: None,
+            },
+            budget_microusd,
+            acknowledge: Acknowledge::Standard,
+            rules: Vec::new(),
+        });
+        let decision = runtime.engine.decide(&eval, accept).unwrap();
+        let ticket = runtime.engine.repos().decision(&decision).unwrap().ticket;
+        (runtime, ticket.unwrap())
+    }
+
+    fn offered(runtime: &Runtime) -> Vec<Option<Ask>> {
+        let sends = runtime.engine.repos().pending_effects().unwrap();
+        sends
+            .into_iter()
+            .filter(|q| matches!(q.effect, Effect::Send(_)))
+            .map(|q| match runtime.job(q.effect, false).unwrap() {
+                Job::Send(_, options) => options.ask,
+                _ => unreachable!("a Send is a Send"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_secret_ask_has_buttons_only_while_its_grant_waits() {
+        let (mut runtime, ticket) = runtime_with_a_ticket(500_000);
+        let secret = SecretId::try_from("local/github-gui".to_owned()).unwrap();
+        let ask = Some(Ask::Secret {
+            secret: secret.clone(),
+        });
+        runtime
+            .engine
+            .ask_secret(&ticket, &secret, "sign in", &[])
+            .unwrap();
+        assert_eq!(
+            offered(&runtime),
+            [None, ask],
+            "the acknowledgement, then the ask"
+        );
+
+        runtime
+            .engine
+            .answer_secret(&ticket, &secret, "slack", Actor::person("alice"), true)
+            .unwrap();
+        assert_eq!(
+            offered(&runtime),
+            [None, None],
+            "the same Send, retried after the answer, posts a plain message"
+        );
+    }
+
+    #[test]
+    fn a_budget_ask_has_buttons_only_while_the_approval_waits() {
+        let (mut runtime, ticket) = runtime_with_a_ticket(5_000_000);
+        assert_eq!(offered(&runtime), [Some(Ask::Budget)]);
+
+        runtime
+            .engine
+            .approve(&ticket, "slack", Actor::person("alice"))
+            .unwrap();
+        assert_eq!(offered(&runtime), [None]);
+
+        let (mut runtime, ticket) = runtime_with_a_ticket(5_000_000);
+        runtime.engine.stop_ticket(&ticket, "stopped").unwrap();
+        assert_eq!(offered(&runtime), [None], "a stopped Ticket asks nothing");
+    }
 
     #[test]
     fn backoff_doubles_up_to_its_cap() {

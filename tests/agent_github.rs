@@ -770,6 +770,7 @@ fn outbound(id: &str, kind: MessageKind, number: u64, text: &str) -> OutboundMes
         kind,
         text: text.into(),
         ticket: Some(TicketId::new("tk_1")),
+        ask: None,
     }
 }
 

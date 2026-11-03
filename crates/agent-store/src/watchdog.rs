@@ -152,6 +152,7 @@ mod tests {
                 kind: MessageKind::Attention,
                 text: "stalled".into(),
                 ticket: Some(TicketId::new("tk_1")),
+                ask: None,
             },
             sent_ms: None,
         }

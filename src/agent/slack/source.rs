@@ -3,7 +3,8 @@
 //! envelope by its id.
 
 use super::{
-    APPROVE_ACTION, Answer, SOURCE, STOP_ACTION, SlackApi, Token, TokenRefused, reply_to, thread,
+    ALLOW_SECRET_ACTION, APPROVE_ACTION, Answer, DENY_SECRET_ACTION, SOURCE, STOP_ACTION,
+    SecretClick, SlackApi, Token, TokenRefused, reply_to, thread,
 };
 use crate::agent::ports::{
     BoxFuture, Command, Fact, FactSink, Order, RetryAfter, Source, TriggerSink,
@@ -342,8 +343,8 @@ impl SlackSource {
         })
     }
 
-    /// The Approve and Stop clicks of a `block_actions` payload. Slack
-    /// vouches for the user; the runtime asks the Policy what they may do.
+    /// The button clicks of a `block_actions` payload. Slack vouches for the
+    /// user; the runtime asks the Policy what they may do.
     fn commands(&self, payload: &Value) -> Vec<Command> {
         let text = |value: &Value| value.as_str().map(str::to_owned);
         if payload["type"] != "block_actions" {
@@ -382,16 +383,22 @@ impl SlackSource {
             .iter()
             .filter_map(|action| {
                 let id = action["action_id"].as_str()?;
-                let order = match id {
-                    APPROVE_ACTION => Order::Approve,
-                    STOP_ACTION => Order::Stop,
+                let value = action["value"].as_str()?;
+                let (order, ticket) = match id {
+                    APPROVE_ACTION => (Order::Approve, TicketId::new(value)),
+                    STOP_ACTION => (Order::Stop, TicketId::new(value)),
+                    ALLOW_SECRET_ACTION | DENY_SECRET_ACTION => {
+                        let SecretClick { ticket, secret } = serde_json::from_str(value).ok()?;
+                        let allow = id == ALLOW_SECRET_ACTION;
+                        (Order::Secret { secret, allow }, ticket)
+                    }
                     _ => return None,
                 };
                 let at = action["action_ts"].as_str().unwrap_or_default();
                 Some(Command {
                     id: format!("{SOURCE}:{channel}:{at}:{user}:{id}"),
                     order,
-                    ticket: TicketId::new(action["value"].as_str()?),
+                    ticket,
                     source: SOURCE.into(),
                     by: by.clone(),
                     reply_to: reply_to(&channel, Some(&root)),

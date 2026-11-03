@@ -43,6 +43,55 @@ ids!(
     MessageId,
 );
 
+/// The longest [`SecretId`]. Discord's `custom_id` holds 100 characters and
+/// carries the action, the Ticket id and the secret.
+pub const MAX_SECRET_CHARS: usize = 60;
+
+/// A vault item as a Ticket names it: `<environment>/<name>`, such as
+/// `local/github-gui`. Both sides are ASCII letters, digits, `-` and `_`, so
+/// no `:` splits a Discord `custom_id` wrongly and nothing needs escaping.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct SecretId(String);
+
+impl SecretId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl TryFrom<String> for SecretId {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, String> {
+        let part = |side: &str| {
+            !side.is_empty()
+                && side
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        };
+        let shaped = value
+            .split_once('/')
+            .is_some_and(|(environment, name)| part(environment) && part(name));
+        if shaped && value.len() <= MAX_SECRET_CHARS {
+            Ok(Self(value))
+        } else {
+            Err(format!(
+                "expected <environment>/<name> of ASCII letters, digits, '-' and '_', \
+                 at most {MAX_SECRET_CHARS} characters"
+            ))
+        }
+    }
+}
+impl From<SecretId> for String {
+    fn from(value: SecretId) -> String {
+        value.0
+    }
+}
+impl std::fmt::Display for SecretId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActorKind {
@@ -227,6 +276,29 @@ pub enum Approval {
     Granted { by: Actor, at_ms: Ms },
 }
 
+/// A person's decision on one vault item for one Ticket. Granted and Denied
+/// are final for the Ticket's life.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SecretGrant {
+    Waiting {
+        /// From the item's metadata, never model or page text.
+        label: String,
+        /// `source:id`s that may answer; empty: the Policy's approvers.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        answerable_by: Vec<String>,
+        asked_ms: Ms,
+    },
+    Granted {
+        by: Actor,
+        at_ms: Ms,
+    },
+    Denied {
+        by: Actor,
+        at_ms: Ms,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InputBody {
@@ -239,6 +311,13 @@ pub enum InputBody {
         text: String,
     },
     Approved {
+        by: Actor,
+    },
+    /// A person's click on a vault item's Allow or Deny. Typed text never
+    /// becomes one.
+    Secret {
+        secret: SecretId,
+        granted: bool,
         by: Actor,
     },
 }
@@ -348,6 +427,9 @@ pub struct Ticket {
     #[serde(default)]
     pub assignments: Vec<Assignment>,
     pub approval: Approval,
+    /// Approvals of vault items for this Ticket, held across its Assignments.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secrets: BTreeMap<SecretId, SecretGrant>,
     /// The question waiting for a person, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention: Option<String>,
@@ -377,6 +459,17 @@ impl Ticket {
     }
     pub fn stopped_by_person(&self) -> bool {
         self.ended.as_ref().is_some_and(|e| e.by == EndedBy::Person)
+    }
+    /// Whether `ask` still stands: the Ticket is open and its question has
+    /// not been answered.
+    pub fn awaits(&self, ask: &Ask) -> bool {
+        self.ended.is_none()
+            && match ask {
+                Ask::Budget => self.approval == Approval::Waiting,
+                Ask::Secret { secret } => {
+                    matches!(self.secrets.get(secret), Some(SecretGrant::Waiting { .. }))
+                }
+            }
     }
     /// The latest Report is `blocked` or `failed` and no person wrote since:
     /// automatic Inputs (bots, CI) are held until someone does.
@@ -520,6 +613,16 @@ pub enum MessageKind {
     Attention,
 }
 
+/// What a message asks a person, so a Channel with buttons can offer them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Ask {
+    /// Approve or Stop the Ticket's budget.
+    Budget,
+    /// Allow or Deny one vault item for the Ticket.
+    Secret { secret: SecretId },
+}
+
 /// A message for a Channel.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboundMessage {
@@ -529,6 +632,8 @@ pub struct OutboundMessage {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket: Option<TicketId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask: Option<Ask>,
 }
 
 /// What the Router sees of a Ticket when it judges a candidate.
@@ -658,6 +763,24 @@ pub enum DomainEvent {
         assignment: AssignmentId,
         n: u32,
         outcome: TrailOutcome,
+    },
+    SecretAsked {
+        ticket: TicketId,
+        secret: SecretId,
+    },
+    SecretAnswered {
+        ticket: TicketId,
+        secret: SecretId,
+        by: Actor,
+        granted: bool,
+    },
+    /// Written before a keyed `fetch_url` leaves.
+    KeyUsed {
+        ticket: TicketId,
+        assignment: AssignmentId,
+        secret: SecretId,
+        method: String,
+        url: String,
     },
 }
 

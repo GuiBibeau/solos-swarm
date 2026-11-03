@@ -56,10 +56,14 @@ use zeroize::Zeroizing;
 
 pub const SOURCE: &str = "discord";
 pub const DEFAULT_API_BASE: &str = "https://discord.com/api/v10/";
-/// The `custom_id` prefixes of an approval request's buttons. Each is
-/// followed by `:` and the Ticket id.
+/// The `custom_id` prefixes of an approval request's buttons. A budget
+/// button is followed by `:` and the Ticket id.
 pub const APPROVE_ACTION: &str = "solos_approve";
 pub const STOP_ACTION: &str = "solos_stop";
+/// The prefixes of a vault item's Allow and Deny. Each is followed by `:`, the
+/// Ticket id, `:` and the item's `SecretId`, which holds no `:`.
+pub const ALLOW_SECRET_ACTION: &str = "solos_secret_allow";
+pub const DENY_SECRET_ACTION: &str = "solos_secret_deny";
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RETRY_AFTER: f64 = 3_600.0;

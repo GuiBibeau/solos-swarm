@@ -158,7 +158,7 @@ fn state_survives_closing_and_reopening_the_file() {
     assert_eq!(store.effects().unwrap(), queue);
     assert_eq!(store.open_tickets().unwrap(), open);
     assert_eq!(store.verify_chain().unwrap(), chain);
-    assert_eq!(store.schema_version().unwrap(), 4);
+    assert_eq!(store.schema_version().unwrap(), 5);
     for t in &before.triggers {
         assert_eq!(store.trigger(&t.id).as_ref(), Some(t));
     }
@@ -272,7 +272,7 @@ fn a_file_store_uses_wal_and_migrates_once() {
     let db = TempDb::new("wal");
     drop(SqliteStore::open(&db.path).unwrap());
     let store = SqliteStore::open(&db.path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 4);
+    assert_eq!(store.schema_version().unwrap(), 5);
     let raw = db.raw();
     let mode: String = raw
         .query_row("PRAGMA journal_mode", [], |row| row.get(0))
@@ -281,5 +281,5 @@ fn a_file_store_uses_wal_and_migrates_once() {
     let rows: u32 = raw
         .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(rows, 4, "one row per migration");
+    assert_eq!(rows, 5, "one row per migration");
 }

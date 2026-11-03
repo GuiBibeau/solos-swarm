@@ -20,8 +20,8 @@ use common::{
 };
 use solos_agent_core::model::{
     Accept, Acknowledge, Actor, Addressed, Approval, AssignmentId, AssignmentState, ChannelRef,
-    Effect, EvalId, InputBody, Plan, ReportIn, ReportStatus, ThreadKey, Ticket, TicketId, Trigger,
-    TriggerId, Verdict,
+    Effect, EvalId, InputBody, Plan, ReportIn, ReportStatus, SecretGrant, SecretId, ThreadKey,
+    Ticket, TicketId, Trigger, TriggerId, Verdict,
 };
 use solos_agent_core::trail::{
     ActText, CloseReason, Digest, MAX_URL_CHARS, PageAction, StepOutcome, TrailAction, TrailOutcome,
@@ -36,9 +36,10 @@ use std::rc::Rc;
 use std::time::Instant;
 
 const THREADS: [&str; 3] = ["th1", "th2", "th3"];
+const SECRETS: [&str; 3] = ["local/github-gui", "local/openai", "laptop/gh"];
 
 /// Every public Engine command, by the name `Op::name` gives it.
-const COMMANDS: [&str; 16] = [
+const COMMANDS: [&str; 19] = [
     "receive",
     "evaluate_due",
     "decide(accept)",
@@ -55,6 +56,9 @@ const COMMANDS: [&str; 16] = [
     "report",
     "trail_ask",
     "trail_done",
+    "ask_secret",
+    "answer_secret",
+    "use_key",
 ];
 
 struct Lcg(u64);
@@ -100,6 +104,9 @@ enum Op {
     Report(TicketId, AssignmentId, ReportIn),
     TrailAsk(TicketId, AssignmentId, TrailAction),
     TrailDone(TicketId, AssignmentId, u32, TrailOutcome),
+    AskSecret(TicketId, SecretId, String, Vec<String>),
+    AnswerSecret(TicketId, SecretId, String, Actor, bool),
+    UseKey(TicketId, AssignmentId, SecretId, String, String),
     SetPolicy(AllowlistPolicy),
     Advance(u64),
     /// SQLite only: the effect runner takes up to this many due Effects.
@@ -127,6 +134,9 @@ impl Op {
             Op::Report(..) => "report",
             Op::TrailAsk(..) => "trail_ask",
             Op::TrailDone(..) => "trail_done",
+            Op::AskSecret(..) => "ask_secret",
+            Op::AnswerSecret(..) => "answer_secret",
+            Op::UseKey(..) => "use_key",
             Op::SetPolicy(_) => "set_policy",
             Op::Advance(_) => "advance_clock",
             Op::RunEffects(_) => "run_effects",
@@ -156,6 +166,13 @@ fn apply<R: Repositories>(
         Op::Report(t, a, r) => e.report(t, a, r.clone()).map(unit),
         Op::TrailAsk(t, a, action) => e.trail_ask(t, a, action.clone()).map(|n| n.to_string()),
         Op::TrailDone(t, a, n, outcome) => e.trail_done(t, a, *n, outcome.clone()).map(unit),
+        Op::AskSecret(t, secret, label, by) => e
+            .ask_secret(t, secret, label, by)
+            .map(|grant| format!("{grant:?}")),
+        Op::AnswerSecret(t, secret, source, by, allow) => e
+            .answer_secret(t, secret, source, by.clone(), *allow)
+            .map(unit),
+        Op::UseKey(t, a, secret, method, url) => e.use_key(t, a, secret, method, url).map(unit),
         Op::SetPolicy(p) => {
             e.set_policy(p.clone());
             Ok(String::new())
@@ -517,9 +534,106 @@ fn gen_trail_done(rng: &mut Lcg, r: &MemoryRepositories) -> Op {
     Op::TrailDone(ticket, assignment, 1, outcome)
 }
 
+fn waiting_secrets(t: &Ticket) -> Vec<SecretId> {
+    t.secrets
+        .iter()
+        .filter(|(_, grant)| matches!(grant, SecretGrant::Waiting { .. }))
+        .map(|(secret, _)| secret.clone())
+        .collect()
+}
+
+fn gen_secret(rng: &mut Lcg) -> SecretId {
+    SecretId::try_from(rng.pick(&SECRETS).to_owned()).unwrap()
+}
+
+fn gen_answerable_by(rng: &mut Lcg) -> Vec<String> {
+    let names = |list: &[&str]| list.iter().map(|s| (*s).to_owned()).collect();
+    match rng.below(8) {
+        0 | 1 => Vec::new(),
+        2 | 3 => names(&["slack:alice"]),
+        4 => names(&["slack:bob"]),
+        5 => names(&["slack:alice", "slack:bob"]),
+        6 => names(&["slack:ci-bot", "slack:mallory"]),
+        _ => names(&["github:alice"]),
+    }
+}
+
+fn gen_ask_secret(rng: &mut Lcg, r: &MemoryRepositories) -> Op {
+    let asked: Vec<(TicketId, SecretId)> = r
+        .tickets
+        .values()
+        .filter(|t| t.ended.is_none())
+        .flat_map(|t| t.secrets.keys().map(|s| (t.id.clone(), s.clone())))
+        .collect();
+    let (ticket, secret) = if !asked.is_empty() && rng.chance(35) {
+        rng.pick(&asked)
+    } else {
+        (pick_ticket(rng, r, |t| t.ended.is_none()), gen_secret(rng))
+    };
+    let label = match rng.below(20) {
+        0 => String::new(),
+        1 => "  ".to_owned(),
+        _ => "sign in to https://github.com as gui".to_owned(),
+    };
+    Op::AskSecret(ticket, secret, label, gen_answerable_by(rng))
+}
+
+fn gen_answer_secret(rng: &mut Lcg, r: &MemoryRepositories) -> Op {
+    let ticket = pick_ticket(rng, r, |t| {
+        t.ended.is_none() && !waiting_secrets(t).is_empty()
+    });
+    let waiting = r
+        .tickets
+        .get(&ticket)
+        .map(waiting_secrets)
+        .unwrap_or_default();
+    let secret = if !waiting.is_empty() && rng.chance(85) {
+        rng.pick(&waiting)
+    } else {
+        gen_secret(rng)
+    };
+    let source = if rng.chance(85) { "slack" } else { "github" };
+    let by = match rng.below(20) {
+        0..=9 => Actor::person("alice"),
+        10..=13 => Actor::person("bob"),
+        14 | 15 => Actor::person("mallory"),
+        16 | 17 => Actor::bot("ci-bot"),
+        _ => Actor::system("schedule"),
+    };
+    Op::AnswerSecret(ticket, secret, source.into(), by, rng.chance(50))
+}
+
+fn gen_use_key(rng: &mut Lcg, r: &MemoryRepositories) -> Op {
+    let ticket = pick_ticket(rng, r, |t| latest_is(t, AssignmentState::Running));
+    let assignment = pick_assignment(rng, r, &ticket);
+    let held: Vec<SecretId> = r
+        .tickets
+        .get(&ticket)
+        .map(|t| t.secrets.keys().cloned().collect())
+        .unwrap_or_default();
+    let secret = if !held.is_empty() && rng.chance(60) {
+        rng.pick(&held)
+    } else {
+        gen_secret(rng)
+    };
+    let method = match rng.below(20) {
+        0..=14 => "GET",
+        15 | 16 => "POST",
+        17 => "get",
+        18 => "",
+        _ => "ABCDEFGHIJKLMNOPQ",
+    };
+    let url = match rng.below(20) {
+        0..=16 => "https://api.openai.com/v1/models?q=ünï".to_owned(),
+        17 | 18 => format!("https://example.com/{}", "a".repeat(MAX_URL_CHARS)),
+        _ => "é".repeat(MAX_URL_CHARS),
+    };
+    Op::UseKey(ticket, assignment, secret, method.to_owned(), url)
+}
+
 fn gen_op(rng: &mut Lcg, w: &mut Walk) -> Op {
     let r = w.mem.repos();
-    match rng.below(112) {
+    match rng.below(130) {
         0..=19 => Op::Receive(gen_trigger(rng, r, &mut w.fresh, w.now.get())),
         20..=29 => Op::EvaluateDue,
         30..=41 => gen_decide(rng, r),
@@ -596,6 +710,9 @@ fn gen_op(rng: &mut Lcg, w: &mut Walk) -> Op {
             Op::TrailAsk(t, a, gen_action(rng))
         }
         103..=108 => gen_trail_done(rng, r),
+        112..=117 => gen_ask_secret(rng, r),
+        118..=125 => gen_answer_secret(rng, r),
+        126..=129 => gen_use_key(rng, r),
         _ if w.db.is_some() => Op::Reopen,
         _ => Op::EvaluateDue,
     }

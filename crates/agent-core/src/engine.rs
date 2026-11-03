@@ -5,19 +5,20 @@
 
 use crate::ids::key;
 use crate::model::{
-    Accept, Acknowledge, Actor, Approval, Assignment, AssignmentId, AssignmentState, Candidate,
-    ChangeSet, Decision, DecisionId, DecisionKind, DomainEvent, Effect, Ended, EndedBy, Eval,
-    EvalId, Event, Input, InputBody, InputId, Mandate, MessageId, MessageKind, MicroUsd, Ms,
-    OutboundMessage, Plan, Report, ReportIn, ReportStatus, Strength, Thread, ThreadKey, Ticket,
-    TicketId, TicketOutcome, TicketSummary, Trigger, TriggerId, Verdict,
+    Accept, Acknowledge, Actor, Approval, Ask, Assignment, AssignmentId, AssignmentState,
+    Candidate, ChangeSet, Decision, DecisionId, DecisionKind, DomainEvent, Effect, Ended, EndedBy,
+    Eval, EvalId, Event, Input, InputBody, InputId, Mandate, MessageId, MessageKind, MicroUsd, Ms,
+    OutboundMessage, Plan, Report, ReportIn, ReportStatus, SecretGrant, SecretId, Strength, Thread,
+    ThreadKey, Ticket, TicketId, TicketOutcome, TicketSummary, Trigger, TriggerId, Verdict,
 };
 use crate::ports::{Clock, Error, Gate, Policy, Repositories};
 use crate::trail::{self, TrailAction, TrailCursor, TrailOutcome};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The third consecutive expired Eval on a Thread records `unavailable`.
 pub const MAX_EXPIRED_EVALS: u32 = 3;
 pub const MAX_SWARM_AGENTS: u16 = 30;
+const MAX_METHOD_CHARS: usize = 16;
 
 /// What `receive` did with a Trigger.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -408,11 +409,11 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
             let ends = matches!(report.status, ReportStatus::Ready | ReportStatus::Dropped);
             if !ends && let Some(question) = &report.question {
                 t.attention = Some(question.clone());
-                tx.send(&mut t, MessageKind::Attention, question.clone());
+                tx.send(&mut t, MessageKind::Attention, question.clone(), None);
             }
             match report.status {
                 ReportStatus::Ready => {
-                    tx.send(&mut t, MessageKind::Result, report.text);
+                    tx.send(&mut t, MessageKind::Result, report.text, None);
                     tx.end_ticket(&mut t, EndedBy::Executor, TicketOutcome::Completed, "ready");
                 }
                 ReportStatus::Dropped => {
@@ -424,7 +425,7 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
                     );
                 }
                 ReportStatus::Blocked | ReportStatus::Failed if report.question.is_none() => {
-                    tx.send(&mut t, MessageKind::Attention, report.text);
+                    tx.send(&mut t, MessageKind::Attention, report.text, None);
                 }
                 _ => {}
             }
@@ -511,6 +512,149 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
                 outcome: outcome.bounded(),
             });
             tx.save_trail(cursor);
+            Ok(())
+        })
+    }
+
+    /// Ask a person to approve the vault item `secret` for the Ticket, once.
+    /// An existing grant, in any state, is returned unchanged and commits
+    /// nothing, so a worker that retries while it waits cannot fill the
+    /// thread. `label` and `answerable_by` come from the item's metadata.
+    pub fn ask_secret(
+        &mut self,
+        ticket: &TicketId,
+        secret: &SecretId,
+        label: &str,
+        answerable_by: &[String],
+    ) -> Result<SecretGrant, Error> {
+        self.run(|tx, _| {
+            let mut t = tx.open_ticket(ticket)?;
+            if let Some(grant) = t.secrets.get(secret) {
+                return Ok(grant.clone());
+            }
+            if label.trim().is_empty() {
+                return Err(Error::Invalid("a secret's label is empty".into()));
+            }
+            let grant = SecretGrant::Waiting {
+                label: label.to_owned(),
+                answerable_by: answerable_by.to_vec(),
+                asked_ms: tx.now,
+            };
+            t.secrets.insert(secret.clone(), grant.clone());
+            tx.event(DomainEvent::SecretAsked {
+                ticket: t.id.clone(),
+                secret: secret.clone(),
+            });
+            let text = format!("{} wants to {label} for the first time.", t.title);
+            let ask = Ask::Secret {
+                secret: secret.clone(),
+            };
+            tx.send(&mut t, MessageKind::Attention, text, Some(ask));
+            tx.save_ticket(t);
+            Ok(grant)
+        })
+    }
+
+    /// A person's Allow or Deny, from a Source's own controls and never from
+    /// message text. Only the item's own `answerable_by` may answer, or the
+    /// Policy's approvers when that list is empty. The answer reaches the
+    /// worker as an Input.
+    pub fn answer_secret(
+        &mut self,
+        ticket: &TicketId,
+        secret: &SecretId,
+        source: &str,
+        by: Actor,
+        allow: bool,
+    ) -> Result<(), Error> {
+        self.run(|tx, policy| {
+            let mut t = tx.open_ticket(ticket)?;
+            let Some(SecretGrant::Waiting { answerable_by, .. }) = t.secrets.get(secret) else {
+                return Err(Error::Refused(format!(
+                    "{secret} does not wait for an answer"
+                )));
+            };
+            let may = by.is_person()
+                && if answerable_by.is_empty() {
+                    policy.may_approve(source, &by)
+                } else {
+                    answerable_by.contains(&format!("{source}:{}", by.id))
+                };
+            if !may {
+                let who = by.name.as_deref().unwrap_or(&by.id);
+                return Err(Error::Refused(format!("{who} may not answer for {secret}")));
+            }
+            let at_ms = tx.now;
+            let grant = if allow {
+                SecretGrant::Granted {
+                    by: by.clone(),
+                    at_ms,
+                }
+            } else {
+                SecretGrant::Denied {
+                    by: by.clone(),
+                    at_ms,
+                }
+            };
+            t.secrets.insert(secret.clone(), grant);
+            tx.event(DomainEvent::SecretAnswered {
+                ticket: t.id.clone(),
+                secret: secret.clone(),
+                by: by.clone(),
+                granted: allow,
+            });
+            let body = InputBody::Secret {
+                secret: secret.clone(),
+                granted: allow,
+                by,
+            };
+            tx.add_input(&mut t, body, true);
+            tx.save_ticket(t);
+            Ok(())
+        })
+    }
+
+    /// Record that `assignment` is about to send a request with the vault
+    /// key `secret`, before it leaves, so a use never goes unrecorded. No
+    /// state changes, and a Denied item is refused.
+    pub fn use_key(
+        &mut self,
+        ticket: &TicketId,
+        assignment: &AssignmentId,
+        secret: &SecretId,
+        method: &str,
+        url: &str,
+    ) -> Result<(), Error> {
+        self.run(|tx, _| {
+            let t = tx.open_ticket(ticket)?;
+            if t.running_assignment().is_none_or(|a| a.id != *assignment) {
+                return Err(Error::Refused(format!("{assignment} is not running")));
+            }
+            if matches!(t.secrets.get(secret), Some(SecretGrant::Denied { .. })) {
+                return Err(Error::Refused(format!(
+                    "a person denied {secret} for this ticket"
+                )));
+            }
+            if url.chars().count() > trail::MAX_URL_CHARS {
+                return Err(Error::Invalid(format!(
+                    "a url is at most {} characters",
+                    trail::MAX_URL_CHARS
+                )));
+            }
+            if !(1..=MAX_METHOD_CHARS).contains(&method.len())
+                || !method.bytes().all(|b| b.is_ascii_uppercase())
+            {
+                return Err(Error::Invalid(format!(
+                    "a method is 1 to {MAX_METHOD_CHARS} uppercase ASCII letters"
+                )));
+            }
+            tx.event(DomainEvent::KeyUsed {
+                ticket: ticket.clone(),
+                assignment: assignment.clone(),
+                secret: secret.clone(),
+                method: method.to_owned(),
+                url: url.to_owned(),
+            });
             Ok(())
         })
     }
@@ -733,7 +877,7 @@ impl<R: Repositories> Tx<'_, R> {
                 usd(ticket.mandate.budget_microusd)
             );
             ticket.attention = Some(ask.clone());
-            self.send(ticket, MessageKind::Attention, ask);
+            self.send(ticket, MessageKind::Attention, ask, Some(Ask::Budget));
         }
         None
     }
@@ -846,7 +990,7 @@ impl<R: Repositories> Tx<'_, R> {
         });
     }
 
-    fn send(&mut self, ticket: &mut Ticket, kind: MessageKind, text: String) {
+    fn send(&mut self, ticket: &mut Ticket, kind: MessageKind, text: String, ask: Option<Ask>) {
         ticket.seq += 1;
         let seq = ticket.seq.to_string();
         for (n, channel) in ticket.channels.iter().enumerate() {
@@ -857,6 +1001,7 @@ impl<R: Repositories> Tx<'_, R> {
                 kind,
                 text: text.clone(),
                 ticket: Some(ticket.id.clone()),
+                ask: ask.clone(),
             }));
         }
     }
@@ -1117,6 +1262,7 @@ impl<R: Repositories> Tx<'_, R> {
             inputs: Vec::new(),
             assignments: Vec::new(),
             approval: Approval::NotNeeded,
+            secrets: BTreeMap::new(),
             attention: None,
             ended: None,
             created_ms: self.now,
@@ -1137,7 +1283,7 @@ impl<R: Repositories> Tx<'_, R> {
         if let Some(ack) = ack
             && !needs_approval(&ticket, policy)
         {
-            self.send(&mut ticket, MessageKind::Acknowledgement, ack);
+            self.send(&mut ticket, MessageKind::Acknowledgement, ack, None);
         }
         self.save_thread(thread.clone());
         self.adopt_waiting(&mut ticket, policy);
