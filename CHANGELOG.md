@@ -93,6 +93,12 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   and three designs (`super-agent`, `no-pass-through` through the new `pass_through: false` and
   `Engine::set_pass_through`, and `serial`), writing `report.json` and `report.md`; `--router pi` refuses to start
   without `--max-spend-usd` and caps each run's Router account.
+- Agent mode, vault and browser, PR 1 of the design in #36: capabilities live in the tool registry
+  (`src/agent/broker/registry.rs`). `ToolSpec.needs` is a set of capabilities (`run_code`, `browser`, `vault`), a tool
+  is offered and callable only when its seat has all of them, and `ROUTER_TOOLS`, `WORKER_TOOLS`, a worker's grants,
+  `GET /tools` and the refusal in `/tool` all read the registry, which replaces `job_host`'s own check. The three
+  sandbox builders bind `bwrap::SYSTEM_BINDS`. No change in behavior: every tool-list test and golden argv test
+  passes unedited.
 - Agent mode, the trail (first step of the verifiable browser, PR #36's design): `agent-core` gains `trail`
   (`TrailAction`, `StepBody`, `SignedStep` and the `Digest`, `TrailKey` and `Signature` hex newtypes, with no crypto
   type) and `Engine::{trail_ask, trail_done}`, which write `TrailAsked` before a browser acts and `TrailDone` after,

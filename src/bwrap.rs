@@ -6,6 +6,8 @@
 //! `wasi_worker.rs`.
 use std::ffi::{OsStr, OsString};
 
+pub const SYSTEM_BINDS: [&str; 4] = ["/usr", "/etc", "/lib", "/lib64"];
+
 /// bwrap's options so far. [`Bwrap::exec`] ends the line with the program the
 /// sandbox runs and gives back the argument vector, without bwrap itself.
 /// No `Debug`: a `setenv` value can be a bearer token.
@@ -39,6 +41,15 @@ impl Bwrap {
     /// `--ro-bind-try`: bwrap skips it when `source` is missing.
     pub fn ro_bind_try(self, source: impl AsRef<OsStr>, dest: impl AsRef<OsStr>) -> Self {
         self.arg("--ro-bind-try").arg(source).arg(dest)
+    }
+
+    pub fn system_binds(self) -> Self {
+        let [required, optional @ ..] = SYSTEM_BINDS;
+        optional
+            .into_iter()
+            .fold(self.ro_bind(required, required), |sandbox, path| {
+                sandbox.ro_bind_try(path, path)
+            })
     }
 
     pub fn bind(self, source: impl AsRef<OsStr>, dest: impl AsRef<OsStr>) -> Self {
@@ -176,6 +187,31 @@ mod tests {
                 "/usr/bin/bash",
                 "-c",
                 "echo ok",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_system_binds_need_usr_and_take_the_rest_when_the_host_has_them() {
+        let args = Bwrap::new()
+            .system_binds()
+            .exec("/usr/bin/true", Vec::<&str>::new());
+        assert_eq!(
+            text(&args),
+            [
+                "--ro-bind",
+                "/usr",
+                "/usr",
+                "--ro-bind-try",
+                "/etc",
+                "/etc",
+                "--ro-bind-try",
+                "/lib",
+                "/lib",
+                "--ro-bind-try",
+                "/lib64",
+                "/lib64",
+                "/usr/bin/true",
             ]
         );
     }

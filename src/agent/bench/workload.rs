@@ -135,6 +135,12 @@ impl WorkloadSpec {
         );
         ensure!(self.requests > 0, "workload.requests must be above zero");
         ensure!(
+            self.requests <= TASKS.len(),
+            "workload.requests must be at most {}, the number of distinct tasks: a repeated \
+             task reads as work already done to a model Router",
+            TASKS.len()
+        );
+        ensure!(
             self.requests + self.follow_ups + self.ci_messages <= self.messages,
             "workload.messages must hold the requests, their follow-ups and their CI messages"
         );
@@ -284,7 +290,7 @@ impl Rng {
     }
 }
 
-const TASKS: [&str; 12] = [
+const TASKS: [&str; 24] = [
     "fix the flaky retry test in the payments service",
     "add pagination to the /orders endpoint",
     "find out why the nightly export is slow and speed it up",
@@ -297,6 +303,18 @@ const TASKS: [&str; 12] = [
     "port the billing report from the old cron box to the scheduler",
     "cover the session refresh path with integration tests",
     "rename the legacy feature flags and remove the dead ones",
+    "add a health check endpoint to the notification service",
+    "stop the webhook consumer from double-processing retried events",
+    "move the email templates out of the database and into the repo",
+    "add an audit log entry when an admin changes a user's role",
+    "fix the timezone bug in the weekly digest scheduler",
+    "cache the exchange rates so checkout stops calling the provider on every page",
+    "make the CSV import skip blank rows instead of failing",
+    "add retries with backoff to the S3 upload client",
+    "remove the unused GraphQL resolvers from the admin API",
+    "add a per-tenant quota to the file storage service",
+    "make the deploy script fail fast when a migration is pending",
+    "split the monolithic settings page into tabs",
 ];
 
 const FOLLOW_UPS: [&str; 8] = [
@@ -433,7 +451,7 @@ pub fn generate(spec: &WorkloadSpec, seed: u64) -> Result<Workload> {
         let trigger = match *role {
             Some(Role::Request { request }) => {
                 let plan = &requests[request];
-                let text = format!("@agent {}", TASKS[request % TASKS.len()]);
+                let text = format!("@agent {}", TASKS[request]);
                 let meta = json!({"bench": {
                     "kind": Kind::Request, "request": plan.id, "work_ms": plan.work_ms,
                 }});
@@ -598,9 +616,9 @@ fn message(
 
 #[cfg(test)]
 mod tests {
-    use super::{Arrivals, Kind, WorkloadSpec, generate};
+    use super::{Arrivals, Kind, TASKS, WorkloadSpec, generate};
     use solos_agent_core::model::{ActorKind, Addressed};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     #[test]
     fn a_seed_names_one_workload() {
@@ -702,6 +720,27 @@ mod tests {
     }
 
     #[test]
+    fn no_two_requests_ask_for_the_same_work() {
+        let spec = WorkloadSpec {
+            messages: 1_000,
+            requests: TASKS.len(),
+            ..WorkloadSpec::default()
+        };
+        for seed in 1..=3 {
+            let workload = generate(&spec, seed).unwrap();
+            let texts: Vec<&str> = workload
+                .triggers
+                .iter()
+                .filter(|t| Kind::of(t) == Some(Kind::Request))
+                .map(|t| t.text.as_str())
+                .collect();
+            assert_eq!(texts.len(), TASKS.len(), "seed {seed}");
+            let distinct: BTreeSet<&str> = texts.iter().copied().collect();
+            assert_eq!(distinct.len(), texts.len(), "seed {seed} repeats a request");
+        }
+    }
+
+    #[test]
     fn a_spec_that_cannot_hold_its_requests_is_refused() {
         let cases = [
             WorkloadSpec {
@@ -722,6 +761,11 @@ mod tests {
             },
             WorkloadSpec {
                 request_span: 0.01,
+                ..WorkloadSpec::default()
+            },
+            WorkloadSpec {
+                messages: 1_000,
+                requests: TASKS.len() + 1,
                 ..WorkloadSpec::default()
             },
         ];

@@ -5,6 +5,7 @@
 //! environment on each call, so a node that went offline is a clear tool
 //! error, and the executor holds a Launch until the node is back.
 
+use super::broker::registry::{Cap, Caps};
 use crate::code::{CodeExecutor, OutputBounds, Started};
 use anyhow::Result;
 use serde_json::Value;
@@ -160,6 +161,20 @@ impl Environments {
     /// Whether such a worker has `run_code`.
     pub fn offers_run_code(&self, named: Option<&str>) -> bool {
         matches!(self.get(named), Ok(Some(_)))
+    }
+
+    pub fn capabilities(&self, named: Option<&str>) -> Caps {
+        if self.offers_run_code(named) {
+            Caps::of(&[Cap::RunCode])
+        } else {
+            Caps::NONE
+        }
+    }
+
+    pub fn why_lacks(&self, named: Option<&str>, cap: Cap) -> String {
+        self.get(named)
+            .err()
+            .unwrap_or_else(|| cap.unavailable().to_owned())
     }
 
     pub fn launchable(&self, named: Option<&str>) -> Launchable {

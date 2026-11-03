@@ -11,16 +11,20 @@ use solos_agent_core::model::{
     MessageKind, OutboundMessage, ReportStatus, ThreadKey, TicketId, Trigger, TriggerId,
 };
 use solos_agent_store::{SpendState, SqliteStore};
+use solos_swarm::agent::broker::registry::{self, PrincipalKind};
 use solos_swarm::agent::broker::{
     self, Account, AgentBroker, BrokerParts, DecideTerms, Grant, ModelTerms, Principal,
     ROUTER_TOOLS, WORKER_TOOLS, WorkerParts, WorkerSeat,
 };
+use solos_swarm::agent::environment::{ExecutionEnvironment, Nodes, Offline, Work};
+use solos_swarm::agent::jobs::JobLimits;
 use solos_swarm::agent::jsonl::{JsonlChannel, JsonlSource};
 use solos_swarm::agent::ports::{
     BoxFuture, Channel, Delivery, Executor, Fact, FactSink, Launch, Router,
 };
 use solos_swarm::agent::scripted::{ScriptedExecutor, ScriptedRouter};
 use solos_swarm::agent::{Adapters, AgentConfig, RunOptions, Runtime, STORE_FILE};
+use solos_swarm::code::{OutputBounds, Started};
 use solos_swarm::gateway::{Dispatch, PriceTable, Provider, Upstream, upstream_body};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -330,7 +334,18 @@ fn serve_deciding(
     daily: u64,
     decide: DecideTerms,
 ) -> Served {
-    let broker = AgentBroker::new(BrokerParts {
+    serve_on(scratch, provider, facts, daily, decide, Nodes::default())
+}
+
+fn serve_on(
+    scratch: &Scratch,
+    provider: Arc<Scripted>,
+    facts: FactSink,
+    daily: u64,
+    decide: DecideTerms,
+    nodes: Nodes,
+) -> Served {
+    let parts = BrokerParts {
         dir: scratch.state(),
         store: scratch.store(),
         provider,
@@ -340,8 +355,8 @@ fn serve_deciding(
             terms: terms(),
             code: None,
         }),
-    })
-    .unwrap();
+    };
+    let broker = AgentBroker::with_nodes(parts, JobLimits::default(), nodes).unwrap();
     broker.admit(TOKEN.into(), grant(daily)).unwrap();
     let (listener, socket) = broker::bind(&scratch.state()).unwrap();
     let app = broker.router().unwrap();
@@ -1087,4 +1102,115 @@ async fn fetch_url_keeps_swarm_modes_limits_for_a_worker() {
     let why = refused["error"].as_str().unwrap();
     assert!(why.contains("read budget exhausted after 32 MiB"), "{why}");
     server.abort();
+}
+
+struct Laptop;
+
+impl ExecutionEnvironment for Laptop {
+    fn ready(&self) -> Result<(), Offline> {
+        Ok(())
+    }
+    fn run_code(&self, _: Work<'_>, _: &Value) -> Result<Started> {
+        anyhow::bail!("not in this test")
+    }
+    fn job(&self, _: Work<'_>, _: &str, _: Duration, _: OutputBounds) -> Result<Started> {
+        anyhow::bail!("not in this test")
+    }
+}
+
+const HERE: &str = "worker-here";
+const THERE: &str = "worker-there";
+
+fn serve_with_a_node(scratch: &Scratch) -> (Runtime, Served) {
+    let runtime = scratch.runtime(Arc::new(Holding::default()), true);
+    let nodes = Nodes {
+        default: None,
+        nodes: BTreeMap::from([(
+            "laptop".to_owned(),
+            Arc::new(Laptop) as Arc<dyn ExecutionEnvironment>,
+        )]),
+    };
+    let served = serve_on(
+        scratch,
+        Scripted::new(),
+        runtime.facts(),
+        1_000_000,
+        TERMS,
+        nodes,
+    );
+    for (token, ticket, environment) in
+        [(HERE, "tk_here", None), (THERE, "tk_there", Some("laptop"))]
+    {
+        let seat = WorkerSeat::new(
+            TicketId::new(ticket),
+            AssignmentId::new("as_1"),
+            scratch.state(),
+            500_000,
+        )
+        .in_environment(environment.map(str::to_owned));
+        served
+            .broker
+            .admit_worker(token.into(), seat, "You are a worker.".into())
+            .unwrap();
+    }
+    (runtime, served)
+}
+
+#[tokio::test]
+async fn a_seat_may_call_exactly_the_tools_it_is_offered() {
+    let scratch = Scratch::new("offered");
+    let (_runtime, served) = serve_with_a_node(&scratch);
+
+    for (token, environment) in [(HERE, None), (THERE, Some("laptop"))] {
+        let offered = served.listed(token).await;
+        assert_eq!(
+            served.broker.worker_tools(environment),
+            offered,
+            "its grants"
+        );
+        for tool in WORKER_TOOLS {
+            let (status, reply) = served
+                .post(&format!("tool/{tool}"), Some(token), json!({}))
+                .await;
+            let refused = (status, reply["error"].as_str())
+                == (403, Some("run_code is not available on this host"));
+            assert_eq!(
+                offered.iter().any(|name| name == tool),
+                !refused,
+                "{tool} for {environment:?}: {status} {reply}"
+            );
+        }
+    }
+    assert_eq!(
+        served.listed(THERE).await,
+        WORKER_TOOLS,
+        "a node's worker has them all"
+    );
+    assert_eq!(
+        served.listed(HERE).await,
+        ["worker_report", "worker_handback", "fetch_url"],
+        "this host has no run_code"
+    );
+}
+
+#[tokio::test]
+async fn every_tool_has_a_handler() {
+    let scratch = Scratch::new("handlers");
+    let (_runtime, served) = serve_with_a_node(&scratch);
+
+    for (kind, token) in [
+        (PrincipalKind::Router, TOKEN),
+        (PrincipalKind::Worker, THERE),
+    ] {
+        for tool in registry::tools(kind) {
+            let (status, reply) = served
+                .post(&format!("tool/{}", tool.name), Some(token), json!({}))
+                .await;
+            assert_ne!(
+                status, 403,
+                "{kind:?} {}: a refusal before any handler ran: {reply}",
+                tool.name
+            );
+        }
+    }
 }
