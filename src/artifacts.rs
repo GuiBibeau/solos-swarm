@@ -1,15 +1,11 @@
 //! Encrypted immutable payloads and scoped, offline prepared artifact versions.
-use aes_gcm::{
-    Aes256Gcm, Nonce,
-    aead::{Aead, KeyInit, Payload},
-};
+use crate::sealed::{Key, private_file};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    fs::{self, File, OpenOptions},
-    io::Write,
+    fs,
     path::{Path, PathBuf},
 };
 use zeroize::{Zeroize, Zeroizing};
@@ -103,12 +99,6 @@ struct Index {
 }
 
 #[derive(Serialize, Deserialize)]
-struct Encrypted {
-    schema_version: u32,
-    nonce: Vec<u8>,
-    ciphertext: Vec<u8>,
-}
-#[derive(Serialize, Deserialize)]
 struct Blob {
     info: ArtifactInfo,
     bytes: Vec<u8>,
@@ -121,7 +111,7 @@ impl Drop for Blob {
 
 pub struct ArtifactStore {
     root: PathBuf,
-    key: Zeroizing<Vec<u8>>,
+    key: Key,
     index: Index,
 }
 impl std::fmt::Debug for ArtifactStore {
@@ -134,60 +124,9 @@ impl std::fmt::Debug for ArtifactStore {
     }
 }
 
-fn private_file(path: &Path, bytes: &[u8], overwrite: bool) -> Result<()> {
-    let parent = path.parent().context("artifact parent missing")?;
-    fs::create_dir_all(parent)?;
-    let temporary = parent.join(format!(".write-{}", uuid::Uuid::new_v4()));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let result = (|| -> Result<()> {
-        let mut file = options.open(&temporary)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        if overwrite {
-            fs::rename(&temporary, path)?;
-        } else {
-            fs::hard_link(&temporary, path)?;
-            fs::remove_file(&temporary)?;
-        }
-        File::open(parent)?.sync_all()?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
-}
-
 impl ArtifactStore {
-    /// Provisioning only: no key is invented or downloaded during normal dispatch.
-    pub fn create_key(path: &Path) -> Result<()> {
-        let mut key = Zeroizing::new(vec![0u8; 32]);
-        getrandom::fill(&mut key).map_err(|_| anyhow::anyhow!("OS random source unavailable"))?;
-        private_file(path, &key, false)
-    }
     pub fn open(root: &Path, key_file: &Path) -> Result<Self> {
-        ensure!(
-            key_file.is_file(),
-            "operator-provisioned encryption key missing"
-        );
-        ensure!(
-            !fs::symlink_metadata(key_file)?.file_type().is_symlink(),
-            "key symlink is not admitted"
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            ensure!(
-                fs::metadata(key_file)?.permissions().mode() & 0o077 == 0,
-                "encryption key permissions are not private"
-            );
-        }
+        let key = Key::read(key_file)?;
         let key_file = key_file.canonicalize()?;
         fs::create_dir_all(root)?;
         ensure!(
@@ -204,8 +143,6 @@ impl ArtifactStore {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
         }
-        let key = Zeroizing::new(fs::read(key_file)?);
-        ensure!(key.len() == 32, "AES-256 key must have exactly 32 bytes");
         let mut store = Self {
             root,
             key,
@@ -213,7 +150,7 @@ impl ArtifactStore {
         };
         let index = store.root.join("index.enc");
         if index.exists() {
-            let plaintext = store.decrypt(&fs::read(index)?, b"solos-swarm/index/v1")?;
+            let plaintext = store.key.open(&fs::read(index)?, b"solos-swarm/index/v1")?;
             store.index =
                 serde_json::from_slice(&plaintext).context("encrypted artifact index invalid")?;
         }
@@ -222,45 +159,11 @@ impl ArtifactStore {
     pub fn revision(&self) -> u64 {
         self.index.revision
     }
-    fn encrypt(&self, bytes: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
-        let cipher = Aes256Gcm::new_from_slice(&self.key)
-            .map_err(|_| anyhow::anyhow!("invalid encryption key"))?;
-        let mut nonce = [0u8; 12];
-        getrandom::fill(&mut nonce).map_err(|_| anyhow::anyhow!("OS random source unavailable"))?;
-        let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce), Payload { msg: bytes, aad })
-            .map_err(|_| anyhow::anyhow!("artifact encryption failed"))?;
-        Ok(serde_json::to_vec(&Encrypted {
-            schema_version: 1,
-            nonce: nonce.to_vec(),
-            ciphertext,
-        })?)
-    }
-    fn decrypt(&self, bytes: &[u8], aad: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
-        let value: Encrypted =
-            serde_json::from_slice(bytes).context("encrypted artifact envelope invalid")?;
-        ensure!(
-            value.schema_version == 1 && value.nonce.len() == 12,
-            "unsupported encrypted artifact format"
-        );
-        let cipher = Aes256Gcm::new_from_slice(&self.key)
-            .map_err(|_| anyhow::anyhow!("invalid encryption key"))?;
-        let plaintext = cipher
-            .decrypt(
-                Nonce::from_slice(&value.nonce),
-                Payload {
-                    msg: &value.ciphertext,
-                    aad,
-                },
-            )
-            .map_err(|_| anyhow::anyhow!("artifact authentication failed"))?;
-        Ok(Zeroizing::new(plaintext))
-    }
     fn save(&self, index: &Index) -> Result<()> {
         let plain = Zeroizing::new(serde_json::to_vec(index)?);
         private_file(
             &self.root.join("index.enc"),
-            &self.encrypt(&plain, b"solos-swarm/index/v1")?,
+            &self.key.seal(&plain, b"solos-swarm/index/v1")?,
             true,
         )
     }
@@ -319,10 +222,10 @@ impl ArtifactStore {
             bytes: bytes.to_vec(),
         };
         let plain = Zeroizing::new(serde_json::to_vec(&blob)?);
-        let encrypted = self.encrypt(&plain, id.as_bytes())?;
+        let encrypted = self.key.seal(&plain, id.as_bytes())?;
         let path = self.root.join(format!("{id}.enc"));
         if path.exists() {
-            let previous = self.decrypt(&fs::read(&path)?, id.as_bytes())?;
+            let previous = self.key.open(&fs::read(&path)?, id.as_bytes())?;
             let old: Blob = serde_json::from_slice(&previous)?;
             ensure!(
                 crate::domain::hash_json(&old.info)? == crate::domain::hash_json(&info)?
@@ -396,7 +299,7 @@ impl ArtifactStore {
             fs::metadata(&path)?.len() <= MAX_BLOB_BYTES as u64 * 10,
             "encrypted artifact exceeds storage bound"
         );
-        let plain = self.decrypt(&fs::read(path)?, id.as_bytes())?;
+        let plain = self.key.open(&fs::read(path)?, id.as_bytes())?;
         let mut blob: Blob =
             serde_json::from_slice(&plain).context("decrypted artifact invalid")?;
         ensure!(
@@ -579,7 +482,7 @@ mod tests {
             std::env::temp_dir().join(format!("swarm-artifact-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let key = root.join("keys/key.bin");
-        ArtifactStore::create_key(&key).unwrap();
+        Key::create(&key).unwrap();
         let blobs = root.join("blobs");
         let mut store = ArtifactStore::open(&blobs, &key).unwrap();
         let source = store
@@ -643,7 +546,7 @@ mod tests {
             std::env::temp_dir().join(format!("swarm-artifact-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let key = root.join("key.bin");
-        ArtifactStore::create_key(&key).unwrap();
+        Key::create(&key).unwrap();
         let blobs = root.join("blobs");
         let mut store = ArtifactStore::open(&blobs, &key).unwrap();
         let info = store.put(b"data", metadata("source", vec![])).unwrap();
@@ -661,8 +564,10 @@ mod tests {
         assert_eq!(fs::read(path).unwrap(), b"data");
         assert!(store.export(&info.id, "result.bin", &export, 2).is_err());
         let path = blobs.join(format!("{}.enc", info.id));
-        let mut encrypted: Encrypted = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        encrypted.ciphertext[0] ^= 1;
+        let mut encrypted: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let first = encrypted["ciphertext"][0].as_u64().unwrap();
+        encrypted["ciphertext"][0] = (first ^ 1).into();
         fs::write(path, serde_json::to_vec(&encrypted).unwrap()).unwrap();
         assert!(store.get(&info.id, &permit(), 2).is_err());
         fs::remove_dir_all(root).unwrap();

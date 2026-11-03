@@ -1,9 +1,9 @@
 //! Explicit real-KVM qualification probe. The ordinary unit suite does not require a hypervisor.
 use crate::{
-    artifacts::ArtifactStore,
     ledger::{PriceTable, Rate},
     node::{ToolDefinition, receiver_tests::Harness},
     sandbox::{MicroVmAssets, PinnedAsset, ProcessLimits, ToolLimits},
+    sealed::Key,
     security::{CapabilityKind, OperationClass, test_support},
     tools::{InstalledConfig, InstalledTools, NativeBackend, TargetEndpoint},
 };
@@ -42,7 +42,7 @@ async fn actual_microvm_sdk_uses_normal_broker_and_preserves_private_lineage() {
     );
     assert!(proof_root.is_absolute() && !proof_root.exists());
     std::fs::create_dir_all(&proof_root).unwrap();
-    ArtifactStore::create_key(&proof_root.join("artifact.key")).unwrap();
+    Key::create(&proof_root.join("artifact.key")).unwrap();
     struct RemoveKey(PathBuf);
     impl Drop for RemoveKey {
         fn drop(&mut self) {

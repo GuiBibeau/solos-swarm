@@ -15,6 +15,7 @@ use super::wire::{
 use crate::code::{
     self, CodeConfig, CodeExecutor, Ended, Mount, OutputBounds, Secret, Started, Unread,
 };
+use crate::vault::{SandboxView, VaultConfig};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -80,6 +81,8 @@ pub struct NodeConfig {
     pub sandbox: SandboxConfig,
     #[serde(default)]
     pub secrets: SecretsConfig,
+    #[serde(default)]
+    pub vault: Option<VaultConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -176,8 +179,22 @@ impl NodeConfig {
         for file in secrets.env.values_mut().chain(secrets.files.values_mut()) {
             *file = base.join(&*file);
         }
+        if let Some(vault) = &mut config.vault {
+            vault.resolve(base);
+        }
         config.validate()?;
         Ok(config)
+    }
+
+    pub fn sandbox_view(&self) -> SandboxView {
+        let sandbox = &self.sandbox;
+        SandboxView::new(
+            [self.work_root.clone()]
+                .into_iter()
+                .chain(sandbox.mounts.iter().map(|mount| mount.source.clone()))
+                .chain(sandbox.uv_root.clone())
+                .chain(self.secrets.files.values().cloned()),
+        )
     }
 
     pub fn validate(&self) -> Result<()> {

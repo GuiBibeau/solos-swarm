@@ -2966,7 +2966,7 @@ mod tests {
         private_write(&identity.certificate_der, &fixture.identity.certificate_der);
         private_write(&identity.private_key_der, &fixture.identity.private_key_der);
         private_write(&identity.ca_der, &fixture.identity.ca_der);
-        ArtifactStore::create_key(&root.join("evidence.key")).unwrap();
+        crate::sealed::Key::create(&root.join("evidence.key")).unwrap();
         let mut posture = fixture.posture.clone();
         posture.limits.total = fixture.policy.payload.global_limits.total + 1;
         posture.evaluator_public_key =
@@ -3245,7 +3245,7 @@ mod tests {
         fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         let key_file = root.join("evidence.key");
-        ArtifactStore::create_key(&key_file).unwrap();
+        crate::sealed::Key::create(&key_file).unwrap();
         let mut store = ArtifactStore::open(&root.join("blobs"), &key_file).unwrap();
         let signer = CryptoSigner::from_seed([74; 32]);
         let payload = vec![9; 33 * 1024 * 1024];

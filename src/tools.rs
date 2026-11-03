@@ -853,7 +853,7 @@ mod tests {
     fn setup() -> (PathBuf, InstalledTools, Session, Arc<CryptoSigner>) {
         let root = std::env::temp_dir().join(format!("solos-tools-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
-        ArtifactStore::create_key(&root.join("key")).unwrap();
+        crate::sealed::Key::create(&root.join("key")).unwrap();
         let signer = Arc::new(CryptoSigner::from_seed([41; 32]));
         let config = InstalledConfig {
             owned_directory: root.join("owned"),

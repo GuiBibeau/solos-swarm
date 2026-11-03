@@ -5296,7 +5296,7 @@ mod tests {
         std::fs::create_dir(&private_root).unwrap();
         std::fs::set_permissions(&private_root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let response_key = private_root.join("key");
-        crate::artifacts::ArtifactStore::create_key(&response_key).unwrap();
+        crate::sealed::Key::create(&response_key).unwrap();
         let response_store = Arc::new(tokio::sync::Mutex::new(
             crate::artifacts::ArtifactStore::open(&private_root.join("blobs"), &response_key)
                 .unwrap(),

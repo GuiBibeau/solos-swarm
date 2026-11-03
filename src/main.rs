@@ -7,6 +7,7 @@ use solos_swarm::{
     gateway::provider_for,
     harness::{PiHarness, Role, SessionSpec, bounded_line},
     swarm::{self, GoalRun, GoalStatus},
+    vault,
 };
 
 use anyhow::{Context, Result, ensure};
@@ -74,6 +75,12 @@ enum Action {
     Node {
         #[command(subcommand)]
         command: NodeCommand,
+    },
+    /// This machine's logins and API keys, which agent mode uses without a
+    /// model ever seeing a value. No command prints a value.
+    Vault {
+        #[command(subcommand)]
+        command: VaultCommand,
     },
     /// A Model Context Protocol server on stdin and stdout, for an MCP host
     /// such as Claude Code or Codex. With --socket and --token-file it offers
@@ -278,6 +285,100 @@ enum NodeCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum VaultCommand {
+    /// Write the key file and an empty vault where the config's `vault:`
+    /// names them. An existing key or vault is never replaced.
+    Init {
+        /// agent.yaml or node.yaml.
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Add a website login, or with --replace change one. The password comes
+    /// on stdin or from --password-file.
+    AddLogin {
+        /// agent.yaml or node.yaml.
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        name: vault::SecretName,
+        /// An exact origin it is filled on, such as https://github.com.
+        /// Repeat for more.
+        #[arg(long = "site", required = true)]
+        sites: Vec<vault::Origin>,
+        #[arg(long)]
+        username: String,
+        /// Shown to the model and to the person who approves its use.
+        #[arg(long, default_value = "")]
+        hint: String,
+        /// Whose Tickets may use it, as the Policy names people, such as
+        /// slack:U024BE7LH. Repeat for more; without it, any requester.
+        #[arg(long = "for")]
+        users: Vec<String>,
+        /// first-use: a person approves the first use on each Ticket. none:
+        /// unattended use.
+        #[arg(long, default_value = "first-use")]
+        approval: vault::Approval,
+        /// Read once and deleted; `-` reads stdin.
+        #[arg(long, default_value = "-")]
+        password_file: PathBuf,
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Add an API key, or with --replace change one. The value comes on
+    /// stdin or from --value-file.
+    AddKey {
+        /// agent.yaml or node.yaml.
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        name: vault::SecretName,
+        /// An exact host it is sent to, such as api.openai.com. Repeat for
+        /// more.
+        #[arg(long = "host", required = true)]
+        hosts: Vec<vault::HostSpec>,
+        /// The request header that carries it, such as authorization.
+        #[arg(long)]
+        header: vault::HeaderField,
+        /// bearer: the header says `Bearer <value>`. raw: the value alone.
+        #[arg(long)]
+        scheme: vault::KeyScheme,
+        /// Shown to the model and to the person who approves its use.
+        #[arg(long, default_value = "")]
+        about: String,
+        /// Whose Tickets may use it, as the Policy names people, such as
+        /// slack:U024BE7LH. Repeat for more; without it, any requester.
+        #[arg(long = "for")]
+        users: Vec<String>,
+        /// first-use: a person approves the first use on each Ticket. none:
+        /// unattended use.
+        #[arg(long, default_value = "first-use")]
+        approval: vault::Approval,
+        /// Read once and deleted; `-` reads stdin.
+        #[arg(long, default_value = "-")]
+        value_file: PathBuf,
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Each item's name, sites or hosts, username, hint, approval and who
+    /// may use it.
+    List {
+        /// agent.yaml or node.yaml.
+        #[arg(long)]
+        config: PathBuf,
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    Remove {
+        /// agent.yaml or node.yaml.
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        name: vault::SecretName,
+    },
+}
+
 /// Write an identity in `dir` and say what to do with its fingerprint.
 fn init_identity(dir: &Path, subject: &str, peer: &str) -> Result<()> {
     let fingerprint = solos_swarm::remote::tls::init(dir, subject)?;
@@ -298,6 +399,121 @@ fn consume_credential(path: &Path) -> Result<Zeroizing<String>> {
     let _ = fs::remove_file(path);
     let raw = Zeroizing::new(result.context("cannot read broker credential")?);
     Ok(Zeroizing::new(raw.trim().to_owned()))
+}
+
+fn vault_command(command: VaultCommand) -> Result<()> {
+    use vault::{ItemKind, NewItem, SecretValue, Vault};
+    match command {
+        VaultCommand::Init { config } => {
+            let (config, view) = vault_config(&config)?;
+            Vault::init(&config, &view)?;
+            eprintln!(
+                "the vault {} is ready, under the key {}",
+                config.path.display(),
+                config.key_file.display()
+            );
+            Ok(())
+        }
+        VaultCommand::AddLogin {
+            config,
+            name,
+            sites,
+            username,
+            hint,
+            users,
+            approval,
+            password_file,
+            replace,
+        } => {
+            let value = SecretValue::read_once(&password_file)?;
+            let item = NewItem {
+                name,
+                kind: ItemKind::Login {
+                    sites,
+                    username,
+                    hint,
+                },
+                users: users.into_iter().collect(),
+                approval,
+                value,
+            };
+            add_to_vault(&config, item, replace)
+        }
+        VaultCommand::AddKey {
+            config,
+            name,
+            hosts,
+            header,
+            scheme,
+            about,
+            users,
+            approval,
+            value_file,
+            replace,
+        } => {
+            let value = SecretValue::read_once(&value_file)?;
+            let item = NewItem {
+                name,
+                kind: ItemKind::Key {
+                    hosts,
+                    header,
+                    scheme,
+                    about,
+                },
+                users: users.into_iter().collect(),
+                approval,
+                value,
+            };
+            add_to_vault(&config, item, replace)
+        }
+        VaultCommand::List { config, json } => {
+            let items = open_vault(&config)?.list()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&items)?);
+            } else {
+                print!("{}", vault::table(&items));
+            }
+            Ok(())
+        }
+        VaultCommand::Remove { config, name } => {
+            ensure!(
+                open_vault(&config)?.remove(&name)?,
+                "the vault holds no item {name}"
+            );
+            eprintln!("removed {name}");
+            Ok(())
+        }
+    }
+}
+
+fn add_to_vault(config: &Path, item: vault::NewItem, replace: bool) -> Result<()> {
+    let name = item.name.clone();
+    open_vault(config)?.add(item, replace)?;
+    eprintln!("saved {name}");
+    Ok(())
+}
+
+fn open_vault(config: &Path) -> Result<vault::Vault> {
+    let (config, view) = vault_config(config)?;
+    vault::Vault::open(&config, &view)
+}
+
+fn vault_config(path: &Path) -> Result<(vault::VaultConfig, vault::SandboxView)> {
+    let shown = path.display();
+    let bytes = fs::read(path).with_context(|| format!("cannot read {shown}"))?;
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_slice(&bytes).with_context(|| format!("{shown} is not YAML"))?;
+    let (config, view) = if yaml.get("work_root").is_some() {
+        let node = solos_swarm::remote::NodeConfig::load(path)?;
+        let view = node.sandbox_view();
+        (node.vault, view)
+    } else {
+        let agent = solos_swarm::agent::AgentConfig::load(path)?;
+        let view = agent.sandbox_view();
+        (agent.vault, view)
+    };
+    let config = config.with_context(|| format!("{shown} has no vault: section"))?;
+    Ok((config, view))
 }
 
 /// `bridge`: exit with the program's status, as if it ran alone.
@@ -538,6 +754,7 @@ async fn execute(command: Action) -> Result<()> {
             solos_swarm::remote::tls::NODE_NAME,
             "the agent's nodes.allow.<name>.fingerprint",
         ),
+        Action::Vault { command } => vault_command(command),
         Action::Node {
             command: NodeCommand::Serve { config },
         } => {

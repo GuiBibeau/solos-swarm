@@ -732,6 +732,7 @@ async fn a_real_claude_code_worker_runs_its_code_on_its_tickets_node() {
         work_root: root.join("laptop-work"),
         sandbox: SandboxConfig::default(),
         secrets: SecretsConfig::default(),
+        vault: None,
     })
     .unwrap();
     let daemon = tokio::spawn(async move { node.serve(std::future::pending()).await });
