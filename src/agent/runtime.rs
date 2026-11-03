@@ -918,8 +918,123 @@ impl Job {
 
 #[cfg(test)]
 mod tests {
-    use super::{RunOptions, backoff};
+    use super::{Adapters, Job, RunOptions, Runtime, backoff};
+    use crate::agent::scripted::{ScriptedExecutor, ScriptedRouter};
+    use solos_agent_core::model::{
+        Accept, Acknowledge, Actor, Addressed, Ask, ChannelRef, Effect, Plan, SecretId, ThreadKey,
+        TicketId, Trigger, TriggerId, Verdict,
+    };
+    use solos_agent_core::{AllowlistPolicy, Repositories};
+    use solos_agent_store::SqliteStore;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
     use std::time::Duration;
+
+    fn runtime_with_a_ticket(budget_microusd: u64) -> (Runtime, TicketId) {
+        let policy = AllowlistPolicy {
+            people: ["slack:alice".to_owned()].into(),
+            approvers: ["slack:alice".to_owned()].into(),
+            auto_approve_microusd: 1_000_000,
+            ..AllowlistPolicy::default()
+        };
+        let adapters = Adapters {
+            sources: Vec::new(),
+            channels: BTreeMap::new(),
+            router: Arc::new(ScriptedRouter::new(budget_microusd)),
+            executor: Arc::new(ScriptedExecutor),
+        };
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut runtime = Runtime::new(store, policy, adapters, RunOptions::default());
+        runtime
+            .engine
+            .receive(Trigger {
+                id: TriggerId::new("t1"),
+                source: "slack".into(),
+                at_ms: 1_000,
+                actor: Actor::person("alice"),
+                addressed: Addressed::Mention,
+                text: "triage my notifications".into(),
+                threads: vec![ThreadKey::new("th1")],
+                reply_to: vec![ChannelRef {
+                    source: "slack".into(),
+                    address: BTreeMap::from([("channel".to_owned(), "C1".to_owned())]),
+                }],
+                meta: serde_json::Value::Null,
+            })
+            .unwrap();
+        let eval = runtime.engine.evaluate_due().unwrap().remove(0);
+        let accept = Verdict::Accept(Accept {
+            title: "Triage".into(),
+            scope: "triage".into(),
+            reason: "alice asked".into(),
+            plan: Plan::Session {
+                harness: None,
+                environment: None,
+            },
+            budget_microusd,
+            acknowledge: Acknowledge::Standard,
+            rules: Vec::new(),
+        });
+        let decision = runtime.engine.decide(&eval, accept).unwrap();
+        let ticket = runtime.engine.repos().decision(&decision).unwrap().ticket;
+        (runtime, ticket.unwrap())
+    }
+
+    fn offered(runtime: &Runtime) -> Vec<Option<Ask>> {
+        let sends = runtime.engine.repos().pending_effects().unwrap();
+        sends
+            .into_iter()
+            .filter(|q| matches!(q.effect, Effect::Send(_)))
+            .map(|q| match runtime.job(q.effect, false).unwrap() {
+                Job::Send(_, options) => options.ask,
+                _ => unreachable!("a Send is a Send"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_secret_ask_has_buttons_only_while_its_grant_waits() {
+        let (mut runtime, ticket) = runtime_with_a_ticket(500_000);
+        let secret = SecretId::try_from("local/github-gui".to_owned()).unwrap();
+        let ask = Some(Ask::Secret {
+            secret: secret.clone(),
+        });
+        runtime
+            .engine
+            .ask_secret(&ticket, &secret, "sign in", &[])
+            .unwrap();
+        assert_eq!(
+            offered(&runtime),
+            [None, ask],
+            "the acknowledgement, then the ask"
+        );
+
+        runtime
+            .engine
+            .answer_secret(&ticket, &secret, "slack", Actor::person("alice"), true)
+            .unwrap();
+        assert_eq!(
+            offered(&runtime),
+            [None, None],
+            "the same Send, retried after the answer, posts a plain message"
+        );
+    }
+
+    #[test]
+    fn a_budget_ask_has_buttons_only_while_the_approval_waits() {
+        let (mut runtime, ticket) = runtime_with_a_ticket(5_000_000);
+        assert_eq!(offered(&runtime), [Some(Ask::Budget)]);
+
+        runtime
+            .engine
+            .approve(&ticket, "slack", Actor::person("alice"))
+            .unwrap();
+        assert_eq!(offered(&runtime), [None]);
+
+        let (mut runtime, ticket) = runtime_with_a_ticket(5_000_000);
+        runtime.engine.stop_ticket(&ticket, "stopped").unwrap();
+        assert_eq!(offered(&runtime), [None], "a stopped Ticket asks nothing");
+    }
 
     #[test]
     fn backoff_doubles_up_to_its_cap() {
