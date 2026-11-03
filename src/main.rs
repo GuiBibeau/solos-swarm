@@ -3,6 +3,7 @@ mod smoke;
 
 use solos_swarm::{
     broker,
+    bwrap::Bwrap,
     gateway::provider_for,
     harness::{PiHarness, Role, SessionSpec, bounded_line},
     swarm::{self, GoalRun, GoalStatus},
@@ -13,6 +14,7 @@ use broker::{Goal, Upstream, write_json};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use std::{
+    ffi::OsString,
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -407,36 +409,27 @@ async fn doctor(root: &Path, node: &Path) -> Result<()> {
     );
     let version = Command::new(node).arg("--version").output().await?;
     ensure!(version.status.success(), "Node executable failed");
-    let result = Command::new("bwrap")
-        .args([
-            "--unshare-all",
-            "--die-with-parent",
-            "--ro-bind",
-            "/usr",
-            "/usr",
-            "--ro-bind-try",
-            "/lib",
-            "/lib",
-            "--ro-bind-try",
-            "/lib64",
-            "/lib64",
-            "--ro-bind-try",
-            "/etc",
-            "/etc",
-            "--proc",
-            "/proc",
-            "--dev",
-            "/dev",
-            "/usr/bin/true",
-        ])
-        .status()
-        .await?;
+    let result = Command::new("bwrap").args(doctor_probe()).status().await?;
     ensure!(result.success(), "bubblewrap isolation unavailable");
     println!(
         "{}",
         json!({"verdict":"PASS","node":String::from_utf8_lossy(&version.stdout).trim(),"isolation":"bubblewrap-unshare-all"})
     );
     Ok(())
+}
+
+/// The sandbox `doctor` starts to prove bubblewrap isolates on this host.
+fn doctor_probe() -> Vec<OsString> {
+    Bwrap::new()
+        .unshare_all()
+        .die_with_parent()
+        .ro_bind("/usr", "/usr")
+        .ro_bind_try("/lib", "/lib")
+        .ro_bind_try("/lib64", "/lib64")
+        .ro_bind_try("/etc", "/etc")
+        .proc("/proc")
+        .dev("/dev")
+        .exec("/usr/bin/true", std::iter::empty::<&str>())
 }
 
 /// Probe the sandboxed worker path end to end without spending a token.
@@ -764,6 +757,36 @@ mod tests {
             // `env_clear` has no stable getter; the unix Debug form prints it as `env -i`.
             assert!(format!("{command:?}").starts_with("env -i "), "{command:?}");
         }
+    }
+
+    #[test]
+    fn the_doctor_probe_keeps_its_exact_argv() {
+        let args = doctor_probe();
+        let args: Vec<&str> = args.iter().map(|arg| arg.to_str().unwrap()).collect();
+        assert_eq!(
+            args,
+            [
+                "--unshare-all",
+                "--die-with-parent",
+                "--ro-bind",
+                "/usr",
+                "/usr",
+                "--ro-bind-try",
+                "/lib",
+                "/lib",
+                "--ro-bind-try",
+                "/lib64",
+                "/lib64",
+                "--ro-bind-try",
+                "/etc",
+                "/etc",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                "/usr/bin/true",
+            ]
+        );
     }
 
     /// A fresh directory with a Goal file, an empty run dir and a stand-in Pi

@@ -67,6 +67,11 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   background; a job's end reaches the worker once, in its turn or as a Note that wakes it, and the job dies with its
   Assignment. Limits under `executor.run_code` (`background_after_secs`, `max_jobs`, `job_max_secs`,
   `job_output_bytes`); swarm `run_code` is unchanged.
+- Agent mode, P2b, which closes P2: one bwrap builder (`src/bwrap.rs`) for the Pi launch, `run_code`'s sandbox and
+  `doctor`'s probe, with the same argument vectors (the golden tests pass unedited; the frozen mvp sandboxes keep
+  their own lines). The research words in the swarm runtime are now optional Goal fields: `nudges`, one template
+  per escalation stage, and `record_fields`, the Task fields a host-filed record reads. `Goal::validate` checks
+  them, a Goal template can set them, and a Goal without them runs exactly as before.
 - Agent mode, P7a: `solos-swarm mcp`, a hand-written stdio MCP server. `--socket --token-file` offers one principal's
   broker tools (the broker's new `GET /tools`, from a Rust tool registry the Pi extension's schemas are tested
   against), with refusals as `isError` results and pauses waited out; `--state-dir --operator` offers `agent_status`,
