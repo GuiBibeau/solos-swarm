@@ -93,6 +93,12 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   and three designs (`super-agent`, `no-pass-through` through the new `pass_through: false` and
   `Engine::set_pass_through`, and `serial`), writing `report.json` and `report.md`; `--router pi` refuses to start
   without `--max-spend-usd` and caps each run's Router account.
+- Agent mode, vault and browser, PR 1 of the design in #36: capabilities live in the tool registry
+  (`src/agent/broker/registry.rs`). `ToolSpec.needs` is a set of capabilities (`run_code`, `browser`, `vault`), a tool
+  is offered and callable only when its seat has all of them, and `ROUTER_TOOLS`, `WORKER_TOOLS`, a worker's grants,
+  `GET /tools` and the refusal in `/tool` all read the registry, which replaces `job_host`'s own check. The three
+  sandbox builders bind `bwrap::SYSTEM_BINDS`. No change in behavior: every tool-list test and golden argv test
+  passes unedited.
 - `collect` leaves the per-run `code/` scratch directory on the host and writes `collect-manifest.json`; `--include-code` opts back in.
 - Docs: pause mode, self-update operations, dashboard tunnel, tournament runbook, replay status.
 
