@@ -5,16 +5,17 @@
 //! `run_code`'s receipts; a certificate that is not pinned is refused on
 //! either side; a node that drops fails its calls at once; a Ticket bound to
 //! an offline node launches once it connects; the node's secrets reach its
-//! sandbox and never a receipt; oversized frames end the connection. Tests
-//! that run a sandbox skip without Linux, bwrap and prlimit.
+//! sandbox and never a receipt; oversized frames end the connection; a
+//! Claude Code worker's tools, `solos-swarm mcp` over the broker, run on its
+//! node too. Tests that run a sandbox skip without Linux, bwrap and prlimit.
 
 use serde_json::{Value, json};
 use solos_agent_core::AllowlistPolicy;
 use solos_agent_core::model::{AssignmentId, Effect, Stage, TicketId, TicketOutcome};
 use solos_agent_store::SqliteStore;
 use solos_swarm::agent::broker::{
-    Account, AgentBroker, BrokerParts, DecideTerms, Grant, ModelTerms, Principal, WorkerParts,
-    WorkerSeat,
+    Account, AgentBroker, BrokerParts, DecideTerms, Grant, ModelTerms, Principal, SOCKET_FILE,
+    WORKER_TOOLS, WorkerParts, WorkerSeat,
 };
 use solos_swarm::agent::config::{AllowedNode, NodesConfig};
 use solos_swarm::agent::environment::{ExecutionEnvironment, Nodes, Work};
@@ -36,7 +37,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::task::JoinHandle;
 
 const LIMIT: Duration = Duration::from_secs(60);
@@ -495,6 +496,118 @@ async fn remote_background_jobs_start_wait_and_stop() {
         (&json!("exited"), &json!("late\n")),
         "{late}"
     );
+}
+
+/// `solos-swarm mcp` for the worker `token`, as Claude Code starts it: the
+/// answers to `tools/list` and then to each `tools/call` of `calls`.
+async fn through_mcp(w: &World, token: &str, calls: &[(&str, Value)]) -> Vec<Value> {
+    let token_file = w.root.join(format!("{token}.token"));
+    std::fs::write(&token_file, token).unwrap();
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_solos-swarm"))
+        .arg("mcp")
+        .arg("--socket")
+        .arg(w.root.join("state").join(SOCKET_FILE))
+        .arg("--token-file")
+        .arg(&token_file)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut requests = vec![
+        json!({"method": "initialize", "params": {"protocolVersion": "2025-06-18",
+               "capabilities": {}, "clientInfo": {"name": "test-host", "version": "1"}}}),
+        json!({"method": "tools/list", "params": {}}),
+    ];
+    for (name, arguments) in calls {
+        requests.push(json!({"method": "tools/call",
+                             "params": {"name": name, "arguments": arguments}}));
+    }
+    let mut answers = Vec::new();
+    for (id, mut request) in requests.into_iter().enumerate() {
+        request["jsonrpc"] = json!("2.0");
+        request["id"] = json!(id);
+        stdin
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+        let answer = tokio::time::timeout(LIMIT, async {
+            loop {
+                let line = lines.next_line().await.unwrap().expect("mcp exited");
+                let reply: Value = serde_json::from_str(&line).unwrap();
+                if reply["id"] == id {
+                    return reply;
+                }
+            }
+        })
+        .await
+        .expect("mcp did not answer");
+        answers.push(answer["result"].clone());
+    }
+    answers.remove(0);
+    answers
+}
+
+#[tokio::test]
+async fn a_claude_code_workers_tools_list_and_run_on_its_node() {
+    let mut w = World::new("mcp", SecretsConfig::default()).await;
+    let there = w.worker("tk_mcp", Some("laptop"));
+    let here = w.worker("tk_mcp_here", None);
+    let names = |listed: &Value| -> Vec<String> {
+        listed["tools"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{listed}"))
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(w.broker.worker_tools(Some("laptop")), WORKER_TOOLS);
+    let listed = through_mcp(&w, &here, &[]).await;
+    assert_eq!(
+        names(&listed[0]),
+        w.broker.worker_tools(None),
+        "this host's"
+    );
+    let calls = if sandbox() {
+        vec![
+            ("run_code", json!({"code": "echo from-mcp | tee mcp.txt"})),
+            ("job_start", json!({"code": "cat mcp.txt"})),
+        ]
+    } else {
+        Vec::new()
+    };
+    let answers = through_mcp(&w, &there, &calls).await;
+    assert_eq!(names(&answers[0]), WORKER_TOOLS, "run_code on the node");
+    if sandbox() {
+        let text = |answer: &Value| -> Value {
+            assert_eq!(answer["isError"], false, "{answer}");
+            serde_json::from_str(answer["content"][0]["text"].as_str().unwrap()).unwrap()
+        };
+        let receipt = text(&answers[1]);
+        assert_eq!(
+            (&receipt["exit_code"], &receipt["stdout"]),
+            (&json!(0), &json!("from-mcp\n")),
+            "{receipt}"
+        );
+        assert!(w.node_work("tk_mcp").join("mcp.txt").is_file());
+        let job = text(&answers[2]);
+        let (_, ended) = w
+            .post("job_wait", &there, json!({"job": job["job"], "wait_s": 20}))
+            .await;
+        assert_eq!(
+            ended["stdout"], "from-mcp\n",
+            "the job ran on the node: {ended}"
+        );
+    }
+    w.drop_node().await;
+    let answers = through_mcp(&w, &there, &[("run_code", json!({"code": "true"}))]).await;
+    assert_eq!(answers[1]["isError"], true, "{}", answers[1]);
+    let why = answers[1]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(why.contains("node laptop is offline"), "{why}");
 }
 
 #[tokio::test]

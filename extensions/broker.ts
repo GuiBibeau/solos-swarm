@@ -17,6 +17,7 @@ const ROUTER_TOOLS = [
       scope: Type.Optional(Type.String({ description: "accept: what the worker must do, in your words and complete on its own." })),
       plan: Type.Optional(StringEnum(["session", "swarm"] as const, { description: "accept: session (one worker, the default) or swarm (wide research and tournaments only)." })),
       agents: Type.Optional(Type.Integer({ minimum: 1, maximum: 30, description: "accept with plan swarm: how many agents." })),
+      goal_template: Type.Optional(Type.String({ description: "accept with plan swarm: the goal template it runs, one the prompt names. Omit it for the default." })),
       environment: Type.Optional(Type.String({ description: "accept with plan session: the machine its run_code runs on, one your instructions name. Omit it for the default." })),
       budget_microusd: Type.Optional(Type.Integer({ minimum: 1, description: "accept: the Ticket's whole budget in microusd. Omit it for the default." })),
       acknowledge: Type.Optional(Type.String({ description: "accept: the first reply, instead of the standard one. An empty string sends none." })),
