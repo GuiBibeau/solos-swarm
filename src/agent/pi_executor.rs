@@ -7,6 +7,7 @@
 //! launch past that waits for a slot.
 
 use super::broker::{self, AgentBroker, WorkerSeat, clip};
+use super::environment::{self, Launchable};
 use super::jobs::JOB_TOOLS;
 use super::ports::{BoxFuture, Delivered, Delivery, Executor, Fact, FactSink, Launch};
 use super::swarm_executor::SwarmExecutor;
@@ -296,13 +297,9 @@ where
 {
     pub fn new(parts: PiExecutorParts<H>) -> Result<Self> {
         ensure!(parts.max_workers > 0, "a pi executor needs a worker slot");
-        let mut grants: Vec<String> = ["worker_report", "worker_handback", "fetch_url"]
+        let grants: Vec<String> = ["worker_report", "worker_handback", "fetch_url"]
             .map(String::from)
             .to_vec();
-        if parts.broker.offers_run_code() {
-            grants.push("run_code".into());
-            grants.extend(JOB_TOOLS.map(String::from));
-        }
         private_dir(&parts.tickets_dir)?;
         Ok(Self {
             inner: Arc::new(Inner {
@@ -339,8 +336,16 @@ where
         Box::pin(async move {
             match (runner(&launch.plan), &self.inner.parts.swarm) {
                 (Runner::Session, _) => {
-                    self.inner.start(launch, facts);
-                    Ok(())
+                    let environments = self.inner.parts.broker.environments();
+                    match environments.launchable(environment::named(&launch.plan)) {
+                        Launchable::Now => {
+                            self.inner.start(launch, facts);
+                            Ok(())
+                        }
+                        // The effect runner's backoff holds the Launch until the node is back.
+                        Launchable::Later(why) => Err(anyhow!(why)),
+                        Launchable::Never(why) => failed(&facts, &launch, false, &why, 0).await,
+                    }
                 }
                 (Runner::Swarm, Some(swarm)) => swarm.launch(launch, facts).await,
                 (Runner::Swarm, None) => {
@@ -472,15 +477,26 @@ where
         let parts = &self.parts;
         let dir = self.ticket_dir(&launch.ticket)?;
         let work = dir.join(WORK_DIR);
-        self.prepare(&launch.ticket, &dir, &work).await?;
+        let named = environment::named(&launch.plan);
+        let environments = parts.broker.environments();
+        // A node's /work is its own, so this host's prepare has nothing to set up there.
+        if environments.is_local(named) {
+            self.prepare(&launch.ticket, &dir, &work).await?;
+        }
         let token = broker::new_token();
-        let run_code = parts.broker.offers_run_code();
+        let run_code = environments.offers_run_code(named);
+        let mut grants = self.grants.clone();
+        if run_code {
+            grants.push("run_code".into());
+            grants.extend(JOB_TOOLS.map(String::from));
+        }
         let seat = WorkerSeat::new(
             launch.ticket.clone(),
             launch.assignment.clone(),
             work,
             launch.budget_microusd,
-        );
+        )
+        .in_environment(named.map(str::to_owned));
         let prompt = system_prompt(launch.budget_microusd, run_code);
         let seat = parts.broker.admit_worker(token.clone(), seat, prompt)?;
         let _revoke = Revoke {
@@ -491,7 +507,7 @@ where
         let spec = SessionSpec {
             id: launch.assignment.to_string(),
             role: Role::TicketWorker,
-            grants: self.grants.clone(),
+            grants,
             token,
             model: parts.model.clone(),
             pi_settings: dir.join("pi-settings.json"),

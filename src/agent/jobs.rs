@@ -1,6 +1,7 @@
 //! A worker's background jobs: `job_start`, `job_wait`, `job_stop`, and a
 //! `run_code` that moves to the background when it runs long. Each job runs
-//! in the shared sandbox ([`CodeExecutor`]) in its Ticket's directory and
+//! in its Ticket's environment, this host's shared sandbox
+//! ([`CodeExecutor`](crate::code::CodeExecutor)) or a remote node's, and
 //! belongs to one Assignment; it dies with that Assignment's worker.
 //!
 //! A job's end reaches the worker once. In a turn, only the worker's own
@@ -10,8 +11,9 @@
 //! jobs, so the two paths cannot both take one end: whoever takes it removes
 //! the job from the table.
 
+use super::environment::{ExecutionEnvironment, Offline, Work};
 use super::ports::{Fact, FactSink};
-use crate::code::{CodeExecutor, Ended, MAX_TIMEOUT_SECONDS, OutputBounds, Started};
+use crate::code::{Ended, MAX_TIMEOUT_SECONDS, OutputBounds, Started};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use solos_agent_core::ids::key;
@@ -79,11 +81,13 @@ pub enum Refused {
     Unknown(String),
     /// The Ticket holds its most jobs, or its worker has ended.
     Full(String),
+    /// The Ticket's node is not connected.
+    Offline(String),
 }
 
 /// Where one worker's jobs run and where their ends go.
 pub struct Host<'a> {
-    pub code: &'a Arc<CodeExecutor>,
+    pub environment: &'a dyn ExecutionEnvironment,
     pub limits: JobLimits,
     pub facts: &'a FactSink,
     pub ticket: &'a TicketId,
@@ -161,6 +165,23 @@ struct StopArgs {
 fn arguments<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, Refused> {
     serde_json::from_value(args)
         .map_err(|err| Refused::BadArguments(format!("bad arguments: {err}")))
+}
+
+/// Why a command did not start.
+fn not_started(err: anyhow::Error) -> Refused {
+    match err.downcast::<Offline>() {
+        Ok(Offline(why)) => Refused::Offline(why),
+        Err(err) => Refused::BadArguments(format!("{err:#}")),
+    }
+}
+
+impl Host<'_> {
+    fn work(&self) -> Work<'_> {
+        Work {
+            ticket: self.ticket,
+            dir: self.work_dir,
+        }
+    }
 }
 
 const LATER: &str = "Keep working: if it ends after your turn, its result comes to you as new \
@@ -250,9 +271,9 @@ impl Jobs {
         let mut state = self.lock();
         room(&state, host.limits)?;
         let sandbox = host
-            .code
-            .start_job_in(host.work_dir, &code, Duration::from_secs(timeout_s), bounds)
-            .map_err(|err| Refused::BadArguments(format!("{err:#}")))?;
+            .environment
+            .job(host.work(), &code, Duration::from_secs(timeout_s), bounds)
+            .map_err(not_started)?;
         let id = self.keep(&mut state, host, &code, sandbox);
         Ok(json!({"job": id, "status": "started", "timeout_s": timeout_s, "next": LATER}))
     }
@@ -266,9 +287,9 @@ impl Jobs {
         args: &Value,
     ) -> Result<Value, Refused> {
         let sandbox = host
-            .code
-            .start_in(host.work_dir, args)
-            .map_err(|err| Refused::BadArguments(format!("{err:#}")))?;
+            .environment
+            .run_code(host.work(), args)
+            .map_err(not_started)?;
         if let Some(ended) = sandbox.wait(host.limits.background_after).await {
             return receipt(ended);
         }

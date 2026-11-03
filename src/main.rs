@@ -58,6 +58,12 @@ enum Action {
         #[command(subcommand)]
         command: AgentCommand,
     },
+    /// A machine that runs an agent's commands: it dials out to the agent and
+    /// runs what it is sent in its own sandbox.
+    Node {
+        #[command(subcommand)]
+        command: NodeCommand,
+    },
     Run {
         #[arg(long)]
         config: PathBuf,
@@ -150,6 +156,45 @@ enum AgentCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Write the key and self-signed certificate the agent's node listener
+    /// serves, and print the fingerprint each node's config pins.
+    InitNodes {
+        /// Created if missing; an existing key is never replaced.
+        #[arg(long)]
+        dir: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum NodeCommand {
+    /// Write this machine's key and self-signed certificate, and print the
+    /// fingerprint the agent's `nodes.allow` pins.
+    Init {
+        /// Created if missing; an existing key is never replaced.
+        #[arg(long)]
+        dir: PathBuf,
+    },
+    /// Dial the agent and run what it sends until SIGINT or SIGTERM, dialing
+    /// again whenever the connection ends.
+    Serve {
+        /// The node's name, the agent's address and fingerprint, its own
+        /// certificate, sandbox mounts and secrets.
+        #[arg(long)]
+        config: PathBuf,
+    },
+}
+
+/// Write an identity in `dir` and say what to do with its fingerprint.
+fn init_identity(dir: &Path, subject: &str, peer: &str) -> Result<()> {
+    let fingerprint = solos_swarm::remote::tls::init(dir, subject)?;
+    let (cert, key) = solos_swarm::remote::tls::files(dir);
+    eprintln!(
+        "wrote {} and {}; pin this fingerprint in {peer}:",
+        cert.display(),
+        key.display()
+    );
+    println!("{fingerprint}");
+    Ok(())
 }
 
 /// Read a one-use credential file and delete it, whether or not the read
@@ -307,6 +352,31 @@ async fn execute(command: Action) -> Result<()> {
                 print!("{}", status::render(&report));
             }
             Ok(())
+        }
+        Action::Agent {
+            command: AgentCommand::InitNodes { dir },
+        } => init_identity(
+            &dir,
+            solos_swarm::remote::tls::AGENT_NAME,
+            "each node's agent.fingerprint",
+        ),
+        Action::Node {
+            command: NodeCommand::Init { dir },
+        } => init_identity(
+            &dir,
+            solos_swarm::remote::tls::NODE_NAME,
+            "the agent's nodes.allow.<name>.fingerprint",
+        ),
+        Action::Node {
+            command: NodeCommand::Serve { config },
+        } => {
+            ensure!(
+                std::env::consts::OS == "linux",
+                "a node's sandbox requires Linux"
+            );
+            let config = solos_swarm::remote::NodeConfig::load(&config)?;
+            let node = solos_swarm::remote::Node::new(&config)?;
+            node.serve(solos_swarm::agent::shutdown()).await
         }
         Action::Run {
             config,
