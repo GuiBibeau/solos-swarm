@@ -17,7 +17,7 @@ A Rust control plane, scheduler, and capability broker for governed agent swarms
 - **`solos-swarm run`**: a single-host run of N sandboxed Pi agents against one Goal, with a model broker that enforces
   a microUSD budget (conservative holds, cache-aware settlement), per-task envelopes, and a hash-chained event log.
 - **`scripts/remote.py`**: the controller for running on a Linux host over SSH: deploy immutable candidates, start,
-  status, collect and cancel runs, plus channels, drain and doctor.
+  status, collect and cancel runs, plus candidate channels (`candidates`), drain, pause, resume and doctor.
 - **Pause mode**: model calls can be held in peak-price windows or by an operator; deadlines count unpaused time.
   [docs/pause-mode.md](docs/pause-mode.md)
 - **Self-update**: `stable`/`canary` candidate channels with a promotion gate, rollback, prune, drain, doctor and
@@ -30,6 +30,8 @@ A Rust control plane, scheduler, and capability broker for governed agent swarms
 - **Agent mode (in progress)**: a long-lived agent for Slack, Discord, GitHub and schedules that runs each request on one
   worker or on a governed swarm, sharing this broker, ledger, harness and sandbox. The pure domain is
   `crates/agent-core`. Plan: [docs/agent-mode/README.md](docs/agent-mode/README.md).
+- **Vault and verifiable browser (designed, not yet built)**: a secrets vault and a browser whose steps are signed, for
+  agent mode. Design: [docs/agent-mode/vault-browser/rationale.md](docs/agent-mode/vault-browser/rationale.md).
 
 See [CHANGELOG.md](CHANGELOG.md) for what changed and when.
 
@@ -60,7 +62,7 @@ See [CHANGELOG.md](CHANGELOG.md) for what changed and when.
 | `Pi Agent Sandbox` | Pinned Pi 1.1.0 inside `bwrap`, Landlock, `seccomp`, and Unix RPC socket. |
 | `WASI Worker` | Separate `wasmtime` process with deterministic fuel and memory caps. |
 | `Firecracker MicroVM` | KVM microVMs with scoped broker SVID over vsock (`gVisor` fallback). |
-| `Model Broker` | Keyless worker gate for DeepSeek API and local Qwen / `llama.cpp`. |
+| `Model Broker` | Keyless worker gate for DeepSeek and Venice APIs and local Qwen / `llama.cpp`. |
 
 ## Quickstart
 
@@ -137,8 +139,8 @@ Dashboard checks: `node --test tests/dashboard-spatial.test.mjs tests/dashboard-
 
 | Document | Scope |
 |---|---|
-| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Domain model, Raft over mTLS QUIC, Tier-P sandboxes, and spend ledger. |
-| [`docs/agent-mode/README.md`](docs/agent-mode/README.md) | Agent mode plan: ports, shared kernel, roadmap P0-P10. |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Domain model, Raft over mTLS QUIC, sandbox tiers W, P, G and V, and spend ledger. |
+| [`docs/agent-mode/README.md`](docs/agent-mode/README.md) | Agent mode plan: ports, shared kernel, roadmap P0-P12. |
 | [`docs/adr/0001-hexagonal-ports-and-two-modes.md`](docs/adr/0001-hexagonal-ports-and-two-modes.md) | One hexagon, two modes (swarm and agent). |
 | [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | Identity provisioning, offline startup, cluster recovery, and operations. |
 | [`docs/CAMPAIGNS.md`](docs/CAMPAIGNS.md) | Matched 1-vs-10 worker evaluation design and schemas. |
@@ -149,7 +151,7 @@ Dashboard checks: `node --test tests/dashboard-spatial.test.mjs tests/dashboard-
 | [`docs/running-a-tournament.md`](docs/running-a-tournament.md) | Runbook from the first live tournament. |
 | [`replay/README.md`](replay/README.md) | Replay-scored policy loop. |
 | [`docs/rust-style.md`](docs/rust-style.md) | Rust style, lints and the gates CI runs. |
-| [`CHANGELOG.md`](CHANGELOG.md) | PRs #6-#14 and what they added. |
+| [`CHANGELOG.md`](CHANGELOG.md) | Unreleased agent-mode work, and what PRs #6-#14 added. |
 | [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | Live 10-agent DeepSeek results, microbenchmarks, and acceptance SLOs. |
 | [`dashboard/index.html`](dashboard/index.html) | Spatial dashboard for runtime telemetry and saved snapshots. |
 | [`skills/verify-solos-swarm/SKILL.md`](skills/verify-solos-swarm/SKILL.md) | Release qualification workflow for immutable candidates. |
