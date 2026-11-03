@@ -553,7 +553,7 @@ async fn a_failed_call_releases_its_hold_and_an_unreadable_receipt_is_charged_at
 }
 
 #[tokio::test]
-async fn a_call_past_its_limit_is_dropped_and_its_hold_released_while_an_unlimited_token_waits() {
+async fn a_call_past_its_limit_is_dropped_and_charged_its_hold_while_an_unlimited_token_waits() {
     let scratch = Scratch::new("limit");
     let provider = Scripted::new();
     let (_runtime, served) = model_only(&scratch, provider.clone(), 1_000_000);
@@ -582,7 +582,11 @@ async fn a_call_past_its_limit_is_dropped_and_its_hold_released_while_an_unlimit
         "{reply}"
     );
     assert!(started.elapsed() < SLOW * 5, "{:?}", started.elapsed());
-    assert_eq!(scratch.store().committed("router", 0).unwrap(), 0);
+    assert_eq!(
+        scratch.store().committed("router", 0).unwrap(),
+        hold_for("judge"),
+        "the provider may still bill a dropped call"
+    );
 
     provider.set(Behaviour::Slow);
     assert_eq!(ask(TOKEN).await.0, 200, "a token without a limit waits");
@@ -595,9 +599,9 @@ async fn a_call_past_its_limit_is_dropped_and_its_hold_released_while_an_unlimit
     assert_eq!(
         closed,
         [
-            (SpendState::Released, 0),
+            (SpendState::Unknown, hold_for("judge")),
             (SpendState::Settled, COST),
-            (SpendState::Released, 0),
+            (SpendState::Unknown, hold_for("judge")),
             (SpendState::Settled, COST)
         ]
     );
