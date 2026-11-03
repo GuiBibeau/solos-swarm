@@ -18,7 +18,10 @@ fn populate(db: &TempDb) {
             .receive(slack(&id, Actor::person("alice"), thread, "@agent do it"))
             .unwrap();
         let eval = engine.evaluate_due().unwrap().remove(0);
-        let session = Plan::Session { harness: None };
+        let session = Plan::Session {
+            harness: None,
+            environment: None,
+        };
         engine
             .decide(&eval, accept("Do it", session, 1_000))
             .unwrap();

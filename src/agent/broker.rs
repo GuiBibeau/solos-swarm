@@ -794,9 +794,10 @@ impl DecideArgs {
             },
             Choice::Accept => {
                 let plan = match (self.plan.unwrap_or(PlanKind::Session), self.agents) {
-                    (PlanKind::Session, None) if self.goal_template.is_none() => {
-                        Plan::Session { harness: None }
-                    }
+                    (PlanKind::Session, None) if self.goal_template.is_none() => Plan::Session {
+                        harness: None,
+                        environment: None,
+                    },
                     (PlanKind::Session, _) => {
                         return Err("agents and goal_template are for a swarm plan only".into());
                     }
@@ -1278,7 +1279,13 @@ mod tests {
         .unwrap() else {
             panic!("not an accept")
         };
-        assert_eq!(accept.plan, Plan::Session { harness: None });
+        assert_eq!(
+            accept.plan,
+            Plan::Session {
+                harness: None,
+                environment: None
+            }
+        );
         assert_eq!(accept.budget_microusd, 500_000);
         assert_eq!(accept.acknowledge, Acknowledge::Standard);
         let Verdict::Accept(swarm) = verdict(json!({

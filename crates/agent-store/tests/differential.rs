@@ -256,6 +256,7 @@ fn gen_accept(rng: &mut Lcg) -> Accept {
     let plan = if rng.chance(70) {
         Plan::Session {
             harness: rng.chance(20).then(|| "pi".to_owned()),
+            environment: rng.chance(30).then(|| "laptop".to_owned()),
         }
     } else {
         Plan::Swarm {

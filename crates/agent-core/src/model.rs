@@ -188,6 +188,10 @@ pub enum Plan {
     Session {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         harness: Option<String>,
+        /// Where its commands run: a remote node by name, or `local`.
+        /// `None` is the executor's default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        environment: Option<String>,
     },
     /// The Ticket's scope becomes a Goal run by a governed swarm of `agents`
     /// sandboxed workers under the Ticket's budget.

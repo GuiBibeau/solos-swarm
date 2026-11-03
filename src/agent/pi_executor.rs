@@ -186,12 +186,14 @@ enum Runner {
 
 fn runner(plan: &Plan) -> Runner {
     match plan {
-        Plan::Session { harness: None } => Runner::Session,
+        Plan::Session { harness: None, .. } => Runner::Session,
         Plan::Session {
             harness: Some(name),
+            ..
         } if name == "pi" => Runner::Session,
         Plan::Session {
             harness: Some(name),
+            ..
         } => Runner::Unavailable(format!("the {name} harness is not available here")),
         Plan::Swarm { .. } => Runner::Swarm,
     }
@@ -973,7 +975,10 @@ mod tests {
             title: "Fix the flaky test".into(),
             scope: "Make tests/retry.rs pass ten times in a row.".into(),
             rules: Vec::new(),
-            plan: Plan::Session { harness: None },
+            plan: Plan::Session {
+                harness: None,
+                environment: None,
+            },
             budget_microusd: 500_000,
             recovery: false,
             inputs: Vec::new(),
