@@ -1157,7 +1157,7 @@ async fn execute_watched(
 /// clones nothing more, then kill what it cloned, the namespace's init,
 /// whose death ends every process in the namespace, and then it.
 #[cfg(target_os = "linux")]
-async fn kill_sandbox(child: &mut tokio::process::Child) {
+pub(crate) async fn kill_sandbox(child: &mut tokio::process::Child) {
     if let Some(pid) = child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()) {
         // SAFETY: kill(2) takes no pointers. `pid` is our child and tokio
         // has not reaped it (it clears the id when it does), so the pid
@@ -1179,7 +1179,7 @@ async fn kill_sandbox(child: &mut tokio::process::Child) {
 }
 
 #[cfg(not(target_os = "linux"))]
-async fn kill_sandbox(child: &mut tokio::process::Child) {
+pub(crate) async fn kill_sandbox(child: &mut tokio::process::Child) {
     let _ = child.start_kill();
 }
 
