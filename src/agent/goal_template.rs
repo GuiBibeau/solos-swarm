@@ -282,6 +282,39 @@ mod tests {
     }
 
     #[test]
+    fn a_template_can_name_its_own_nudges_and_record_fields() {
+        let own = format!(
+            "{RESEARCH}nudges:\n  \
+             explore: {{{{ \"You are {{agent_id}}. Read the code for \" ~ ticket ~ \".\" }}}}\n  \
+             file: \"You are {{agent_id}}. File now: {{call}}\"\n\
+             record_fields:\n  file_from: [path]\n  copy: [part]\n  result_key: notes\n"
+        );
+        let t = templates(&[("code", &own)], Some("code"));
+        t.check(500_000).unwrap();
+        let (goal, _) = t.goal(None, &fill("T", "S", 2)).unwrap();
+        let nudges = goal.nudges();
+        assert_eq!(
+            nudges.explore("agent-01").unwrap(),
+            "You are agent-01. Read the code for tk_1."
+        );
+        assert_eq!(
+            nudges.assemble,
+            crate::broker::Nudges::default().assemble,
+            "a stage the template leaves out"
+        );
+        let fields = goal.record_fields();
+        assert_eq!(fields.file_from, ["path"]);
+        assert_eq!(fields.copy, ["part"]);
+        assert_eq!(fields.result_key, "notes");
+        assert_eq!(fields.marked_result_key, "experiments");
+
+        let (research, _) = templates(&[("research", RESEARCH)], Some("research"))
+            .goal(None, &fill("T", "S", 2))
+            .unwrap();
+        assert!(research.nudges.is_none() && research.record_fields.is_none());
+    }
+
+    #[test]
     fn text_from_a_trigger_cannot_add_a_key_or_leave_its_string() {
         let t = templates(&[("research", RESEARCH)], Some("research"));
         let hostile =
@@ -313,7 +346,13 @@ mod tests {
             "provider: venice\nmodel: deepseek-flash",
         );
         let wide = RESEARCH.replace("synthetic-fixtures-only", "the-whole-internet");
+        let nudge = format!("{RESEARCH}nudges: {{explore: \"You are {{agent}}.\"}}\n");
         for (case, source, why) in [
+            (
+                "a malformed nudge",
+                nudge.as_str(),
+                "nudges.explore: {agent} is not a placeholder",
+            ),
             ("a fixed budget", fixed.as_str(), "not the ticket's 400000"),
             ("a fixed agent count", two.as_str(), "invalid Goal"),
             ("an unknown placeholder", typo.as_str(), "undefined"),

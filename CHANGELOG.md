@@ -67,6 +67,11 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   background; a job's end reaches the worker once, in its turn or as a Note that wakes it, and the job dies with its
   Assignment. Limits under `executor.run_code` (`background_after_secs`, `max_jobs`, `job_max_secs`,
   `job_output_bytes`); swarm `run_code` is unchanged.
+- Agent mode, P2b, which closes P2: one bwrap builder (`src/bwrap.rs`) for the Pi launch, `run_code`'s sandbox and
+  `doctor`'s probe, with the same argument vectors (the golden tests pass unedited; the frozen mvp sandboxes keep
+  their own lines). The research words in the swarm runtime are now optional Goal fields: `nudges`, one template
+  per escalation stage, and `record_fields`, the Task fields a host-filed record reads. `Goal::validate` checks
+  them, a Goal template can set them, and a Goal without them runs exactly as before.
 - `collect` leaves the per-run `code/` scratch directory on the host and writes `collect-manifest.json`; `--include-code` opts back in.
 - Docs: pause mode, self-update operations, dashboard tunnel, tournament runbook, replay status.
 
