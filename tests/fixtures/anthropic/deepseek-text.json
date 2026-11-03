@@ -1,0 +1,26 @@
+{
+  "id": "5b1e7c3a-2f0d-4c8e-9a61-0d4f7b2e9c11",
+  "object": "chat.completion",
+  "created": 1793613601,
+  "model": "deepseek-v4-flash",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Reported; the ticket has ended."
+      },
+      "logprobs": null,
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 1240,
+    "completion_tokens": 9,
+    "total_tokens": 1249,
+    "prompt_tokens_details": {"cached_tokens": 1152},
+    "prompt_cache_hit_tokens": 1152,
+    "prompt_cache_miss_tokens": 88
+  },
+  "system_fingerprint": "fp_8802369eaa_prod0623_fp8_kvcache"
+}
