@@ -20,7 +20,9 @@ pub enum Call {
     /// `submit_artifact` with the exact union of the findings last read.
     SubmitArtifact,
     /// Each tool call the turn's model reply asked for, with its arguments,
-    /// as Pi would run them.
+    /// as Pi would run them. A reply cut off at the output limit
+    /// (`finish_reason` length) with tool calls runs none of them, and the
+    /// model is asked again with the same prompt, as Pi's agent loop does.
     Replied,
 }
 
@@ -146,15 +148,13 @@ impl Agent {
     }
 
     async fn turn(&mut self, prompt: &str, calls: &[Call]) -> Result<()> {
-        let reply = self
-            .post(
-                "model",
-                json!({"model":self.model,"messages":[{"role":"user","content":prompt}]}),
-            )
-            .await?;
+        let mut reply = self.model(prompt).await?;
         for call in calls {
             match call {
                 Call::Replied => {
+                    while cut_off(&reply) {
+                        reply = self.model(prompt).await?;
+                    }
                     let asked = reply["choices"][0]["message"]["tool_calls"]
                         .as_array()
                         .cloned()
@@ -194,6 +194,11 @@ impl Agent {
         Ok(())
     }
 
+    async fn model(&self, prompt: &str) -> Result<Value> {
+        let body = json!({"model":self.model,"messages":[{"role":"user","content":prompt}]});
+        self.post("model", body).await
+    }
+
     async fn post(&self, path: &str, body: Value) -> Result<Value> {
         let response = self
             .client
@@ -210,6 +215,15 @@ impl Agent {
         );
         Ok(serde_json::from_str(&text)?)
     }
+}
+
+/// A reply the output limit cut off while it was asking for tool calls.
+fn cut_off(reply: &Value) -> bool {
+    let choice = &reply["choices"][0];
+    choice["finish_reason"] == "length"
+        && choice["message"]["tool_calls"]
+            .as_array()
+            .is_some_and(|calls| !calls.is_empty())
 }
 
 /// Every record of every finding, verbatim, under their one result key.

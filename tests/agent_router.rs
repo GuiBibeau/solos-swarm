@@ -20,12 +20,30 @@ use std::time::Duration;
 
 const LIMIT: Duration = Duration::from_secs(120);
 
+/// Model calls after which a `Judge` that cuts replies off gives up and
+/// answers in plain text, so a Router that never stops asking ends the test
+/// instead of hanging it.
+const CALL_CAP: usize = 200;
+
 /// The Router's model: every explicit candidate on the latest prompt is
 /// accepted, every inferred one ignored. After a tool result it ends the
 /// turn, as a model does once it has decided.
 #[derive(Default)]
 struct Judge {
     bodies: Mutex<Vec<Value>>,
+    /// How many tool calls one reply holds before the output limit cuts it
+    /// off. A prompt with more cards gets a cut-off reply of that many calls
+    /// (at least one).
+    fits: Option<usize>,
+}
+
+impl Judge {
+    fn fitting(fits: usize) -> Self {
+        Self {
+            fits: Some(fits),
+            ..Self::default()
+        }
+    }
 }
 
 /// `(eval, strength, first quoted line)` of each card in `prompt`.
@@ -62,9 +80,16 @@ impl Provider for Judge {
         let messages = body["messages"].as_array().cloned().unwrap_or_default();
         let last = messages.last().cloned().unwrap_or(Value::Null);
         let n = self.bodies.lock().unwrap().len();
-        let message = if last["role"] == "user" {
-            let calls: Vec<Value> = cards(&text(&last))
+        let asked = cards(&text(&last));
+        let given_up = self.fits.is_some() && n > CALL_CAP;
+        let (kept, cut) = match self.fits {
+            Some(fits) if asked.len() > fits => (fits.max(1), true),
+            _ => (asked.len(), false),
+        };
+        let message = if last["role"] == "user" && !given_up {
+            let calls: Vec<Value> = asked
                 .into_iter()
+                .take(kept)
                 .map(|(eval, strength, title)| {
                     let arguments = if strength == "explicit" {
                         json!({"eval":eval,"decision":"accept","reason":"a person asked for it",
@@ -80,10 +105,10 @@ impl Provider for Judge {
         } else {
             json!({"role":"assistant","content":"Decided."})
         };
-        let finish = if message["tool_calls"].is_array() {
-            "tool_calls"
-        } else {
-            "stop"
+        let finish = match (message["tool_calls"].is_array(), cut) {
+            (true, true) => "length",
+            (true, false) => "tool_calls",
+            (false, _) => "stop",
         };
         Box::pin(async move {
             Ok(
@@ -177,7 +202,50 @@ budgets: {session_microusd: 500000, router_daily_microusd: 1000000}
         std::fs::write(&path, yaml).unwrap();
         AgentConfig::load(&path).unwrap()
     }
-    async fn serve<H>(&self, harness: H, judge: Arc<Judge>, pi_root: &Path, node: &Path) -> Summary
+    /// `requests` messages from a listed bot, each on a Thread of its own, all
+    /// judged at once; an Eval left undecided expires after `eval_timeout_ms`.
+    fn crowd(&self, requests: usize, eval_timeout_ms: u64) -> AgentConfig {
+        let lines: Vec<String> = (1..=requests)
+            .map(|n| {
+                json!({"id":format!("t-{n}"),"source":"slack","at_ms":1_793_613_600_000u64,
+                       "actor":{"id":"deploy-bot","kind":"bot"},"addressed":"mention",
+                       "text":format!("Deploy {n} finished"),"threads":[format!("T{n}")],
+                       "reply_to":[{"source":"slack","address":{"thread_ts":format!("T{n}")}}]})
+                .to_string()
+            })
+            .collect();
+        std::fs::write(self.root.join("triggers.jsonl"), lines.join("\n") + "\n").unwrap();
+        let yaml = format!(
+            "
+policy:
+  bots: [slack:deploy-bot]
+  eval_timeout_ms: {eval_timeout_ms}
+sources:
+  - {{kind: jsonl, path: triggers.jsonl}}
+channels:
+  - {{kind: jsonl, source: slack, path: outbox.jsonl}}
+router:
+  kind: pi
+  provider: deepseek
+  model: deepseek-flash
+  prices: {{input_microusd_per_million: 300000, output_microusd_per_million: 1200000, cache_hit_microusd_per_million: 6000}}
+  max_output_tokens: 2048
+executor: {{kind: scripted}}
+budgets: {{session_microusd: 500000, router_daily_microusd: 1000000}}
+"
+        );
+        let path = self.root.join("agent.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        AgentConfig::load(&path).unwrap()
+    }
+    async fn serve<H>(
+        &self,
+        config: AgentConfig,
+        harness: H,
+        judge: Arc<Judge>,
+        pi_root: &Path,
+        node: &Path,
+    ) -> Summary
     where
         H: AgentHarness + Send + Sync + 'static,
         H::Session: Send + 'static,
@@ -189,7 +257,7 @@ budgets: {session_microusd: 500000, router_daily_microusd: 1000000}
             node: node.to_owned(),
         };
         let state = self.state();
-        let serving = serve_with(self.config(), &state, true, Some(host));
+        let serving = serve_with(config, &state, true, Some(host));
         tokio::time::timeout(LIMIT, serving)
             .await
             .expect("serve did not go idle")
@@ -288,6 +356,7 @@ async fn agent_serve_judges_through_a_scripted_router_session_and_the_broker() {
 
     let summary = scratch
         .serve(
+            scratch.config(),
             harness,
             judge.clone(),
             &scratch.root,
@@ -327,6 +396,101 @@ async fn agent_serve_judges_through_a_scripted_router_session_and_the_broker() {
     );
 }
 
+/// The cards on each prompt the model was asked, in order.
+fn prompt_sizes(judge: &Judge) -> Vec<usize> {
+    let bodies = judge.bodies.lock().unwrap();
+    bodies
+        .iter()
+        .map(|body| cards(&text(body["messages"].as_array().unwrap().last().unwrap())).len())
+        .collect()
+}
+
+/// `requests` bot messages judged at once by `judge` through a scripted
+/// session that, like Pi, asks again after a reply the output limit cut off.
+async fn judge_crowd(
+    name: &str,
+    requests: usize,
+    eval_timeout_ms: u64,
+    judge: &Arc<Judge>,
+) -> (Scratch, Summary) {
+    let scratch = Scratch::new(name);
+    std::fs::write(scratch.root.join("node"), "").unwrap();
+    let harness = ScriptedHarness::new(BTreeMap::new()).every_turn(vec![Call::Replied]);
+    let config = scratch.crowd(requests, eval_timeout_ms);
+    let node = scratch.root.join("node");
+    let summary = scratch
+        .serve(config, harness, judge.clone(), &scratch.root, &node)
+        .await;
+    (scratch, summary)
+}
+
+#[tokio::test]
+async fn a_queue_longer_than_the_batch_goes_out_in_bounded_prompts_and_every_candidate_is_decided()
+{
+    let judge = Arc::new(Judge::default());
+    let (scratch, summary) = judge_crowd("batches", 20, 120_000, &judge).await;
+
+    assert_eq!((summary.triggers_received, summary.effects_pending), (20, 0));
+    let sizes = prompt_sizes(&judge);
+    assert!(sizes.iter().all(|cards| *cards <= 6), "{sizes:?}");
+    assert_eq!(sizes.iter().sum::<usize>(), 20, "{sizes:?}");
+    let decisions = scratch.store().decisions().unwrap();
+    assert_eq!(decisions.len(), 20);
+    assert!(
+        decisions
+            .iter()
+            .all(|d| d.kind == DecisionKind::Ignore && d.reason == "nobody asked for work"),
+        "{decisions:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_reply_cut_off_at_the_output_limit_is_followed_by_a_smaller_prompt() {
+    let judge = Arc::new(Judge::fitting(4));
+    let (scratch, summary) = judge_crowd("cutoff", 20, 300, &judge).await;
+
+    assert_eq!((summary.triggers_received, summary.effects_pending), (20, 0));
+    let sizes = prompt_sizes(&judge);
+    let calls = sizes.len();
+    assert!(calls < CALL_CAP, "the model was asked {calls} times: {sizes:?}");
+    let mut asked = sizes.clone();
+    asked.dedup();
+    for pair in asked.windows(2) {
+        assert!(
+            pair[0] <= 4 || pair[1] < pair[0],
+            "a cut-off prompt of {} cards was followed by one of {}: {asked:?}",
+            pair[0],
+            pair[1]
+        );
+    }
+    let decisions = scratch.store().decisions().unwrap();
+    assert_eq!(decisions.len(), 20, "{sizes:?}");
+    assert!(
+        decisions
+            .iter()
+            .all(|d| d.kind == DecisionKind::Ignore && d.reason == "nobody asked for work"),
+        "{decisions:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_router_whose_every_reply_is_cut_off_leaves_its_evals_to_expire() {
+    let judge = Arc::new(Judge::fitting(0));
+    let (scratch, summary) = judge_crowd("always-cut", 4, 300, &judge).await;
+
+    assert_eq!((summary.triggers_received, summary.effects_pending), (4, 0));
+    let calls = judge.bodies.lock().unwrap().len();
+    assert!(calls < CALL_CAP / 4, "the model was asked {calls} times");
+    let decisions = scratch.store().decisions().unwrap();
+    assert_eq!(decisions.len(), 4, "{decisions:?}");
+    assert!(
+        decisions.iter().all(
+            |d| d.kind == DecisionKind::Unavailable && d.reason == "the Router did not decide in time"
+        ),
+        "{decisions:?}"
+    );
+}
+
 /// The same run with the real Pi in bubblewrap. On a Linux box with the
 /// pinned Pi tree:
 ///
@@ -341,7 +505,7 @@ async fn agent_serve_judges_through_a_real_pi_router_session() {
     let judge = Arc::new(Judge::default());
 
     let summary = scratch
-        .serve(PiHarness, judge.clone(), &pi_root, &node)
+        .serve(scratch.config(), PiHarness, judge.clone(), &pi_root, &node)
         .await;
 
     eprintln!("summary: {}", json!(summary));
