@@ -33,7 +33,8 @@ pub use runtime::{Adapters, HOST_RESTARTED, RunOptions, Runtime, Summary};
 
 use crate::broker::{now_ms, write_json};
 use crate::browse::{Browsers, Launcher, TrailSigner};
-use crate::code::{CodeConfig, CodeExecutor, Mount};
+use crate::code::{CodeConfig, CodeExecutor};
+use crate::exposure::{self, Exposure, Host};
 use crate::gateway::{Provider, provider_for, upstream_profile};
 use crate::harness::claude_code::ClaudeCodeHarness;
 use crate::harness::{AgentHarness, PiHarness, Role, SessionSpec};
@@ -328,12 +329,17 @@ where
                 Some(Arc::new(opened))
             }
         };
-        let tickets_dir = canonical(state_dir)?.join(TICKETS_DIR);
-        let readable = config.sandbox_view().and([
-            tickets_dir.clone(),
-            crate::harness::node_root(&node).to_owned(),
-            pi_root.clone(),
-        ]);
+        let state = canonical(state_dir)?;
+        let tickets_dir = state.join(TICKETS_DIR);
+        let readable = Exposure::new(
+            config,
+            &Host {
+                state_dir: Some(state),
+                pi_root: Some(pi_root.clone()),
+                node: Some(node.clone()),
+            },
+        )
+        .view();
         let mut browsers = None;
         let workers = match &config.executor {
             ExecutorConfig::Scripted {} | ExecutorConfig::Simulated { .. } => None,
@@ -561,12 +567,10 @@ fn claude_harness(install: &ClaudeConfig) -> Result<ClaudeCodeHarness> {
 /// The workers' `run_code` sandbox, with every scratch directory under the
 /// Tickets' directory.
 fn code_config(run_code: &RunCodeConfig, tickets_dir: &Path, tree: Option<&Path>) -> CodeConfig {
-    let mut mounts = run_code.mounts.clone();
-    mounts.extend(tree.map(|root| Mount {
-        target: PathBuf::from(pstack::MOUNT),
-        source: root.to_owned(),
-    }));
-    let mut code = CodeConfig::new(tickets_dir.to_owned(), mounts);
+    let mut code = CodeConfig::new(
+        tickets_dir.to_owned(),
+        exposure::run_code_mounts(run_code, tree),
+    );
     code.uv_root = run_code.uv_root.clone();
     code.concurrency = run_code.concurrency;
     code.memory_bytes = run_code.memory_bytes;

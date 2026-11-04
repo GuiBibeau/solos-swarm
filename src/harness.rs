@@ -1,7 +1,7 @@
 //! The agent harness port: how a mode starts an agent session, prompts it and
 //! stops it, whichever program runs the session. `PiHarness` is the adapter
 //! swarm runs launch.
-use crate::{agent::pstack, broker::now_ms, bwrap::Bwrap};
+use crate::{broker::now_ms, bwrap::Bwrap, exposure};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -143,7 +143,6 @@ impl PiHarness {
     /// The single documented worker isolation boundary: every input is a
     /// distinct mount or identity.
     pub fn command(spec: &SessionSpec) -> Command {
-        let node = spec.node.as_path();
         let mut sandbox = Bwrap::new()
             .unshare_all()
             .die_with_parent()
@@ -154,12 +153,12 @@ impl PiHarness {
             .tmpfs("/tmp")
             .tmpfs("/work")
             .dir("/work/config")
-            .dir("/runtime")
-            .ro_bind(node_root(node), "/runtime/node")
-            .ro_bind(spec.pi_root.join("node_modules"), "/runtime/node_modules")
-            .ro_bind(spec.pi_root.join("extensions"), "/runtime/extensions");
+            .dir("/runtime");
+        for bind in exposure::pi_binds(&spec.node, &spec.pi_root) {
+            sandbox = exposure::read_only(sandbox, &bind);
+        }
         if spec.grants.iter().any(|grant| grant == "read") {
-            sandbox = sandbox.ro_bind(spec.pi_root.join(pstack::VENDORED), pstack::MOUNT);
+            sandbox = exposure::read_only(sandbox, &exposure::pstack_bind(&spec.pi_root));
         }
         let mut sandbox = sandbox
             .ro_bind(&spec.broker_socket, "/broker.sock")
