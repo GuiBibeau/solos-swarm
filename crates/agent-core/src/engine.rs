@@ -3,6 +3,7 @@
 //! through [`Repositories::commit`]. A command that returns an error commits
 //! nothing.
 
+use crate::change::Deliverable;
 use crate::ids::key;
 use crate::model::{
     Accept, Acknowledge, Actor, Approval, Ask, Assignment, AssignmentId, AssignmentState,
@@ -714,7 +715,21 @@ fn validate(accept: &Accept) -> Result<(), Error> {
     if accept.budget_microusd == 0 {
         return Err(Error::Invalid("an accept needs a budget".into()));
     }
-    Ok(())
+    match (&accept.plan, &accept.repo) {
+        (Plan::Swarm { .. }, Some(_)) => Err(Error::Invalid(
+            "a repository is for a session plan only".into(),
+        )),
+        (
+            Plan::Session {
+                method: Some(method),
+                ..
+            },
+            None,
+        ) if method.deliverable > Deliverable::Answer => Err(Error::Invalid(
+            "a change or a pull request needs a repository".into(),
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Put `triggers` back at the front of the queue, each at most once.
@@ -1276,6 +1291,7 @@ impl<R: Repositories> Tx<'_, R> {
                 requester: primary.actor,
                 source: primary.source,
                 budget_microusd: accept.budget_microusd,
+                repo: accept.repo,
             },
             plan: accept.plan,
             channels: primary.reply_to,

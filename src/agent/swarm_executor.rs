@@ -707,6 +707,7 @@ mod tests {
                     default_budget_microusd: 1,
                     max_budget_microusd: None,
                     swarm: None,
+                    repos: BTreeMap::new(),
                 },
                 workers: None,
             })
@@ -822,6 +823,7 @@ mod tests {
                 goal_template: None,
             },
             budget_microusd: 500_000,
+            repo: None,
             recovery: false,
             inputs: Vec::new(),
         }

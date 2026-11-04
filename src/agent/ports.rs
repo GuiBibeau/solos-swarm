@@ -4,12 +4,15 @@
 //! them as Engine commands.
 
 use anyhow::{Result, anyhow};
+use serde::{Deserialize, Serialize};
+use solos_agent_core::change::RepoName;
 use solos_agent_core::model::{
     Actor, Ask, AssignmentId, Candidate, ChannelRef, Decision, EvalId, Input, MicroUsd,
     OutboundMessage, Plan, ReportIn, SecretGrant, SecretId, TicketId, Trigger, TriggerId, Verdict,
 };
 use solos_agent_core::trail::{TrailAction, TrailOutcome};
 use solos_agent_store::EffectId;
+use std::path::Path;
 use std::time::Duration;
 use std::{future::Future, pin::Pin};
 use tokio::sync::{mpsc, oneshot};
@@ -89,6 +92,9 @@ pub struct Launch {
     pub rules: Vec<String>,
     pub plan: Plan,
     pub budget_microusd: MicroUsd,
+    /// The repository the Mandate names, which the worker's `/work` is a
+    /// clone of.
+    pub repo: Option<RepoName>,
     /// A resume or restart, or a Launch an earlier run may have performed:
     /// check the working directory before repeating outside actions.
     pub recovery: bool,
@@ -127,6 +133,44 @@ pub trait Executor: Send + Sync {
         assignment: AssignmentId,
         reason: String,
     ) -> BoxFuture<'_, Result<()>>;
+}
+
+/// Where repository Tickets' code comes from. The adapter holds the token
+/// and its mirrors; callers get domain types back, never a forge's wire
+/// objects.
+pub trait Forge: Send + Sync {
+    /// Make `dirs.work` a clone of `repo` at its base's tip, with its
+    /// history and the agent's commit identity, then write
+    /// `dirs.host/repo.json`. It runs before any sandbox has touched `work`.
+    /// Once `repo.json` exists it returns what that says and touches
+    /// nothing, so a recovery keeps the tree as the worker left it; until
+    /// then no sandbox ran, so a half-made `work` is made again.
+    fn prepare<'a>(
+        &'a self,
+        repo: &'a RepoName,
+        dirs: TicketDirs<'a>,
+    ) -> BoxFuture<'a, Result<Workspace>>;
+}
+
+/// A repository Ticket's directories on the host.
+#[derive(Clone, Copy, Debug)]
+pub struct TicketDirs<'a> {
+    /// `<ticket>/work`, the clone, writable by sandboxes once prepared.
+    pub work: &'a Path,
+    /// `<ticket>/host`, written by the host only.
+    pub host: &'a Path,
+}
+
+/// What `/host/repo.json` holds, and what a worker's prompt says of its
+/// repository.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Workspace {
+    pub repo: RepoName,
+    pub base: String,
+    /// The base's tip in the host's mirror when the clone was made.
+    pub base_commit: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
 }
 
 /// What an adapter observed, applied by the runtime as an Engine command.

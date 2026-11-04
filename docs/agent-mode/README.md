@@ -32,7 +32,7 @@ and its MIT-licensed prototype `deepseek-ai/dsh-superagent-prototype` (docs 000-
 | P10 Benchmark | Done (#34). `solos-swarm agent bench` (`src/agent/bench/`) reproduces the article's ablation. A seeded generator writes the Triggers file: chatter from allowed and unlisted people, CI and bot messages and follow-ups on request Threads, and about 20 addressed requests, each with its expected work in `meta.bench.work_ms`, at a Poisson or even rate. `executor: {kind: simulated}` (`src/agent/simulated.rs`) takes each request's time on a scaled clock and reports `ready`. The designs are agent.yaml: `super-agent` as it is, `no-pass-through` (`pass_through: false`, backed by the one core change, `Engine::set_pass_through`), and `serial` (one worker slot, and the Router waits while work runs: an approximation of one session with a subagent tool). Each run serves a fresh agent, feeds the stream at its arrival times and reads completion, Router decisions, Evals, model calls, tokens and spend from the Store into `report.json` and `report.md`. `--router scripted` is free; `--router pi` refuses to start without `--max-spend-usd`, prints an estimate, and caps every run's Router account. The free scripted run (default workload, seeds 1 to 3, `--time-factor 0.01`): completion p50 / p95 10.2 / 15.7 min for `super-agent` and for `no-pass-through`, whose Router decides 25% more often (177 against 142 a run), and 82.4 / 177.3 for `serial`, with no request unfinished. A live run with a DeepSeek V4.1 Flash Router follows the benchmark how-to's free-run table. |
 | P11 Discord | Done (#35). `src/agent/discord/`: `DiscordSource` holds one Gateway v10 connection (an outbound WebSocket, nothing exposed) and `DiscordChannel` posts over REST, configured as `kind: discord` and read from a token file that is deleted once read. The Source dials the URL `GET /gateway/bot` names, heartbeats at Hello's interval with a random first beat and the last sequence number, identifies with the Guilds, Guild Messages, Direct Messages and Message Content intents, and treats a heartbeat with no ACK as a zombie. A dropped socket, op 7 and an invalid session with `d: true` resume the session on `resume_gateway_url`; a refused resume, `d: false` and close codes 4007 and 4009 identify again after 1 to 5 s. Five connections in a row that never became ready drop the session, and a spent limit on new sessions is waited out. Close codes 4004 and 4010 to 4014 end the run with the fix named, such as turning on Message Content Intent. A message from a listed guild or channel (or a thread of a listed channel) becomes a Trigger `discord:<channel>:<message>` by `discord:<user id>`, and a mention (of the bot or its managed role) or a pinging reply is addressed, a DM direct. The Thread is one snowflake, `discord:<id>`: a thread channel's id, or the message at the top of a reply chain, which the Source keeps for the agent's own posts too, so a reply to the agent's answer joins its request, and a Discord thread started from a message is the message's Thread. Posts are replies, at most 2,000 characters (a marker says what was cut), parse no mentions, and carry a `nonce` derived from their `MessageId` with `enforce_nonce`, so a retry cannot post twice. A 429 waits `retry_after`, a 5xx retries and another 4xx drops the message. An approval request carries Approve and Stop buttons; a click is an interaction the Source acknowledges at once and applies as the same `Fact::Command` Slack's buttons feed, for the policy to judge. No new dependency. Tests run against a fake Discord (HTTP and a Gateway that keeps each session's events for a resume). |
 | P12 Vault and verifiable browser | Done: the first build. Designed in #36 and built in eight PRs: capabilities in the tool registry (#38), the sealed envelope and the vault with its `solos-swarm vault` CLI (#43), approvals of vault items in the core, Slack and Discord (#47), keyed `fetch_url` and `vault_list` (#48), the trail in the core and schema V4 (#39), the `browse` module (#46), the browser tools (#49), and `solos-swarm agent trail` (#51). A worker uses an API key it never sees. `fetch_url {key}` writes `KeyUsed` to the chain, sends the key only to the key's hosts, on each redirect hop that stays there and through no proxy, scrubs every vault value from what comes back, and asks the item's owner in the thread before its first use on a Ticket. A worker also browses with a headless Lightpanda on this host and signs in with a vault login it never sees. Each browser step is on the chain as asked before the browser acts, then answered with the step this host's trail key signed, and the page and the exact View the model got are blobs in the state directory. `solos-swarm agent trail` checks a trail with public keys only: the chain, each step's signature and answer, each browser session's order and close, and every blob. Setup is in [Vault and API keys](#vault-and-api-keys), [Browser](#browser) and [Check a trail](#check-a-trail). [`vault-browser/`](vault-browser/rationale.md) holds the design: a write-only vault of logins and API keys used only on the machine that holds them, keyed `fetch_url` with first-use approval in chat, and a Lightpanda browser per Assignment whose every step is recorded in the chain and signed with Ed25519 by the machine that ran it. The PRs in [`prs.md`](vault-browser/prs.md) are the plan: browsers on nodes and keys in the browser (PRs 9 and 10) come later. |
-| P13 pstack as the coding method | Designed (#53). [`pstack/`](pstack/rationale.md) holds the design: pstack vendored verbatim and pinned, entered by the host, with a `read` tool, delegates that run as jobs on their own pool, repository workspaces cloned from a host mirror, pull requests published from a sandbox-made bundle so no token reaches a model or sandbox, a `ready` gate on host-recorded checks, cross-family review, and merges behind a click. Built in the PRs of [`prs.md`](pstack/prs.md). |
+| P13 pstack as the coding method | Building. PRs 1 and 2 of [`prs.md`](pstack/prs.md) are done. PR 1 (#54) puts pstack in every worker with the vendored tree pinned by its MANIFEST, the entry into poteto-mode, the solos-swarm adapter and the `read` tool. PR 2 gives a Ticket a repository. The Router names one of `forge.repos`, the host clones it from its own mirror into the Ticket's `work/` before the worker starts, and the worker reads the clone and commits in it. Setup is in [Repositories](#repositories). Designed in #53. [`pstack/`](pstack/rationale.md) holds the design: pstack vendored verbatim and pinned, entered by the host, with a `read` tool, delegates that run as jobs on their own pool, repository workspaces cloned from a host mirror, pull requests published from a sandbox-made bundle so no token reaches a model or sandbox, a `ready` gate on host-recorded checks, cross-family review, and merges behind a click. Built in the PRs of [`prs.md`](pstack/prs.md). |
 
 ## Later steps
 
@@ -175,6 +175,7 @@ and external work leaves as `Effect`s. The shell ports are async and live in the
 | `EventLog` | `append(kind, data) -> seq`; `verify()` | `events.jsonl` hash chain | `Store::record` (`src/broker.rs`), `broker_control::read_chain`/`load_image` |
 | `Source` | `run(sink, facts)`, with people's commands (Slack and Discord buttons) as `Fact::Command`; later `context(trigger, part)` for bounded recall | `JsonlSource` (P3b), `SlackSource` (P4), `GithubSource` and `ScheduleSource` (P8), `DiscordSource` (P11) | new |
 | `Channel` | `send(OutboundMessage, SendOptions { repeat, approval }) -> Sent \| Gone`; shapes text per medium (short chat, PRs structured) | `JsonlChannel` (P3b), `SlackChannel` (P4), `GithubChannel` (P8), `DiscordChannel` (P11) | `src/agent/jsonl.rs`, `src/agent/slack/`, `src/agent/github/`, `src/agent/discord/` |
+| `Forge` | `prepare(repo, dirs) -> Workspace`: a repository Ticket's `work/` cloned from the host's mirror, and its `repo.json` (`src/agent/ports.rs`, P13) | `GithubForge`, `LocalForge` (`src/agent/forge.rs`) | new |
 | `Store` | agent-core `Repositories` plus the effect queue | in-memory (P0), SQLite `crates/agent-store` (P3a) | new |
 | `ToolSurface` | How a session calls tools: `GET /tools`, `/model` (or `/v1/messages`, P7b) and `/tool/{name}` on the broker | Pi extension (`extensions/broker.ts`); `solos-swarm mcp` (P7a), so any MCP harness gets the same tools | the tool schemas live in `src/agent/broker/registry.rs`; the extension's copy is tested against it |
 
@@ -1390,6 +1391,70 @@ answered, which a host that stops in the middle of a step leaves. The other is a
 the agent's word and no signature. `--strict` counts both as problems. An open browser whose Assignment still runs
 is neither. A step that fails a check is no evidence about its session, so one tampered step shows as one problem.
 Nothing anchors the chain's head outside `agent.db`, so a trail cut at a clean session boundary still checks clean.
+
+## Repositories
+
+A worker can answer from a repository's real code, and change it in a clone of its own. The Router names the
+repository when it accepts work on it, and a question about how or why a repository works counts as work. Before the
+Ticket's first worker starts, the host clones the repository into the Ticket's `work/`. The worker reads the clone
+with `read` and runs git and the code there with `run_code`, where its commits work. Nothing is pushed yet. Pull
+requests come with PR 3 of [`pstack/prs.md`](pstack/prs.md).
+
+1. List the repositories under `forge`. The executor must be `pi` with `run_code`, where workers run git:
+
+   ```yaml
+   # agent.yaml
+   forge:
+     kind: github
+     token_file: secrets/forge-token          # relative to this file; read once and deleted
+     identity: {name: solos-swarm-bot, email: bot@example.com}   # who the clone's commits are by
+     repos:
+       GuiBibeau/solos-swarm:
+         about: The agent's own code, Rust and TypeScript.   # the Router reads this
+         base: main                           # each clone starts at its tip
+         budget_microusd: 3000000             # an accept that names no budget gets this
+         notes: Rust is at /rust/bin and its crates at /cargo; build offline.   # the worker reads this
+         owes: pull_request                   # answer (the default), change or pull_request
+   ```
+
+   `kind: local` takes `remote: <dir>` instead of `token_file`. Each repository is then the bare repository
+   `<dir>/<owner>/<name>.git` on this disk, so tests and dry runs need no network.
+2. Give the forge its own token. Use a fine-grained personal access token of the agent's machine account, on the
+   listed repositories only, with Contents: Read. It is not the github Source's token. Write it to a file readable
+   only by the agent's user, and provide a fresh one for every start.
+3. Mount the toolchains a repository needs into `run_code` with `executor.run_code.mounts`, and say where they are
+   in `notes`. `run_code` has no network, so a build must work offline.
+
+What happens:
+
+- `router_decide` takes `repo`, one of `forge.repos`, and `deliverable`, which says what the finished work owes:
+  `answer`, `change` or `pull_request`. Without `deliverable` the Ticket owes the repository's `owes`. The Ticket
+  records the repository in its Mandate and the deliverable in its Plan. Nothing enforces the deliverable yet.
+  `router_decide` refuses an unknown repository, a repository on a swarm plan, a repository on a remote node, and a
+  `deliverable` with no repository.
+- The host keeps a bare mirror of each repository at `<state>/forge/<owner>/<name>.git`. Before a Ticket's first
+  worker, it fetches the mirror and clones it into `<state>/tickets/<ticket>/work`. The clone has its history, the
+  forge's other branches as `origin/*`, a `.git` of its own, and the identity in its config. Then the host writes
+  `<ticket>/host/repo.json`: the repository, its base, the commit the clone started from and the notes. A later
+  Assignment of the same Ticket finds `repo.json` and keeps the tree as the last worker left it. The host makes a
+  clone with no `repo.json` again, since no worker ran in it.
+- The host runs git only in its mirror and in the empty `work/` before any sandbox touched it. A sandbox can plant a
+  hook or a config in the clone, but no host git ever reads them. The token reaches git in its environment, for the
+  mirror's fetch alone, and never in an argument, a sandbox or the clone's config.
+- On that Ticket, `read` also reaches `/work`, the clone, and `/host`, read-only. The worker's system prompt names
+  the repository, its base and the notes. The worker writes `/work`, so `read` bounds what it scans there: a file's
+  lines are counted over its first 32 MiB, and a longer file's reply says `total_at_least` in place of `total`; a
+  directory is listed from its first 20,000 entries, and `truncated` says there were more. A Ticket on a repository
+  gets `read` with no pstack configured, and the Pi sandbox then binds no `/pstack`: it binds only the tree the host
+  checked, and only when `pstack:` is set.
+- `executor.prepare` still runs after the clone. With `forge` configured, config load refuses a `prepare` that runs
+  `git worktree add` into `$SOLOS_WORK_DIR`: a linked worktree's `.git` points at a path no sandbox has.
+- `prepare` runs on the host, as the agent's user and outside any sandbox, over the repository's content. With `forge`
+  set it must not execute repository code: no build, test or install step, no `make`, `npm install` or `./configure`,
+  no script or hook from the clone. A repository is data until a sandbox runs it, and a `prepare` that runs it gives
+  that repository's authors the host. Keep `prepare` to work that touches no file of the clone, such as writing a
+  scratch directory or a file beside it.
+- Tickets that name a repository need schema V6 of `agent.db`, so an older build refuses the file.
 
 ## Security model
 

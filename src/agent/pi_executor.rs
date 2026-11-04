@@ -9,7 +9,9 @@
 use super::broker::{self, AgentBroker, WorkerSeat, browser, clip};
 use super::config::HarnessKind;
 use super::environment::{self, Launchable};
-use super::ports::{BoxFuture, Delivered, Delivery, Executor, Fact, FactSink, Launch};
+use super::ports::{
+    BoxFuture, Delivered, Delivery, Executor, Fact, FactSink, Forge, Launch, TicketDirs, Workspace,
+};
 use super::swarm_executor::SwarmExecutor;
 use crate::broker::write_json;
 use crate::harness::claude_code::ClaudeCodeHarness;
@@ -34,6 +36,9 @@ use tokio::task::JoinHandle;
 
 /// `run_code`'s `/work`, inside the Ticket's directory.
 pub const WORK_DIR: &str = "work";
+/// What the host writes about a repository Ticket, which `read` serves at
+/// `/host`.
+pub const HOST_DIR: &str = "host";
 /// Written once the prepare command succeeded, so it runs once per Ticket.
 const PREPARED: &str = "prepared";
 const PREPARE_WAIT: Duration = Duration::from_secs(300);
@@ -211,6 +216,25 @@ pub fn assignment_text(launch: &Launch, run_code: bool) -> String {
     text
 }
 
+fn repository_text(workspace: &Workspace) -> String {
+    let Workspace {
+        repo,
+        base,
+        base_commit,
+        notes,
+    } = workspace;
+    let short = base_commit.get(..7).unwrap_or(base_commit);
+    let mut text = format!(
+        "Repository: {repo}, base {base}. /work is a clone of it at {base}'s tip ({short}), with \
+         its history and your commit identity: run git and its code there with run_code, and \
+         read its files with read. /host/repo.json says the same."
+    );
+    if let Some(notes) = notes {
+        let _ = write!(text, "\nNotes on {repo}: {}", notes.trim());
+    }
+    text
+}
+
 /// A later prompt: Inputs that reached the Ticket after its assignment.
 pub fn delivery_text(ticket: &TicketId, inputs: &[Delivered]) -> String {
     let mut text = format!("New input on ticket {ticket}, oldest first:");
@@ -273,6 +297,8 @@ pub struct PiExecutorParts<H, C = ClaudeCodeHarness> {
     /// A shell command run once per Ticket in its directory before its
     /// first worker, with `SOLOS_TICKET` and `SOLOS_WORK_DIR` set.
     pub prepare: Option<String>,
+    /// Clones a repository Ticket's `work`; without it such a Ticket fails.
+    pub forge: Option<Arc<dyn Forge>>,
     /// Runs `Plan::Swarm` Assignments; without it they fail.
     pub swarm: Option<SwarmExecutor<H>>,
 }
@@ -540,28 +566,55 @@ where
         let parts = &self.parts;
         let dir = self.ticket_dir(&launch.ticket)?;
         let work = dir.join(WORK_DIR);
+        let host = dir.join(HOST_DIR);
         let named = environment::named(&launch.plan);
         let environments = parts.broker.environments();
+        let workspace = match &launch.repo {
+            None => None,
+            Some(repo) => {
+                ensure!(
+                    environments.is_local(named),
+                    "a ticket on a repository runs on this host only"
+                );
+                let forge = parts
+                    .forge
+                    .as_ref()
+                    .with_context(|| format!("this agent has no forge to clone {repo} from"))?;
+                private_dir(&host)?;
+                let dirs = TicketDirs {
+                    work: &work,
+                    host: &host,
+                };
+                let cloned = forge.prepare(repo, dirs).await;
+                Some(cloned.with_context(|| format!("{repo} was not cloned"))?)
+            }
+        };
         // A node's /work is its own, so this host's prepare has nothing to set up there.
         if environments.is_local(named) {
             self.prepare(&launch.ticket, &dir, &work).await?;
         }
         let token = broker::new_token();
-        let grants: Vec<String> = parts
-            .broker
-            .worker_tools(named)
-            .into_iter()
-            .map(String::from)
-            .collect();
-        let run_code = grants.iter().any(|tool| tool == "run_code");
-        let seat = WorkerSeat::new(
+        let mut seat = WorkerSeat::new(
             launch.ticket.clone(),
             launch.assignment.clone(),
             work,
             launch.budget_microusd,
         )
         .in_environment(named.map(str::to_owned));
+        if workspace.is_some() {
+            seat = seat.on_repository(host);
+        }
+        let grants: Vec<String> = parts
+            .broker
+            .seat_tools(&seat)
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let run_code = grants.iter().any(|tool| tool == "run_code");
         let mut prompt = system_prompt(launch.budget_microusd, &grants);
+        if let Some(workspace) = &workspace {
+            prompt = format!("{prompt}\n\n{}", repository_text(workspace));
+        }
         let mut assignment = assignment_text(launch, run_code);
         if let Some(pstack) = parts.broker.pstack() {
             let run_code_has_pstack = run_code && environments.is_local(named);
@@ -586,6 +639,7 @@ where
             broker_socket: parts.broker_socket.clone(),
             node: parts.node.clone(),
             pi_root: parts.pi_root.clone(),
+            pstack: parts.broker.pstack().map(|pstack| pstack.root().to_owned()),
         };
         let (events_tx, mut events) = mpsc::channel(64);
         let turns = Turns {
@@ -897,6 +951,8 @@ mod tests {
         events: Events,
         /// Each session's grants, by its id.
         grants: Arc<Mutex<BTreeMap<String, Vec<String>>>>,
+        /// The pstack tree each session's spec names, by its id.
+        trees: Arc<Mutex<BTreeMap<String, Option<PathBuf>>>>,
         prompts: Arc<Mutex<Vec<(String, String)>>>,
         live: Arc<AtomicUsize>,
         most: Arc<AtomicUsize>,
@@ -919,6 +975,8 @@ mod tests {
             self.events.lock().unwrap().push((spec.id.clone(), events));
             let grants = spec.grants.clone();
             self.grants.lock().unwrap().insert(spec.id.clone(), grants);
+            let tree = spec.pstack.clone();
+            self.trees.lock().unwrap().insert(spec.id.clone(), tree);
             let live = self.live.fetch_add(1, Ordering::SeqCst) + 1;
             self.most.fetch_max(live, Ordering::SeqCst);
             Ok(FakeSession {
@@ -967,6 +1025,9 @@ mod tests {
         }
         fn grants(&self, id: &str) -> Vec<String> {
             self.grants.lock().unwrap()[id].clone()
+        }
+        fn tree(&self, id: &str) -> Option<PathBuf> {
+            self.trees.lock().unwrap()[id].clone()
         }
         async fn tell(&self, id: &str, event: anyhow::Result<SessionEvent>) {
             let sender = self
@@ -1047,6 +1108,7 @@ mod tests {
                     default_budget_microusd: 1,
                     max_budget_microusd: None,
                     swarm: None,
+                    repos: BTreeMap::new(),
                 },
                 workers: Some(WorkerParts {
                     terms,
@@ -1070,6 +1132,7 @@ mod tests {
                 model: "deepseek-flash".into(),
                 max_workers,
                 prepare: prepare.map(String::from),
+                forge: None,
                 swarm: None,
             })
             .unwrap();
@@ -1154,8 +1217,10 @@ mod tests {
             plan: Plan::Session {
                 harness: None,
                 environment: None,
+                method: None,
             },
             budget_microusd: 500_000,
+            repo: None,
             recovery: false,
             inputs: Vec::new(),
         }
@@ -1447,6 +1512,7 @@ mod tests {
             launch.plan = Plan::Session {
                 harness: harness.map(String::from),
                 environment: None,
+                method: None,
             };
             launch
         };
@@ -1504,6 +1570,7 @@ mod tests {
         on_claude.plan = Plan::Session {
             harness: Some("claude-code".into()),
             environment: None,
+            method: None,
         };
         w.launch(on_claude).await;
         assert!(started(&w.fact().await, "as_a"));
@@ -1531,6 +1598,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_session_names_the_tree_the_host_checked_and_none_where_pstack_is_off() {
+        let mut off = World::new(1, None);
+        off.launch(launch("tk_1", "as_1")).await;
+        assert!(started(&off.fact().await, "as_1"));
+        assert_eq!(off.fake.tree("as_1"), None);
+        off.executor.shutdown().await;
+
+        let mut on = World::with_pstack();
+        on.launch(launch("tk_2", "as_2")).await;
+        assert!(started(&on.fact().await, "as_2"));
+        let checked = on.executor.inner.parts.broker.pstack().unwrap().root();
+        assert_eq!(on.fake.tree("as_2").as_deref(), Some(checked));
+        on.executor.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn without_claude_code_configured_a_plan_naming_it_fails() {
         let dir = std::env::temp_dir().join(format!("pi-executor-{}", uuid::Uuid::new_v4()));
         let mut w = World::new(1, None);
@@ -1548,6 +1631,7 @@ mod tests {
             model: "deepseek-flash".into(),
             max_workers: 1,
             prepare: None,
+            forge: None,
             swarm: None,
         })
         .unwrap();
@@ -1555,6 +1639,7 @@ mod tests {
         asks.plan = Plan::Session {
             harness: Some("claude-code".into()),
             environment: None,
+            method: None,
         };
         executor.launch(asks, w.facts.clone()).await.unwrap();
         let why = failure(&mut w, "as_1").await;
@@ -1607,6 +1692,7 @@ mod tests {
             launch.plan = Plan::Session {
                 harness: Some(harness.into()),
                 environment: environment.map(String::from),
+                method: None,
             };
             launch
         };

@@ -70,10 +70,12 @@ impl ScriptedRouter {
             plan: Plan::Session {
                 harness: None,
                 environment: None,
+                method: None,
             },
             budget_microusd: self.budget_microusd,
             acknowledge: Acknowledge::Standard,
             rules: Vec::new(),
+            repo: None,
         })
     }
 }

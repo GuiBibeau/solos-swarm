@@ -676,6 +676,7 @@ impl Runtime {
                     rules: found.mandate.rules,
                     plan,
                     budget_microusd,
+                    repo: found.mandate.repo,
                     recovery: recovery || repeat,
                     inputs,
                 }))
@@ -978,10 +979,12 @@ mod tests {
             plan: Plan::Session {
                 harness: None,
                 environment: None,
+                method: None,
             },
             budget_microusd,
             acknowledge: Acknowledge::Standard,
             rules: Vec::new(),
+            repo: None,
         });
         let decision = runtime.engine.decide(&eval, accept).unwrap();
         let ticket = runtime.engine.repos().decision(&decision).unwrap().ticket;

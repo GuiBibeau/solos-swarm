@@ -352,6 +352,7 @@ mod tests {
             pi_settings: run_dir.join("pi-settings.json"),
             node: PathBuf::from("/opt/node/bin/node"),
             pi_root: PathBuf::from("/srv/pi"),
+            pstack: None,
         }
     }
 

@@ -1,7 +1,8 @@
+use solos_agent_core::change::{Deliverable, RepoName};
 use solos_agent_core::model::{
-    Accept, Acknowledge, Actor, Addressed, Approval, ChannelRef, DecisionKind, Effect, MessageKind,
-    Plan, ReportIn, ReportStatus, Stage, ThreadKey, TicketId, TicketOutcome, Trigger, TriggerId,
-    Verdict,
+    Accept, Acknowledge, Actor, Addressed, Approval, ChannelRef, DecisionKind, Effect, Mandate,
+    MessageKind, Method, Plan, ReportIn, ReportStatus, Stage, ThreadKey, TicketId, TicketOutcome,
+    Trigger, TriggerId, Verdict,
 };
 use solos_agent_core::{
     AcceptMode, AllowlistPolicy, Engine, Error, Intake, MAX_EXPIRED_EVALS, MemoryRepositories,
@@ -83,6 +84,7 @@ fn accept(plan: Plan, budget: u64) -> Verdict {
         budget_microusd: budget,
         acknowledge: Acknowledge::Standard,
         rules: Vec::new(),
+        repo: None,
     })
 }
 
@@ -90,6 +92,7 @@ fn session() -> Plan {
     Plan::Session {
         harness: None,
         environment: None,
+        method: None,
     }
 }
 
@@ -464,6 +467,7 @@ fn a_session_plan_names_its_environment_and_one_stored_without_it_still_reads() 
     let on_laptop = Plan::Session {
         harness: None,
         environment: Some("laptop".into()),
+        method: None,
     };
     w.engine
         .decide(&eval, accept(on_laptop.clone(), 500_000))
@@ -473,6 +477,94 @@ fn a_session_plan_names_its_environment_and_one_stored_without_it_still_reads() 
         serde_json::to_string(&on_laptop).unwrap(),
         r#"{"kind":"session","environment":"laptop"}"#
     );
+}
+
+#[test]
+fn a_session_on_a_repository_keeps_it_in_its_mandate_and_what_it_owes_in_its_plan() {
+    let widgets = RepoName::try_from("acme/widgets".to_owned()).unwrap();
+    let owes = |deliverable| Plan::Session {
+        harness: None,
+        environment: None,
+        method: Some(Method { deliverable }),
+    };
+    let on = |plan: Plan, repo: Option<&RepoName>| {
+        let Verdict::Accept(mut accepted) = accept(plan, 500_000) else {
+            panic!("accept() makes an accept")
+        };
+        accepted.repo = repo.cloned();
+        Verdict::Accept(accepted)
+    };
+    let mut w = World::new(policy());
+    let eval = w.receive_and_start_eval(slack(
+        "t1",
+        Actor::person("alice"),
+        Addressed::Mention,
+        "th1",
+        "fix the flake in acme/widgets",
+    ));
+    let swarm = Plan::Swarm {
+        agents: 2,
+        goal_template: None,
+    };
+    for (refused, why) in [
+        (
+            on(swarm, Some(&widgets)),
+            "a repository is for a session plan only",
+        ),
+        (
+            on(owes(Deliverable::Change), None),
+            "a change or a pull request needs a repository",
+        ),
+        (
+            on(owes(Deliverable::PullRequest), None),
+            "a change or a pull request needs a repository",
+        ),
+    ] {
+        let err = w.engine.decide(&eval, refused).unwrap_err();
+        assert_eq!(err, Error::Invalid(why.into()));
+    }
+
+    let pull_request = owes(Deliverable::PullRequest);
+    let decision = w
+        .engine
+        .decide(&eval, on(pull_request.clone(), Some(&widgets)))
+        .unwrap();
+    let id = w
+        .engine
+        .repos()
+        .decision(&decision)
+        .unwrap()
+        .ticket
+        .unwrap();
+    let ticket = w.engine.repos().ticket(&id).unwrap();
+    assert_eq!(ticket.mandate.repo, Some(widgets));
+    assert_eq!(launched(&w.effects())[0].2, pull_request);
+    let written = serde_json::to_value(&ticket).unwrap();
+    assert_eq!(written["mandate"]["repo"], "acme/widgets");
+    assert_eq!(
+        written["plan"],
+        serde_json::json!({"kind":"session","method":{"deliverable":"pull_request"}})
+    );
+
+    let answer = w.receive_and_start_eval(slack(
+        "t2",
+        Actor::person("alice"),
+        Addressed::Mention,
+        "th2",
+        "what is a flake?",
+    ));
+    w.engine
+        .decide(&answer, on(owes(Deliverable::Answer), None))
+        .unwrap();
+    assert_eq!(launched(&w.effects())[0].2, owes(Deliverable::Answer));
+}
+
+#[test]
+fn a_mandate_stored_before_repositories_reads_and_writes_back_unchanged() {
+    let stored = r#"{"policy_version":"p1","scope":"fix it","strength":"explicit","rules":[],"requester":{"id":"alice","kind":"person"},"source":"slack","budget_microusd":500000}"#;
+    let mandate: Mandate = serde_json::from_str(stored).unwrap();
+    assert_eq!(mandate.repo, None);
+    assert_eq!(serde_json::to_string(&mandate).unwrap(), stored);
 }
 
 #[test]

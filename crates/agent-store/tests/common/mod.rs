@@ -206,5 +206,6 @@ pub fn accept(title: &str, plan: Plan, budget: u64) -> Verdict {
         budget_microusd: budget,
         acknowledge: Acknowledge::Standard,
         rules: Vec::new(),
+        repo: None,
     })
 }

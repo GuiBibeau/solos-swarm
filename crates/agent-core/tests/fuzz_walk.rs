@@ -43,11 +43,13 @@
 //! that Ticket or Thread. Each distinct (invariant, command) pair is shrunk to
 //! a minimal command sequence and printed.
 
+use solos_agent_core::change::{Deliverable, RepoName};
 use solos_agent_core::ids::key;
 use solos_agent_core::model::{
     Accept, Acknowledge, Actor, Addressed, Approval, Ask, AssignmentId, AssignmentState,
-    ChannelRef, DomainEvent, Effect, EvalId, InputBody, InputId, MessageKind, Plan, ReportIn,
-    ReportStatus, SecretGrant, SecretId, ThreadKey, Ticket, TicketId, Trigger, TriggerId, Verdict,
+    ChannelRef, DomainEvent, Effect, EvalId, InputBody, InputId, MessageKind, Method, Plan,
+    ReportIn, ReportStatus, SecretGrant, SecretId, ThreadKey, Ticket, TicketId, Trigger, TriggerId,
+    Verdict,
 };
 use solos_agent_core::trail::{
     ActText, CloseReason, Digest, MAX_URL_CHARS, PageAction, PageSeen, STEP_VERSION, Signature,
@@ -510,6 +512,13 @@ fn gen_accept(rng: &mut Lcg) -> Accept {
         Plan::Session {
             harness: None,
             environment: None,
+            method: rng.chance(30).then(|| Method {
+                deliverable: rng.pick(&[
+                    Deliverable::Answer,
+                    Deliverable::Change,
+                    Deliverable::PullRequest,
+                ]),
+            }),
         }
     } else {
         let agents = if rng.chance(12) {
@@ -543,6 +552,9 @@ fn gen_accept(rng: &mut Lcg) -> Accept {
             vec!["r1".to_owned()],
             vec!["r1".into(), "r2".into()],
         ]),
+        repo: rng
+            .chance(40)
+            .then(|| RepoName::try_from("acme/widgets".to_owned()).unwrap()),
     }
 }
 

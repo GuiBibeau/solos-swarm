@@ -186,6 +186,7 @@ impl HostArgs {
             state_dir: self.state_dir.clone(),
             pi_root: self.pi_root.clone(),
             node: self.node.clone(),
+            pstack: None,
         }
     }
 }
@@ -1113,6 +1114,7 @@ async fn fetch_probe(root: &Path, node: &Path, url: &str) -> Result<()> {
         pi_settings: settings,
         node,
         pi_root: root,
+        pstack: None,
     })
     .spawn()?;
     let mut stdin = child.stdin.take().context("missing Pi stdin")?;
@@ -1304,6 +1306,7 @@ mod tests {
                 pi_settings: PathBuf::from("/runs/r1/pi-settings.json"),
                 node: PathBuf::from("/opt/node-v24/bin/node"),
                 pi_root: PathBuf::from("/srv/pi"),
+                pstack: None,
             });
             let command = command.as_std();
             assert_eq!(command.get_program(), "bwrap");
@@ -1340,6 +1343,7 @@ budgets: {session_microusd: 500000}
             state_dir: Some(state.clone()),
             pi_root: Some(pi_root.clone()),
             node: None,
+            pstack: None,
         };
         let cases = [
             (state.join("tickets/vault.yaml"), dir.join("keys/vault.key")),

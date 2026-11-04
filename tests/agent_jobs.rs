@@ -148,6 +148,7 @@ impl World {
                 default_budget_microusd: 500_000,
                 max_budget_microusd: None,
                 swarm: None,
+                repos: BTreeMap::new(),
             },
             workers: Some(WorkerParts {
                 terms: terms(),
@@ -364,7 +365,11 @@ async fn get_tools_lists_run_code_and_the_job_tools_on_a_host_with_run_code_and_
         "fetch_url",
     ];
     assert_eq!(names, with_run_code);
-    assert_eq!(w.broker.worker_tools(None), with_run_code, "its grants");
+    assert_eq!(
+        w.broker.worker_tools(None, false),
+        with_run_code,
+        "its grants"
+    );
     for tool in ROUTER_TOOLS.iter().chain(&WORKER_TOOLS) {
         let (status, reply) = w.post(tool, &token, json!({})).await;
         assert_eq!(

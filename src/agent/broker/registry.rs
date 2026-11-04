@@ -30,7 +30,7 @@ impl Cap {
             Self::RunCode => "run_code is not available on this host",
             Self::Browser => "no browser where this ticket runs",
             Self::Vault => "no vault on this host",
-            Self::Read => "this host gives workers no pstack to read",
+            Self::Read => "this ticket has neither pstack nor a repository to read",
         }
     }
 
@@ -243,11 +243,13 @@ const WORKER: &[Tool] = &[
     Tool {
         name: "read",
         needs: Caps::of(&[Cap::Read]),
-        description: "Read a text file, or list a directory, under /pstack, where pstack's skills \
-                      are, read-only. Paths are absolute. A file comes back as numbered lines, at \
-                      most 2000 lines or 256 KiB at a time, so use offset and limit for the rest. \
-                      A path outside /pstack, a link that leads out of it, and a binary file are \
-                      refused.",
+        description: "Read a text file, or list a directory, read-only. Where your instructions \
+                      say pstack is at /pstack, its skills are there. On a ticket with a \
+                      repository, its clone is under /work and what the host wrote about it \
+                      under /host. Paths are absolute. A file comes back as numbered lines, at \
+                      most 2000 lines or 256 KiB at a time, so use offset and limit for the \
+                      rest. A path outside these, a link that leads out of one, and a binary \
+                      file are refused.",
         input_schema: read,
     },
 ];
@@ -324,6 +326,12 @@ fn router_decide() -> Value {
             },
             "goal_template": string("accept with plan swarm: the goal template it runs, one the prompt names. Omit it for the default."),
             "environment": string("accept with plan session: the machine its run_code runs on, one your instructions name. Omit it for the default."),
+            "repo": string("accept with plan session: the repository the work reads or changes, one your instructions name. Omit it for work on no repository."),
+            "deliverable": {
+                "type": "string",
+                "enum": ["answer", "change", "pull_request"],
+                "description": "accept with a repo: what the finished work owes: an answer, a change committed in the clone, or a pull_request. Omit it for the repository's default.",
+            },
             "budget_microusd": {
                 "type": "integer",
                 "minimum": 1,
@@ -516,7 +524,7 @@ fn read() -> Value {
         "type": "object",
         "required": ["path"],
         "properties": {
-            "path": required_string("An absolute path, such as /pstack/skills/poteto-mode/SKILL.md."),
+            "path": required_string("An absolute path, such as /work/README.md on a ticket with a repository, or /pstack/skills/poteto-mode/SKILL.md where pstack is at /pstack."),
             "offset": {"type": "integer", "minimum": 1, "description": "The first line to read, from 1. Default 1."},
             "limit": {
                 "type": "integer",

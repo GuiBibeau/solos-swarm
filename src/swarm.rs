@@ -223,6 +223,7 @@ pub async fn run_goal_until<H: AgentHarness>(
             pi_settings: settings.clone(),
             node: node.clone(),
             pi_root: root.clone(),
+            pstack: None,
         };
         match harness.start(&spec, tx.clone()).await {
             Ok(worker) => workers.push(worker),

@@ -35,7 +35,7 @@ const V4_EVENTS: [&str; 3] = [
 fn a_v4_file(db: &TempDb) {
     drop(SqliteStore::open(&db.path).unwrap());
     let raw = db.raw();
-    raw.execute("DELETE FROM schema_version WHERE version = 5", [])
+    raw.execute("DELETE FROM schema_version WHERE version > 4", [])
         .unwrap();
     raw.execute(
         "INSERT INTO tickets (id, open, body) VALUES ('tk_1', 1, ?1)",
@@ -70,7 +70,7 @@ fn head(db: &TempDb) -> String {
 }
 
 #[test]
-fn a_v4_file_opens_as_v5_and_reads_its_ticket_send_and_events_back_unchanged() {
+fn a_v4_file_opens_at_the_latest_version_and_reads_its_ticket_send_and_events_back_unchanged() {
     let db = TempDb::new("v4-file");
     a_v4_file(&db);
     assert_eq!(
@@ -84,9 +84,13 @@ fn a_v4_file_opens_as_v5_and_reads_its_ticket_send_and_events_back_unchanged() {
 
     let store = SqliteStore::open(&db.path).unwrap();
 
-    assert_eq!(store.schema_version().unwrap(), 5);
+    assert_eq!(store.schema_version().unwrap(), 6);
     let ticket = store.read_ticket(&TicketId::new("tk_1")).unwrap().unwrap();
     assert!(ticket.secrets.is_empty());
+    assert_eq!(
+        ticket.mandate.repo, None,
+        "a ticket from before repositories has none"
+    );
     assert_eq!(ticket.title, "Read notifications");
     assert_eq!(serde_json::to_string(&ticket).unwrap(), V4_TICKET);
     let effects = store.effects().unwrap();

@@ -13,7 +13,7 @@ If you run in Claude Code, its own tools are off. There is no `Read`, `Agent`, `
 | `AskQuestion` | `worker_report` with status `waiting` and a `question`. Put the options in the question. It ends your turn, and the person's answer comes back as new input. Do not use `blocked` for a question, because it holds automatic input until a person writes. |
 | Open a todolist | Keep the list in the text of a `worker_report` with status `progress`, and send a new one each time the list changes. Your latest report is what the operator sees in `agent status`. |
 | Run another pstack skill (`/name`, "the **name** skill") | `read` `/pstack/skills/<name>/SKILL.md` and follow it. People here ask in chat, so never tell a person to type a slash command. Say what to ask for instead. |
-| Read a file, open `playbooks/<title>.md`, "read the leaf skill" | `read` with an absolute path under `/pstack`. Resolve a relative link against the directory of the file that holds it. A directory lists its entries. A long file comes in parts, so call again with `offset`. |
+| Read a file, open `playbooks/<title>.md`, "read the leaf skill" | `read` with an absolute path under `/pstack`, or on a ticket with a repository under `/work` and `/host`. Resolve a relative link against the directory of the file that holds it. A directory lists its entries. A long file comes in parts, so call again with `offset`. |
 | `Grep`, `Glob`, a shell | `run_code`. Use `rg` if it is there, else `grep -rn` and `find`. |
 | Edit or write a file | `run_code`, with its `files` argument or a heredoc. |
 | A long command, a command in the background | `job_start`. `job_wait` waits for it and `job_stop` stops it. If it ends after your turn, its end comes back as new input. |
@@ -38,7 +38,9 @@ If you run in Claude Code, its own tools are off. There is no `Read`, `Agent`, `
 | --- | --- |
 | `<pstack>`, `../<name>/SKILL.md`, `pstack/skills/...`, a skill's `references/` or `scripts/` | `/pstack/...`, read-only. `read` it. Run pstack's bash scripts with `run_code` only when your instructions say that `run_code` has `/pstack`. |
 | `https://github.com/cursor/plugins/blob/main/pstack/<path>` | `/pstack/<path>` when that file exists. Give people the URL when they need a link. |
-| The work dir, scratch files, the agent store's `docs/`, a Project tracker `notes.md`, `decisions.tsv` | `/work` in `run_code`, this ticket's own directory. It keeps what you write between calls and for any later work on this ticket. |
+| The work dir, scratch files, the agent store's `docs/`, a Project tracker `notes.md`, `decisions.tsv` | `/work` in `run_code`, this ticket's own directory. It keeps what you write between calls and for any later work on this ticket. On a ticket with a repository, `/work` is the clone, so list your notes in `.git/info/exclude` and keep them out of your commits. |
+| A repository: the work dir as a clone, `git log`, `git blame`, a worktree off main | On a ticket with a repository, `/work` is a clone of it at its base's tip, with its history and your commit identity. Run git there with `run_code`, and make your own branch with `git switch -c <name>`. `/host/repo.json` names the repository, its base, the commit the clone started from and the operator's notes. A ticket with no repository has none, so skip with the line. |
+| `.cursor/skills/<name>/` in a project | `/work/.agents/skills/<name>/` on a ticket with a repository. `read` it. |
 | `~/.cursor/...`, `~/.claude/...`, `.cursor/rules/*.mdc`, `CLAUDE.md`, `AGENTS.md` | None of these exist here. |
 
 ## Verification
@@ -59,7 +61,7 @@ When a step needs one of these, put one line in your next report, `Skipped in so
 | `Task`, a subagent, `poteto-agent`, `subagent_type`, `readonly`, `environment`, `resume`, `file_attachments`, spawning N "in a single message" | Later. This host has no subagents yet, so pstack's rule for that case applies: "A subagent forbidden to spawn satisfies this by owning the diff directly." Do the subagent's work yourself in this session. Where a step wants several independent runs, such as explorers, arena runners or reviewers, do them one after another, each from its brief alone, and say so in your report. |
 | A pull request: `git push`, `gh pr create`, `gh pr view`, `gh pr checks`, `gh pr merge`, `watch-pr`, Origin, **Opening a PR**, **Babysit**, **Shipping** | Later. This host opens no pull requests yet. Skip with the line. Your result is your `ready` report. |
 | An independent verifier per pull request, a verdict at a head commit | Later. Skip with the line, and verify with `run_code` as Verification says. |
-| A repository: the work dir as a clone, `git log`, `git blame`, a worktree off main, `.cursor/skills/<name>/` in a project, **create-verification-skill** | Later. A ticket here has no repository yet. Skip with the line. |
+| **create-verification-skill** | Later. The skill it writes stays in `/work` until this host opens pull requests. Skip with the line. |
 | Transcripts in `agent-transcripts/`, as **reflect**, **recall** and **session-pickup** read them | Later. No transcript is readable here. Skip with the line. |
 | Cursor Automations, routine wakes, `update_state`, `SendToUser` | Skip with the line. Schedules are the operator's to configure. |
 | Bugbot, Cursor cloud agents | Skip with the line. |

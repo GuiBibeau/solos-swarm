@@ -54,6 +54,7 @@ const TERMS: DecideTerms = DecideTerms {
     default_budget_microusd: 500_000,
     max_budget_microusd: Some(2_000_000),
     swarm: None,
+    repos: BTreeMap::new(),
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1047,7 +1048,11 @@ async fn a_worker_reports_with_the_ledgers_spend_and_calls_only_its_own_tools() 
             ["worker_report", "worker_handback", "fetch_url"],
             "no run_code and no job tools on a host without run_code"
         );
-        assert_eq!(served.broker.worker_tools(None), listed, "its grants");
+        assert_eq!(
+            served.broker.worker_tools(None, false),
+            listed,
+            "its grants"
+        );
         for tool in ROUTER_TOOLS.iter().chain(&WORKER_TOOLS) {
             let (status, reply) = served
                 .post(&format!("tool/{tool}"), Some(WORKER), json!({}))
@@ -1401,7 +1406,7 @@ async fn a_seat_may_call_exactly_the_tools_it_is_offered() {
     for (token, environment) in [(HERE, None), (THERE, Some("laptop"))] {
         let offered = served.listed(token).await;
         assert_eq!(
-            served.broker.worker_tools(environment),
+            served.broker.worker_tools(environment, false),
             offered,
             "its grants"
         );

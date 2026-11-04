@@ -21,6 +21,7 @@ fn running(e: &mut SqlEngine) -> (TicketId, AssignmentId) {
     let session = Plan::Session {
         harness: None,
         environment: None,
+        method: None,
     };
     let decision = e.decide(&eval, accept("Read", session, 1_000)).unwrap();
     let ticket = e.repos().decision(&decision).unwrap().ticket.unwrap();

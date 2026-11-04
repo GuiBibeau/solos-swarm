@@ -94,7 +94,7 @@ pub(super) async fn vault_list(broker: &AgentBroker, seat: &WorkerSeat) -> Reply
         .vault()
         .ok_or_else(|| failed("vault_list was admitted without a vault"))?;
     let context = use_context(broker, seat).await?;
-    let offered = broker.worker_tools(seat.environment.as_deref());
+    let offered = broker.seat_tools(seat);
     let login_use: &[&str] = if offered.contains(&"browser_login") {
         &["browser_login"]
     } else {

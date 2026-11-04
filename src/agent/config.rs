@@ -21,6 +21,7 @@ use crate::vault::VaultConfig;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Deserializer};
 use solos_agent_core::AllowlistPolicy;
+use solos_agent_core::change::{Deliverable, RepoName};
 use solos_agent_core::model::MicroUsd;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -56,10 +57,77 @@ pub struct AgentConfig {
     pub trail: TrailStoreConfig,
     #[serde(default)]
     pub pstack: Option<PstackConfig>,
+    /// Where repository Tickets' code comes from. Without it, no Ticket
+    /// names a repository.
+    #[serde(default)]
+    pub forge: Option<ForgeConfig>,
 }
 
 fn pass_through() -> bool {
     true
+}
+
+/// `forge:` in agent.yaml: the repositories a Ticket may name, and where
+/// the host's mirror of each fetches from.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ForgeConfig {
+    /// GitHub, with a token of the agent's own account, read once and
+    /// deleted. It is not the github Source's token.
+    Github {
+        token_file: PathBuf,
+        identity: Identity,
+        repos: BTreeMap<RepoName, RepoConfig>,
+    },
+    /// Bare repositories on this disk, `<remote>/<owner>/<name>.git`, for
+    /// tests and dry runs.
+    Local {
+        remote: PathBuf,
+        identity: Identity,
+        repos: BTreeMap<RepoName, RepoConfig>,
+    },
+}
+
+impl ForgeConfig {
+    pub fn repos(&self) -> &BTreeMap<RepoName, RepoConfig> {
+        match self {
+            Self::Github { repos, .. } | Self::Local { repos, .. } => repos,
+        }
+    }
+
+    pub fn identity(&self) -> &Identity {
+        match self {
+            Self::Github { identity, .. } | Self::Local { identity, .. } => identity,
+        }
+    }
+}
+
+/// Who the commits in a clone are by.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Identity {
+    pub name: String,
+    pub email: String,
+}
+
+/// One repository, `forge.repos.<owner>/<name>`.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepoConfig {
+    /// What the Router reads to tell which repository a request is about.
+    pub about: String,
+    /// The branch a Ticket's clone starts from.
+    pub base: String,
+    /// What an accept that names this repository and no budget gets.
+    #[serde(default)]
+    pub budget_microusd: Option<MicroUsd>,
+    /// What the worker's prompt says about working in it, such as where its
+    /// toolchain is.
+    #[serde(default)]
+    pub notes: Option<String>,
+    /// What its work owes when the Router names nothing.
+    #[serde(default)]
+    pub owes: Deliverable,
 }
 
 /// pstack in every worker: its first prompt enters `entry`, its system
@@ -71,6 +139,28 @@ pub struct PstackConfig {
     /// `vendor/pstack/skills`.
     #[serde(default = "pstack_entry")]
     pub entry: String,
+}
+
+/// Whether `prepare` runs `git worktree add` into the worker's work dir,
+/// whose `.git` would then point outside every sandbox.
+fn worktree_into_work(prepare: &str) -> bool {
+    let words: Vec<&str> = prepare.split_whitespace().collect();
+    words.windows(2).any(|pair| pair == ["worktree", "add"]) && prepare.contains("SOLOS_WORK_DIR")
+}
+
+/// A branch name `git clone --branch` takes as one: no option, no range, no
+/// path that climbs.
+fn branch_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 200
+        && !name.starts_with(['-', '/', '.'])
+        && !name.ends_with(['/', '.'])
+        && !name.ends_with(".lock")
+        && !name.contains("..")
+        && !name.contains("//")
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/'))
 }
 
 fn pstack_entry() -> String {
@@ -527,6 +617,11 @@ impl AgentConfig {
             browser.runtime_dir = browser.runtime_dir.as_ref().map(|dir| base.join(dir));
         }
         config.trail.path = config.trail.path.as_ref().map(|path| base.join(path));
+        match &mut config.forge {
+            Some(ForgeConfig::Github { token_file, .. }) => *token_file = base.join(&*token_file),
+            Some(ForgeConfig::Local { remote, .. }) => *remote = base.join(&*remote),
+            None => {}
+        }
         if let ExecutorConfig::Pi {
             provider,
             swarm: Some(swarm),
@@ -650,7 +745,57 @@ impl AgentConfig {
             }
         }
         self.validate_pstack()?;
+        self.validate_forge()?;
         self.validate_executor()
+    }
+
+    fn validate_forge(&self) -> Result<()> {
+        let Some(forge) = &self.forge else {
+            return Ok(());
+        };
+        let ExecutorConfig::Pi {
+            run_code, prepare, ..
+        } = &self.executor
+        else {
+            bail!("forge needs executor: {{kind: pi}}, whose workers work in its clones");
+        };
+        ensure!(
+            run_code.is_some(),
+            "forge needs executor.run_code, where workers run git in their clones"
+        );
+        ensure!(
+            !prepare.as_deref().is_some_and(worktree_into_work),
+            "executor.prepare runs git worktree add into the work dir, and the forge clones each \
+             repository ticket's work dir itself: drop the worktree add"
+        );
+        let Identity { name, email } = forge.identity();
+        for (field, value) in [("name", name), ("email", email)] {
+            ensure!(
+                !value.trim().is_empty() && !value.chars().any(char::is_control),
+                "forge.identity.{field} must be one line of text"
+            );
+        }
+        ensure!(!forge.repos().is_empty(), "forge names no repos");
+        for (repo, terms) in forge.repos() {
+            ensure!(
+                !terms.about.trim().is_empty(),
+                "forge.repos.{repo}.about is empty, and the Router reads it"
+            );
+            ensure!(
+                branch_name(&terms.base),
+                "forge.repos.{repo}.base {:?} is not a branch name",
+                terms.base
+            );
+            if let Some(budget) = terms.budget_microusd {
+                ensure!(budget > 0, "forge.repos.{repo}.budget_microusd is zero");
+                ensure!(
+                    self.takes_approvals() || budget <= self.policy.auto_approve_microusd,
+                    "forge.repos.{repo}.budget_microusd {budget} is above \
+                     policy.auto_approve_microusd, and nobody here can approve a budget"
+                );
+            }
+        }
+        Ok(())
     }
 
     fn validate_pstack(&self) -> Result<()> {
@@ -890,9 +1035,11 @@ impl SwarmConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentConfig, ChannelConfig, ClaudeConfig, ExecutorConfig, HarnessKind, JobLimits,
-        RouterConfig, SourceConfig,
+        AgentConfig, ChannelConfig, ClaudeConfig, ExecutorConfig, ForgeConfig, HarnessKind,
+        JobLimits, RepoConfig, RouterConfig, SourceConfig,
     };
+    use solos_agent_core::change::{Deliverable, RepoName};
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -1204,6 +1351,151 @@ budgets: {session_microusd: 500000}
             (
                 on(workers(|yaml| yaml), "{entry: how, models: {}}"),
                 "unknown field `models`",
+            ),
+        ] {
+            let refused = format!("{:#}", parse(&yaml).unwrap_err());
+            assert!(refused.contains(why), "{refused}");
+        }
+    }
+
+    const FORGE: &str = "forge:
+  kind: github
+  token_file: secrets/forge-token
+  identity: {name: solos-bot, email: bot@example.com}
+  repos:
+    acme/widgets:
+      about: Widgets, in Rust.
+      base: main
+      budget_microusd: 1500000
+      notes: Tests run with ./check.
+      owes: pull_request
+    acme/docs: {about: The handbook., base: release/2026}
+";
+    const WORKTREE: &str = "  prepare: git -C /srv/repo worktree add \"$SOLOS_WORK_DIR\"\n";
+
+    fn forged(edit: impl Fn(String) -> String) -> String {
+        let workers = workers(|yaml| yaml.replace(WORKTREE, ""));
+        format!("{workers}{}", edit(FORGE.to_owned()))
+    }
+
+    #[test]
+    fn a_forge_loads_its_repositories_with_its_files_beside_the_config() {
+        let dir = std::env::temp_dir().join(format!("agent-config-forge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.yaml");
+        let local = |yaml: String| {
+            yaml.replace(
+                "kind: github\n  token_file: secrets/forge-token",
+                "kind: local\n  remote: remotes",
+            )
+        };
+        let load = |yaml: String| {
+            std::fs::write(&path, yaml).unwrap();
+            AgentConfig::load(&path).unwrap().forge.unwrap()
+        };
+        let github = load(forged(|yaml| yaml));
+        let on_disk = load(forged(local));
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let ForgeConfig::Github { token_file, .. } = &github else {
+            panic!("{github:?}")
+        };
+        assert_eq!(*token_file, dir.join("secrets/forge-token"));
+        let ForgeConfig::Local { remote, .. } = &on_disk else {
+            panic!("{on_disk:?}")
+        };
+        assert_eq!(*remote, dir.join("remotes"));
+        assert_eq!(github.identity().email, "bot@example.com");
+        let repo = |name: &str| RepoName::try_from(name.to_owned()).unwrap();
+        assert_eq!(
+            *github.repos(),
+            BTreeMap::from([
+                (
+                    repo("acme/docs"),
+                    RepoConfig {
+                        about: "The handbook.".into(),
+                        base: "release/2026".into(),
+                        budget_microusd: None,
+                        notes: None,
+                        owes: Deliverable::Answer,
+                    }
+                ),
+                (
+                    repo("acme/widgets"),
+                    RepoConfig {
+                        about: "Widgets, in Rust.".into(),
+                        base: "main".into(),
+                        budget_microusd: Some(1_500_000),
+                        notes: Some("Tests run with ./check.".into()),
+                        owes: Deliverable::PullRequest,
+                    }
+                ),
+            ])
+        );
+        assert_eq!(on_disk.repos(), github.repos());
+    }
+
+    #[test]
+    fn a_forge_refuses_a_worktree_prepare_and_needs_pi_workers_with_run_code() {
+        let worktree = format!("{}{FORGE}", workers(|yaml| yaml));
+        assert!(worktree.contains(WORKTREE));
+        assert!(
+            parse(&workers(|yaml| yaml)).is_ok(),
+            "the same prepare loads without a forge"
+        );
+        let scripted = format!("{VALID}{FORGE}");
+        let no_run_code = format!(
+            "{}{FORGE}",
+            workers(|yaml| {
+                let bare = yaml.replace(WORKTREE, "");
+                let at = bare.find("  run_code:").unwrap();
+                let end = bare[at..].find("budgets:").unwrap();
+                format!("{}{}", &bare[..at], &bare[at + end..])
+            })
+        );
+        for (yaml, why) in [
+            (
+                worktree,
+                "executor.prepare runs git worktree add into the work dir, and the forge clones \
+                 each repository ticket's work dir itself",
+            ),
+            (scripted, "forge needs executor: {kind: pi}"),
+            (no_run_code, "forge needs executor.run_code"),
+            (
+                forged(|yaml| {
+                    let at = yaml.find("  repos:").unwrap();
+                    format!("{}  repos: {{}}\n", &yaml[..at])
+                }),
+                "forge names no repos",
+            ),
+            (
+                forged(|yaml| yaml.replace("acme/docs:", "acme/../docs:")),
+                "\"acme/../docs\" is not a repository",
+            ),
+            (
+                forged(|yaml| yaml.replace("base: release/2026", "base: --upload-pack=x")),
+                "forge.repos.acme/docs.base \"--upload-pack=x\" is not a branch name",
+            ),
+            (
+                forged(|yaml| yaml.replace("about: The handbook.", "about: \"  \"")),
+                "forge.repos.acme/docs.about is empty",
+            ),
+            (
+                forged(|yaml| yaml.replace("1500000", "2500000")),
+                "forge.repos.acme/widgets.budget_microusd 2500000 is above \
+                 policy.auto_approve_microusd, and nobody here can approve a budget",
+            ),
+            (
+                forged(|yaml| yaml.replace("name: solos-bot", "name: \"\"")),
+                "forge.identity.name must be one line of text",
+            ),
+            (
+                forged(|yaml| yaml.replace("owes: pull_request", "owes: merge")),
+                "unknown variant `merge`",
+            ),
+            (
+                forged(|yaml| yaml.replace("kind: github", "kind: local")),
+                "unknown field `token_file`",
             ),
         ] {
             let refused = format!("{:#}", parse(&yaml).unwrap_err());

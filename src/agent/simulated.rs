@@ -279,8 +279,10 @@ mod tests {
             plan: Plan::Session {
                 harness: None,
                 environment: None,
+                method: None,
             },
             budget_microusd: 1,
+            repo: None,
             recovery: false,
             inputs: Vec::new(),
         }

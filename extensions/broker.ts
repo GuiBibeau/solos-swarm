@@ -19,6 +19,8 @@ const ROUTER_TOOLS = [
       agents: Type.Optional(Type.Integer({ minimum: 1, maximum: 30, description: "accept with plan swarm: how many agents." })),
       goal_template: Type.Optional(Type.String({ description: "accept with plan swarm: the goal template it runs, one the prompt names. Omit it for the default." })),
       environment: Type.Optional(Type.String({ description: "accept with plan session: the machine its run_code runs on, one your instructions name. Omit it for the default." })),
+      repo: Type.Optional(Type.String({ description: "accept with plan session: the repository the work reads or changes, one your instructions name. Omit it for work on no repository." })),
+      deliverable: Type.Optional(StringEnum(["answer", "change", "pull_request"] as const, { description: "accept with a repo: what the finished work owes: an answer, a change committed in the clone, or a pull_request. Omit it for the repository's default." })),
       budget_microusd: Type.Optional(Type.Integer({ minimum: 1, description: "accept: the Ticket's whole budget in microusd. Omit it for the default." })),
       acknowledge: Type.Optional(Type.String({ description: "accept: the first reply, instead of the standard one. An empty string sends none." })),
       rules: Type.Optional(Type.Array(Type.String(), { description: "accept of inferred work: the proactive rules it matches." })),
@@ -129,9 +131,9 @@ const WORKER_TOOLS = [
   },
   {
     name: "read",
-    description: "Read a text file, or list a directory, under /pstack, where pstack's skills are, read-only. Paths are absolute. A file comes back as numbered lines, at most 2000 lines or 256 KiB at a time, so use offset and limit for the rest. A path outside /pstack, a link that leads out of it, and a binary file are refused.",
+    description: "Read a text file, or list a directory, read-only. Where your instructions say pstack is at /pstack, its skills are there. On a ticket with a repository, its clone is under /work and what the host wrote about it under /host. Paths are absolute. A file comes back as numbered lines, at most 2000 lines or 256 KiB at a time, so use offset and limit for the rest. A path outside these, a link that leads out of one, and a binary file are refused.",
     parameters: Type.Object({
-      path: Type.String({ minLength: 1, description: "An absolute path, such as /pstack/skills/poteto-mode/SKILL.md." }),
+      path: Type.String({ minLength: 1, description: "An absolute path, such as /work/README.md on a ticket with a repository, or /pstack/skills/poteto-mode/SKILL.md where pstack is at /pstack." }),
       offset: Type.Optional(Type.Integer({ minimum: 1, description: "The first line to read, from 1. Default 1." })),
       limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 2000, description: "How many lines. Default and most: 2000." })),
     }),

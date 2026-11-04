@@ -8,6 +8,7 @@ pub mod broker;
 pub mod config;
 pub mod discord;
 pub mod environment;
+pub mod forge;
 pub mod github;
 pub mod goal_template;
 pub mod jobs;
@@ -337,6 +338,7 @@ where
                 state_dir: Some(state),
                 pi_root: Some(pi_root.clone()),
                 node: Some(node.clone()),
+                pstack: pstack.as_ref().map(|opened| opened.root().to_owned()),
             },
         )
         .view();
@@ -485,6 +487,11 @@ where
                 model,
                 max_workers: *max_workers,
                 prepare: prepare.clone(),
+                forge: config
+                    .forge
+                    .as_ref()
+                    .map(|wanted| forge::open(wanted, canonical(state_dir)?.join(forge::FORGE_DIR)))
+                    .transpose()?,
                 swarm,
             })?)),
             _ => None,
@@ -622,6 +629,7 @@ fn router_session(
         pi_settings: settings,
         node: node.to_owned(),
         pi_root: pi_root.to_owned(),
+        pstack: None,
     };
     let grant = Grant {
         principal: Principal::Router,
