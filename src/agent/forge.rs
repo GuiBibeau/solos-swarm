@@ -11,7 +11,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use solos_agent_core::change::RepoName;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,7 +44,11 @@ pub fn open(config: &ForgeConfig, dir: PathBuf) -> Result<Arc<dyn Forge>> {
             repos,
         } => Arc::new(LocalForge {
             mirrors: Mirrors::new(dir, identity, repos),
-            remote: remote.clone(),
+            // Git runs in the mirror, so it would read a relative path from
+            // there, not from where the agent was started.
+            remote: remote
+                .canonicalize()
+                .with_context(|| format!("forge.remote {} cannot be found", remote.display()))?,
         }),
     })
 }
@@ -144,36 +148,24 @@ impl Mirrors {
         remote: &Remote<'_>,
     ) -> Result<Workspace> {
         let marker = dirs.host.join(REPO_JSON);
-        match std::fs::read(&marker) {
-            Ok(bytes) => {
-                return serde_json::from_slice(&bytes)
-                    .with_context(|| format!("{} is not what the forge wrote", marker.display()));
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(err).with_context(|| format!("cannot read {}", marker.display()));
-            }
+        if let Some(done) = prepared(&marker)? {
+            return Ok(done);
         }
         let (terms, lock) = self
             .repos
             .get(repo)
             .with_context(|| format!("the forge has no repository {repo}"))?;
         let _one_ticket_at_a_time = lock.lock().await;
+        // A launch of this Ticket that overlapped this one may have cloned
+        // while it waited, and then `work/` is the worker's.
+        if let Some(done) = prepared(&marker)? {
+            return Ok(done);
+        }
         let owner = self.dir.join(repo.owner());
         private_dir(&owner)?;
         let mirror = owner.join(format!("{}.git", repo.name()));
+        refresh(&mirror, repo, remote).await?;
         let mirror = mirror.as_os_str();
-        run(
-            git([
-                OsStr::new("init"),
-                "--bare".as_ref(),
-                "--quiet".as_ref(),
-                mirror,
-            ]),
-            "init",
-        )
-        .await?;
-        run(fetch(mirror, remote), "fetch").await?;
         let tip = format!("refs/heads/{}^{{commit}}", terms.base);
         let base_commit = run(
             git([
@@ -198,9 +190,12 @@ impl Mirrors {
         let email = format!("user.email={}", self.identity.email);
         run(
             git([
+                "-c".as_ref(),
+                "core.hooksPath=/dev/null".as_ref(),
                 "clone".as_ref(),
                 "--quiet".as_ref(),
                 "--no-local".as_ref(),
+                "--template=".as_ref(),
                 "--branch".as_ref(),
                 terms.base.as_ref(),
                 "--config".as_ref(),
@@ -232,9 +227,108 @@ impl Mirrors {
             base_commit,
             notes: terms.notes.clone(),
         };
+        // The marker says the clone is whole, so it must not reach the disk
+        // before the clone does.
+        sync_to_disk(dirs.work).await?;
         write_json(&marker, &workspace)?;
         Ok(workspace)
     }
+}
+
+/// What `repo.json` says, or `None` before the clone is done.
+fn prepared(marker: &Path) -> Result<Option<Workspace>> {
+    match std::fs::read(marker) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .with_context(|| format!("{} is not what the forge wrote", marker.display())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("cannot read {}", marker.display())),
+    }
+}
+
+/// Bring `mirror` up to the remote's branches and tags. A fetch that was
+/// killed can leave lock files or temporary packs that fail every fetch
+/// after it, so a failed fetch clears them and tries again, and a mirror
+/// that still fails is made again from nothing.
+async fn refresh(mirror: &Path, repo: &RepoName, remote: &Remote<'_>) -> Result<()> {
+    let Err(first) = fetch_into(mirror, remote).await else {
+        return Ok(());
+    };
+    eprintln!("agent: forge: the mirror of {repo} failed ({first:#}); clearing its stale files");
+    clear_stale(mirror, false);
+    let Err(second) = fetch_into(mirror, remote).await else {
+        return Ok(());
+    };
+    eprintln!("agent: forge: the mirror of {repo} failed again ({second:#}); making it again");
+    match std::fs::remove_dir_all(mirror) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+            return Err(err).with_context(|| format!("cannot remove {}", mirror.display()));
+        }
+        _ => {}
+    }
+    fetch_into(mirror, remote)
+        .await
+        .with_context(|| format!("the mirror of {repo} failed, was made again, and failed"))
+}
+
+async fn fetch_into(mirror: &Path, remote: &Remote<'_>) -> Result<()> {
+    let mirror = mirror.as_os_str();
+    run(
+        git([
+            OsStr::new("init"),
+            "--bare".as_ref(),
+            "--quiet".as_ref(),
+            mirror,
+        ]),
+        "init",
+    )
+    .await?;
+    run(fetch(mirror, remote), "fetch").await?;
+    Ok(())
+}
+
+/// Remove what a killed git leaves in a repository: its lock files, and the
+/// temporary packs and objects it was writing. Links are not followed.
+fn clear_stale(dir: &Path, in_objects: bool) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if kind.is_dir() {
+            clear_stale(&entry.path(), in_objects || name == "objects");
+        } else if kind.is_file()
+            && (name.ends_with(".lock") || (in_objects && name.starts_with("tmp_")))
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Write what is pending on `dir`'s filesystem to disk.
+async fn sync_to_disk(dir: &Path) -> Result<()> {
+    let owned = dir.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(&owned)?;
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: the descriptor is open for the whole call, and syncfs
+            // reads nothing from this process's memory.
+            if unsafe { libc::syncfs(file.as_raw_fd()) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        file.sync_all()?;
+        Ok::<(), std::io::Error>(())
+    })
+    .await?
+    .with_context(|| format!("cannot sync {}", dir.display()))
 }
 
 fn git<'a>(args: impl IntoIterator<Item = &'a OsStr>) -> Command {
@@ -300,14 +394,15 @@ async fn run(mut git: Command, what: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GithubForge, LocalForge, Mirrors, REPO_JSON, fetch};
-    use crate::agent::config::{Identity, RepoConfig};
+    use super::{GithubForge, LocalForge, Mirrors, REPO_JSON, fetch, open};
+    use crate::agent::config::{ForgeConfig, Identity, RepoConfig};
     use crate::agent::github::Token;
     use crate::agent::ports::{Forge, TicketDirs, Workspace};
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use solos_agent_core::change::{Deliverable, RepoName};
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
+    use std::time::Duration;
 
     fn widgets() -> RepoName {
         RepoName::try_from("acme/widgets".to_owned()).unwrap()
@@ -481,6 +576,17 @@ mod tests {
             !work.join(".git/objects/info/alternates").exists(),
             "its objects are its own"
         );
+        assert!(
+            std::fs::read_dir(work.join(".git/hooks"))
+                .map_or(true, |mut hooks| hooks.next().is_none()),
+            "no template, so no hooks"
+        );
+        assert!(
+            git(&work, &["config", "--local", "--list"])
+                .lines()
+                .all(|line| !line.starts_with("core.hookspath")),
+            "the hooks path is not left in the clone's config"
+        );
     }
 
     #[tokio::test]
@@ -522,6 +628,139 @@ mod tests {
 
         assert!(!work.join("half-made").exists());
         assert_eq!(git(&work, &["log", "--format=%s"]), "second\nfirst");
+    }
+
+    #[tokio::test]
+    async fn a_launch_that_waited_for_the_mirror_leaves_the_clone_another_launch_made() {
+        let w = World::new("overlap");
+        let (work, host) = w.ticket("tk_1");
+        let guard = w.forge.mirrors.repos[&widgets()].1.lock().await;
+        let repo = widgets();
+        let mut late = Box::pin(w.prepare(&repo, "tk_1"));
+        let waiting = tokio::time::timeout(Duration::from_millis(200), &mut late).await;
+        assert!(waiting.is_err(), "the second launch waits for the first");
+
+        // Meanwhile the first launch cloned, and the worker began.
+        let made = Workspace {
+            repo: widgets(),
+            base: "main".into(),
+            base_commit: "0123456789abcdef".into(),
+            notes: None,
+        };
+        std::fs::write(host.join(REPO_JSON), serde_json::to_vec(&made).unwrap()).unwrap();
+        std::fs::write(work.join("mine"), "the worker's").unwrap();
+        drop(guard);
+
+        assert_eq!(late.await.unwrap(), made);
+        assert_eq!(
+            std::fs::read_to_string(work.join("mine")).unwrap(),
+            "the worker's"
+        );
+        assert!(!work.join(".git").exists(), "nothing cleared or cloned it");
+    }
+
+    #[tokio::test]
+    async fn a_killed_fetchs_stale_files_do_not_stop_the_next_ticket() {
+        let w = World::new("stale");
+        w.prepare(&widgets(), "tk_1").await.unwrap();
+        let pushed = w.push("later.txt");
+        let mirror = w.root.join("forge/acme/widgets.git");
+        let lock = mirror.join("refs/heads/main.lock");
+        let pack = mirror.join("objects/pack/tmp_pack_Xa1b2c");
+        std::fs::write(&lock, "").unwrap();
+        std::fs::write(&pack, "half a pack").unwrap();
+        let fetch_would_fail = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&mirror)
+            .args(["fetch", "--quiet", "--"])
+            .arg(w.root.join("remote/acme/widgets.git"))
+            .arg("+refs/heads/*:refs/heads/*")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(!fetch_would_fail.status.success(), "the lock is in the way");
+
+        let next = w.prepare(&widgets(), "tk_2").await.unwrap();
+
+        assert_eq!(next.base_commit, pushed);
+        assert_eq!(
+            git(&w.root.join("tk_2/work"), &["rev-parse", "HEAD"]),
+            pushed
+        );
+        assert!(!lock.exists() && !pack.exists());
+    }
+
+    #[tokio::test]
+    async fn a_mirror_that_clearing_does_not_mend_is_made_again() {
+        let w = World::new("broken");
+        w.prepare(&widgets(), "tk_1").await.unwrap();
+        let pushed = w.push("later.txt");
+        std::fs::write(w.root.join("forge/acme/widgets.git/config"), "[[[ not git").unwrap();
+
+        let next = w.prepare(&widgets(), "tk_2").await.unwrap();
+
+        assert_eq!(next.base_commit, pushed);
+        assert_eq!(
+            git(&w.root.join("tk_2/work"), &["log", "--format=%s", "-1"]),
+            "later.txt"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mirror_that_cannot_be_made_again_is_an_error_not_a_loop() {
+        let w = World::new("gone");
+        std::fs::remove_dir_all(w.root.join("remote/acme/widgets.git")).unwrap();
+
+        let err = w.prepare(&widgets(), "tk_1").await.unwrap_err();
+
+        assert!(
+            err.to_string().contains("was made again, and failed"),
+            "{err:#}"
+        );
+        assert!(!w.root.join("tk_1/host").join(REPO_JSON).exists());
+    }
+
+    #[tokio::test]
+    async fn a_relative_remote_is_read_from_where_the_agent_runs_not_from_the_mirror() {
+        let w = World::new("relative");
+        let tip = git(&w.upstream, &["rev-parse", "main"]);
+        let here = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let mut relative = PathBuf::new();
+        relative.extend(here.components().skip(1).map(|_| ".."));
+        relative.push(w.root.join("remote").strip_prefix("/").unwrap());
+        assert!(relative.is_relative());
+        let config = |remote: PathBuf| ForgeConfig::Local {
+            remote,
+            identity: identity(),
+            repos: repos(),
+        };
+
+        let forge = open(&config(relative), w.root.join("mirrors")).unwrap();
+
+        let (work, host) = w.ticket("tk_1");
+        let dirs = TicketDirs {
+            work: &work,
+            host: &host,
+        };
+        let made = forge.prepare(&widgets(), dirs).await.unwrap();
+        assert_eq!(made.base_commit, tip);
+        let origin = git(&work, &["remote", "get-url", "origin"]);
+        assert_eq!(
+            origin,
+            w.root
+                .canonicalize()
+                .unwrap()
+                .join("remote/acme/widgets.git")
+                .to_str()
+                .unwrap()
+        );
+        let missing = open(&config(PathBuf::from("no/such/remote")), w.root.join("x"));
+        let err = missing.err().unwrap();
+        assert!(
+            err.to_string()
+                .starts_with("forge.remote no/such/remote cannot be found"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
