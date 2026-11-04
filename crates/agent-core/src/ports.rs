@@ -7,8 +7,13 @@ use crate::trail::TrailCursor;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
     Invalid(String),
-    Missing { kind: &'static str, id: String },
+    Missing {
+        kind: &'static str,
+        id: String,
+    },
     Refused(String),
+    /// The actor may not give this command. Checked before any state is read.
+    Forbidden(String),
     Store(String),
 }
 impl std::fmt::Display for Error {
@@ -17,6 +22,7 @@ impl std::fmt::Display for Error {
             Self::Invalid(why) => write!(f, "invalid: {why}"),
             Self::Missing { kind, id } => write!(f, "no {kind} {id}"),
             Self::Refused(why) => write!(f, "refused: {why}"),
+            Self::Forbidden(why) => write!(f, "forbidden: {why}"),
             Self::Store(why) => write!(f, "store: {why}"),
         }
     }
@@ -63,6 +69,9 @@ pub trait Policy {
     fn auto_approve_microusd(&self) -> MicroUsd;
     /// `source` is where the approval came from, such as `slack`.
     fn may_approve(&self, source: &str, actor: &Actor) -> bool;
+    /// `source` is where the stop came from. A person who may approve, or
+    /// who may ask for work, may stop a Ticket.
+    fn may_stop(&self, source: &str, actor: &Actor) -> bool;
 }
 
 pub trait Clock {

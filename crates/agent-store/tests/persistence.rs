@@ -101,7 +101,8 @@ fn script<R: Repositories>(e: &mut AnyEngine<R>, now: &Cell<u64>) -> EvalId {
     ))
     .unwrap();
     assert!(e.evaluate_due().unwrap().is_empty(), "the gate rejects it");
-    e.stop_ticket(&second, "not needed").unwrap();
+    e.stop_ticket(&second, "slack", alice(), "not needed")
+        .unwrap();
     now.set(now.get() + 5_000);
     e.receive(slack("t5", alice(), "th3", "@agent look at this"))
         .unwrap();

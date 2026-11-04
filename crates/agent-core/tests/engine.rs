@@ -4,7 +4,8 @@ use solos_agent_core::model::{
     Verdict,
 };
 use solos_agent_core::{
-    AcceptMode, AllowlistPolicy, Engine, Intake, MAX_EXPIRED_EVALS, MemoryRepositories,
+    AcceptMode, AllowlistPolicy, Engine, Error, Intake, MAX_EXPIRED_EVALS, MemoryRepositories,
+    Repositories,
 };
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -638,7 +639,9 @@ fn a_person_resumes_ended_work_and_a_stopped_ticket_hears_nothing() {
             .any(|e| matches!(e, Effect::Launch { recovery: true, .. }))
     );
 
-    w.engine.stop_ticket(ticket, "not needed").unwrap();
+    w.engine
+        .stop_ticket(ticket, "slack", Actor::person("alice"), "not needed")
+        .unwrap();
     let late = slack(
         "t3",
         Actor::person("alice"),
@@ -982,7 +985,9 @@ fn a_restart_ends_the_lost_assignment_and_launches_a_recovery_in_one_commit() {
         w.engine.restart(&ticket, &second, "again").is_err(),
         "an ended assignment does not restart"
     );
-    w.engine.stop_ticket(&ticket, "stopped").unwrap();
+    w.engine
+        .stop_ticket(&ticket, "slack", Actor::person("alice"), "stopped")
+        .unwrap();
     assert!(w.engine.restart(&ticket, &second, "again").is_err());
 }
 
@@ -1039,7 +1044,9 @@ fn an_unlisted_follow_up_neither_resumes_work_nor_ends_a_hold() {
             },
         )
         .unwrap();
-    w.engine.stop_ticket(&ticket, "reset").unwrap();
+    w.engine
+        .stop_ticket(&ticket, "slack", Actor::person("alice"), "reset")
+        .unwrap();
     let (done, assignment) = started_ticket(&mut w, "th2");
     w.engine
         .report(&done, &assignment, report(ReportStatus::Ready))
@@ -1155,5 +1162,62 @@ fn a_pause_starts_no_evals_but_still_records_work() {
         w.engine.evaluate_due().unwrap().len(),
         1,
         "judged once the pause lifts"
+    );
+}
+
+/// The Engine, not the shell, decides who may stop: a refused stop commits nothing.
+#[test]
+fn the_engine_refuses_a_stop_from_anyone_the_policy_does_not_allow() {
+    let mut w = World::new(policy());
+    let (ticket, _) = started_ticket(&mut w, "th1");
+    let before = format!("{:?}", w.engine.repos());
+    let refused = [
+        ("github", Actor::person("alice")),
+        ("slack", Actor::person("mallory")),
+        ("slack", Actor::bot("ci-bot")),
+        ("slack", Actor::system("schedule")),
+    ];
+    for (source, by) in refused {
+        let result = w.engine.stop_ticket(&ticket, source, by.clone(), "stopped");
+        assert!(
+            matches!(result, Err(Error::Forbidden(_))),
+            "{source} {by:?}: {result:?}"
+        );
+        assert_eq!(format!("{:?}", w.engine.repos()), before, "{source} {by:?}");
+    }
+    assert!(w.effects().is_empty());
+    w.engine
+        .stop_ticket(&ticket, "slack", Actor::person("alice"), "stopped")
+        .unwrap();
+    assert!(
+        w.engine
+            .repos()
+            .ticket(&ticket)
+            .unwrap()
+            .stopped_by_person()
+    );
+}
+
+/// A listed person may ask for work and so may stop it, without approving budgets.
+#[test]
+fn a_listed_person_who_cannot_approve_may_still_stop_their_work() {
+    let mut p = policy();
+    p.people.insert("slack:bob".into());
+    let mut w = World::new(p);
+    let (ticket, _) = started_ticket(&mut w, "th1");
+    let bob = Actor::person("bob");
+    assert!(matches!(
+        w.engine.approve(&ticket, "slack", bob.clone()),
+        Err(Error::Forbidden(_))
+    ));
+    w.engine
+        .stop_ticket(&ticket, "slack", bob, "enough")
+        .unwrap();
+    assert!(
+        w.engine
+            .repos()
+            .ticket(&ticket)
+            .unwrap()
+            .stopped_by_person()
     );
 }

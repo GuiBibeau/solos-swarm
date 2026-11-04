@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use solos_agent_core::ids::key;
 use solos_agent_core::model::{
-    Actor, AssignmentId, AssignmentState, Candidate, Effect, EvalId, Input, InputBody, MessageId,
+    AssignmentId, AssignmentState, Candidate, Effect, EvalId, Input, InputBody, MessageId,
     MessageKind, Ms, OutboundMessage, Stage, Ticket, TicketId, Trigger,
 };
 use solos_agent_core::{AllowlistPolicy, Engine, Error, Intake, Policy, Repositories};
@@ -535,21 +535,18 @@ impl Runtime {
             reply_to,
         } = command;
         let who = by.name.clone().unwrap_or_else(|| by.id.clone());
-        let policy = self.engine.policy();
         let outcome = match &order {
-            Order::Approve if !policy.may_approve(&source, &by) => {
-                Err(format!("{who} is not allowed to approve budgets."))
-            }
-            Order::Stop if !may_stop(policy, &source, &by) => {
-                Err(format!("{who} is not allowed to stop this work."))
-            }
             Order::Approve => told(
                 self.engine.approve(&ticket, &source, by.clone()),
                 format!("Approved by {who}. The work starts now."),
             )?,
             Order::Stop => told(
-                self.engine
-                    .stop_ticket(&ticket, &format!("stopped by {who} on {source}")),
+                self.engine.stop_ticket(
+                    &ticket,
+                    &source,
+                    by.clone(),
+                    &format!("stopped by {who} on {source}"),
+                ),
                 format!("Stopped by {who}."),
             )?,
             Order::Secret { secret, allow } => told(
@@ -859,19 +856,12 @@ fn told(result: Result<(), Error>, done: String) -> Result<Result<String, String
     match result {
         Ok(()) => Ok(Ok(done)),
         Err(Error::Store(why)) => bail!("a command: {why}"),
+        Err(Error::Forbidden(why)) => Ok(Err(why)),
         Err(Error::Refused(why) | Error::Invalid(why)) => {
             Ok(Err(format!("Nothing changed: {why}.")))
         }
         Err(other) => Ok(Err(format!("Nothing changed: {other}."))),
     }
-}
-
-/// The core lets any command stop a Ticket, so the shell decides who may:
-/// an approver, or a person allowed to ask for work.
-fn may_stop(policy: &AllowlistPolicy, source: &str, by: &Actor) -> bool {
-    by.is_person()
-        && (policy.may_approve(source, by)
-            || policy.people.contains(&format!("{source}:{}", by.id)))
 }
 
 /// `assignment` is `ticket`'s latest and has not ended, so a worker may
@@ -1050,7 +1040,10 @@ mod tests {
         assert_eq!(offered(&runtime), [None]);
 
         let (mut runtime, ticket) = runtime_with_a_ticket(5_000_000);
-        runtime.engine.stop_ticket(&ticket, "stopped").unwrap();
+        runtime
+            .engine
+            .stop_ticket(&ticket, "slack", Actor::person("alice"), "stopped")
+            .unwrap();
         assert_eq!(offered(&runtime), [None], "a stopped Ticket asks nothing");
     }
 
