@@ -637,6 +637,7 @@ mod tests {
             pi_settings: PathBuf::from("/nowhere/settings.json"),
             node: PathBuf::from("/nowhere/node"),
             pi_root: PathBuf::from("/nowhere"),
+            pstack: None,
         }
     }
 

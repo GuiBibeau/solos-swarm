@@ -338,6 +338,7 @@ where
                 state_dir: Some(state),
                 pi_root: Some(pi_root.clone()),
                 node: Some(node.clone()),
+                pstack: pstack.as_ref().map(|opened| opened.root().to_owned()),
             },
         )
         .view();
@@ -628,6 +629,7 @@ fn router_session(
         pi_settings: settings,
         node: node.to_owned(),
         pi_root: pi_root.to_owned(),
+        pstack: None,
     };
     let grant = Grant {
         principal: Principal::Router,

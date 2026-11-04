@@ -33,10 +33,12 @@ pub fn pi_binds(node: &Path, pi_root: &Path) -> Vec<Mount> {
     ]
 }
 
-/// The vendored pstack tree, bound for a session granted `read` and for
-/// the `run_code` sandbox.
-pub fn pstack_bind(pi_root: &Path) -> Mount {
-    mount(pstack::MOUNT, &pi_root.join(pstack::VENDORED))
+/// The pstack tree the host checked (`Pstack::root`), bound at `/pstack` in
+/// a Pi session and in the `run_code` sandbox. Only a configured pstack has
+/// a tree: `read` alone binds nothing, since a repository Ticket is granted
+/// it with no pstack.
+pub fn pstack_bind(tree: &Path) -> Mount {
+    mount(pstack::MOUNT, tree)
 }
 
 /// The read-only binds of a Claude Code session. Without `node` the program
@@ -58,7 +60,7 @@ pub fn claude_binds(binary: &Path, node: Option<&Path>, solos_swarm: &Path) -> V
 /// tree when one is open.
 pub fn run_code_mounts(run_code: &RunCodeConfig, tree: Option<&Path>) -> Vec<Mount> {
     let mut mounts = run_code.mounts.clone();
-    mounts.extend(tree.map(|root| mount(pstack::MOUNT, root)));
+    mounts.extend(tree.map(pstack_bind));
     mounts
 }
 
@@ -81,6 +83,10 @@ pub struct Host {
     pub pi_root: Option<PathBuf>,
     /// The node binary, canonical.
     pub node: Option<PathBuf>,
+    /// The pstack tree `Pstack::open` checked, canonical. A link at
+    /// `vendor/pstack` makes it a tree outside `pi_root`, and the sandboxes
+    /// bind that tree, so the view holds it by itself.
+    pub pstack: Option<PathBuf>,
 }
 
 /// Every host path some sandbox of one config and host may read.
@@ -106,6 +112,7 @@ impl Exposure {
         visible.extend(host.state_dir.as_ref().map(|state| state.join(TICKETS_DIR)));
         visible.extend(host.node.as_deref().map(|node| node_root(node).to_owned()));
         visible.extend(host.pi_root.clone());
+        visible.extend(host.pstack.clone());
         Self { visible }
     }
 
@@ -166,6 +173,7 @@ budgets: {session_microusd: 500000}
             state_dir: Some(PathBuf::from("/srv/state")),
             pi_root: Some(PathBuf::from("/srv/pi")),
             node: Some(PathBuf::from("/opt/node/bin/node")),
+            pstack: Some(PathBuf::from("/srv/pi/vendor/pstack")),
         };
         (config, host)
     }
@@ -198,8 +206,9 @@ budgets: {session_microusd: 500000}
         let view = Exposure::new(&config, &host).view();
         let pi_root = Path::new("/srv/pi");
         let node = Path::new("/opt/node/bin/node");
+        let tree = host.pstack.as_deref().unwrap();
         let mut binds = pi_binds(node, pi_root);
-        binds.push(pstack_bind(pi_root));
+        binds.push(pstack_bind(tree));
         binds.extend(claude_binds(
             Path::new("/opt/claude/cli.js"),
             Some(node),
@@ -217,10 +226,7 @@ budgets: {session_microusd: 500000}
         else {
             panic!("the representative config runs code");
         };
-        binds.extend(run_code_mounts(
-            run_code,
-            Some(Path::new("/srv/pi/vendor/pstack")),
-        ));
+        binds.extend(run_code_mounts(run_code, Some(tree)));
         for bind in binds {
             assert!(
                 view.hides(&bind.source).is_err(),
@@ -228,6 +234,43 @@ budgets: {session_microusd: 500000}
                 bind.source.display()
             );
         }
+    }
+
+    #[test]
+    fn the_pstack_bind_is_the_checked_tree_wherever_it_is_and_it_is_in_the_view() {
+        let (config, mut host) = representative();
+        // vendor/pstack is a link to a tree outside the Pi checkout.
+        let tree = Path::new("/opt/pstack-0.15.36");
+        host.pstack = Some(tree.to_owned());
+
+        let bind = pstack_bind(tree);
+
+        assert_eq!(
+            (bind.source.as_path(), bind.target.as_path()),
+            (tree, Path::new("/pstack"))
+        );
+        let view = Exposure::new(&config, &host).view();
+        assert!(view.hides(&tree.join("skills/poteto-mode")).is_err());
+        let without = Exposure::new(&config, &Host::default()).view();
+        assert!(
+            without.hides(tree).is_ok(),
+            "a host that names no pstack exposes none"
+        );
+        let ExecutorConfig::Pi {
+            run_code: Some(run_code),
+            ..
+        } = &config.executor
+        else {
+            panic!("the representative config runs code");
+        };
+        let pstack_mounts = |tree| {
+            run_code_mounts(run_code, tree)
+                .into_iter()
+                .filter(|mount| mount.target == Path::new("/pstack"))
+                .count()
+        };
+        assert_eq!(pstack_mounts(Some(tree)), 1);
+        assert_eq!(pstack_mounts(None), 0, "no pstack, no /pstack mount");
     }
 
     #[test]

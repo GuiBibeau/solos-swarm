@@ -1442,7 +1442,11 @@ What happens:
   hook or a config in the clone, but no host git ever reads them. The token reaches git in its environment, for the
   mirror's fetch alone, and never in an argument, a sandbox or the clone's config.
 - On that Ticket, `read` also reaches `/work`, the clone, and `/host`, read-only. The worker's system prompt names
-  the repository, its base and the notes.
+  the repository, its base and the notes. The worker writes `/work`, so `read` bounds what it scans there: a file's
+  lines are counted over its first 32 MiB, and a longer file's reply says `total_at_least` in place of `total`; a
+  directory is listed from its first 20,000 entries, and `truncated` says there were more. A Ticket on a repository
+  gets `read` with no pstack configured, and the Pi sandbox then binds no `/pstack`: it binds only the tree the host
+  checked, and only when `pstack:` is set.
 - `executor.prepare` still runs after the clone. With `forge` configured, config load refuses a `prepare` that runs
   `git worktree add` into `$SOLOS_WORK_DIR`: a linked worktree's `.git` points at a path no sandbox has.
 - `prepare` runs on the host, as the agent's user and outside any sandbox, over the repository's content. With `forge`

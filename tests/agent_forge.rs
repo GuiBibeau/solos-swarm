@@ -6,7 +6,7 @@ use solos_swarm::agent::pi_executor::WORK_DIR;
 use solos_swarm::agent::{AgentConfig, PiHost, STORE_FILE, TICKETS_DIR, serve_with};
 use solos_swarm::gateway::{Dispatch, Provider};
 use solos_swarm::harness::scripted::{Call, ScriptedHarness, ScriptedSession};
-use solos_swarm::harness::{AgentHarness, Observation, Role, Session, SessionSpec};
+use solos_swarm::harness::{AgentHarness, Observation, PiHarness, Role, Session, SessionSpec};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -104,6 +104,10 @@ impl Provider for Model {
 #[derive(Default)]
 struct Seen {
     grants: Vec<String>,
+    /// The pstack tree the session's spec names, and the argv Pi would be
+    /// launched with from it.
+    pstack: Option<PathBuf>,
+    argv: Vec<String>,
     system_prompt: String,
     calls: Vec<(String, u16, Value)>,
 }
@@ -170,8 +174,15 @@ impl Session for RecordedSession {
                 let (status, reply) = self.post(&format!("tool/{tool}"), arguments).await?;
                 calls.push((tool.to_owned(), status, reply));
             }
+            let argv = PiHarness::command(&self.spec)
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
             *self.seen.lock().unwrap() = Seen {
                 grants: self.spec.grants.clone(),
+                pstack: self.spec.pstack.clone(),
+                argv,
                 system_prompt: session["system_prompt"].as_str().unwrap_or("").to_owned(),
                 calls,
             };
@@ -346,6 +357,13 @@ async fn a_question_about_a_repository_gets_a_worker_on_a_clone_it_reads_and_com
     for tool in ["read", "run_code"] {
         assert!(seen.grants.iter().any(|t| t == tool), "{:?}", seen.grants);
     }
+    assert_eq!(seen.pstack, None, "this agent has no pstack");
+    assert!(
+        !seen.argv.iter().any(|arg| arg.contains("pstack")),
+        "read is granted, but no pstack is bound: {:?}",
+        seen.argv
+    );
+    assert!(!seen.system_prompt.contains("/pstack"));
     let told = format!(
         "Repository: acme/widgets, base main. /work is a clone of it at main's tip ({}), with \
          its history and your commit identity: run git and its code there with run_code, and \

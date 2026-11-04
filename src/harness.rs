@@ -86,6 +86,10 @@ pub struct SessionSpec {
     pub node: PathBuf,
     /// The checkout that holds `node_modules` and `extensions`.
     pub pi_root: PathBuf,
+    /// The pstack tree the host checked, which the sandbox binds at
+    /// `/pstack`. `None` binds nothing, whatever the grants are: a
+    /// repository Ticket may `read` with no pstack configured.
+    pub pstack: Option<PathBuf>,
 }
 
 pub trait AgentHarness {
@@ -157,8 +161,8 @@ impl PiHarness {
         for bind in exposure::pi_binds(&spec.node, &spec.pi_root) {
             sandbox = exposure::read_only(sandbox, &bind);
         }
-        if spec.grants.iter().any(|grant| grant == "read") {
-            sandbox = exposure::read_only(sandbox, &exposure::pstack_bind(&spec.pi_root));
+        if let Some(tree) = &spec.pstack {
+            sandbox = exposure::read_only(sandbox, &exposure::pstack_bind(tree));
         }
         let mut sandbox = sandbox
             .ro_bind(&spec.broker_socket, "/broker.sock")
@@ -430,6 +434,7 @@ mod tests {
             pi_settings: PathBuf::from("/state/router/pi-settings.json"),
             node: PathBuf::from("/opt/node/bin/node"),
             pi_root: PathBuf::from("/srv/pi"),
+            pstack: None,
         };
         let args = |role| -> Vec<String> {
             PiHarness::command(&spec(role))
@@ -474,8 +479,8 @@ mod tests {
     }
 
     #[test]
-    fn a_worker_granted_read_sees_the_vendored_pstack_at_its_mount_and_nothing_else_changes() {
-        let args = |grants: &[&str]| -> Vec<String> {
+    fn a_session_binds_pstack_when_the_host_names_a_checked_tree_and_never_for_read_alone() {
+        let args = |grants: &[&str], pstack: Option<&str>| -> Vec<String> {
             let spec = SessionSpec {
                 id: "as_1".into(),
                 role: Role::TicketWorker,
@@ -487,6 +492,7 @@ mod tests {
                 pi_settings: PathBuf::from("/state/tickets/tk_1/pi-settings.json"),
                 node: PathBuf::from("/opt/node/bin/node"),
                 pi_root: PathBuf::from("/srv/pi"),
+                pstack: pstack.map(PathBuf::from),
             };
             PiHarness::command(&spec)
                 .as_std()
@@ -494,9 +500,22 @@ mod tests {
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect()
         };
-        let without = args(&["worker_report", "fetch_url"]);
-        let with = args(&["worker_report", "fetch_url", "read"]);
-        let bind = ["--ro-bind", "/srv/pi/vendor/pstack", "/pstack"];
+        // A repository Ticket on a host with no pstack is granted read.
+        let repository = ["worker_report", "fetch_url", "read"];
+        let without = args(&repository, None);
+        assert!(!without.iter().any(|arg| arg == "/pstack"), "{without:?}");
+        let mut plain = args(&["worker_report", "fetch_url"], None);
+        let grants = plain
+            .iter()
+            .position(|arg| arg == "worker_report,fetch_url")
+            .unwrap();
+        plain[grants] = "worker_report,fetch_url,read".into();
+        assert_eq!(without, plain, "with no tree, read changes only the grants");
+
+        // With one, the sandbox binds the tree the host checked, not
+        // whatever sits at pi_root/vendor/pstack.
+        let with = args(&repository, Some("/srv/checked/pstack"));
+        let bind = ["--ro-bind", "/srv/checked/pstack", "/pstack"];
         let at = without
             .iter()
             .position(|arg| arg == "/runtime/extensions")
@@ -509,13 +528,8 @@ mod tests {
         assert_eq!(with[at..at + 3], bind);
         let mut expected = without.clone();
         expected.splice(at..at, bind.map(String::from));
-        let grants = expected
-            .iter()
-            .position(|arg| arg == "worker_report,fetch_url")
-            .unwrap();
-        expected[grants] = "worker_report,fetch_url,read".into();
-        assert_eq!(with, expected);
-        assert!(!without.iter().any(|arg| arg == "/pstack"));
+        assert_eq!(with, expected, "the bind is the only difference");
+        assert!(!with.iter().any(|arg| arg == "/srv/pi/vendor/pstack"));
     }
 
     #[test]

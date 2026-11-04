@@ -639,6 +639,7 @@ where
             broker_socket: parts.broker_socket.clone(),
             node: parts.node.clone(),
             pi_root: parts.pi_root.clone(),
+            pstack: parts.broker.pstack().map(|pstack| pstack.root().to_owned()),
         };
         let (events_tx, mut events) = mpsc::channel(64);
         let turns = Turns {
@@ -950,6 +951,8 @@ mod tests {
         events: Events,
         /// Each session's grants, by its id.
         grants: Arc<Mutex<BTreeMap<String, Vec<String>>>>,
+        /// The pstack tree each session's spec names, by its id.
+        trees: Arc<Mutex<BTreeMap<String, Option<PathBuf>>>>,
         prompts: Arc<Mutex<Vec<(String, String)>>>,
         live: Arc<AtomicUsize>,
         most: Arc<AtomicUsize>,
@@ -972,6 +975,8 @@ mod tests {
             self.events.lock().unwrap().push((spec.id.clone(), events));
             let grants = spec.grants.clone();
             self.grants.lock().unwrap().insert(spec.id.clone(), grants);
+            let tree = spec.pstack.clone();
+            self.trees.lock().unwrap().insert(spec.id.clone(), tree);
             let live = self.live.fetch_add(1, Ordering::SeqCst) + 1;
             self.most.fetch_max(live, Ordering::SeqCst);
             Ok(FakeSession {
@@ -1020,6 +1025,9 @@ mod tests {
         }
         fn grants(&self, id: &str) -> Vec<String> {
             self.grants.lock().unwrap()[id].clone()
+        }
+        fn tree(&self, id: &str) -> Option<PathBuf> {
+            self.trees.lock().unwrap()[id].clone()
         }
         async fn tell(&self, id: &str, event: anyhow::Result<SessionEvent>) {
             let sender = self
@@ -1587,6 +1595,22 @@ mod tests {
             assert!(grants.iter().any(|tool| tool == "read"), "{grants:?}");
         }
         w.executor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_session_names_the_tree_the_host_checked_and_none_where_pstack_is_off() {
+        let mut off = World::new(1, None);
+        off.launch(launch("tk_1", "as_1")).await;
+        assert!(started(&off.fact().await, "as_1"));
+        assert_eq!(off.fake.tree("as_1"), None);
+        off.executor.shutdown().await;
+
+        let mut on = World::with_pstack();
+        on.launch(launch("tk_2", "as_2")).await;
+        assert!(started(&on.fact().await, "as_2"));
+        let checked = on.executor.inner.parts.broker.pstack().unwrap().root();
+        assert_eq!(on.fake.tree("as_2").as_deref(), Some(checked));
+        on.executor.shutdown().await;
     }
 
     #[tokio::test]
