@@ -343,7 +343,7 @@ fn c2_approve_only_waiting_only_listed_approver_then_launches() {
     for (source, by) in refusals {
         let r = w.engine.approve(&t, source, by.clone());
         assert!(
-            matches!(r, Err(Error::Refused(_))),
+            matches!(r, Err(Error::Forbidden(_))),
             "{source} {by:?}: {r:?}"
         );
         assert!(w.effects().is_empty());
@@ -362,7 +362,9 @@ fn c2_approve_only_waiting_only_listed_approver_then_launches() {
     ));
 
     let (stopped, _) = w.accept("th2", session(), 9_000_000);
-    w.engine.stop_ticket(&stopped, "no").unwrap();
+    w.engine
+        .stop_ticket(&stopped, "slack", Actor::person("alice"), "no")
+        .unwrap();
     assert!(matches!(
         w.engine.approve(&stopped, "slack", Actor::person("alice")),
         Err(Error::Refused(_))

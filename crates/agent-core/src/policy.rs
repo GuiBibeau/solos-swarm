@@ -138,4 +138,8 @@ impl Policy for AllowlistPolicy {
     fn may_approve(&self, source: &str, actor: &Actor) -> bool {
         self.approvers.contains(&ident(source, actor))
     }
+    fn may_stop(&self, source: &str, actor: &Actor) -> bool {
+        actor.is_person()
+            && (self.may_approve(source, actor) || self.people.contains(&ident(source, actor)))
+    }
 }

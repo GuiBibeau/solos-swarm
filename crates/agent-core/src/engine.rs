@@ -20,6 +20,11 @@ pub const MAX_EXPIRED_EVALS: u32 = 3;
 pub const MAX_SWARM_AGENTS: u16 = 30;
 const MAX_METHOD_CHARS: usize = 16;
 
+/// How a person is named to other people: their display name, else their id.
+fn who(by: &Actor) -> &str {
+    by.name.as_deref().unwrap_or(&by.id)
+}
+
 /// What `receive` did with a Trigger.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Intake {
@@ -206,14 +211,17 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
     /// A person approves a Ticket's budget; its first Assignment launches.
     pub fn approve(&mut self, ticket: &TicketId, source: &str, by: Actor) -> Result<(), Error> {
         self.run(|tx, policy| {
+            if !by.is_person() || !policy.may_approve(source, &by) {
+                return Err(Error::Forbidden(format!(
+                    "{} is not allowed to approve budgets.",
+                    who(&by)
+                )));
+            }
             let mut t = tx.open_ticket(ticket)?;
             if t.approval != Approval::Waiting {
                 return Err(Error::Refused(
                     "the ticket does not wait for approval".into(),
                 ));
-            }
-            if !by.is_person() || !policy.may_approve(source, &by) {
-                return Err(Error::Refused(format!("{} may not approve budgets", by.id)));
             }
             t.approval = Approval::Granted {
                 by: by.clone(),
@@ -230,9 +238,22 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
         })
     }
 
-    /// A person's stop: withdraws the Mandate, so nothing resumes it.
-    pub fn stop_ticket(&mut self, ticket: &TicketId, reason: &str) -> Result<(), Error> {
-        self.run(|tx, _| {
+    /// A person's stop, from `source`: withdraws the Mandate, so nothing
+    /// resumes it. The Policy decides who may stop.
+    pub fn stop_ticket(
+        &mut self,
+        ticket: &TicketId,
+        source: &str,
+        by: Actor,
+        reason: &str,
+    ) -> Result<(), Error> {
+        self.run(|tx, policy| {
+            if !policy.may_stop(source, &by) {
+                return Err(Error::Forbidden(format!(
+                    "{} is not allowed to stop this work.",
+                    who(&by)
+                )));
+            }
             let mut t = tx.require_ticket(ticket)?;
             if t.stopped_by_person() {
                 return Err(Error::Refused("the ticket was already stopped".into()));

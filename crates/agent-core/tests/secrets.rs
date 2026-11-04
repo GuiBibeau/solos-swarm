@@ -795,7 +795,9 @@ fn a_keyed_use_is_bounded_before_it_reaches_the_chain() {
 fn an_ended_ticket_takes_no_ask_answer_or_use() {
     let mut w = World::new();
     w.ask(&FOR).unwrap();
-    w.engine.stop_ticket(&w.ticket, "stopped").unwrap();
+    w.engine
+        .stop_ticket(&w.ticket, "slack", Actor::person("alice"), "stopped")
+        .unwrap();
     w.effects();
     let before = w.state();
 
@@ -837,7 +839,9 @@ fn a_ticket_awaits_an_ask_until_it_is_answered_or_ends() {
     );
 
     let mut w = World::awaiting_budget();
-    w.engine.stop_ticket(&w.ticket, "stopped").unwrap();
+    w.engine
+        .stop_ticket(&w.ticket, "slack", Actor::person("alice"), "stopped")
+        .unwrap();
     assert!(!w.ticket().awaits(&budget), "a stopped Ticket asks nothing");
 
     let mut w = World::new();
@@ -863,7 +867,9 @@ fn a_ticket_awaits_an_ask_until_it_is_answered_or_ends() {
 
     let mut w = World::new();
     w.ask(&FOR).unwrap();
-    w.engine.stop_ticket(&w.ticket, "stopped").unwrap();
+    w.engine
+        .stop_ticket(&w.ticket, "slack", Actor::person("alice"), "stopped")
+        .unwrap();
     assert!(!w.ticket().awaits(&item), "an ended Ticket asks nothing");
 }
 

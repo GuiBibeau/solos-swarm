@@ -157,7 +157,9 @@ fn apply<R: Repositories>(
         Op::Decide(eval, verdict) => e.decide(eval, verdict.clone()).map(|d| d.to_string()),
         Op::Approve(t, source, by) => e.approve(t, source, by.clone()).map(unit),
         Op::Note(t) => e.note(t, "a fact from other work".into()).map(unit),
-        Op::StopTicket(t) => e.stop_ticket(t, "a person stopped it").map(unit),
+        Op::StopTicket(t) => e
+            .stop_ticket(t, "slack", Actor::person("alice"), "a person stopped it")
+            .map(unit),
         Op::Retry(t) => e.retry(t).map(|a| format!("{a:?}")),
         Op::Handback(t, trigger) => e.handback(t, trigger, "not mine").map(|b| b.to_string()),
         Op::Started(t, a) => e.assignment_started(t, a).map(unit),

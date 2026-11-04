@@ -474,7 +474,12 @@ fn a_done_for_an_ended_assignment_is_recorded() {
         .assignment_ended(&w.ticket, &w.assignment, "process exited")
         .unwrap();
     w.engine
-        .stop_ticket(&w.ticket, "a person stopped it")
+        .stop_ticket(
+            &w.ticket,
+            "slack",
+            Actor::person("alice"),
+            "a person stopped it",
+        )
         .unwrap();
 
     let outcome = w.signed(n, click(1), page("https://github.com/notifications"));

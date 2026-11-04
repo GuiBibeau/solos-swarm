@@ -130,7 +130,7 @@ enum Cmd {
     Decide(EvalRef, VerdictSpec),
     Approve(TicketRef, String, Actor),
     Note(TicketRef),
-    StopTicket(TicketRef),
+    StopTicket(TicketRef, String, Actor),
     Retry(TicketRef),
     Handback(TicketRef, TriggerId),
     Started(TicketRef, AssignmentRef),
@@ -193,7 +193,7 @@ enum Op {
     Decide(EvalId, Verdict),
     Approve(TicketId, String, Actor),
     Note(TicketId),
-    StopTicket(TicketId),
+    StopTicket(TicketId, String, Actor),
     Retry(TicketId),
     Handback(TicketId, TriggerId),
     Started(TicketId, AssignmentId),
@@ -218,7 +218,7 @@ impl Op {
             Op::Decide(_, Verdict::Stop { .. }) => "decide(stop)",
             Op::Approve(..) => "approve",
             Op::Note(_) => "note",
-            Op::StopTicket(_) => "stop_ticket",
+            Op::StopTicket(..) => "stop_ticket",
             Op::Retry(_) => "retry",
             Op::Handback(..) => "handback",
             Op::Started(..) => "assignment_started",
@@ -300,7 +300,7 @@ fn resolve(w: &World, cmd: &Cmd) -> Op {
         }
         Cmd::Approve(t, source, by) => Op::Approve(ticket(t), source.clone(), by.clone()),
         Cmd::Note(t) => Op::Note(ticket(t)),
-        Cmd::StopTicket(t) => Op::StopTicket(ticket(t)),
+        Cmd::StopTicket(t, source, by) => Op::StopTicket(ticket(t), source.clone(), by.clone()),
         Cmd::Retry(t) => Op::Retry(ticket(t)),
         Cmd::Handback(t, trigger) => Op::Handback(ticket(t), trigger.clone()),
         Cmd::Started(t, a) => {
@@ -364,7 +364,9 @@ fn apply(w: &mut World, op: &Op) -> Result<String, Error> {
         Op::Decide(eval, verdict) => e.decide(eval, verdict.clone()).map(|d| d.to_string()),
         Op::Approve(t, source, by) => e.approve(t, source, by.clone()).map(unit),
         Op::Note(t) => e.note(t, "a fact from other work".into()).map(unit),
-        Op::StopTicket(t) => e.stop_ticket(t, "a person stopped it").map(unit),
+        Op::StopTicket(t, source, by) => e
+            .stop_ticket(t, source, by.clone(), "a person stopped it")
+            .map(unit),
         Op::Retry(t) => e.retry(t).map(|a| format!("{a:?}")),
         Op::Handback(t, trigger) => e.handback(t, trigger, "not mine").map(|b| b.to_string()),
         Op::Started(t, a) => e.assignment_started(t, a).map(unit),
@@ -908,7 +910,11 @@ fn gen_cmd(rng: &mut Lcg, w: &mut World) -> Cmd {
             Cmd::Approve(t, source.into(), by)
         }
         68..=70 => Cmd::Note(pick_ticket(rng, r, |t| t.ended.is_none())),
-        71..=73 => Cmd::StopTicket(pick_ticket(rng, r, |t| t.ended.is_none())),
+        71..=73 => {
+            let t = pick_ticket(rng, r, |t| t.ended.is_none());
+            let (source, by) = gen_clicker(rng);
+            Cmd::StopTicket(t, source, by)
+        }
         74..=77 => Cmd::Retry(pick_ticket(rng, r, |t| t.ended.is_none())),
         78..=83 => {
             let t = pick_ticket(rng, r, |t| !owned_triggers(t).is_empty());
@@ -1197,6 +1203,10 @@ fn describe(kind: &str) -> (&'static str, &'static str) {
             "A KeyUsed holds a method or a url beyond its bounds",
             "a method is 1 to 16 uppercase letters and a url at most MAX_URL_CHARS",
         ),
+        "12-stop-not-allowed" => (
+            "A stop by someone the Policy does not allow succeeded",
+            "only an allowed person's stop ends a Ticket",
+        ),
         "11-key-changed-state" => (
             "A keyed use changed state or sent something",
             "use_key records one event and changes nothing else",
@@ -1330,10 +1340,23 @@ struct Checker {
 impl Checker {
     fn step(&mut self, w: &mut World, cmd: &Cmd) -> (Op, Result<String, Error>, Vec<Finding>) {
         let op = resolve(w, cmd);
+        let stop_allowed = match &op {
+            Op::StopTicket(_, source, by) => Some(w.engine.policy().may_stop(source, by)),
+            _ => None,
+        };
         let before = w.repos().clone();
         let result = apply(w, &op);
         let after = w.repos();
         let mut found: Vec<(&'static str, String)> = Vec::new();
+
+        // 12. Only a person the Policy allows stops a Ticket, and the Engine
+        // itself says so: a stop by anyone else must not succeed.
+        if stop_allowed == Some(false) && result.is_ok() {
+            found.push((
+                "12-stop-not-allowed",
+                format!("{} succeeded without the Policy's permission", op.name()),
+            ));
+        }
 
         // 1. Atomicity.
         if let Err(err) = &result {
@@ -2179,7 +2202,9 @@ fn show(cmd: &Op) -> String {
         Op::Decide(e, Verdict::Stop { ticket, .. }) => format!("decide {e} stop {ticket}"),
         Op::Approve(t, source, by) => format!("approve {t} by {source}:{} ({:?})", by.id, by.kind),
         Op::Note(t) => format!("note {t}"),
-        Op::StopTicket(t) => format!("stop_ticket {t}"),
+        Op::StopTicket(t, source, by) => {
+            format!("stop_ticket {t} by {source}:{} ({:?})", by.id, by.kind)
+        }
         Op::Retry(t) => format!("retry {t}"),
         Op::Handback(t, trigger) => format!("handback {t} {trigger}"),
         Op::Started(t, a) => format!("assignment_started {t} {a}"),

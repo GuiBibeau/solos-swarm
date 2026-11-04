@@ -638,7 +638,9 @@ fn c5_a_stopped_ticket_receives_nothing_more() {
                 )
                 .unwrap();
         } else {
-            w.engine.stop_ticket(&ticket, "no").unwrap();
+            w.engine
+                .stop_ticket(&ticket, "slack", Actor::person("alice"), "no")
+                .unwrap();
         }
         w.effects();
         let before = w.ticket(&ticket);
