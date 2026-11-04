@@ -127,6 +127,15 @@ const WORKER_TOOLS = [
       element: Type.Optional(Type.Integer({ minimum: 1, description: "Read the whole text of this element instead." })),
     }),
   },
+  {
+    name: "read",
+    description: "Read a text file, or list a directory, under /pstack, where pstack's skills are, read-only. Paths are absolute. A file comes back as numbered lines, at most 2000 lines or 256 KiB at a time, so use offset and limit for the rest. A path outside /pstack, a link that leads out of it, and a binary file are refused.",
+    parameters: Type.Object({
+      path: Type.String({ minLength: 1, description: "An absolute path, such as /pstack/skills/poteto-mode/SKILL.md." }),
+      offset: Type.Optional(Type.Integer({ minimum: 1, description: "The first line to read, from 1. Default 1." })),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 2000, description: "How many lines. Default and most: 2000." })),
+    }),
+  },
 ];
 
 function granted(name: string): boolean {

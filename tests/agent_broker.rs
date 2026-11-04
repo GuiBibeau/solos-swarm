@@ -23,6 +23,7 @@ use solos_swarm::agent::jsonl::{JsonlChannel, JsonlSource};
 use solos_swarm::agent::ports::{
     BoxFuture, Channel, Delivery, Executor, Fact, FactSink, Launch, Router,
 };
+use solos_swarm::agent::pstack::Pstack;
 use solos_swarm::agent::scripted::{ScriptedExecutor, ScriptedRouter};
 use solos_swarm::agent::trail::{BlobStore, TrailStoreConfig};
 use solos_swarm::agent::{Adapters, AgentConfig, RunOptions, Runtime, STORE_FILE};
@@ -33,7 +34,7 @@ use solos_swarm::gateway::{Dispatch, PriceTable, Provider, Upstream, upstream_bo
 use solos_swarm::vault::{SandboxView, Vault, VaultConfig};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -358,6 +359,7 @@ fn serve_deciding(
         decide,
         Nodes::default(),
         workers(None, None),
+        None,
     )
 }
 
@@ -370,6 +372,7 @@ fn workers(vault: Option<VaultParts>, browser: Option<BrowserParts>) -> WorkerPa
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_on(
     scratch: &Scratch,
     provider: Arc<Scripted>,
@@ -378,6 +381,7 @@ fn serve_on(
     decide: DecideTerms,
     nodes: Nodes,
     workers: WorkerParts,
+    pstack: Option<Arc<Pstack>>,
 ) -> Served {
     let parts = BrokerParts {
         dir: scratch.state(),
@@ -387,7 +391,7 @@ fn serve_on(
         decide,
         workers: Some(workers),
     };
-    let broker = AgentBroker::with_nodes(parts, JobLimits::default(), nodes).unwrap();
+    let broker = AgentBroker::with_pstack(parts, JobLimits::default(), nodes, pstack).unwrap();
     broker.admit(TOKEN.into(), grant(daily)).unwrap();
     let (listener, socket) = broker::bind(&scratch.state()).unwrap();
     let app = broker.router().unwrap();
@@ -1360,6 +1364,7 @@ fn serve_with_a_node_a_vault_and_a_browser(scratch: &Scratch) -> (Runtime, Serve
         asks_on: BTreeSet::new(),
     };
     let (fake, browser) = local_browser(scratch);
+    let pstack = Pstack::open(Path::new(env!("CARGO_MANIFEST_DIR")), "poteto-mode").unwrap();
     let served = serve_on(
         scratch,
         Scripted::new(),
@@ -1368,6 +1373,7 @@ fn serve_with_a_node_a_vault_and_a_browser(scratch: &Scratch) -> (Runtime, Serve
         TERMS,
         nodes,
         workers(Some(vault), Some(browser)),
+        Some(Arc::new(pstack)),
     );
     for (token, ticket, environment) in
         [(HERE, "tk_here", None), (THERE, "tk_there", Some("laptop"))]
@@ -1426,7 +1432,8 @@ async fn a_seat_may_call_exactly_the_tools_it_is_offered() {
             "job_wait",
             "job_stop",
             "fetch_url",
-            "vault_list"
+            "vault_list",
+            "read"
         ],
         "a node's worker has run_code there and no browser"
     );
@@ -1440,7 +1447,8 @@ async fn a_seat_may_call_exactly_the_tools_it_is_offered() {
             "browser_open",
             "browser_act",
             "browser_login",
-            "browser_read"
+            "browser_read",
+            "read"
         ],
         "this host has a browser and no run_code"
     );

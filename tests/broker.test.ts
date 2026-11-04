@@ -372,7 +372,7 @@ test("SWARM_TOOLSET=router registers only the Router tools, whatever the role an
 const workerNames = ["fetch_url", "run_code", "worker_handback", "worker_report"];
 const jobNames = ["job_start", "job_stop", "job_wait"];
 const browserNames = ["browser_act", "browser_login", "browser_open", "browser_read"];
-const allWorkerNames = [...workerNames, ...jobNames, "vault_list", ...browserNames].sort();
+const allWorkerNames = [...workerNames, ...jobNames, "vault_list", ...browserNames, "read"].sort();
 
 test("SWARM_TOOLSET=worker registers the worker tools that SWARM_GRANTS names and blocks every other call", () => {
   const saved = { role: process.env.SWARM_ROLE, grants: process.env.SWARM_GRANTS, toolset: process.env.SWARM_TOOLSET };
