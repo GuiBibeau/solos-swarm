@@ -1,0 +1,23 @@
+# The default config launch.sh installs as ~/work/verify/<run>/agent.yaml. A real DeepSeek Router and real Pi
+# workers; the person is mcp:verifier, whom bin/mcp.sh speaks as. Prices are DeepSeek V4.1 Flash at its peak
+# output rate, so the caps hold at any hour. The worker's budget is under auto_approve, so no request waits for a
+# click: approvals are verified through Discord, where a person clicks (features/discord-chat.md).
+policy:
+  people: [mcp:verifier]
+  auto_approve_microusd: 600000
+sources:
+  - kind: mcp
+channels:
+  - kind: mcp
+router:
+  kind: pi
+  provider: deepseek
+  model: deepseek-flash
+  prices: {input_microusd_per_million: 300000, output_microusd_per_million: 1320000, cache_hit_microusd_per_million: 30000}
+executor:
+  kind: pi
+  provider: deepseek
+  model: deepseek-flash
+  prices: {input_microusd_per_million: 300000, output_microusd_per_million: 1320000, cache_hit_microusd_per_million: 30000}
+  max_workers: 2
+budgets: {session_microusd: 500000, router_daily_microusd: 1000000}

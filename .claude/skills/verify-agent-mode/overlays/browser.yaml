@@ -1,0 +1,1 @@
+browser: {lightpanda: /home/debian/work/ci/lightpanda/1.0.2/lightpanda, audit_key: secrets/audit.key}
