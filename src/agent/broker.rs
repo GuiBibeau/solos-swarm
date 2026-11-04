@@ -10,7 +10,7 @@ pub mod registry;
 mod secrets;
 
 use super::AgentConfig;
-use super::config::ExecutorConfig;
+use super::config::{ExecutorConfig, RepoConfig};
 use super::environment::{Environments, Nodes};
 use super::jobs::{Host, JobLimits, Jobs, Refused};
 use super::ports::{Applied, Fact, FactSink};
@@ -31,8 +31,9 @@ use registry::{Cap, Caps, PrincipalKind};
 pub use registry::{ROUTER_TOOLS, WORKER_TOOLS};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use solos_agent_core::change::{Deliverable, RepoName};
 use solos_agent_core::model::{
-    Accept, Acknowledge, AssignmentId, EvalId, MicroUsd, Ms, Plan, ReportIn, ReportStatus,
+    Accept, Acknowledge, AssignmentId, EvalId, Method, MicroUsd, Ms, Plan, ReportIn, ReportStatus,
     ThreadKey, Ticket, TicketId, Trigger, TriggerId, Verdict,
 };
 use solos_agent_store::{
@@ -295,6 +296,8 @@ pub struct DecideTerms {
     pub max_budget_microusd: Option<MicroUsd>,
     /// What a swarm plan may name, or `None` where no swarm runs.
     pub swarm: Option<SwarmTerms>,
+    /// The repositories an accept may name, from `forge.repos`.
+    pub repos: BTreeMap<RepoName, RepoConfig>,
 }
 
 /// The Goal templates a swarm plan may name.
@@ -324,6 +327,25 @@ impl SwarmTerms {
 }
 
 impl DecideTerms {
+    fn repo(&self, name: &str) -> std::result::Result<(RepoName, &RepoConfig), String> {
+        let found = RepoName::try_from(name.to_owned())
+            .ok()
+            .and_then(|repo| self.repos.get_key_value(&repo));
+        match found {
+            Some((repo, terms)) => Ok((repo.clone(), terms)),
+            None if self.repos.is_empty() => {
+                Err("this agent works on no repository; accept the work without a repo".into())
+            }
+            None => {
+                let names: Vec<&str> = self.repos.keys().map(RepoName::as_str).collect();
+                Err(format!(
+                    "there is no repository {name}; the repositories are {}",
+                    names.join(", ")
+                ))
+            }
+        }
+    }
+
     /// What `config` lets an accept name: above `policy.auto_approve_microusd`
     /// only when Slack or Discord can take the approval its Ticket then waits
     /// for, and a swarm only when `executor.swarm` runs one.
@@ -342,6 +364,11 @@ impl DecideTerms {
             max_budget_microusd: (!config.takes_approvals())
                 .then_some(config.policy.auto_approve_microusd),
             swarm,
+            repos: config
+                .forge
+                .as_ref()
+                .map(|forge| forge.repos().clone())
+                .unwrap_or_default(),
         }
     }
 }
@@ -1009,6 +1036,10 @@ struct DecideArgs {
     #[serde(default)]
     environment: Option<String>,
     #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    deliverable: Option<Deliverable>,
+    #[serde(default)]
     budget_microusd: Option<MicroUsd>,
     #[serde(default)]
     acknowledge: Option<String>,
@@ -1031,17 +1062,36 @@ impl DecideArgs {
                 reason,
             },
             Choice::Accept => {
+                let repo = self
+                    .repo
+                    .as_deref()
+                    .map(|name| terms.repo(name))
+                    .transpose()?;
                 let plan = match (self.plan.unwrap_or(PlanKind::Session), self.agents) {
-                    (PlanKind::Session, None) if self.goal_template.is_none() => Plan::Session {
-                        harness: None,
-                        environment: self.environment,
-                        method: None,
-                    },
+                    (PlanKind::Session, None) if self.goal_template.is_none() => {
+                        let method = match (&repo, self.deliverable) {
+                            (None, None) => None,
+                            (None, Some(_)) => {
+                                return Err("deliverable is for an accept that names a repo".into());
+                            }
+                            (Some((_, terms)), owed) => Some(Method {
+                                deliverable: owed.unwrap_or(terms.owes),
+                            }),
+                        };
+                        Plan::Session {
+                            harness: None,
+                            environment: self.environment,
+                            method,
+                        }
+                    }
                     (PlanKind::Session, _) => {
                         return Err("agents and goal_template are for a swarm plan only".into());
                     }
                     (PlanKind::Swarm, Some(_)) if self.environment.is_some() => {
                         return Err("environment is for a session plan only".into());
+                    }
+                    (PlanKind::Swarm, Some(_)) if repo.is_some() || self.deliverable.is_some() => {
+                        return Err("repo and deliverable are for a session plan only".into());
                     }
                     (PlanKind::Swarm, Some(agents)) => {
                         let swarm = terms.swarm.as_ref().ok_or(
@@ -1057,6 +1107,7 @@ impl DecideArgs {
                 };
                 let budget = self
                     .budget_microusd
+                    .or(repo.as_ref().and_then(|(_, terms)| terms.budget_microusd))
                     .unwrap_or(terms.default_budget_microusd);
                 if let Some(max) = terms.max_budget_microusd
                     && budget > max
@@ -1079,7 +1130,7 @@ impl DecideArgs {
                     budget_microusd: budget,
                     acknowledge,
                     rules: self.rules,
-                    repo: None,
+                    repo: repo.map(|(name, _)| name),
                 })
             }
         };
@@ -1101,6 +1152,12 @@ async fn decide(broker: &AgentBroker, args: Value) -> Reply {
                 "there is no environment {name}; the environments are {}",
                 environments.names().join(", ")
             ),
+        ));
+    }
+    if args.repo.is_some() && !environments.is_local(args.environment.as_deref()) {
+        return Err(refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a ticket on a repository runs on this host only; name environment local",
         ));
     }
     let (eval, verdict) = args
@@ -1443,6 +1500,7 @@ fn ticket_summary(ticket: &Ticket) -> Value {
         "title": ticket.title,
         "stage": ticket.stage(),
         "scope": scope,
+        "repo": ticket.mandate.repo,
         "plan": ticket.plan,
         "budget_microusd": ticket.mandate.budget_microusd,
         "requester": ticket.mandate.requester.id,
@@ -1536,8 +1594,11 @@ mod messages;
 #[cfg(test)]
 mod tests {
     use super::{Account, DecideArgs, DecideTerms, SwarmTerms, clip};
+    use crate::agent::config::RepoConfig;
     use serde_json::json;
-    use solos_agent_core::model::{Acknowledge, Plan, TicketId, Verdict};
+    use solos_agent_core::change::{Deliverable, RepoName};
+    use solos_agent_core::model::{Acknowledge, Method, Plan, TicketId, Verdict};
+    use std::collections::BTreeMap;
 
     fn terms() -> DecideTerms {
         DecideTerms {
@@ -1547,6 +1608,7 @@ mod tests {
                 templates: vec!["audit".into(), "research".into()],
                 default_template: Some("research".into()),
             }),
+            repos: BTreeMap::new(),
         }
     }
 
@@ -1714,6 +1776,80 @@ mod tests {
         assert!(
             refused.contains("names its goal_template, one of audit"),
             "{refused}"
+        );
+    }
+
+    #[test]
+    fn an_accept_names_a_configured_repo_and_owes_its_default_unless_it_names_a_deliverable() {
+        let widgets = RepoName::try_from("acme/widgets".to_owned()).unwrap();
+        let with_repos = DecideTerms {
+            repos: BTreeMap::from([(
+                widgets.clone(),
+                RepoConfig {
+                    about: "Widgets.".into(),
+                    base: "main".into(),
+                    budget_microusd: Some(1_500_000),
+                    notes: None,
+                    owes: Deliverable::PullRequest,
+                },
+            )]),
+            ..terms()
+        };
+        let accept = |extra: serde_json::Value| {
+            let mut args = json!({"eval":"ev_1","decision":"accept","reason":"asked","title":"T",
+                                  "scope":"S","repo":"acme/widgets"});
+            for (key, value) in extra.as_object().unwrap() {
+                args[key] = value.clone();
+            }
+            verdict_under(&with_repos, args)
+        };
+        let owes = |deliverable| Plan::Session {
+            harness: None,
+            environment: None,
+            method: Some(Method { deliverable }),
+        };
+
+        let Ok(Verdict::Accept(defaulted)) = accept(json!({})) else {
+            panic!("refused")
+        };
+        assert_eq!(defaulted.repo, Some(widgets.clone()));
+        assert_eq!(defaulted.plan, owes(Deliverable::PullRequest));
+        assert_eq!(defaulted.budget_microusd, 1_500_000, "the repo's budget");
+        let Ok(Verdict::Accept(named)) =
+            accept(json!({"deliverable":"answer","budget_microusd":700_000}))
+        else {
+            panic!("refused")
+        };
+        assert_eq!(named.plan, owes(Deliverable::Answer));
+        assert_eq!(named.budget_microusd, 700_000);
+
+        for (extra, why) in [
+            (
+                json!({"repo":"acme/gadgets"}),
+                "there is no repository acme/gadgets; the repositories are acme/widgets",
+            ),
+            (
+                json!({"repo":"acme/../etc"}),
+                "there is no repository acme/../etc; the repositories are acme/widgets",
+            ),
+            (
+                json!({"plan":"swarm","agents":2}),
+                "repo and deliverable are for a session plan only",
+            ),
+        ] {
+            assert_eq!(accept(extra), Err(why.to_owned()));
+        }
+        let unscoped = json!({"eval":"ev_1","decision":"accept","reason":"asked","title":"T",
+                              "scope":"S","deliverable":"change"});
+        assert_eq!(
+            verdict_under(&with_repos, unscoped),
+            Err("deliverable is for an accept that names a repo".to_owned())
+        );
+        let elsewhere = json!({"eval":"ev_1","decision":"accept","reason":"asked","title":"T",
+                               "scope":"S","repo":"acme/widgets"});
+        assert_eq!(
+            verdict(elsewhere),
+            Err("this agent works on no repository; accept the work without a repo".to_owned())
         );
     }
 

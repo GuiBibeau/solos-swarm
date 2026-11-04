@@ -1879,6 +1879,7 @@ impl KeyedBroker {
                 default_budget_microusd: BUDGET,
                 max_budget_microusd: None,
                 swarm: None,
+                repos: BTreeMap::new(),
             },
             workers: Some(WorkerParts {
                 terms: ModelTerms {

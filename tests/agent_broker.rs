@@ -54,6 +54,7 @@ const TERMS: DecideTerms = DecideTerms {
     default_budget_microusd: 500_000,
     max_budget_microusd: Some(2_000_000),
     swarm: None,
+    repos: BTreeMap::new(),
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]

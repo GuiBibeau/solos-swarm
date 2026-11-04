@@ -59,6 +59,19 @@
             "type": "string",
             "description": "accept with plan session: the machine its run_code runs on, one your instructions name. Omit it for the default."
           },
+          "repo": {
+            "type": "string",
+            "description": "accept with plan session: the repository the work reads or changes, one your instructions name. Omit it for work on no repository."
+          },
+          "deliverable": {
+            "type": "string",
+            "enum": [
+              "answer",
+              "change",
+              "pull_request"
+            ],
+            "description": "accept with a repo: what the finished work owes: an answer, a change committed in the clone, or a pull_request. Omit it for the repository's default."
+          },
           "budget_microusd": {
             "type": "integer",
             "minimum": 1,

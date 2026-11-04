@@ -246,6 +246,7 @@ impl World {
                 default_budget_microusd: 500_000,
                 max_budget_microusd: None,
                 swarm: None,
+                repos: BTreeMap::new(),
             },
             workers: Some(WorkerParts {
                 terms: terms(),
@@ -784,6 +785,14 @@ async fn router_decide_names_only_this_host_or_a_configured_node() {
     let (status, refused) = w.post("router_decide", "router-token", swarm).await;
     assert_eq!(status, 422, "{refused}");
     assert_eq!(refused["error"], "environment is for a session plan only");
+    let mut on_a_repo = accept("laptop");
+    on_a_repo["repo"] = json!("acme/widgets");
+    let (status, refused) = w.post("router_decide", "router-token", on_a_repo).await;
+    assert_eq!(status, 422, "{refused}");
+    assert_eq!(
+        refused["error"],
+        "a ticket on a repository runs on this host only; name environment local"
+    );
 }
 
 #[tokio::test]

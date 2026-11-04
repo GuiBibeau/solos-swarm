@@ -1100,6 +1100,7 @@ mod tests {
                     default_budget_microusd: 1,
                     max_budget_microusd: None,
                     swarm: None,
+                    repos: BTreeMap::new(),
                 },
                 workers: Some(WorkerParts {
                     terms,

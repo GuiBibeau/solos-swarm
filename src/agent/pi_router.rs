@@ -106,6 +106,30 @@ pub fn system_prompt(
             };
         }
     }
+    if !decide.repos.is_empty() {
+        prompt.push_str(
+            "\nRepositories: work on one of these is work, and so is a question about how or why \
+             it works, since a worker answers from its code. Accept it as a session that names \
+             the repository in `repo`. `deliverable` says what the finished work owes: answer, \
+             change (committed in the worker's clone) or pull_request; omit it for the \
+             repository's own. The repositories:",
+        );
+        for (repo, terms) in &decide.repos {
+            let _ = write!(
+                prompt,
+                "\n- {repo}: {} (owes {}",
+                terms.about.trim(),
+                terms.owes.as_str()
+            );
+            if let Some(budget) = terms.budget_microusd {
+                let _ = write!(
+                    prompt,
+                    "; {budget} microusd unless the accept names a budget"
+                );
+            }
+            prompt.push(')');
+        }
+    }
     if policy.rules.is_empty() {
         prompt.push_str(
             "\nNo proactive rules are enabled: an inferred candidate is recorded, never started.",
@@ -400,9 +424,11 @@ async fn drive<H>(
 mod tests {
     use super::{PiRouter, batch, card, system_prompt};
     use crate::agent::broker::{DecideTerms, SwarmTerms};
+    use crate::agent::config::RepoConfig;
     use crate::agent::ports::{FactSink, Router};
     use crate::harness::{AgentHarness, Observation, Role, Session, SessionEvent, SessionSpec};
     use solos_agent_core::AllowlistPolicy;
+    use solos_agent_core::change::{Deliverable, RepoName};
     use solos_agent_core::model::{
         Actor, Addressed, Candidate, EvalId, Stage, Strength, ThreadKey, TicketId, TicketSummary,
         Trigger, TriggerId,
@@ -828,6 +854,7 @@ mod tests {
             default_budget_microusd: 500_000,
             max_budget_microusd: Some(2_000_000),
             swarm: None,
+            repos: BTreeMap::new(),
         };
         let policy = AllowlistPolicy {
             rules: ["ci-red".to_owned(), "stale-pr".to_owned()].into(),
@@ -886,5 +913,57 @@ mod tests {
             ),
             "{gated}"
         );
+        assert!(!gated.contains("Repositories"), "{gated}");
+    }
+
+    #[test]
+    fn the_system_prompt_lists_the_repositories_and_counts_a_question_about_one_as_work() {
+        let repo = |about: &str, budget, owes| RepoConfig {
+            about: about.into(),
+            base: "main".into(),
+            budget_microusd: budget,
+            notes: Some("Workers read this, the Router does not.".into()),
+            owes,
+        };
+        let name = |name: &str| RepoName::try_from(name.to_owned()).unwrap();
+        let decide = DecideTerms {
+            default_budget_microusd: 500_000,
+            max_budget_microusd: None,
+            swarm: None,
+            repos: BTreeMap::from([
+                (
+                    name("acme/widgets"),
+                    repo(
+                        "Widgets, in Rust.",
+                        Some(3_000_000),
+                        Deliverable::PullRequest,
+                    ),
+                ),
+                (
+                    name("acme/docs"),
+                    repo("The handbook.", None, Deliverable::Answer),
+                ),
+            ]),
+        };
+
+        let prompt = system_prompt(None, &AllowlistPolicy::default(), &BTreeMap::new(), &decide);
+
+        assert!(
+            prompt.contains(
+                "\nRepositories: work on one of these is work, and so is a question about how or \
+                 why it works, since a worker answers from its code. Accept it as a session that \
+                 names the repository in `repo`."
+            ),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(
+                "The repositories:\n- acme/docs: The handbook. (owes answer)\n- acme/widgets: \
+                 Widgets, in Rust. (owes pull_request; 3000000 microusd unless the accept names a \
+                 budget)\n"
+            ),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("Workers read this"), "{prompt}");
     }
 }

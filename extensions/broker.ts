@@ -19,6 +19,8 @@ const ROUTER_TOOLS = [
       agents: Type.Optional(Type.Integer({ minimum: 1, maximum: 30, description: "accept with plan swarm: how many agents." })),
       goal_template: Type.Optional(Type.String({ description: "accept with plan swarm: the goal template it runs, one the prompt names. Omit it for the default." })),
       environment: Type.Optional(Type.String({ description: "accept with plan session: the machine its run_code runs on, one your instructions name. Omit it for the default." })),
+      repo: Type.Optional(Type.String({ description: "accept with plan session: the repository the work reads or changes, one your instructions name. Omit it for work on no repository." })),
+      deliverable: Type.Optional(StringEnum(["answer", "change", "pull_request"] as const, { description: "accept with a repo: what the finished work owes: an answer, a change committed in the clone, or a pull_request. Omit it for the repository's default." })),
       budget_microusd: Type.Optional(Type.Integer({ minimum: 1, description: "accept: the Ticket's whole budget in microusd. Omit it for the default." })),
       acknowledge: Type.Optional(Type.String({ description: "accept: the first reply, instead of the standard one. An empty string sends none." })),
       rules: Type.Optional(Type.Array(Type.String(), { description: "accept of inferred work: the proactive rules it matches." })),

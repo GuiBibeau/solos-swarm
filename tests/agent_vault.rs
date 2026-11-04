@@ -166,6 +166,7 @@ impl World {
                 default_budget_microusd: 500_000,
                 max_budget_microusd: None,
                 swarm: None,
+                repos: BTreeMap::new(),
             },
             workers: Some(WorkerParts {
                 terms: terms(),
