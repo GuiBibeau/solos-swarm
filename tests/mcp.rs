@@ -399,20 +399,11 @@ async fn a_router_and_a_worker_each_list_and_call_only_their_own_tools() {
     let mut worker = Mcp::broker(&socket, &token_file, &[]);
     worker.initialize().await;
     assert!(!token_file.exists());
-    let mut expected: Vec<String> = schemas(PrincipalKind::Worker).into_keys().collect();
-    let unavailable = [
-        "run_code",
-        "job_start",
-        "job_wait",
-        "job_stop",
-        "vault_list",
-        "browser_open",
-        "browser_act",
-        "browser_login",
-        "browser_read",
-        "read",
-    ];
-    expected.retain(|name| !unavailable.contains(&name.as_str()));
+    // The seat of a host with no run_code, vault, browser or pstack.
+    let mut expected: Vec<String> = ["worker_report", "worker_handback", "fetch_url"]
+        .map(String::from)
+        .to_vec();
+    expected.sort();
     let mut names = worker.names().await;
     names.sort();
     assert_eq!(

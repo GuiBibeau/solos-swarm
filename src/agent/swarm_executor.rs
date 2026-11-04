@@ -675,6 +675,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("swarm-executor-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join("pi/extensions")).unwrap();
         std::fs::write(dir.join("pi/extensions/broker.ts"), "// stand-in").unwrap();
+        std::fs::write(dir.join("pi/extensions/agent-tools.json"), "{}").unwrap();
         std::fs::write(dir.join("pi/package-lock.json"), "{}").unwrap();
         std::fs::write(dir.join("node"), "").unwrap();
         std::fs::create_dir_all(dir.join("state")).unwrap();

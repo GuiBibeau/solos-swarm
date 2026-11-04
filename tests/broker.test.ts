@@ -530,8 +530,8 @@ test("the worker tool set runs code, sees a refused report as a tool error, and 
 test("the router and worker tool schemas match the Rust registry that GET /tools and solos-swarm mcp serve", () => {
   const saved = { grants: process.env.SWARM_GRANTS, toolset: process.env.SWARM_TOOLSET };
   const restore = (name: string, value: string | undefined) => { if (value === undefined) delete process.env[name]; else process.env[name] = value; };
-  // The Rust test agent_tool_registry_matches_its_fixture holds the registry to the same file.
-  const registry = JSON.parse(readFileSync(resolve("tests/fixtures/agent-tools.json"), "utf8"));
+  // The Rust test agent_tools_json_is_the_registry holds the registry to the same file.
+  const registry = JSON.parse(readFileSync(resolve("extensions/agent-tools.json"), "utf8"));
   try {
     delete process.env.SWARM_GRANTS;
     for (const toolset of ["router", "worker"]) {

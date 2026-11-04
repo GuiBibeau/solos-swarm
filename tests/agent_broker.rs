@@ -1490,3 +1490,131 @@ async fn every_tool_has_a_handler() {
         }
     }
 }
+
+/// On a host with only a pstack, a seat holds `read` and the tools that need
+/// no resource, and each tool it lacks is refused with the reason.
+#[tokio::test]
+async fn a_host_with_only_a_pstack_gives_a_seat_read_and_refuses_the_rest_with_why() {
+    let scratch = Scratch::new("pstack_only");
+    let runtime = scratch.runtime(Arc::new(Holding::default()), true);
+    let pstack = Pstack::open(Path::new(env!("CARGO_MANIFEST_DIR")), "poteto-mode").unwrap();
+    let served = serve_on(
+        &scratch,
+        Scripted::new(),
+        runtime.facts(),
+        1_000_000,
+        TERMS,
+        Nodes::default(),
+        workers(None, None),
+        Some(Arc::new(pstack)),
+    );
+    let seat = WorkerSeat::new(
+        TicketId::new("tk_pstack"),
+        AssignmentId::new("as_1"),
+        scratch.state(),
+        500_000,
+    );
+    served
+        .broker
+        .admit_worker(WORKER.into(), seat, "You are a worker.".into())
+        .unwrap();
+
+    let held = ["worker_report", "worker_handback", "fetch_url", "read"];
+    assert_eq!(served.broker.worker_tools(None, false), held, "its grants");
+    assert_eq!(served.listed(WORKER).await, held, "GET /tools");
+    for (tool, why) in [
+        ("run_code", "run_code is not available on this host"),
+        ("vault_list", "no vault on this host"),
+        ("browser_login", "no browser where this ticket runs"),
+    ] {
+        let (status, reply) = served
+            .post(&format!("tool/{tool}"), Some(WORKER), json!({}))
+            .await;
+        assert_eq!(
+            (status, reply["error"].as_str()),
+            (403, Some(why)),
+            "{tool}: {reply}"
+        );
+    }
+    let (status, reply) = served
+        .post(
+            "tool/read",
+            Some(WORKER),
+            json!({"path": "/pstack/SKILL.md"}),
+        )
+        .await;
+    assert_ne!(status, 403, "read is held: {reply}");
+}
+
+/// `read` is held per seat. With no pstack on this host, a seat on a
+/// repository holds it, bound to its own clone and host notes, and a seat on
+/// no repository is refused it with the reason.
+#[tokio::test]
+async fn without_a_pstack_only_a_seat_on_a_repository_holds_read_of_its_own_clone() {
+    const CLONED: &str = "worker-cloned";
+    const BARE: &str = "worker-bare";
+    let scratch = Scratch::new("repository_read");
+    let runtime = scratch.runtime(Arc::new(Holding::default()), true);
+    let served = serve_on(
+        &scratch,
+        Scripted::new(),
+        runtime.facts(),
+        1_000_000,
+        TERMS,
+        Nodes::default(),
+        workers(None, None),
+        None,
+    );
+    let (work, host) = (scratch.root.join("work"), scratch.root.join("host"));
+    for dir in [&work, &host] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::write(work.join("README.md"), "Widgets\n").unwrap();
+    let seat = |ticket: &str, work: PathBuf| {
+        WorkerSeat::new(
+            TicketId::new(ticket),
+            AssignmentId::new("as_1"),
+            work,
+            500_000,
+        )
+    };
+    let cloned = seat("tk_cloned", work).on_repository(host);
+    let named = served.broker.seat_tools(&cloned);
+    for (token, seat) in [(CLONED, cloned), (BARE, seat("tk_bare", scratch.state()))] {
+        served
+            .broker
+            .admit_worker(token.into(), seat, "You are a worker.".into())
+            .unwrap();
+    }
+
+    let with_read = ["worker_report", "worker_handback", "fetch_url", "read"];
+    let without = &with_read[..3];
+    assert_eq!(named, with_read, "its grants, named before it is admitted");
+    assert_eq!(served.listed(CLONED).await, with_read, "GET /tools");
+    assert_eq!(served.listed(BARE).await, without, "GET /tools");
+    assert_eq!(served.broker.worker_tools(None, true), with_read);
+    assert_eq!(served.broker.worker_tools(None, false), without);
+
+    let read = |token: &'static str, path: &'static str| {
+        served.post("tool/read", Some(token), json!({"path": path}))
+    };
+    let (status, reply) = read(BARE, "/work/README.md").await;
+    assert_eq!(
+        (status, reply["error"].as_str()),
+        (
+            403,
+            Some("this ticket has neither pstack nor a repository to read")
+        ),
+        "{reply}"
+    );
+    let (status, reply) = read(CLONED, "/work/README.md").await;
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["lines"].as_str().map(str::trim), Some("1\tWidgets"));
+    let (status, reply) = read(CLONED, "/work/../../etc/passwd").await;
+    assert_eq!(status, 403, "{reply}");
+    let (status, reply) = read(CLONED, "/pstack/skills").await;
+    assert!(
+        (400..500).contains(&status),
+        "no pstack here: {status} {reply}"
+    );
+}

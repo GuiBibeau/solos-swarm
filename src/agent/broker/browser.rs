@@ -1,5 +1,5 @@
 use super::secrets::{ask_first_use, use_context};
-use super::{AgentBroker, Refusal, WorkerSeat, arguments, failed, forbidden, refuse};
+use super::{AgentBroker, Refusal, VaultParts, WorkerSeat, arguments, failed, forbidden, refuse};
 use crate::agent::environment::LOCAL;
 use crate::agent::ports::{Applied, BoxFuture, Fact};
 use crate::agent::trail::BlobStore;
@@ -68,6 +68,22 @@ pub struct BrowserParts {
     closing: AtomicBool,
 }
 
+/// This host's browser, and the vault its logins come from when it has one.
+#[derive(Clone)]
+pub struct Browse {
+    pub parts: Arc<BrowserParts>,
+    pub vault: Option<Arc<VaultParts>>,
+}
+
+/// The browser tools' handlers, by what each does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrowserTool {
+    Open,
+    Act,
+    Login,
+    Read,
+}
+
 impl BrowserParts {
     /// A browser with no step for `idle` is closed.
     pub fn new(place: Arc<dyn BrowserPlace>, blobs: BlobStore, idle: Duration) -> Self {
@@ -90,7 +106,8 @@ pub struct SeatBrowser {
 pub(super) async fn call(
     broker: &AgentBroker,
     seat: &Arc<WorkerSeat>,
-    tool: &str,
+    tool: BrowserTool,
+    browse: Browse,
     args: Value,
 ) -> Result<Response, Refusal> {
     let (action, typed) = action_of(tool, args)?;
@@ -104,15 +121,14 @@ pub(super) async fn call(
     let (broker, seat) = (broker.clone(), seat.clone());
     detached(async move {
         let mut open = seat.browser.open_since_last_step.lock().await;
-        let parts = browser(&broker)?;
-        if parts.closing.load(Ordering::SeqCst) {
+        if browse.parts.closing.load(Ordering::SeqCst) {
             return Err(refuse(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "the agent is stopping, so no browser step starts",
             ));
         }
-        let answered = step(&broker, &seat, &mut open, action, typed).await?;
-        show(&broker, &seat, answered).await
+        let answered = step(&broker, &seat, &browse, &mut open, action, typed).await?;
+        show(&broker, &seat, &browse, answered).await
     })
     .await
     .map_err(failed)?
@@ -138,11 +154,12 @@ struct Asked {
 async fn step(
     broker: &AgentBroker,
     seat: &WorkerSeat,
+    browse: &Browse,
     open: &mut Option<Instant>,
     action: TrailAction,
     typed: Option<String>,
 ) -> Result<Answered, Refusal> {
-    let asked = ask_step(broker, seat, action, typed).await?;
+    let asked = ask_step(broker, seat, browse, action, typed).await?;
     let answered = answer_step(broker, asked).await?;
     *open = open_since(*open, &answered);
     Ok(answered)
@@ -151,11 +168,12 @@ async fn step(
 async fn ask_step(
     broker: &AgentBroker,
     seat: &WorkerSeat,
+    browse: &Browse,
     action: TrailAction,
     typed: Option<String>,
 ) -> Result<Asked, Refusal> {
-    let parts = browser(broker)?;
-    let context = use_context(broker, seat).await?;
+    let parts = &browse.parts;
+    let context = use_context(broker, seat, browse.vault.as_deref()).await?;
     let room = if keeps_blobs(&action) {
         parts.blobs.room(&seat.ticket)
     } else {
@@ -321,6 +339,7 @@ fn open_since(open: Option<Instant>, answered: &Answered) -> Option<Instant> {
 async fn show(
     broker: &AgentBroker,
     seat: &WorkerSeat,
+    browse: &Browse,
     answered: Answered,
 ) -> Result<Response, Refusal> {
     let verified = match answered {
@@ -342,9 +361,15 @@ async fn show(
                 .fetch_add(view.len() as u64, Ordering::SeqCst);
             Ok(([(header::CONTENT_TYPE, "application/json")], view).into_response())
         }
-        StepOutcome::NeedsApproval { secret, label } => {
-            Err(approval(broker, seat, &body.action, secret, label).await)
-        }
+        StepOutcome::NeedsApproval { secret, label } => Err(approval(
+            broker,
+            seat,
+            browse.vault.as_deref(),
+            &body.action,
+            secret,
+            label,
+        )
+        .await),
         StepOutcome::Refused { why } => Err(refuse(StatusCode::CONFLICT, why)),
         StepOutcome::Closed { .. } => Err(refuse(
             StatusCode::BAD_GATEWAY,
@@ -357,6 +382,7 @@ async fn show(
 async fn approval(
     broker: &AgentBroker,
     seat: &WorkerSeat,
+    vault: Option<&VaultParts>,
     action: &TrailAction,
     secret: &str,
     label: &str,
@@ -364,10 +390,10 @@ async fn approval(
     let TrailAction::Login { login, .. } = action else {
         return failed("a step that fills no login asked for an approval");
     };
-    let Some(vault) = broker.vault() else {
+    let Some(vault) = vault else {
         return failed("a login asked for an approval on a host with no vault");
     };
-    let context = match use_context(broker, seat).await {
+    let context = match use_context(broker, seat, Some(vault)).await {
         Ok(context) => context,
         Err(refusal) => return refusal,
     };
@@ -395,19 +421,27 @@ async fn approval(
 
 /// Close `seat`'s browser with a signed step, if one may be open.
 pub async fn end(broker: &AgentBroker, seat: &Arc<WorkerSeat>, reason: CloseReason) {
-    close(broker.clone(), seat.clone(), reason, None).await;
+    if let Some(browse) = broker.browse() {
+        close(broker.clone(), seat.clone(), browse, reason, None).await;
+    }
 }
 
 /// Close every admitted worker's browser with a signed step, and start no
 /// step after.
 pub async fn close_all(broker: AgentBroker) {
-    let Ok(parts) = browser(&broker) else {
+    let Some(browse) = broker.browse() else {
         return;
     };
-    parts.closing.store(true, Ordering::SeqCst);
+    browse.parts.closing.store(true, Ordering::SeqCst);
     let mut closing = JoinSet::new();
     for seat in broker.worker_seats() {
-        closing.spawn(close(broker.clone(), seat, CloseReason::Shutdown, None));
+        closing.spawn(close(
+            broker.clone(),
+            seat,
+            browse.clone(),
+            CloseReason::Shutdown,
+            None,
+        ));
     }
     while closing.join_next().await.is_some() {}
 }
@@ -415,7 +449,8 @@ pub async fn close_all(broker: AgentBroker) {
 /// Close each admitted worker's browser that has had no step for the
 /// browser's idle time. `None` where this host has no browser.
 pub fn spawn_reaper(broker: &AgentBroker) -> Option<JoinHandle<()>> {
-    let idle = browser(broker).ok()?.idle;
+    let browse = broker.browse()?;
+    let idle = browse.parts.idle;
     let broker = broker.clone();
     Some(tokio::spawn(async move {
         let mut tick = tokio::time::interval(idle.min(REAP_EVERY));
@@ -429,7 +464,13 @@ pub fn spawn_reaper(broker: &AgentBroker) -> Option<JoinHandle<()>> {
                     .try_lock()
                     .is_ok_and(|open| open.is_some_and(|at| at.elapsed() >= idle));
                 if due {
-                    tokio::spawn(close(broker.clone(), seat, CloseReason::Idle, Some(idle)));
+                    tokio::spawn(close(
+                        broker.clone(),
+                        seat,
+                        browse.clone(),
+                        CloseReason::Idle,
+                        Some(idle),
+                    ));
                 }
             }
         }
@@ -439,6 +480,7 @@ pub fn spawn_reaper(broker: &AgentBroker) -> Option<JoinHandle<()>> {
 async fn close(
     broker: AgentBroker,
     seat: Arc<WorkerSeat>,
+    browse: Browse,
     reason: CloseReason,
     idle: Option<Duration>,
 ) {
@@ -454,7 +496,9 @@ async fn close(
             return Ok(());
         }
         let close = TrailAction::Close { reason };
-        step(&broker, &seat, &mut open, close, None).await.map(drop)
+        step(&broker, &seat, &browse, &mut open, close, None)
+            .await
+            .map(drop)
     })
     .await;
     let why = match closed {
@@ -470,12 +514,6 @@ async fn close(
 /// it short, so a step asked on the chain is still answered there.
 fn detached<T: Send + 'static>(work: impl Future<Output = T> + Send + 'static) -> JoinHandle<T> {
     tokio::spawn(work)
-}
-
-fn browser(broker: &AgentBroker) -> Result<&BrowserParts, Refusal> {
-    broker
-        .browser()
-        .ok_or_else(|| failed("a browser tool was admitted without a browser"))
 }
 
 async fn ask(broker: &AgentBroker, fact: Fact) -> Result<Applied, Refusal> {
@@ -522,13 +560,13 @@ struct ReadArgs {
     element: Option<u32>,
 }
 
-fn action_of(tool: &str, args: Value) -> Result<(TrailAction, Option<String>), Refusal> {
+fn action_of(tool: BrowserTool, args: Value) -> Result<(TrailAction, Option<String>), Refusal> {
     let action = match tool {
-        "browser_open" => {
+        BrowserTool::Open => {
             let OpenArgs { url } = arguments(args)?;
             TrailAction::Open { url, key: None }
         }
-        "browser_act" => {
+        BrowserTool::Act => {
             let ActArgs {
                 action,
                 element,
@@ -565,7 +603,7 @@ fn action_of(tool: &str, args: Value) -> Result<(TrailAction, Option<String>), R
             };
             return Ok((action, Some(text)));
         }
-        "browser_login" => {
+        BrowserTool::Login => {
             let LoginArgs {
                 login,
                 username_element,
@@ -579,11 +617,10 @@ fn action_of(tool: &str, args: Value) -> Result<(TrailAction, Option<String>), R
                 submit: submit.unwrap_or(true),
             }
         }
-        "browser_read" => {
+        BrowserTool::Read => {
             let ReadArgs { part, element } = arguments(args)?;
             TrailAction::Read { part, element }
         }
-        _ => return Err(forbidden("unknown tool")),
     };
     Ok((action, None))
 }

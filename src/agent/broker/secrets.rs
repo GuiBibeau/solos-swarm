@@ -1,5 +1,5 @@
-use super::registry::Cap;
-use super::{AgentBroker, Refusal, Reply, WorkerSeat, failed, forbidden, refuse};
+use super::toolbox::Resource;
+use super::{AgentBroker, Refusal, Reply, VaultParts, WorkerSeat, failed, forbidden, refuse};
 use crate::agent::environment::LOCAL;
 use crate::agent::ports::Fact;
 use crate::broker::fetch_with;
@@ -18,9 +18,12 @@ const NOTE: &str = "You never see these values. `use` names the tools that take 
                     denied is their answer, and no_approver means nobody can answer from this \
                     ticket's channels, so the item cannot be used.";
 
+/// `fetch_url` with a key. A host without a vault holds `fetch_url` for
+/// keyless requests, so a key is refused here with the reason.
 pub(super) async fn fetch(
     broker: &AgentBroker,
     seat: &WorkerSeat,
+    vault: Option<&VaultParts>,
     key: Value,
     args: &Value,
 ) -> Result<Value, Refusal> {
@@ -30,9 +33,7 @@ pub(super) async fn fetch(
             format!("bad arguments: key: {err}"),
         )
     })?;
-    let parts = broker
-        .vault()
-        .ok_or_else(|| forbidden(Cap::Vault.unavailable()))?;
+    let parts = vault.ok_or_else(|| forbidden(Resource::Vault.unavailable()))?;
     let url = args["url"]
         .as_str()
         .and_then(|url| reqwest::Url::parse(url).ok())
@@ -42,7 +43,7 @@ pub(super) async fn fetch(
                 "fetch_url's url is not an absolute URL",
             )
         })?;
-    let context = use_context(broker, seat).await?;
+    let context = use_context(broker, seat, Some(parts)).await?;
     let key = match parts
         .vault
         .admit_key(&name, &url, &context)
@@ -89,13 +90,13 @@ pub(super) async fn fetch(
     }
 }
 
-pub(super) async fn vault_list(broker: &AgentBroker, seat: &WorkerSeat) -> Reply {
-    let parts = broker
-        .vault()
-        .ok_or_else(|| failed("vault_list was admitted without a vault"))?;
-    let context = use_context(broker, seat).await?;
-    let offered = broker.seat_tools(seat);
-    let login_use: &[&str] = if offered.contains(&"browser_login") {
+pub(super) async fn vault_list(
+    broker: &AgentBroker,
+    seat: &WorkerSeat,
+    parts: &VaultParts,
+) -> Reply {
+    let context = use_context(broker, seat, Some(parts)).await?;
+    let login_use: &[&str] = if seat.held.holds("browser_login") {
         &["browser_login"]
     } else {
         &[]
@@ -130,9 +131,12 @@ pub(super) async fn vault_list(broker: &AgentBroker, seat: &WorkerSeat) -> Reply
     Ok(Json(json!({"logins": logins, "keys": keys, "note": NOTE})))
 }
 
+/// The context a seat's vault items are judged in. `vault` is this host's,
+/// when it has one: without it no approval can be asked here.
 pub(super) async fn use_context(
     broker: &AgentBroker,
     seat: &WorkerSeat,
+    vault: Option<&VaultParts>,
 ) -> Result<UseContext, Refusal> {
     let id = seat.ticket.clone();
     let ticket = broker
@@ -154,9 +158,7 @@ pub(super) async fn use_context(
             Some((name, state))
         })
         .collect();
-    let takes_approvals = broker
-        .vault()
-        .is_some_and(|parts| can_ask(&ticket, &parts.asks_on));
+    let takes_approvals = vault.is_some_and(|parts| can_ask(&ticket, &parts.asks_on));
     let mandate = &ticket.mandate;
     Ok(UseContext {
         requester: format!("{}:{}", mandate.source, mandate.requester.id),

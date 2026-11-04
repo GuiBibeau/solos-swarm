@@ -151,6 +151,7 @@ impl Scratch {
         std::fs::create_dir_all(root.join("extensions")).unwrap();
         // What `run_goal` digests into each swarm's manifest.
         std::fs::write(root.join("extensions/broker.ts"), "// stand-in").unwrap();
+        std::fs::write(root.join("extensions/agent-tools.json"), "{}").unwrap();
         std::fs::write(root.join("package-lock.json"), "{}").unwrap();
         std::fs::write(root.join("node"), "").unwrap();
         std::fs::write(root.join("goal.yaml"), TEMPLATE).unwrap();
