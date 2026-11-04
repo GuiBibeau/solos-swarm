@@ -145,6 +145,21 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   `--step N --show view` prints the exact bytes the model got, and `--json` prints the report. It exits 1 on any
   problem. An Assignment's last step asked and never answered, and a lost answer, are warnings that `--strict`
   counts too. `browse::verify_signature` is the signature half of `verify_step`, which now calls it.
+- Agent mode, pstack PR 2 (#57): repository workspaces. `forge:` in agent.yaml lists repositories (`kind: github`
+  with a token file read once, or `kind: local` bare repositories for dry runs). The Router names a repository when it
+  accepts work on it; the host keeps a mirror per repository and clones each repository Ticket's `work/` from it
+  (`--no-local`, no hooks, fsynced before `host/repo.json` is written), recovering from a killed fetch's stale locks.
+  The worker reads the clone with `read` (`/work`, `/host`) and commits in it with `run_code`; nothing is pushed yet.
+  The Pi sandbox binds `/pstack` only for the checked tree of a configured `pstack:`.
+- Agent mode, refactors from an architecture review: the Engine decides who may stop or approve a Ticket, and the fuzz
+  walk generates stops by people the Policy refuses (#55); one module, `src/exposure.rs`, gives both harnesses and
+  `run_code` their binds and computes the `SandboxView` the secret-path checks use, so `solos-swarm vault`
+  (`--state-dir`, `--pi-root`, `--node`) refuses what `agent serve` refuses (#56); each worker tool is one entry bound
+  to the host resource it needs and held per seat, and `extensions/broker.ts` reads its tool table from
+  `extensions/agent-tools.json`, generated from the registry and recorded in the run manifest as
+  `agent_tools_sha256` (#58).
+- `verify-agent-mode`: `overlays/pstack.yaml` and `overlays/forge.yaml` (a local forge seeded from the shipped
+  checkout), `run_code` in the base config, and the `pstack-repo` feature, driven live.
 - `collect` leaves the per-run `code/` scratch directory on the host and writes `collect-manifest.json`; `--include-code` opts back in.
 - Docs: pause mode, self-update operations, dashboard tunnel, tournament runbook, replay status.
 
