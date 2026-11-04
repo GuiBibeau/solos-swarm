@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import fs, { readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:http";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import test from "node:test";
 import { normalizeContext } from "@earendil-works/pi-ai";
+import { AgentSession, loadSkillsFromDir } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ProviderConfig } from "@earendil-works/pi-coding-agent";
 import swarmBroker from "../extensions/broker.ts";
 
@@ -689,5 +692,31 @@ test("the worker's job tools reach the broker with their arguments, and a refuse
     child.kill("SIGKILL");
     await new Promise<void>((done) => server.close(() => done()));
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("Pi's own /skill: expansion of the vendored entry skill, with pstack at /pstack, is the digest the Rust host is held to", () => {
+  const fixture = JSON.parse(readFileSync(resolve("tests/fixtures/pstack-entry.json"), "utf8"));
+  const { skills } = loadSkillsFromDir({ dir: resolve("vendor/pstack/skills"), source: "path" });
+  const loaded = skills.find((skill) => skill.name === fixture.entry);
+  assert.ok(loaded, `Pi loads no skill ${fixture.entry} from vendor/pstack/skills`);
+  const vendored = loaded.filePath;
+  const skill = { ...loaded, filePath: `/pstack/skills/${fixture.entry}/SKILL.md`, baseDir: `/pstack/skills/${fixture.entry}` };
+  // agent-session.js imports readFileSync from node:fs, so the redirect reaches it only through syncBuiltinESMExports.
+  const original = fs.readFileSync;
+  fs.readFileSync = ((path: fs.PathOrFileDescriptor, ...rest: unknown[]) =>
+    (original as (...args: unknown[]) => unknown)(path === skill.filePath ? vendored : path, ...rest)) as typeof fs.readFileSync;
+  syncBuiltinESMExports();
+  try {
+    const session = {
+      resourceLoader: { getSkills: () => ({ skills: [skill] }) },
+      _extensionRunner: { emitError(error: { error: string }) { throw new Error(error.error); } },
+    };
+    const expanded: string = (AgentSession.prototype as any)._expandSkillCommand.call(session, `/skill:${fixture.entry} ${fixture.text}`);
+    assert.ok(expanded.startsWith(`<skill name="${fixture.entry}" location="/pstack/skills/${fixture.entry}/SKILL.md">\n`), expanded.slice(0, 200));
+    assert.equal(createHash("sha256").update(expanded).digest("hex"), fixture.sha256);
+  } finally {
+    fs.readFileSync = original;
+    syncBuiltinESMExports();
   }
 });
