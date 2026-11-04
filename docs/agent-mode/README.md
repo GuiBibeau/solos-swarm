@@ -1445,6 +1445,11 @@ What happens:
   the repository, its base and the notes.
 - `executor.prepare` still runs after the clone. With `forge` configured, config load refuses a `prepare` that runs
   `git worktree add` into `$SOLOS_WORK_DIR`: a linked worktree's `.git` points at a path no sandbox has.
+- `prepare` runs on the host, as the agent's user and outside any sandbox, over the repository's content. With `forge`
+  set it must not execute repository code: no build, test or install step, no `make`, `npm install` or `./configure`,
+  no script or hook from the clone. A repository is data until a sandbox runs it, and a `prepare` that runs it gives
+  that repository's authors the host. Keep `prepare` to work that touches no file of the clone, such as writing a
+  scratch directory or a file beside it.
 - Tickets that name a repository need schema V6 of `agent.db`, so an older build refuses the file.
 
 ## Security model
