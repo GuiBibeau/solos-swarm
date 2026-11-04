@@ -2,7 +2,7 @@
 # Usage: launch.sh <run> [overlay.yaml...]
 # Starts `agent serve` for <run> on the box with a real DeepSeek Router and Pi workers, from an empty state dir.
 # The config is the skill's agent.verify.yaml with each overlay appended (an overlay adds top-level sections such
-# as vault: or browser:; relative paths in it resolve against ~/work/verify/<run>/). The DeepSeek key goes from this
+# as vault:, browser:, pstack: or forge:; relative paths in it resolve against ~/work/verify/<run>/). The DeepSeek key goes from this
 # Mac's ~/.pi/agent/auth.json over ssh stdin into a 0600 file on the box's tmpfs, which serve reads once and deletes.
 # Ready means: the process is up, the broker socket and the MCP inbox exist, and the key file is gone.
 set -euo pipefail
@@ -22,7 +22,14 @@ fi
 box "rm -rf ~/work/verify/$run/state; cat > ~/work/verify/$run/agent.yaml" < "$config"
 box "set -e; cd ~/work/verify/$run; mkdir -p secrets; chmod 700 secrets
 	if grep -q '^vault:' agent.yaml && ! test -e secrets/vault.enc; then bin/solos-swarm vault init --config agent.yaml; fi
-	if grep -q '^browser:' agent.yaml && ! test -e secrets/audit.key; then bin/solos-swarm browser init-key --out secrets/audit.key; fi"
+	if grep -q '^browser:' agent.yaml && ! test -e secrets/audit.key; then bin/solos-swarm browser init-key --out secrets/audit.key; fi
+	if grep -q '^forge:' agent.yaml && ! test -e forge-remote/GuiBibeau/solos-swarm.git; then
+		mkdir -p forge-remote/GuiBibeau && git init -q --bare -b main forge-remote/GuiBibeau/solos-swarm.git
+		rm -rf forge-seed && cp -r src forge-seed && rm -rf forge-seed/node_modules
+		git -C forge-seed init -q -b main && git -C forge-seed add -A
+		git -C forge-seed -c user.name=verify -c user.email=verify@example.invalid commit -q -m \"the shipped checkout, \$(cat bin/REVISION)\"
+		git -C forge-seed push -q ../forge-remote/GuiBibeau/solos-swarm.git main && rm -rf forge-seed
+	fi"
 python3 -I -c 'import json,os,sys; sys.stdout.write(json.load(open(os.path.expanduser("~/.pi/agent/auth.json")))["deepseek"]["key"].strip())' |
 	box "umask 077; cat > /run/user/\$(id -u)/verify-$run-key"
 box "cd ~/work/verify/$run && setsid -f bash -c 'echo \$\$ > serve.pid; exec timeout ${hours}h bin/solos-swarm agent serve --config agent.yaml --state-dir state --pi-root src --node \$HOME/.local/bin/node --credential-file /run/user/\$(id -u)/verify-$run-key > serve.log 2>&1 < /dev/null' > /dev/null 2>&1 < /dev/null"

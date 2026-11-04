@@ -20,4 +20,5 @@ executor:
   model: deepseek-flash
   prices: {input_microusd_per_million: 300000, output_microusd_per_million: 1320000, cache_hit_microusd_per_million: 30000}
   max_workers: 2
+  run_code: {}
 budgets: {session_microusd: 500000, router_daily_microusd: 1000000}
