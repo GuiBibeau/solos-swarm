@@ -967,6 +967,10 @@ async fn doctor(root: &Path, node: &Path) -> Result<()> {
         "broker extension missing"
     );
     ensure!(
+        root.join("extensions/agent-tools.json").is_file(),
+        "broker extension's tool table missing"
+    );
+    ensure!(
         root.join("node_modules/@earendil-works/pi-coding-agent/dist/cli.js")
             .is_file(),
         "pinned Pi not installed"
@@ -1011,6 +1015,10 @@ async fn fetch_probe(root: &Path, node: &Path, url: &str) -> Result<()> {
     ensure!(
         root.join("extensions/broker.ts").is_file(),
         "broker extension missing"
+    );
+    ensure!(
+        root.join("extensions/agent-tools.json").is_file(),
+        "broker extension's tool table missing"
     );
     let work = std::env::temp_dir().join(format!("swarm-probe-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&work)?;
@@ -1397,7 +1405,8 @@ budgets: {session_microusd: 500000}
     }
 
     /// A fresh directory with a Goal file, an empty run dir and a stand-in Pi
-    /// tree, whose extension and lock file `run_goal` digests into the manifest.
+    /// tree, whose extension, tool table and lock file `run_goal` digests into
+    /// the manifest.
     fn scripted_run(deadline: u64, idle_probe: bool) -> (PathBuf, GoalRun) {
         let dir = std::env::temp_dir().join(format!(
             "ss-e2e-{}",
@@ -1406,6 +1415,7 @@ budgets: {session_microusd: 500000}
         let pi_root = dir.join("pi");
         fs::create_dir_all(pi_root.join("extensions")).unwrap();
         fs::write(pi_root.join("extensions/broker.ts"), "// stand-in").unwrap();
+        fs::write(pi_root.join("extensions/agent-tools.json"), "{}").unwrap();
         fs::write(pi_root.join("package-lock.json"), "{}").unwrap();
         fs::write(dir.join("node"), "").unwrap();
         fs::create_dir(dir.join("run")).unwrap();
@@ -1539,6 +1549,11 @@ budgets: {session_microusd: 500000}
         assert_eq!(
             manifest["extension_sha256"],
             broker::file_digest(&dir.join("pi/extensions/broker.ts")).unwrap()
+        );
+        assert_eq!(
+            manifest["agent_tools_sha256"],
+            broker::file_digest(&dir.join("pi/extensions/agent-tools.json")).unwrap(),
+            "broker.ts loads this file, so the run records it beside the extension"
         );
         assert_eq!(manifest["deadline_seconds"], 60);
         assert!(manifest.get("upstream_provider").is_none());
