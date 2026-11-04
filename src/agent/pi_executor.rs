@@ -1154,8 +1154,10 @@ mod tests {
             plan: Plan::Session {
                 harness: None,
                 environment: None,
+                method: None,
             },
             budget_microusd: 500_000,
+            repo: None,
             recovery: false,
             inputs: Vec::new(),
         }
@@ -1447,6 +1449,7 @@ mod tests {
             launch.plan = Plan::Session {
                 harness: harness.map(String::from),
                 environment: None,
+                method: None,
             };
             launch
         };
@@ -1504,6 +1507,7 @@ mod tests {
         on_claude.plan = Plan::Session {
             harness: Some("claude-code".into()),
             environment: None,
+            method: None,
         };
         w.launch(on_claude).await;
         assert!(started(&w.fact().await, "as_a"));
@@ -1555,6 +1559,7 @@ mod tests {
         asks.plan = Plan::Session {
             harness: Some("claude-code".into()),
             environment: None,
+            method: None,
         };
         executor.launch(asks, w.facts.clone()).await.unwrap();
         let why = failure(&mut w, "as_1").await;
@@ -1607,6 +1612,7 @@ mod tests {
             launch.plan = Plan::Session {
                 harness: Some(harness.into()),
                 environment: environment.map(String::from),
+                method: None,
             };
             launch
         };

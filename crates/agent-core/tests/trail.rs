@@ -145,10 +145,12 @@ fn running_ticket(
         plan: Plan::Session {
             harness: None,
             environment: None,
+            method: None,
         },
         budget_microusd: 1_000_000,
         acknowledge: Acknowledge::Standard,
         rules: Vec::new(),
+        repo: None,
     });
     let decision = engine.decide(&eval, accept).unwrap();
     let ticket = engine.repos().decisions[&decision].ticket.clone().unwrap();

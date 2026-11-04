@@ -993,6 +993,7 @@ impl DecideArgs {
                     (PlanKind::Session, None) if self.goal_template.is_none() => Plan::Session {
                         harness: None,
                         environment: self.environment,
+                        method: None,
                     },
                     (PlanKind::Session, _) => {
                         return Err("agents and goal_template are for a swarm plan only".into());
@@ -1036,6 +1037,7 @@ impl DecideArgs {
                     budget_microusd: budget,
                     acknowledge,
                     rules: self.rules,
+                    repo: None,
                 })
             }
         };
@@ -1539,7 +1541,8 @@ mod tests {
             accept.plan,
             Plan::Session {
                 harness: None,
-                environment: None
+                environment: None,
+                method: None,
             }
         );
         assert_eq!(accept.budget_microusd, 500_000);
@@ -1555,7 +1558,8 @@ mod tests {
             remote.plan,
             Plan::Session {
                 harness: None,
-                environment: Some("laptop".into())
+                environment: Some("laptop".into()),
+                method: None,
             }
         );
         let Verdict::Accept(swarm) = verdict(json!({

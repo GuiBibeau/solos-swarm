@@ -51,6 +51,7 @@ fn script<R: Repositories>(e: &mut AnyEngine<R>, now: &Cell<u64>) -> EvalId {
     let session = Plan::Session {
         harness: None,
         environment: None,
+        method: None,
     };
     let first = ticket_of(e, &eval, accept("Fix the flake", session, 1_000_000));
     let assignment = latest(e, &first);
@@ -159,7 +160,7 @@ fn state_survives_closing_and_reopening_the_file() {
     assert_eq!(store.effects().unwrap(), queue);
     assert_eq!(store.open_tickets().unwrap(), open);
     assert_eq!(store.verify_chain().unwrap(), chain);
-    assert_eq!(store.schema_version().unwrap(), 5);
+    assert_eq!(store.schema_version().unwrap(), 6);
     for t in &before.triggers {
         assert_eq!(store.trigger(&t.id).as_ref(), Some(t));
     }
@@ -273,7 +274,7 @@ fn a_file_store_uses_wal_and_migrates_once() {
     let db = TempDb::new("wal");
     drop(SqliteStore::open(&db.path).unwrap());
     let store = SqliteStore::open(&db.path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 5);
+    assert_eq!(store.schema_version().unwrap(), 6);
     let raw = db.raw();
     let mode: String = raw
         .query_row("PRAGMA journal_mode", [], |row| row.get(0))
@@ -282,5 +283,5 @@ fn a_file_store_uses_wal_and_migrates_once() {
     let rows: u32 = raw
         .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(rows, 5, "one row per migration");
+    assert_eq!(rows, 6, "one row per migration");
 }

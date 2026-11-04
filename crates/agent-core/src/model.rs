@@ -1,3 +1,4 @@
+use crate::change::{Deliverable, RepoName};
 use crate::trail::{TrailAction, TrailCursor, TrailOutcome};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -242,6 +243,10 @@ pub enum Plan {
         /// `None` is the executor's default.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         environment: Option<String>,
+        /// How its work is held to account, fixed at accept. `None`: it
+        /// owes an answer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        method: Option<Method>,
     },
     /// The Ticket's scope becomes a Goal run by a governed swarm of `agents`
     /// sandboxed workers under the Ticket's budget.
@@ -250,6 +255,13 @@ pub enum Plan {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         goal_template: Option<String>,
     },
+}
+
+/// A session's method. The Router names what the work owes; the
+/// repository's default stands in when it names nothing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Method {
+    pub deliverable: Deliverable,
 }
 
 /// What an accept grants, fixed at accept time.
@@ -265,6 +277,9 @@ pub struct Mandate {
     pub source: String,
     /// The Ticket's whole envelope across all of its Assignments.
     pub budget_microusd: MicroUsd,
+    /// The one repository its worker reads and changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<RepoName>,
 }
 
 /// Whether a person has to approve the Ticket's budget before it launches.
@@ -581,6 +596,9 @@ pub struct Accept {
     pub acknowledge: Acknowledge,
     #[serde(default)]
     pub rules: Vec<String>,
+    /// The repository the work reads and changes, for a session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<RepoName>,
 }
 
 /// The first reply on an accepted Ticket. A rule can ask for silence.

@@ -950,10 +950,12 @@ mod tests {
                 requester: Actor::person("alice"),
                 source: "slack".into(),
                 budget_microusd: 1_000_000,
+                repo: None,
             },
             plan: Plan::Session {
                 harness: None,
                 environment: None,
+                method: None,
             },
             channels: vec![ChannelRef {
                 source: "slack".into(),

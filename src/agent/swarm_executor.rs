@@ -822,6 +822,7 @@ mod tests {
                 goal_template: None,
             },
             budget_microusd: 500_000,
+            repo: None,
             recovery: false,
             inputs: Vec::new(),
         }

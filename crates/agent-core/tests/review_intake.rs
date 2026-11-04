@@ -176,10 +176,12 @@ fn accept_rules(budget: u64, rules: Vec<String>) -> Verdict {
         plan: Plan::Session {
             harness: None,
             environment: None,
+            method: None,
         },
         budget_microusd: budget,
         acknowledge: Acknowledge::Silent,
         rules,
+        repo: None,
     })
 }
 

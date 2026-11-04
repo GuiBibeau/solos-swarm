@@ -18,10 +18,11 @@ use common::{
     MemEngine, SqlEngine, TempDb, clock, first_difference, memory_contents, page_seen, port_view,
     signed_step, sqlite_contents,
 };
+use solos_agent_core::change::{Deliverable, RepoName};
 use solos_agent_core::model::{
     Accept, Acknowledge, Actor, Addressed, Approval, AssignmentId, AssignmentState, ChannelRef,
-    Effect, EvalId, InputBody, Plan, ReportIn, ReportStatus, SecretGrant, SecretId, ThreadKey,
-    Ticket, TicketId, Trigger, TriggerId, Verdict,
+    Effect, EvalId, InputBody, Method, Plan, ReportIn, ReportStatus, SecretGrant, SecretId,
+    ThreadKey, Ticket, TicketId, Trigger, TriggerId, Verdict,
 };
 use solos_agent_core::trail::{
     ActText, CloseReason, Digest, MAX_URL_CHARS, PageAction, StepOutcome, TrailAction, TrailOutcome,
@@ -287,6 +288,13 @@ fn gen_accept(rng: &mut Lcg) -> Accept {
         Plan::Session {
             harness: rng.chance(20).then(|| "pi".to_owned()),
             environment: rng.chance(30).then(|| "laptop".to_owned()),
+            method: rng.chance(30).then(|| Method {
+                deliverable: rng.pick(&[
+                    Deliverable::Answer,
+                    Deliverable::Change,
+                    Deliverable::PullRequest,
+                ]),
+            }),
         }
     } else {
         Plan::Swarm {
@@ -306,6 +314,9 @@ fn gen_accept(rng: &mut Lcg) -> Accept {
             Acknowledge::Text("ack".into()),
         ]),
         rules: rng.pick(&[vec![], vec!["r1".to_owned()]]),
+        repo: rng
+            .chance(40)
+            .then(|| RepoName::try_from("acme/widgets".to_owned()).unwrap()),
     }
 }
 

@@ -1,7 +1,7 @@
 use crate::StoreError;
 use rusqlite::{Connection, TransactionBehavior};
 
-pub(crate) const LATEST: u32 = 5;
+pub(crate) const LATEST: u32 = 6;
 
 /// Aggregates are JSON in `body`; the other columns index the port's queries.
 const V1: &str = "
@@ -117,8 +117,13 @@ CREATE INDEX IF NOT EXISTS trails_ticket ON trails (ticket);
 /// `Ticket.secrets` when it rewrites a Ticket.
 const V5: &str = "";
 
+/// No new table. A file whose Tickets can name a repository and a method is
+/// one an older build refuses to open, instead of dropping `Mandate.repo`
+/// and `Plan::Session.method` when it rewrites a Ticket.
+const V6: &str = "";
+
 /// Migration `n` is `MIGRATIONS[n - 1]`.
-const MIGRATIONS: [&str; LATEST as usize] = [V1, V2, V3, V4, V5];
+const MIGRATIONS: [&str; LATEST as usize] = [V1, V2, V3, V4, V5, V6];
 
 /// Applies the migrations the file lacks. The write lock makes a second
 /// process that opens the file at the same time wait, then find nothing to do.
@@ -155,7 +160,7 @@ pub(crate) fn version(conn: &Connection) -> Result<u32, StoreError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LATEST, V1, V2, V3, V4, V5, migrate, version};
+    use super::{LATEST, V1, V2, V3, V4, V5, V6, migrate, version};
     use rusqlite::Connection;
 
     #[test]
@@ -174,6 +179,7 @@ mod tests {
         conn.execute_batch(V3).unwrap();
         conn.execute_batch(V4).unwrap();
         conn.execute_batch(V5).unwrap();
+        conn.execute_batch(V6).unwrap();
     }
 
     #[test]
@@ -254,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn a_v4_file_opens_as_v5_and_keeps_its_rows() {
+    fn a_v4_file_opens_at_the_latest_version_and_keeps_its_rows() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE schema_version (version INTEGER PRIMARY KEY NOT NULL) STRICT;",
@@ -282,11 +288,11 @@ mod tests {
         migrate(&mut conn).unwrap();
         migrate(&mut conn).unwrap();
 
-        assert_eq!(version(&conn).unwrap(), 5);
+        assert_eq!(version(&conn).unwrap(), LATEST);
         let rows: u32 = conn
             .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(rows, 5, "one row per migration");
+        assert_eq!(rows, LATEST, "one row per migration");
         let table = |sql: &str| -> String { conn.query_row(sql, [], |row| row.get(0)).unwrap() };
         assert_eq!(table("SELECT body FROM tickets WHERE id = 'tk1'"), "{}");
         assert_eq!(table("SELECT ticket FROM trails"), "tk1");
