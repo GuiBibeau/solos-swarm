@@ -339,12 +339,14 @@ async fn get_tools_lists_run_code_and_the_job_tools_on_a_host_with_run_code_and_
     assert_eq!(response.status().as_u16(), 200);
     let listed: Value = response.json().await.unwrap();
     let mut specs = registry::tools(PrincipalKind::Worker);
-    specs.retain(|tool| tool.name != "vault_list" && !tool.name.starts_with("browser_"));
+    specs.retain(|tool| {
+        !["vault_list", "read"].contains(&tool.name) && !tool.name.starts_with("browser_")
+    });
     assert_eq!(
         listed["tools"],
         serde_json::to_value(specs).unwrap(),
-        "every worker tool but vault_list and the browser's, from the registry: this host has \
-         no vault and no browser"
+        "every worker tool but vault_list, the browser's and read, from the registry: this host \
+         has no vault, no browser and no pstack"
     );
     let names: Vec<&str> = listed["tools"]
         .as_array()

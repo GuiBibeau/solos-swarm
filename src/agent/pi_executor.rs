@@ -561,7 +561,14 @@ where
             launch.budget_microusd,
         )
         .in_environment(named.map(str::to_owned));
-        let prompt = system_prompt(launch.budget_microusd, &grants);
+        let mut prompt = system_prompt(launch.budget_microusd, &grants);
+        let mut assignment = assignment_text(launch, run_code);
+        if let Some(pstack) = parts.broker.pstack() {
+            let run_code_has_pstack = run_code && environments.is_local(named);
+            let section = pstack.section(&parts.model, run_code_has_pstack);
+            prompt = format!("{prompt}\n\n{section}");
+            assignment = pstack.enter(&assignment);
+        }
         let seat = parts.broker.admit_worker(token.clone(), seat, prompt)?;
         let _revoke = Revoke {
             broker: &parts.broker,
@@ -586,7 +593,7 @@ where
             facts,
             seat: &seat,
             broker: &parts.broker,
-            run_code,
+            assignment,
         };
         const STARTED: &str = "the worker's session did not start";
         // Each arm is the same generic turn loop on its harness's own
@@ -681,7 +688,7 @@ struct Turns<'a> {
     facts: &'a FactSink,
     seat: &'a WorkerSeat,
     broker: &'a AgentBroker,
-    run_code: bool,
+    assignment: String,
 }
 
 impl Turns<'_> {
@@ -727,7 +734,7 @@ impl Turns<'_> {
             .collect();
         seat.begin_turn();
         session
-            .prompt(&assignment_text(launch, self.run_code))
+            .prompt(&self.assignment)
             .await
             .context("the assignment did not reach the session")?;
         let mut in_turn = true;
@@ -857,6 +864,7 @@ mod tests {
     use crate::agent::environment::{ExecutionEnvironment, Nodes, Offline, Work};
     use crate::agent::jobs::JobLimits;
     use crate::agent::ports::{Delivered, Delivery, Executor, Fact, FactSink, Inbound, Launch};
+    use crate::agent::pstack::Pstack;
     use crate::code::{OutputBounds, Started};
     use crate::gateway::{Dispatch, PriceTable, Provider, Upstream};
     use crate::harness::{AgentHarness, Observation, Session, SessionEvent, SessionSpec};
@@ -996,6 +1004,26 @@ mod tests {
             prepare: Option<&str>,
             nodes: Nodes,
         ) -> Self {
+            Self::build(default_harness, max_workers, prepare, nodes, None)
+        }
+        fn with_pstack() -> Self {
+            let checkout = Path::new(env!("CARGO_MANIFEST_DIR"));
+            let pstack = Pstack::open(checkout, "poteto-mode").unwrap();
+            Self::build(
+                HarnessKind::Pi,
+                4,
+                None,
+                Nodes::default(),
+                Some(Arc::new(pstack)),
+            )
+        }
+        fn build(
+            default_harness: HarnessKind,
+            max_workers: usize,
+            prepare: Option<&str>,
+            nodes: Nodes,
+            pstack: Option<Arc<Pstack>>,
+        ) -> Self {
             let dir = std::env::temp_dir().join(format!("pi-executor-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&dir).unwrap();
             let (facts, inbound) = FactSink::channel();
@@ -1027,7 +1055,8 @@ mod tests {
                     browser: None,
                 }),
             };
-            let broker = AgentBroker::with_nodes(parts, JobLimits::default(), nodes).unwrap();
+            let broker =
+                AgentBroker::with_pstack(parts, JobLimits::default(), nodes, pstack).unwrap();
             let (fake, claude) = (Fake::default(), Fake::default());
             let executor = PiExecutor::new(PiExecutorParts {
                 harness: Arc::new(fake.clone()),
@@ -1466,6 +1495,39 @@ mod tests {
         assert_eq!(claude.claude.started(), ["as_e"]);
         assert!(claude.fake.started().is_empty());
         claude.executor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn with_pstack_every_launch_on_either_harness_enters_its_skill_and_may_read() {
+        let mut w = World::with_pstack();
+        let mut on_claude = launch("tk_a", "as_a");
+        on_claude.plan = Plan::Session {
+            harness: Some("claude-code".into()),
+            environment: None,
+        };
+        w.launch(on_claude).await;
+        assert!(started(&w.fact().await, "as_a"));
+        let mut recovery = launch("tk_b", "as_b");
+        recovery.recovery = true;
+        w.launch(recovery).await;
+        assert!(started(&w.fact().await, "as_b"));
+
+        let entered = "<skill name=\"poteto-mode\" location=\"/pstack/skills/poteto-mode/SKILL.md\">\n\
+                       References are relative to /pstack/skills/poteto-mode.\n\n# Poteto mode\n";
+        let claude = &w.claude.prompted(1).await[0].1;
+        assert!(claude.starts_with(entered), "{claude}");
+        assert!(
+            claude.contains("</skill>\n\nTicket tk_a: Fix the flaky test"),
+            "{claude}"
+        );
+        let pi = &w.fake.prompted(1).await[0].1;
+        assert!(pi.starts_with(entered), "{pi}");
+        assert!(pi.contains("</skill>\n\nTicket tk_b: "), "{pi}");
+        assert!(pi.contains("This ticket was worked on before"), "{pi}");
+        for grants in [w.claude.grants("as_a"), w.fake.grants("as_b")] {
+            assert!(grants.iter().any(|tool| tool == "read"), "{grants:?}");
+        }
+        w.executor.shutdown().await;
     }
 
     #[tokio::test]

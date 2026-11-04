@@ -409,14 +409,15 @@ async fn a_router_and_a_worker_each_list_and_call_only_their_own_tools() {
         "browser_act",
         "browser_login",
         "browser_read",
+        "read",
     ];
     expected.retain(|name| !unavailable.contains(&name.as_str()));
     let mut names = worker.names().await;
     names.sort();
     assert_eq!(
         names, expected,
-        "a worker sees worker tools only, and no run_code, job tools, vault_list or browser on \
-         this host"
+        "a worker sees worker tools only, and no run_code, job tools, vault_list, browser or \
+         read on this host"
     );
     for absent in ["run_code", "job_start"] {
         let reply = worker

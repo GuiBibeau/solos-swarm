@@ -1,0 +1,7 @@
+solos-swarm
+Copyright 2026 Gui Bibeau
+
+This product includes pstack (https://github.com/cursor/plugins/tree/main/pstack),
+Copyright (c) 2026 Lauren Tan, licensed under the MIT License. It is vendored
+unchanged in vendor/pstack/, whose LICENSE file holds the license text, and is
+updated only by scripts/pstack-sync.

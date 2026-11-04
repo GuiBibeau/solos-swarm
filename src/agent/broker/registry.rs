@@ -19,16 +19,18 @@ pub enum Cap {
     RunCode,
     Browser,
     Vault,
+    Read,
 }
 
 impl Cap {
-    pub const ALL: [Self; 3] = [Self::RunCode, Self::Browser, Self::Vault];
+    pub const ALL: [Self; 4] = [Self::RunCode, Self::Browser, Self::Vault, Self::Read];
 
     pub const fn unavailable(self) -> &'static str {
         match self {
             Self::RunCode => "run_code is not available on this host",
             Self::Browser => "no browser where this ticket runs",
             Self::Vault => "no vault on this host",
+            Self::Read => "this host gives workers no pstack to read",
         }
     }
 
@@ -237,6 +239,16 @@ const WORKER: &[Tool] = &[
                       (the view's text_parts says how many), or the whole text of one element. \
                       Takes a fresh look, so a page that changed shows its new content.",
         input_schema: browser_read,
+    },
+    Tool {
+        name: "read",
+        needs: Caps::of(&[Cap::Read]),
+        description: "Read a text file, or list a directory, under /pstack, where pstack's skills \
+                      are, read-only. Paths are absolute. A file comes back as numbered lines, at \
+                      most 2000 lines or 256 KiB at a time, so use offset and limit for the rest. \
+                      A path outside /pstack, a link that leads out of it, and a binary file are \
+                      refused.",
+        input_schema: read,
     },
 ];
 
@@ -495,6 +507,23 @@ fn browser_read() -> Value {
         "properties": {
             "part": {"type": "integer", "minimum": 1, "description": "Which part of the page text. Default 1."},
             "element": element("Read the whole text of this element instead."),
+        },
+    })
+}
+
+fn read() -> Value {
+    json!({
+        "type": "object",
+        "required": ["path"],
+        "properties": {
+            "path": required_string("An absolute path, such as /pstack/skills/poteto-mode/SKILL.md."),
+            "offset": {"type": "integer", "minimum": 1, "description": "The first line to read, from 1. Default 1."},
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 2000,
+                "description": "How many lines. Default and most: 2000.",
+            },
         },
     })
 }

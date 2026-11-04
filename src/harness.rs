@@ -1,7 +1,7 @@
 //! The agent harness port: how a mode starts an agent session, prompts it and
 //! stops it, whichever program runs the session. `PiHarness` is the adapter
 //! swarm runs launch.
-use crate::{broker::now_ms, bwrap::Bwrap};
+use crate::{agent::pstack, broker::now_ms, bwrap::Bwrap};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -157,7 +157,11 @@ impl PiHarness {
             .dir("/runtime")
             .ro_bind(node_root(node), "/runtime/node")
             .ro_bind(spec.pi_root.join("node_modules"), "/runtime/node_modules")
-            .ro_bind(spec.pi_root.join("extensions"), "/runtime/extensions")
+            .ro_bind(spec.pi_root.join("extensions"), "/runtime/extensions");
+        if spec.grants.iter().any(|grant| grant == "read") {
+            sandbox = sandbox.ro_bind(spec.pi_root.join(pstack::VENDORED), pstack::MOUNT);
+        }
+        let mut sandbox = sandbox
             .ro_bind(&spec.broker_socket, "/broker.sock")
             .ro_bind(&spec.pi_settings, "/work/config/settings.json")
             .clearenv()
@@ -468,6 +472,51 @@ mod tests {
             as_router, router,
             "role and toolset are the only differences"
         );
+    }
+
+    #[test]
+    fn a_worker_granted_read_sees_the_vendored_pstack_at_its_mount_and_nothing_else_changes() {
+        let args = |grants: &[&str]| -> Vec<String> {
+            let spec = SessionSpec {
+                id: "as_1".into(),
+                role: Role::TicketWorker,
+                grants: grants.iter().map(|grant| (*grant).to_owned()).collect(),
+                token: "t".into(),
+                model: "deepseek-flash".into(),
+                run_dir: PathBuf::from("/state/tickets/tk_1"),
+                broker_socket: PathBuf::from("/state/broker.sock"),
+                pi_settings: PathBuf::from("/state/tickets/tk_1/pi-settings.json"),
+                node: PathBuf::from("/opt/node/bin/node"),
+                pi_root: PathBuf::from("/srv/pi"),
+            };
+            PiHarness::command(&spec)
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect()
+        };
+        let without = args(&["worker_report", "fetch_url"]);
+        let with = args(&["worker_report", "fetch_url", "read"]);
+        let bind = ["--ro-bind", "/srv/pi/vendor/pstack", "/pstack"];
+        let at = without
+            .iter()
+            .position(|arg| arg == "/runtime/extensions")
+            .unwrap()
+            + 1;
+        assert_eq!(
+            with[at - 3..at],
+            ["--ro-bind", "/srv/pi/extensions", "/runtime/extensions"]
+        );
+        assert_eq!(with[at..at + 3], bind);
+        let mut expected = without.clone();
+        expected.splice(at..at, bind.map(String::from));
+        let grants = expected
+            .iter()
+            .position(|arg| arg == "worker_report,fetch_url")
+            .unwrap();
+        expected[grants] = "worker_report,fetch_url,read".into();
+        assert_eq!(with, expected);
+        assert!(!without.iter().any(|arg| arg == "/pstack"));
     }
 
     #[test]

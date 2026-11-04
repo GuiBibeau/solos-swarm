@@ -14,6 +14,7 @@ use super::config::ExecutorConfig;
 use super::environment::{Environments, Nodes};
 use super::jobs::{Host, JobLimits, Jobs, Refused};
 use super::ports::{Applied, Fact, FactSink};
+use super::pstack::{self, Pstack};
 use crate::broker::{FETCH_TOTAL_BYTES, fetch, now_ms};
 use crate::code::CodeExecutor;
 use crate::gateway::{self, PriceTable, Provider, Receipt, Upstream};
@@ -376,6 +377,7 @@ struct Inner {
     overrun: AtomicBool,
     jobs: JobLimits,
     environments: Environments,
+    pstack: Option<Arc<Pstack>>,
 }
 
 type Refusal = (StatusCode, Json<Value>);
@@ -434,6 +436,17 @@ impl AgentBroker {
     /// [`with_jobs`](Self::with_jobs), with remote nodes a worker's
     /// commands may run on.
     pub fn with_nodes(parts: BrokerParts, jobs: JobLimits, nodes: Nodes) -> Result<Self> {
+        Self::with_pstack(parts, jobs, nodes, None)
+    }
+
+    /// [`with_nodes`](Self::with_nodes), with the pstack every worker may
+    /// `read`.
+    pub fn with_pstack(
+        parts: BrokerParts,
+        jobs: JobLimits,
+        nodes: Nodes,
+        pstack: Option<Arc<Pstack>>,
+    ) -> Result<Self> {
         let BrokerParts {
             dir,
             mut store,
@@ -467,6 +480,7 @@ impl AgentBroker {
                 grants: RwLock::new(BTreeMap::new()),
                 overrun: AtomicBool::new(false),
                 jobs,
+                pstack,
             }),
         })
     }
@@ -509,10 +523,15 @@ impl AgentBroker {
         &self.inner.environments
     }
 
+    pub fn pstack(&self) -> Option<&Arc<Pstack>> {
+        self.inner.pstack.as_ref()
+    }
+
     /// What a worker whose Plan names `environment` may call: the worker
     /// tools, less `run_code` and the job tools where that environment
-    /// offers no `run_code`, and less `vault_list` where this host has no
-    /// vault. A worker's grants and its `GET /tools`.
+    /// offers no `run_code`, less `vault_list` where this host has no
+    /// vault, and less `read` where it has no pstack. A worker's grants and
+    /// its `GET /tools`.
     pub fn worker_tools(&self, environment: Option<&str>) -> Vec<&'static str> {
         registry::offered(PrincipalKind::Worker, self.capabilities(environment))
     }
@@ -524,6 +543,9 @@ impl AgentBroker {
         }
         if self.browser().is_some() && self.inner.environments.is_local(environment) {
             have = have.with(Cap::Browser);
+        }
+        if self.inner.pstack.is_some() {
+            have = have.with(Cap::Read);
         }
         have
     }
@@ -889,6 +911,7 @@ async fn tool(
         }
         (Principal::Worker(seat), "fetch_url") => fetch_url(&broker, seat, args).await,
         (Principal::Worker(seat), "vault_list") => secrets::vault_list(&broker, seat).await,
+        (Principal::Worker(_), "read") => read_path(&broker, args).await,
         (
             Principal::Worker(seat),
             tool @ ("browser_open" | "browser_act" | "browser_login" | "browser_read"),
@@ -1240,6 +1263,40 @@ async fn fetch_url(broker: &AgentBroker, seat: &Arc<WorkerSeat>, mut args: Value
     let bytes = response["body_bytes"].as_u64().unwrap_or(0);
     seat.fetched_bytes.fetch_add(bytes, Ordering::SeqCst);
     Ok(Json(response))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadPathArgs {
+    path: String,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+async fn read_path(broker: &AgentBroker, args: Value) -> Reply {
+    let ReadPathArgs {
+        path,
+        offset,
+        limit,
+    } = arguments(args)?;
+    let tree = broker
+        .pstack()
+        .cloned()
+        .ok_or_else(|| failed("read was admitted without pstack"))?;
+    tokio::task::spawn_blocking(move || tree.reader().read(&path, offset, limit))
+        .await
+        .map_err(failed)?
+        .map(Json)
+        .map_err(|refusal| match refusal {
+            pstack::Refused::Invalid(why) | pstack::Refused::NotText(why) => {
+                refuse(StatusCode::UNPROCESSABLE_ENTITY, why)
+            }
+            pstack::Refused::Leaves(why) => forbidden(why),
+            pstack::Refused::Missing(why) => refuse(StatusCode::NOT_FOUND, why),
+            pstack::Refused::Host(why) => failed(why),
+        })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]

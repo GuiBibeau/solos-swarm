@@ -1,0 +1,5 @@
+{
+  "entry": "poteto-mode",
+  "text": "Ticket tk_entry: Explain why agent-core forbids I/O\n\nScope:\nExplain, the poteto way, why agent-core forbids I/O.\n",
+  "sha256": "674b65c24e59306998438aecb2595c52e6dfa9be860b8aa76c5addf9ba8859b5"
+}
