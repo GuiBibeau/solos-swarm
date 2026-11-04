@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""Vendor pstack from cursor/plugins at a ref into vendor/pstack/, verbatim, and write its MANIFEST.
+
+The tree is cursor/plugins' generated Claude Code build of pstack, harness/pstack/claude-code/:
+pstack's skills, agents, guide, README, LICENSE and plugin.json, unchanged. Usage:
+
+    scripts/pstack-sync <ref>
+
+<ref> is a commit, tag or branch of cursor/plugins. Set GITHUB_TOKEN to lift the API's rate limit.
+The MANIFEST names the version, the commit and a tree digest, then one `sha256  path` line per file.
+The tree digest is the sha256 of those file lines, so a reviewer can rerun both checks by hand:
+
+    tail -n +5 vendor/pstack/MANIFEST | sha256sum
+    cd vendor/pstack && tail -n +5 MANIFEST | sha256sum --check --strict --quiet
+
+The script stops with an error when plugin.json names a version the solos-swarm adapter was not
+checked against: a person reads pstack's diff against docs/harness/solos-swarm.md before bumping
+ADAPTER_CHECKED_AGAINST in src/agent/pstack.rs.
+"""
+
+import hashlib
+import io
+import json
+import os
+import re
+import shutil
+import sys
+import tarfile
+import urllib.request
+from pathlib import Path
+
+REPO = "cursor/plugins"
+TREE = "harness/pstack/claude-code/"
+ROOT = Path(__file__).resolve().parents[1]
+VENDORED = ROOT / "vendor" / "pstack"
+ADAPTER_SOURCE = ROOT / "src" / "agent" / "pstack.rs"
+
+
+def fetch(url, accept=None):
+    request = urllib.request.Request(url, headers={"User-Agent": "solos-swarm-pstack-sync"})
+    if accept:
+        request.add_header("Accept", accept)
+    token = os.environ.get("GITHUB_TOKEN")
+    if token and url.startswith("https://api.github.com/"):
+        request.add_header("Authorization", f"Bearer {token}")
+    with urllib.request.urlopen(request, timeout=120) as response:
+        return response.read()
+
+
+def resolve(ref):
+    sha = fetch(f"https://api.github.com/repos/{REPO}/commits/{ref}", "application/vnd.github.sha")
+    sha = sha.decode().strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        sys.exit(f"pstack-sync: {ref} did not resolve to a commit of {REPO}: {sha[:200]}")
+    return sha
+
+
+def extract(sha, into):
+    archive = fetch(f"https://codeload.github.com/{REPO}/tar.gz/{sha}")
+    count = 0
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
+        for member in tar:
+            top, _, inside = member.name.partition("/")
+            if not inside.startswith(TREE) or inside == TREE:
+                continue
+            path = inside[len(TREE):].rstrip("/")
+            parts = path.split("/")
+            if any(part in ("", ".", "..") for part in parts):
+                sys.exit(f"pstack-sync: refusing the archive path {member.name}")
+            target = into.joinpath(*parts)
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+            elif member.isreg():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(tar.extractfile(member).read())
+                target.chmod(0o755 if member.mode & 0o111 else 0o644)
+                count += 1
+            else:
+                sys.exit(f"pstack-sync: {member.name} is not a regular file or a directory")
+    if count == 0:
+        sys.exit(f"pstack-sync: {REPO}@{sha} has no {TREE}")
+
+
+def manifest(tree, version, sha):
+    files = sorted(
+        path.relative_to(tree).as_posix()
+        for path in tree.rglob("*")
+        if path.is_file() and path.relative_to(tree).as_posix() != "MANIFEST"
+    )
+    lines = "".join(
+        f"{hashlib.sha256((tree / name).read_bytes()).hexdigest()}  {name}\n" for name in files
+    )
+    digest = hashlib.sha256(lines.encode()).hexdigest()
+    source = f"https://github.com/{REPO}/tree/{sha}/{TREE.rstrip('/')}"
+    (tree / "MANIFEST").write_text(f"pstack {version}\nsource {source}\ntree sha256:{digest}\n\n{lines}")
+    return len(files), digest
+
+
+def checked_against():
+    found = re.search(r'ADAPTER_CHECKED_AGAINST: &str = "([^"]+)"', ADAPTER_SOURCE.read_text())
+    if not found:
+        sys.exit(f"pstack-sync: no ADAPTER_CHECKED_AGAINST in {ADAPTER_SOURCE}")
+    return found.group(1)
+
+
+def main():
+    if len(sys.argv) != 2 or sys.argv[1].startswith("-"):
+        sys.exit(__doc__)
+    sha = resolve(sys.argv[1])
+    staging = VENDORED.with_name(f".pstack-sync-{os.getpid()}")
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True)
+    try:
+        extract(sha, staging)
+        version = json.loads((staging / "plugin.json").read_text())["version"]
+        files, digest = manifest(staging, version, sha)
+        shutil.rmtree(VENDORED, ignore_errors=True)
+        staging.rename(VENDORED)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    print(f"pstack {version} from {REPO}@{sha}: {files} files, tree sha256:{digest}")
+    adapter = checked_against()
+    if version != adapter:
+        sys.exit(
+            f"pstack-sync: plugin.json says {version} and the adapter was checked against {adapter}. "
+            "Read the diff of vendor/pstack, update docs/harness/solos-swarm.md for any Cursor name "
+            "pstack started to use, then bump ADAPTER_CHECKED_AGAINST in src/agent/pstack.rs and the "
+            "sha256 in tests/fixtures/pstack-entry.json."
+        )
+
+
+if __name__ == "__main__":
+    main()
