@@ -339,22 +339,7 @@ async fn get_tools_lists_run_code_and_the_job_tools_on_a_host_with_run_code_and_
         .unwrap();
     assert_eq!(response.status().as_u16(), 200);
     let listed: Value = response.json().await.unwrap();
-    let mut specs = registry::tools(PrincipalKind::Worker);
-    specs.retain(|tool| {
-        !["vault_list", "read"].contains(&tool.name) && !tool.name.starts_with("browser_")
-    });
-    assert_eq!(
-        listed["tools"],
-        serde_json::to_value(specs).unwrap(),
-        "every worker tool but vault_list, the browser's and read, from the registry: this host \
-         has no vault, no browser and no pstack"
-    );
-    let names: Vec<&str> = listed["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|tool| tool["name"].as_str().unwrap())
-        .collect();
+    // A seat on a host with run_code and no vault, browser or pstack.
     let with_run_code = [
         "worker_report",
         "worker_handback",
@@ -364,6 +349,19 @@ async fn get_tools_lists_run_code_and_the_job_tools_on_a_host_with_run_code_and_
         "job_stop",
         "fetch_url",
     ];
+    let mut specs = registry::tools(PrincipalKind::Worker);
+    specs.retain(|tool| with_run_code.contains(&tool.name));
+    assert_eq!(
+        listed["tools"],
+        serde_json::to_value(specs).unwrap(),
+        "the registry's specs for the tools this host gives: run_code, the job tools and fetch_url"
+    );
+    let names: Vec<&str> = listed["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
     assert_eq!(names, with_run_code);
     assert_eq!(
         w.broker.worker_tools(None, false),

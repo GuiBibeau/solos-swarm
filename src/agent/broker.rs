@@ -8,10 +8,11 @@
 pub mod browser;
 pub mod registry;
 mod secrets;
+mod toolbox;
 
 use super::AgentConfig;
 use super::config::{ExecutorConfig, RepoConfig};
-use super::environment::{Environments, Nodes};
+use super::environment::{Environments, ExecutionEnvironment, Nodes};
 use super::jobs::{Host, JobLimits, Jobs, Refused};
 use super::ports::{Applied, Fact, FactSink};
 use super::pstack::{self, Pstack, Reader};
@@ -27,7 +28,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use registry::{Cap, Caps, PrincipalKind};
+use browser::Browse;
+use registry::{PrincipalKind, RouterOp};
 pub use registry::{ROUTER_TOOLS, WORKER_TOOLS};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -45,6 +47,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::net::UnixListener;
+use toolbox::{Env, Lookup, Toolbox, WorkerCall};
 
 /// The broker's socket in the state directory.
 pub const SOCKET_FILE: &str = "broker.sock";
@@ -99,8 +102,6 @@ pub struct WorkerSeat {
     environment: Option<String>,
     /// A repository Ticket's `<ticket>/host`.
     host_dir: Option<PathBuf>,
-    /// What `read` reaches, made when the seat is admitted.
-    reader: Option<Reader>,
     /// The Ticket's whole budget, which every Assignment of it shares.
     pub budget_microusd: MicroUsd,
     /// The Ticket account's spend from this time on is this Assignment's.
@@ -110,6 +111,9 @@ pub struct WorkerSeat {
     fetched_bytes: AtomicU64,
     jobs: Arc<Jobs>,
     browser: browser::SeatBrowser,
+    /// The worker tools this seat holds. `admit_worker` builds it from the
+    /// seat's environment and the host.
+    held: Toolbox<WorkerCall>,
 }
 
 impl WorkerSeat {
@@ -125,13 +129,13 @@ impl WorkerSeat {
             work_dir,
             environment: None,
             host_dir: None,
-            reader: None,
             budget_microusd,
             since_ms: now_ms(),
             turn: Mutex::new(None),
             fetched_bytes: AtomicU64::new(0),
             jobs: Arc::default(),
             browser: browser::SeatBrowser::default(),
+            held: Toolbox::default(),
         }
     }
 
@@ -416,7 +420,8 @@ struct Inner {
     provider: Arc<dyn Provider>,
     facts: FactSink,
     decide: DecideTerms,
-    workers: Option<WorkerParts>,
+    /// The model terms every admitted worker gets; `None` admits none.
+    worker_terms: Option<ModelTerms>,
     /// `fetch_url`'s egress, apart from the provider's transport.
     client: reqwest::Client,
     keyed: reqwest::Client,
@@ -427,6 +432,10 @@ struct Inner {
     jobs: JobLimits,
     environments: Environments,
     pstack: Option<Arc<Pstack>>,
+    vault: Option<Arc<VaultParts>>,
+    browser: Option<Arc<browser::BrowserParts>>,
+    /// The Router's tools, which need no host resource.
+    router: Toolbox<RouterOp>,
 }
 
 type Refusal = (StatusCode, Json<Value>);
@@ -510,7 +519,20 @@ impl AgentBroker {
                 "agent: charged {orphans} model calls a previous run left open at their hold"
             );
         }
-        let local = workers.as_ref().and_then(|parts| parts.code.clone());
+        let (worker_terms, local, vault, browser) = match workers {
+            Some(WorkerParts {
+                terms,
+                code,
+                vault,
+                browser,
+            }) => (
+                Some(terms),
+                code,
+                vault.map(Arc::new),
+                browser.map(Arc::new),
+            ),
+            None => (None, None, None, None),
+        };
         Ok(Self {
             inner: Arc::new(Inner {
                 dir,
@@ -519,7 +541,7 @@ impl AgentBroker {
                 facts,
                 decide,
                 environments: Environments::new(local, nodes),
-                workers,
+                worker_terms,
                 client: crate::swarm::http_client()?,
                 keyed: reqwest::Client::builder()
                     .no_proxy()
@@ -530,6 +552,9 @@ impl AgentBroker {
                 overrun: AtomicBool::new(false),
                 jobs,
                 pstack,
+                vault,
+                browser,
+                router: toolbox::router(),
             }),
         })
     }
@@ -551,29 +576,18 @@ impl AgentBroker {
         mut seat: WorkerSeat,
         system_prompt: String,
     ) -> Result<Arc<WorkerSeat>> {
-        let parts = self
+        let terms = self
             .inner
-            .workers
-            .as_ref()
+            .worker_terms
+            .clone()
             .context("this broker admits no workers")?;
-        let mut roots: Vec<(&'static str, &Path)> = Vec::new();
-        if let Some(tree) = &self.inner.pstack {
-            roots.push((pstack::MOUNT, tree.root()));
-        }
-        if let Some(host) = &seat.host_dir {
-            roots.extend([
-                (WORK_MOUNT, seat.work_dir.as_path()),
-                (HOST_MOUNT, host.as_path()),
-            ]);
-        }
-        seat.reader = (!roots.is_empty())
-            .then(|| Reader::new(&roots))
-            .transpose()?;
+        let reader = self.seat_reader(&seat)?;
+        seat.held = self.worker_toolbox(seat.environment.as_deref(), reader);
         let seat = Arc::new(seat);
         let grant = Grant {
             principal: Principal::Worker(seat.clone()),
             account: seat.account(),
-            terms: parts.terms.clone(),
+            terms,
             system_prompt: Some(system_prompt),
         };
         self.admit(token, grant)?;
@@ -589,42 +603,26 @@ impl AgentBroker {
         self.inner.pstack.as_ref()
     }
 
-    /// What a worker whose Plan names `environment` may call: the worker
-    /// tools, less `run_code` and the job tools where that environment
-    /// offers no `run_code`, less `vault_list` where this host has no
-    /// vault, and less `read` where it has neither pstack nor, with
-    /// `repository`, a clone to read. A worker's grants and its `GET /tools`.
+    /// What a worker whose Plan names `environment` holds on this host, on a
+    /// Ticket with or without a repository: its grants, and what `GET /tools`
+    /// lists. It is what [`admit_worker`](Self::admit_worker) binds for such a
+    /// seat.
     pub fn worker_tools(&self, environment: Option<&str>, repository: bool) -> Vec<&'static str> {
-        registry::offered(
-            PrincipalKind::Worker,
-            self.capabilities(environment, repository),
-        )
+        self.worker_toolbox(environment, self.unmounted_reader(repository))
+            .names()
     }
 
+    /// What `seat` holds once admitted.
     pub fn seat_tools(&self, seat: &WorkerSeat) -> Vec<&'static str> {
         self.worker_tools(seat.environment.as_deref(), seat.has_repository())
     }
 
-    fn capabilities(&self, environment: Option<&str>, repository: bool) -> Caps {
-        let mut have = self.inner.environments.capabilities(environment);
-        if self.vault().is_some() {
-            have = have.with(Cap::Vault);
-        }
-        if self.browser().is_some() && self.inner.environments.is_local(environment) {
-            have = have.with(Cap::Browser);
-        }
-        if self.inner.pstack.is_some() || repository {
-            have = have.with(Cap::Read);
-        }
-        have
-    }
-
-    fn vault(&self) -> Option<&VaultParts> {
-        self.inner.workers.as_ref()?.vault.as_ref()
-    }
-
-    fn browser(&self) -> Option<&browser::BrowserParts> {
-        self.inner.workers.as_ref()?.browser.as_ref()
+    /// This host's browser, with the vault its logins come from when it has one.
+    fn browse(&self) -> Option<Browse> {
+        Some(Browse {
+            parts: self.inner.browser.clone()?,
+            vault: self.inner.vault.clone(),
+        })
     }
 
     fn worker_seats(&self) -> Vec<Arc<WorkerSeat>> {
@@ -639,18 +637,6 @@ impl AgentBroker {
                 Principal::Router => None,
             })
             .collect()
-    }
-
-    fn unmet_need(&self, principal: &Principal, name: &str) -> Option<String> {
-        let (named, have) = match principal {
-            Principal::Router => (None, Caps::NONE),
-            Principal::Worker(seat) => {
-                let named = seat.environment.as_deref();
-                (named, self.capabilities(named, seat.has_repository()))
-            }
-        };
-        let missing = registry::unmet(principal.kind(), name, have)?;
-        Some(self.inner.environments.why_lacks(named, missing))
     }
 
     /// Refuse `token` from now on. A call already admitted finishes; a
@@ -706,9 +692,9 @@ impl AgentBroker {
     pub fn router(&self) -> Result<axum::Router> {
         let workers = self
             .inner
-            .workers
+            .worker_terms
             .as_ref()
-            .map(|parts| parts.terms.max_input_bytes);
+            .map(|terms| terms.max_input_bytes);
         let largest = self
             .inner
             .grants
@@ -779,15 +765,10 @@ async fn session(State(broker): State<AgentBroker>, headers: HeaderMap) -> Reply
 /// `run_code`, so an MCP host lists only what it can call.
 async fn tools(State(broker): State<AgentBroker>, headers: HeaderMap) -> Reply {
     let grant = broker.authenticate(&headers)?;
-    let kind = grant.principal.kind();
-    let callable = match &grant.principal {
-        Principal::Router => ROUTER_TOOLS.to_vec(),
-        Principal::Worker(seat) => broker.seat_tools(seat),
+    let (kind, offered) = match &grant.principal {
+        Principal::Router => (PrincipalKind::Router, broker.inner.router.specs()),
+        Principal::Worker(seat) => (PrincipalKind::Worker, seat.held.specs()),
     };
-    let offered: Vec<_> = registry::tools(kind)
-        .into_iter()
-        .filter(|tool| callable.contains(&tool.name))
-        .collect();
     Ok(Json(json!({"principal": kind, "tools": offered})))
 }
 
@@ -954,40 +935,61 @@ async fn tool(
     Json(args): Json<Value>,
 ) -> std::result::Result<Response, Refusal> {
     let grant = broker.authenticate(&headers)?;
-    if !grant.principal.tools().contains(&name.as_str()) {
-        return Err(forbidden("tool outside admitted grants"));
+    match &grant.principal {
+        Principal::Router => {
+            let op = held(&broker.inner.router, &name)?;
+            router_call(&broker, *op, args)
+                .await
+                .map(IntoResponse::into_response)
+        }
+        Principal::Worker(seat) => held(&seat.held, &name)?.run(&broker, seat, args).await,
     }
-    if let Some(why) = broker.unmet_need(&grant.principal, &name) {
-        return Err(forbidden(why));
+}
+
+/// The tool `name` as this principal's toolbox holds it. A tool the host
+/// cannot serve is refused with the reason; a name no toolbox has is outside
+/// the grants.
+fn held<'a, C>(toolbox: &'a Toolbox<C>, name: &str) -> std::result::Result<&'a C, Refusal> {
+    match toolbox.get(name) {
+        Lookup::Held(call) => Ok(call),
+        Lookup::Refused(why) => Err(forbidden(why)),
+        Lookup::Unknown => Err(forbidden("tool outside admitted grants")),
     }
-    let reply = match (&grant.principal, name.as_str()) {
-        (Principal::Router, "router_decide") => decide(&broker, args).await,
-        (Principal::Router, "router_read") => read(&broker, args).await,
-        (Principal::Worker(seat), "worker_report") => report(&broker, seat, args).await,
-        (Principal::Worker(seat), "worker_handback") => handback(&broker, seat, args).await,
-        (Principal::Worker(seat), "run_code") => run_code(&broker, seat, args).await,
-        (Principal::Worker(seat), "job_start") => {
-            let host = job_host(&broker, seat)?;
-            seat.jobs.start(&host, args).map(Json).map_err(refused)
-        }
-        (Principal::Worker(seat), "job_wait") => {
-            job_host(&broker, seat)?;
-            seat.jobs.wait(args).await.map(Json).map_err(refused)
-        }
-        (Principal::Worker(seat), "job_stop") => {
-            job_host(&broker, seat)?;
-            seat.jobs.stop(args).await.map(Json).map_err(refused)
-        }
-        (Principal::Worker(seat), "fetch_url") => fetch_url(&broker, seat, args).await,
-        (Principal::Worker(seat), "vault_list") => secrets::vault_list(&broker, seat).await,
-        (Principal::Worker(seat), "read") => read_path(seat, args).await,
-        (
-            Principal::Worker(seat),
-            tool @ ("browser_open" | "browser_act" | "browser_login" | "browser_read"),
-        ) => return browser::call(&broker, seat, tool, args).await,
-        _ => Err(forbidden("unknown tool")),
-    };
-    reply.map(IntoResponse::into_response)
+}
+
+async fn router_call(broker: &AgentBroker, op: RouterOp, args: Value) -> Reply {
+    match op {
+        RouterOp::Decide => decide(broker, args).await,
+        RouterOp::Read => read(broker, args).await,
+    }
+}
+
+impl WorkerCall {
+    async fn run(
+        &self,
+        broker: &AgentBroker,
+        seat: &Arc<WorkerSeat>,
+        args: Value,
+    ) -> std::result::Result<Response, Refusal> {
+        let reply = match self {
+            Self::Browser(tool, browse) => {
+                return browser::call(broker, seat, *tool, browse.clone(), args).await;
+            }
+            Self::Report => report(broker, seat, args).await,
+            Self::Handback => handback(broker, seat, args).await,
+            Self::RunCode(environment) => run_code(broker, seat, environment, args).await,
+            Self::JobStart(environment) => {
+                let host = job_host(broker, seat, environment.as_ref());
+                seat.jobs.start(&host, args).map(Json).map_err(refused)
+            }
+            Self::JobWait => seat.jobs.wait(args).await.map(Json).map_err(refused),
+            Self::JobStop => seat.jobs.stop(args).await.map(Json).map_err(refused),
+            Self::FetchUrl(vault) => fetch_url(broker, seat, vault.as_deref(), args).await,
+            Self::VaultList(vault) => secrets::vault_list(broker, seat, vault).await,
+            Self::ReadPath(reader) => read_path(reader, args).await,
+        };
+        reply.map(IntoResponse::into_response)
+    }
 }
 
 fn arguments<T: serde::de::DeserializeOwned>(args: Value) -> std::result::Result<T, Refusal> {
@@ -1302,8 +1304,13 @@ async fn handback(broker: &AgentBroker, seat: &Arc<WorkerSeat>, args: Value) -> 
 /// `run_code` in the Ticket's directory. Its receipt goes back as is; a
 /// non-zero exit is a result, not an error. One still running after the
 /// background threshold becomes a job.
-async fn run_code(broker: &AgentBroker, seat: &Arc<WorkerSeat>, args: Value) -> Reply {
-    let host = job_host(broker, seat)?;
+async fn run_code(
+    broker: &AgentBroker,
+    seat: &Arc<WorkerSeat>,
+    environment: &Env,
+    args: Value,
+) -> Reply {
+    let host = job_host(broker, seat, environment.as_ref());
     seat.jobs
         .run_code(&host, &args)
         .await
@@ -1311,26 +1318,20 @@ async fn run_code(broker: &AgentBroker, seat: &Arc<WorkerSeat>, args: Value) -> 
         .map_err(refused)
 }
 
-/// Where `seat`'s jobs run, when its environment offers `run_code`.
+/// Where `seat`'s jobs run: the environment its toolbox bound run_code to.
 fn job_host<'a>(
     broker: &'a AgentBroker,
     seat: &'a WorkerSeat,
-) -> std::result::Result<Host<'a>, Refusal> {
-    let environment = broker
-        .inner
-        .environments
-        .get(seat.environment.as_deref())
-        .ok()
-        .flatten()
-        .ok_or_else(|| failed("a tool that needs run_code was admitted without it"))?;
-    Ok(Host {
-        environment: environment.as_ref(),
+    environment: &'a dyn ExecutionEnvironment,
+) -> Host<'a> {
+    Host {
+        environment,
         limits: broker.inner.jobs,
         facts: &broker.inner.facts,
         ticket: &seat.ticket,
         assignment: &seat.assignment,
         work_dir: &seat.work_dir,
-    })
+    }
 }
 
 fn refused(refusal: Refused) -> Refusal {
@@ -1344,7 +1345,12 @@ fn refused(refusal: Refused) -> Refusal {
 
 /// `fetch_url` with swarm mode's limits: each call's bounds in `fetch`, and
 /// a read budget across the Assignment's calls.
-async fn fetch_url(broker: &AgentBroker, seat: &Arc<WorkerSeat>, mut args: Value) -> Reply {
+async fn fetch_url(
+    broker: &AgentBroker,
+    seat: &Arc<WorkerSeat>,
+    vault: Option<&VaultParts>,
+    mut args: Value,
+) -> Reply {
     if seat.fetched_bytes.load(Ordering::SeqCst) >= FETCH_TOTAL_BYTES {
         return Err(forbidden(format!(
             "read budget exhausted after {} MiB; stop fetching and report what you have with worker_report",
@@ -1359,7 +1365,7 @@ async fn fetch_url(broker: &AgentBroker, seat: &Arc<WorkerSeat>, mut args: Value
         None => fetch(&broker.inner.client, &args)
             .await
             .map_err(|err| refuse(StatusCode::BAD_GATEWAY, format!("{err:#}")))?,
-        Some(key) => secrets::fetch(broker, seat, key, &args).await?,
+        Some(key) => secrets::fetch(broker, seat, vault, key, &args).await?,
     };
     let bytes = response["body_bytes"].as_u64().unwrap_or(0);
     seat.fetched_bytes.fetch_add(bytes, Ordering::SeqCst);
@@ -1376,30 +1382,25 @@ struct ReadPathArgs {
     limit: Option<usize>,
 }
 
-async fn read_path(seat: &Arc<WorkerSeat>, args: Value) -> Reply {
+async fn read_path(reader: &Arc<Reader>, args: Value) -> Reply {
     let ReadPathArgs {
         path,
         offset,
         limit,
     } = arguments(args)?;
-    let seat = seat.clone();
-    tokio::task::spawn_blocking(move || match &seat.reader {
-        Some(reader) => reader.read(&path, offset, limit),
-        None => Err(pstack::Refused::Host(
-            "read was admitted without a reader".into(),
-        )),
-    })
-    .await
-    .map_err(failed)?
-    .map(Json)
-    .map_err(|refusal| match refusal {
-        pstack::Refused::Invalid(why) | pstack::Refused::NotText(why) => {
-            refuse(StatusCode::UNPROCESSABLE_ENTITY, why)
-        }
-        pstack::Refused::Leaves(why) => forbidden(why),
-        pstack::Refused::Missing(why) => refuse(StatusCode::NOT_FOUND, why),
-        pstack::Refused::Host(why) => failed(why),
-    })
+    let reader = reader.clone();
+    tokio::task::spawn_blocking(move || reader.read(&path, offset, limit))
+        .await
+        .map_err(failed)?
+        .map(Json)
+        .map_err(|refusal| match refusal {
+            pstack::Refused::Invalid(why) | pstack::Refused::NotText(why) => {
+                refuse(StatusCode::UNPROCESSABLE_ENTITY, why)
+            }
+            pstack::Refused::Leaves(why) => forbidden(why),
+            pstack::Refused::Missing(why) => refuse(StatusCode::NOT_FOUND, why),
+            pstack::Refused::Host(why) => failed(why),
+        })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
