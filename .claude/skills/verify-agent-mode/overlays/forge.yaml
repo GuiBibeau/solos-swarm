@@ -1,0 +1,9 @@
+forge:
+  kind: local
+  remote: forge-remote
+  identity: {name: solos-swarm-verify, email: verify@example.invalid}
+  repos:
+    GuiBibeau/solos-swarm:
+      about: solos-swarm, the agent's own code, Rust and TypeScript.
+      base: main
+      budget_microusd: 500000
