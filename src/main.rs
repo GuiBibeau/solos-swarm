@@ -572,12 +572,7 @@ fn vault_command(host: &Host, command: VaultCommand) -> Result<()> {
     }
 }
 
-fn add_to_vault(
-    config: &Path,
-    item: vault::NewItem,
-    replace: bool,
-    host: &Host,
-) -> Result<()> {
+fn add_to_vault(config: &Path, item: vault::NewItem, replace: bool, host: &Host) -> Result<()> {
     let name = item.name.clone();
     open_vault(config, host)?.add(item, replace)?;
     eprintln!("saved {name}");

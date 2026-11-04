@@ -125,7 +125,10 @@ fn claude_dirs(claude: &ClaudeConfig) -> Vec<PathBuf> {
         .or_else(|| std::env::current_exe().ok());
     [
         Some(binary_dir.to_owned()),
-        claude.node.as_deref().map(|node| node_root(node).to_owned()),
+        claude
+            .node
+            .as_deref()
+            .map(|node| node_root(node).to_owned()),
         solos_swarm,
     ]
     .into_iter()
@@ -214,7 +217,10 @@ budgets: {session_microusd: 500000}
         else {
             panic!("the representative config runs code");
         };
-        binds.extend(run_code_mounts(run_code, Some(Path::new("/srv/pi/vendor/pstack"))));
+        binds.extend(run_code_mounts(
+            run_code,
+            Some(Path::new("/srv/pi/vendor/pstack")),
+        ));
         for bind in binds {
             assert!(
                 view.hides(&bind.source).is_err(),
@@ -228,7 +234,10 @@ budgets: {session_microusd: 500000}
     fn without_a_host_only_the_config_names_mounts() {
         let (config, _) = representative();
         let view = Exposure::new(&config, &Host::default()).view();
-        assert!(view.hides(Path::new("/srv/state/tickets/vault.yaml")).is_ok());
+        assert!(
+            view.hides(Path::new("/srv/state/tickets/vault.yaml"))
+                .is_ok()
+        );
         assert!(view.hides(Path::new("/srv/pi/vendor/x")).is_ok());
         assert!(view.hides(Path::new("/srv/data/x")).is_err());
     }
