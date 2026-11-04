@@ -36,8 +36,9 @@ harness it uses), and `Gotchas`.
 | Feature | Last driven live | Result |
 |---|---|---|
 | [Ask and get real work done](./ask-and-answer.md) | 2026-11-04, v20261104-1032, b04f9f2 | passed: open PRs and PR #51 matched `gh` |
-| [Browse a page with a signed trail](./browser-trail.md) | 2026-11-04, v20261104-1032, b04f9f2 | passed: `agent trail` 3 steps, 3 signatures ok |
-| [Use an API key the model never sees](./keyed-fetch.md) | 2026-11-04, v20261104-1032, b04f9f2 | passed: probe 200 only with the vault key, `key_used` on the chain |
+| [Code work on a repository, the pstack way](./pstack-repo.md) | 2026-11-04, v20261104-1815, 04ceeec | passed: answer and commit id matched the clone, poteto-mode entered, commit by the forge identity, remote untouched |
+| [Browse a page with a signed trail](./browser-trail.md) | 2026-11-04, v20261104-1815, 04ceeec | passed: `agent trail` 2 steps, 2 signatures ok, 2 blobs ok |
+| [Use an API key the model never sees](./keyed-fetch.md) | 2026-11-04, v20261104-1815, 04ceeec | passed: probe 401 without, 200 with the vault key, `key_used` on the chain, no test value in state |
 | [Chat on Discord with approvals](./discord-chat.md) | 2026-11-04, zelix, b04f9f2, scripted Router | passed: approval buttons, Approve, result |
 | [Follow up on a running request](./follow-up.md) | not yet | seeded |
 
