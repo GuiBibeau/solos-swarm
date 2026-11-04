@@ -13,12 +13,12 @@ use super::goal_template::GoalTemplates;
 use super::jobs::{self, JobLimits};
 use super::simulated::TimeFactor;
 use super::trail::TrailStoreConfig;
-use super::{discord, github, mcp, slack};
+use super::{discord, github, mcp, pstack, slack};
 use crate::browse::BrowserConfig;
 use crate::code::{self, Mount};
 use crate::gateway::{PriceTable, upstream_profile};
 use crate::vault::{SandboxView, VaultConfig};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Deserializer};
 use solos_agent_core::AllowlistPolicy;
 use solos_agent_core::model::MicroUsd;
@@ -54,10 +54,27 @@ pub struct AgentConfig {
     /// Where the browser's trail blobs are kept, and how much.
     #[serde(default)]
     pub trail: TrailStoreConfig,
+    #[serde(default)]
+    pub pstack: Option<PstackConfig>,
 }
 
 fn pass_through() -> bool {
     true
+}
+
+/// pstack in every worker: its first prompt enters `entry`, its system
+/// prompt carries the adapter, and it may `read` the tree.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PstackConfig {
+    /// The skill every worker enters, a directory under
+    /// `vendor/pstack/skills`.
+    #[serde(default = "pstack_entry")]
+    pub entry: String,
+}
+
+fn pstack_entry() -> String {
+    "poteto-mode".to_owned()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -660,7 +677,26 @@ impl AgentConfig {
                 );
             }
         }
+        self.validate_pstack()?;
         self.validate_executor()
+    }
+
+    fn validate_pstack(&self) -> Result<()> {
+        if self.pstack.is_none() {
+            return Ok(());
+        }
+        let ExecutorConfig::Pi { run_code, .. } = &self.executor else {
+            bail!("pstack needs executor: {{kind: pi}}, whose workers it enters");
+        };
+        let mounts = run_code.iter().flat_map(|run_code| &run_code.mounts);
+        for mount in mounts {
+            ensure!(
+                mount.target != Path::new(pstack::MOUNT),
+                "executor.run_code mounts {}, where pstack is while pstack is on",
+                pstack::MOUNT
+            );
+        }
+        Ok(())
     }
 
     fn validate_executor(&self) -> Result<()> {
@@ -1171,6 +1207,36 @@ budgets: {session_microusd: 500000}
         edit(pi(|yaml| {
             yaml.replace("executor: {kind: scripted}\n", WORKERS)
         }))
+    }
+
+    #[test]
+    fn pstack_enters_poteto_mode_unless_named_and_needs_pi_workers_and_its_mount() {
+        let on = |yaml: String, pstack: &str| format!("{yaml}pstack: {pstack}\n");
+        let config = parse(&on(workers(|yaml| yaml), "{}")).unwrap();
+        assert_eq!(config.pstack.unwrap().entry, "poteto-mode");
+        let named = parse(&on(workers(|yaml| yaml), "{entry: how}")).unwrap();
+        assert_eq!(named.pstack.unwrap().entry, "how");
+        assert_eq!(parse(&workers(|yaml| yaml)).unwrap().pstack, None);
+        for (yaml, why) in [
+            (
+                on(VALID.to_owned(), "{}"),
+                "pstack needs executor: {kind: pi}",
+            ),
+            (
+                on(
+                    workers(|yaml| yaml.replace("target: /repo", "target: /pstack")),
+                    "{}",
+                ),
+                "executor.run_code mounts /pstack",
+            ),
+            (
+                on(workers(|yaml| yaml), "{entry: how, models: {}}"),
+                "unknown field `models`",
+            ),
+        ] {
+            let refused = format!("{:#}", parse(&yaml).unwrap_err());
+            assert!(refused.contains(why), "{refused}");
+        }
     }
 
     #[test]

@@ -33,7 +33,7 @@ pub use runtime::{Adapters, HOST_RESTARTED, RunOptions, Runtime, Summary};
 
 use crate::broker::{now_ms, write_json};
 use crate::browse::{Browsers, Launcher, TrailSigner};
-use crate::code::{CodeConfig, CodeExecutor};
+use crate::code::{CodeConfig, CodeExecutor, Mount};
 use crate::gateway::{Provider, provider_for, upstream_profile};
 use crate::harness::claude_code::ClaudeCodeHarness;
 use crate::harness::{AgentHarness, PiHarness, Role, SessionSpec};
@@ -55,6 +55,7 @@ use jsonl::{JsonlChannel, JsonlSource};
 use pi_executor::{PiExecutor, PiExecutorParts};
 use pi_router::PiRouter;
 use ports::{Channel, Executor, Router, Source};
+use pstack::Pstack;
 use schedule::ScheduleSource;
 use scripted::{ScriptedExecutor, ScriptedRouter};
 use serde_json::json;
@@ -313,6 +314,20 @@ where
         } = host;
         let harness = Arc::new(harness);
         let (pi_root, node) = (canonical(&pi_root)?, canonical(&node)?);
+        let pstack = match &config.pstack {
+            None => None,
+            Some(wanted) => {
+                let opened = Pstack::open(&pi_root, &wanted.entry).context("pstack")?;
+                eprintln!(
+                    "agent: pstack {} at {}, tree sha256:{}, adapter sha256:{}",
+                    opened.version(),
+                    opened.root().display(),
+                    opened.digest(),
+                    pstack::sha256_hex(pstack::ADAPTER.as_bytes())
+                );
+                Some(Arc::new(opened))
+            }
+        };
         let tickets_dir = canonical(state_dir)?.join(TICKETS_DIR);
         let readable = config.sandbox_view().and([
             tickets_dir.clone(),
@@ -333,10 +348,13 @@ where
             } => {
                 let code = match run_code {
                     None => None,
-                    Some(run_code) => Some(Arc::new(
-                        CodeExecutor::from_config(code_config(run_code, &tickets_dir))
-                            .context("executor.run_code")?,
-                    )),
+                    Some(run_code) => {
+                        let tree = pstack.as_deref().map(Pstack::root);
+                        let sandbox = code_config(run_code, &tickets_dir, tree);
+                        let code =
+                            CodeExecutor::from_config(sandbox).context("executor.run_code")?;
+                        Some(Arc::new(code))
+                    }
                 };
                 let terms = ModelTerms {
                     upstream: upstream_profile(provider, model)?,
@@ -401,7 +419,7 @@ where
             },
             nodes: nodes.map(Listener::environments).unwrap_or_default(),
         };
-        let broker = AgentBroker::with_nodes(parts, job_limits, remote)?;
+        let broker = AgentBroker::with_pstack(parts, job_limits, remote, pstack)?;
         let swarm = match &config.executor {
             ExecutorConfig::Pi {
                 provider: name,
@@ -542,8 +560,13 @@ fn claude_harness(install: &ClaudeConfig) -> Result<ClaudeCodeHarness> {
 
 /// The workers' `run_code` sandbox, with every scratch directory under the
 /// Tickets' directory.
-fn code_config(run_code: &RunCodeConfig, tickets_dir: &Path) -> CodeConfig {
-    let mut code = CodeConfig::new(tickets_dir.to_owned(), run_code.mounts.clone());
+fn code_config(run_code: &RunCodeConfig, tickets_dir: &Path, tree: Option<&Path>) -> CodeConfig {
+    let mut mounts = run_code.mounts.clone();
+    mounts.extend(tree.map(|root| Mount {
+        target: PathBuf::from(pstack::MOUNT),
+        source: root.to_owned(),
+    }));
+    let mut code = CodeConfig::new(tickets_dir.to_owned(), mounts);
     code.uv_root = run_code.uv_root.clone();
     code.concurrency = run_code.concurrency;
     code.memory_bytes = run_code.memory_bytes;
