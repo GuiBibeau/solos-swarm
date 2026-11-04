@@ -25,6 +25,11 @@ const MANIFEST: &str = "MANIFEST";
 const PAGE_LINES: usize = 2_000;
 const PAGE_BYTES: usize = 256 * 1024;
 const PAGE_ENTRIES: usize = 2_000;
+/// `read` is also served `/work`, which a worker writes, so what it scans to
+/// answer is bounded: a file's first 32 MiB are counted for its `total`, and
+/// a directory's first 20,000 entries are listed from.
+const SCAN_BYTES: usize = 32 * 1024 * 1024;
+const SCAN_ENTRIES: usize = 10 * PAGE_ENTRIES;
 const SNIFF_BYTES: usize = 8 * 1024;
 #[cfg(target_os = "linux")]
 const OPEN_TRIES: u32 = 64;
@@ -505,43 +510,49 @@ fn open_beneath(
 
 fn list(path: &str, dir: &File) -> std::result::Result<Value, Refused> {
     let failed = |err: std::io::Error| Refused::Host(format!("cannot list {path}: {err}"));
+    // A directory of millions of entries is read for its first SCAN_ENTRIES
+    // alone, and only the PAGE_ENTRIES that are listed are looked at.
     let mut entries = Vec::new();
+    let mut unscanned = false;
     for entry in std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd())).map_err(failed)? {
+        if entries.len() == SCAN_ENTRIES {
+            unscanned = true;
+            break;
+        }
         let entry = entry.map_err(failed)?;
         let kind = entry.file_type().map_err(failed)?;
-        let (kind, bytes) = if kind.is_file() {
-            ("file", Some(entry.metadata().map_err(failed)?.len()))
-        } else if kind.is_dir() {
-            ("dir", None)
-        } else if kind.is_symlink() {
-            ("link", None)
-        } else {
-            ("other", None)
-        };
         entries.push((
             entry.file_name().to_string_lossy().into_owned(),
             kind,
-            bytes,
+            entry,
         ));
     }
-    entries.sort();
-    let truncated = entries.len() > PAGE_ENTRIES;
-    let entries: Vec<Value> = entries
-        .into_iter()
-        .take(PAGE_ENTRIES)
-        .map(|(name, kind, bytes)| match bytes {
-            Some(bytes) => json!({"name": name, "kind": kind, "bytes": bytes}),
-            None => json!({"name": name, "kind": kind}),
-        })
-        .collect();
-    Ok(json!({"path": path, "entries": entries, "truncated": truncated}))
+    entries.sort_by(|(a, ..), (b, ..)| a.cmp(b));
+    let truncated = unscanned || entries.len() > PAGE_ENTRIES;
+    let mut listed = Vec::new();
+    for (name, kind, entry) in entries.into_iter().take(PAGE_ENTRIES) {
+        listed.push(if kind.is_file() {
+            let bytes = entry.metadata().map_err(failed)?.len();
+            json!({"name": name, "kind": "file", "bytes": bytes})
+        } else {
+            let kind = if kind.is_dir() {
+                "dir"
+            } else if kind.is_symlink() {
+                "link"
+            } else {
+                "other"
+            };
+            json!({"name": name, "kind": kind})
+        });
+    }
+    Ok(json!({"path": path, "entries": listed, "truncated": truncated}))
 }
 
 fn page(path: &str, file: File, from: usize, limit: usize) -> std::result::Result<Value, Refused> {
     let failed = |err: std::io::Error| Refused::Host(format!("cannot read {path}: {err}"));
     let mut reader = BufReader::with_capacity(64 * 1024, file);
     let mut page = Page::new(from, from.saturating_add(limit - 1));
-    let (mut line, mut sniffed, mut partial) = (1, 0, false);
+    let (mut line, mut sniffed, mut scanned, mut partial, mut capped) = (1, 0, 0, false, false);
     loop {
         let chunk = reader.fill_buf().map_err(failed)?;
         if chunk.is_empty() {
@@ -565,13 +576,28 @@ fn page(path: &str, file: File, from: usize, limit: usize) -> std::result::Resul
         }
         let read = chunk.len();
         reader.consume(read);
+        scanned += read;
+        if scanned >= SCAN_BYTES {
+            capped = !reader.fill_buf().map_err(failed)?.is_empty();
+            break;
+        }
     }
     page.end();
     let total = line - 1 + usize::from(partial);
+    if capped && partial && page.to == line {
+        // The scan stopped inside this line, so the page ends short of it.
+        page.cut = true;
+    }
     if total > 0 && from > total {
-        return Err(Refused::Invalid(format!(
-            "{path} has {total} lines; offset {from} is past its end"
-        )));
+        return Err(Refused::Invalid(if capped {
+            format!(
+                "{path} has at least {total} lines; offset {from} is past the first {} MiB, \
+                 which is as far as read goes into a file",
+                SCAN_BYTES >> 20
+            )
+        } else {
+            format!("{path} has {total} lines; offset {from} is past its end")
+        }));
     }
     let mut text = page.text;
     if page.cut
@@ -582,14 +608,16 @@ fn page(path: &str, file: File, from: usize, limit: usize) -> std::result::Resul
     }
     let lines = String::from_utf8(text)
         .map_err(|_| Refused::NotText(format!("{path} is not UTF-8 text")))?;
-    Ok(json!({
+    let mut reply = json!({
         "path": path,
         "from": from,
         "to": page.to,
-        "total": total,
         "cut": page.cut,
         "lines": lines,
-    }))
+    });
+    // Past SCAN_BYTES the count is a floor, and it is named as one.
+    reply[if capped { "total_at_least" } else { "total" }] = json!(total);
+    Ok(reply)
 }
 
 struct Page {
@@ -874,7 +902,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     mod reader {
-        use super::super::{MOUNT, Reader, Refused};
+        use super::super::{MOUNT, PAGE_ENTRIES, Reader, Refused, SCAN_BYTES, SCAN_ENTRIES};
         use super::{scratch, vendored};
         use serde_json::{Value, json};
         use std::os::unix::fs::symlink;
@@ -1064,6 +1092,75 @@ mod tests {
             let lines = cut["lines"].as_str().unwrap();
             assert!(lines.len() <= 256 * 1024 && lines.len() > 256 * 1024 - 2);
             assert!(huge.starts_with(lines.split_once('\t').unwrap().1));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn a_file_is_counted_only_as_far_as_the_scan_goes_and_the_total_says_at_least() {
+            let (dir, root, reader) = world();
+            let lines = SCAN_BYTES / 2;
+            std::fs::write(root.join("exact.txt"), "x\n".repeat(lines)).unwrap();
+            let exact = reader.read("/pstack/exact.txt", None, None).unwrap();
+            assert_eq!(
+                exact["total"], lines,
+                "a file of exactly the bound is counted"
+            );
+            assert!(exact.get("total_at_least").is_none());
+
+            std::fs::write(root.join("big.txt"), "x\n".repeat(lines + lines / 4)).unwrap();
+            let big = reader.read("/pstack/big.txt", None, None).unwrap();
+            assert_eq!(big["total_at_least"], lines);
+            assert!(big.get("total").is_none(), "{big}");
+            assert_eq!(big["to"], 2_000);
+            let deep = reader
+                .read("/pstack/big.txt", Some(lines - 1), Some(2))
+                .unwrap();
+            assert_eq!(
+                deep["lines"],
+                format!("{}\tx\n{lines}\tx\n", lines - 1),
+                "a page inside the scanned part is served"
+            );
+            let past = reader.read("/pstack/big.txt", Some(lines + 1), None);
+            assert!(
+                matches!(&past, Err(Refused::Invalid(why))
+                    if why.contains(&format!("has at least {lines} lines"))),
+                "{past:?}"
+            );
+
+            let mut straddles = "x\n".repeat(lines - 1);
+            straddles.push_str("yyyyyyyy\nz\n");
+            std::fs::write(root.join("straddles.txt"), straddles).unwrap();
+            let last = reader
+                .read("/pstack/straddles.txt", Some(lines), Some(5))
+                .unwrap();
+            assert_eq!(last["lines"], format!("{lines}\tyy"));
+            assert_eq!(
+                last["cut"], true,
+                "the line the scan stopped in is cut short"
+            );
+            assert_eq!(last["total_at_least"], lines);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn a_directory_is_listed_from_its_first_entries_only() {
+            let (dir, root, reader) = world();
+            let many = root.join("many");
+            std::fs::create_dir(&many).unwrap();
+            for n in 0..SCAN_ENTRIES + 5 {
+                std::fs::File::create(many.join(format!("f{n:06}"))).unwrap();
+            }
+            let listed = reader.read("/pstack/many", None, None).unwrap();
+            let names = listed["entries"].as_array().unwrap();
+            assert_eq!(names.len(), PAGE_ENTRIES);
+            assert_eq!(listed["truncated"], true);
+            assert!(
+                names
+                    .windows(2)
+                    .all(|pair| pair[0]["name"].as_str() < pair[1]["name"].as_str()),
+                "what is listed is in order"
+            );
+            assert!(names.iter().all(|entry| entry["bytes"] == 0));
             std::fs::remove_dir_all(dir).unwrap();
         }
     }
