@@ -16,6 +16,7 @@ pub mod diagnostics;
 pub mod domain;
 pub mod evaluator;
 pub mod evaluator_runtime;
+pub mod exposure;
 pub mod flow;
 pub mod gateway;
 pub mod harness;

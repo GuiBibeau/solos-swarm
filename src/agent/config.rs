@@ -17,7 +17,7 @@ use super::{discord, github, mcp, pstack, slack};
 use crate::browse::BrowserConfig;
 use crate::code::{self, Mount};
 use crate::gateway::{PriceTable, upstream_profile};
-use crate::vault::{SandboxView, VaultConfig};
+use crate::vault::VaultConfig;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Deserializer};
 use solos_agent_core::AllowlistPolicy;
@@ -539,34 +539,6 @@ impl AgentConfig {
             GoalTemplates::load(swarm, provider)?.check(config.budgets.session_microusd)?;
         }
         Ok(config)
-    }
-
-    pub fn sandbox_view(&self) -> SandboxView {
-        let ExecutorConfig::Pi {
-            run_code, claude, ..
-        } = &self.executor
-        else {
-            return SandboxView::new([]);
-        };
-        let run_code = run_code.iter().flat_map(|run_code| {
-            let mounts = run_code.mounts.iter().map(|mount| mount.source.clone());
-            mounts.chain(run_code.uv_root.clone())
-        });
-        let claude = claude.iter().flat_map(|claude| {
-            let node_root = claude
-                .node
-                .as_deref()
-                .map(|node| crate::harness::node_root(node).to_owned());
-            let binary_dir = claude.binary.parent().unwrap_or(&claude.binary);
-            [
-                Some(binary_dir.to_owned()),
-                node_root,
-                claude.solos_swarm.clone(),
-            ]
-            .into_iter()
-            .flatten()
-        });
-        SandboxView::new(run_code.chain(claude))
     }
 
     pub fn validate(&self) -> Result<()> {

@@ -4,6 +4,7 @@ mod smoke;
 use solos_swarm::{
     broker,
     bwrap::Bwrap,
+    exposure::{Exposure, Host},
     gateway::provider_for,
     harness::{PiHarness, Role, SessionSpec, bounded_line},
     swarm::{self, GoalRun, GoalStatus},
@@ -79,6 +80,8 @@ enum Action {
     /// This machine's logins and API keys, which agent mode uses without a
     /// model ever seeing a value. No command prints a value.
     Vault {
+        #[command(flatten)]
+        host: HostArgs,
         #[command(subcommand)]
         command: VaultCommand,
     },
@@ -159,6 +162,32 @@ enum Action {
         #[arg(long)]
         url: String,
     },
+}
+
+/// The paths `agent serve` adds to its sandboxes, which a vault, key or
+/// trail path must stay out of. Give the ones `agent serve` got, or the
+/// check covers only the config's mounts.
+#[derive(clap::Args)]
+struct HostArgs {
+    /// The agent's state directory.
+    #[arg(long, global = true)]
+    state_dir: Option<PathBuf>,
+    /// A Pi Router or Pi workers: the checkout that holds `node_modules`.
+    #[arg(long, global = true)]
+    pi_root: Option<PathBuf>,
+    /// A Pi Router or Pi workers: the node binary.
+    #[arg(long, global = true)]
+    node: Option<PathBuf>,
+}
+
+impl HostArgs {
+    fn host(&self) -> Host {
+        Host {
+            state_dir: self.state_dir.clone(),
+            pi_root: self.pi_root.clone(),
+            node: self.node.clone(),
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -458,11 +487,11 @@ fn consume_credential(path: &Path) -> Result<Zeroizing<String>> {
     Ok(Zeroizing::new(raw.trim().to_owned()))
 }
 
-fn vault_command(command: VaultCommand) -> Result<()> {
+fn vault_command(host: &Host, command: VaultCommand) -> Result<()> {
     use vault::{ItemKind, NewItem, SecretValue, Vault};
     match command {
         VaultCommand::Init { config } => {
-            let (config, view) = vault_config(&config)?;
+            let (config, view) = vault_config(&config, host)?;
             Vault::init(&config, &view)?;
             eprintln!(
                 "the vault {} is ready, under the key {}",
@@ -494,7 +523,7 @@ fn vault_command(command: VaultCommand) -> Result<()> {
                 approval,
                 value,
             };
-            add_to_vault(&config, item, replace)
+            add_to_vault(&config, item, replace, host)
         }
         VaultCommand::AddKey {
             config,
@@ -521,10 +550,10 @@ fn vault_command(command: VaultCommand) -> Result<()> {
                 approval,
                 value,
             };
-            add_to_vault(&config, item, replace)
+            add_to_vault(&config, item, replace, host)
         }
         VaultCommand::List { config, json } => {
-            let items = open_vault(&config)?.list()?;
+            let items = open_vault(&config, host)?.list()?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&items)?);
             } else {
@@ -534,7 +563,7 @@ fn vault_command(command: VaultCommand) -> Result<()> {
         }
         VaultCommand::Remove { config, name } => {
             ensure!(
-                open_vault(&config)?.remove(&name)?,
+                open_vault(&config, host)?.remove(&name)?,
                 "the vault holds no item {name}"
             );
             eprintln!("removed {name}");
@@ -543,19 +572,24 @@ fn vault_command(command: VaultCommand) -> Result<()> {
     }
 }
 
-fn add_to_vault(config: &Path, item: vault::NewItem, replace: bool) -> Result<()> {
+fn add_to_vault(
+    config: &Path,
+    item: vault::NewItem,
+    replace: bool,
+    host: &Host,
+) -> Result<()> {
     let name = item.name.clone();
-    open_vault(config)?.add(item, replace)?;
+    open_vault(config, host)?.add(item, replace)?;
     eprintln!("saved {name}");
     Ok(())
 }
 
-fn open_vault(config: &Path) -> Result<vault::Vault> {
-    let (config, view) = vault_config(config)?;
+fn open_vault(config: &Path, host: &Host) -> Result<vault::Vault> {
+    let (config, view) = vault_config(config, host)?;
     vault::Vault::open(&config, &view)
 }
 
-fn vault_config(path: &Path) -> Result<(vault::VaultConfig, vault::SandboxView)> {
+fn vault_config(path: &Path, host: &Host) -> Result<(vault::VaultConfig, vault::SandboxView)> {
     let shown = path.display();
     let bytes = fs::read(path).with_context(|| format!("cannot read {shown}"))?;
     let yaml: serde_yaml::Value =
@@ -566,7 +600,7 @@ fn vault_config(path: &Path) -> Result<(vault::VaultConfig, vault::SandboxView)>
         (node.vault, view)
     } else {
         let agent = solos_swarm::agent::AgentConfig::load(path)?;
-        let view = agent.sandbox_view();
+        let view = Exposure::new(&agent, host).view();
         (agent.vault, view)
     };
     let config = config.with_context(|| format!("{shown} has no vault: section"))?;
@@ -851,7 +885,7 @@ async fn execute(command: Action) -> Result<()> {
             solos_swarm::remote::tls::NODE_NAME,
             "the agent's nodes.allow.<name>.fingerprint",
         ),
-        Action::Vault { command } => vault_command(command),
+        Action::Vault { host, command } => vault_command(&host.host(), command),
         Action::Browser {
             command: BrowserCommand::InitKey { out },
         } => solos_swarm::browse::TrailSigner::init(&out, &vault::SandboxView::new([]))
@@ -1291,6 +1325,46 @@ mod tests {
             // `env_clear` has no stable getter; the unix Debug form prints it as `env -i`.
             assert!(format!("{command:?}").starts_with("env -i "), "{command:?}");
         }
+    }
+
+    /// The Pi agent config `agent serve` judges a vault against.
+    const PI_AGENT: &str = "policy: {people: [slack:alice]}
+sources: [{kind: jsonl, path: triggers.jsonl}]
+channels: [{kind: jsonl, source: slack, path: outbox.jsonl}]
+router: {kind: scripted}
+executor: {kind: pi, provider: deepseek, model: deepseek-flash, max_output_tokens: 2048, prices: {input_microusd_per_million: 300000, output_microusd_per_million: 1200000, cache_hit_microusd_per_million: 6000}}
+vault: {path: VAULT, key_file: KEY}
+budgets: {session_microusd: 500000}
+";
+
+    #[test]
+    fn the_vault_cli_refuses_the_paths_agent_serve_refuses_under_its_mounts() {
+        let dir = std::env::temp_dir().join(format!("swarm-vault-cli-{}", uuid::Uuid::new_v4()));
+        let (state, pi_root) = (dir.join("state"), dir.join("pi"));
+        let host = Host {
+            state_dir: Some(state.clone()),
+            pi_root: Some(pi_root.clone()),
+            node: None,
+        };
+        let cases = [
+            (state.join("tickets/vault.yaml"), dir.join("keys/vault.key")),
+            (dir.join("keys/vault.yaml"), pi_root.join("vault.key")),
+        ];
+        for (vault, key) in cases {
+            let path = dir.join("agent.yaml");
+            std::fs::create_dir_all(&dir).unwrap();
+            let yaml = PI_AGENT
+                .replace("VAULT", &vault.display().to_string())
+                .replace("KEY", &key.display().to_string());
+            std::fs::write(&path, yaml).unwrap();
+            let (config, view) = vault_config(&path, &host).unwrap();
+            assert!(
+                vault::Vault::init(&config, &view).is_err(),
+                "{} is under a mount serve uses",
+                vault.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

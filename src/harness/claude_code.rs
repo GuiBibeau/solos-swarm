@@ -10,6 +10,7 @@ use super::{
     AgentHarness, Observation, PiSession, Session, SessionEvent, SessionSpec, frames, stderr_log,
 };
 use crate::bwrap::Bwrap;
+use crate::exposure::{self, CLAUDE, NODE, SOLOS_SWARM};
 use crate::gateway::anthropic::MCP_SERVER;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -23,9 +24,6 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 
 /// Where the session's own pieces are inside the sandbox.
-const CLAUDE: &str = "/runtime/claude";
-const NODE: &str = "/runtime/node";
-const SOLOS_SWARM: &str = "/runtime/solos-swarm";
 const MCP_CONFIG: &str = "/runtime/mcp.json";
 const TOKEN: &str = "/runtime/token";
 const SOCKET: &str = "/broker.sock";
@@ -73,12 +71,9 @@ impl ClaudeCodeHarness {
             sandbox.dir("/work")
         };
         let mut program = Vec::new();
-        sandbox = match &self.node {
-            None => {
-                program.push(CLAUDE.to_owned());
-                sandbox.ro_bind(&self.binary, CLAUDE)
-            }
-            Some(node) => {
+        match &self.node {
+            None => program.push(CLAUDE.to_owned()),
+            Some(_) => {
                 let name = self
                     .binary
                     .file_name()
@@ -86,11 +81,11 @@ impl ClaudeCodeHarness {
                     .to_string_lossy();
                 program.push(format!("{NODE}/bin/node"));
                 program.push(format!("{CLAUDE}/{name}"));
-                sandbox
-                    .ro_bind(super::node_root(node), NODE)
-                    .ro_bind(self.binary.parent().unwrap_or(&self.binary), CLAUDE)
             }
-        };
+        }
+        for bind in exposure::claude_binds(&self.binary, self.node.as_deref(), &self.solos_swarm) {
+            sandbox = exposure::read_only(sandbox, &bind);
+        }
         let allowed: Vec<String> = spec
             .grants
             .iter()
@@ -128,7 +123,6 @@ impl ClaudeCodeHarness {
             program.extend(["--system-prompt".to_owned(), prompt.to_owned()]);
         }
         let args = sandbox
-            .ro_bind(&self.solos_swarm, SOLOS_SWARM)
             .ro_bind(&files.mcp_config, MCP_CONFIG)
             .ro_bind(&files.token, TOKEN)
             .ro_bind(&spec.broker_socket, SOCKET)
