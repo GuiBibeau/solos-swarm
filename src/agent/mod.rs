@@ -8,6 +8,7 @@ pub mod broker;
 pub mod config;
 pub mod discord;
 pub mod environment;
+pub mod forge;
 pub mod github;
 pub mod goal_template;
 pub mod jobs;
@@ -485,6 +486,11 @@ where
                 model,
                 max_workers: *max_workers,
                 prepare: prepare.clone(),
+                forge: config
+                    .forge
+                    .as_ref()
+                    .map(|wanted| forge::open(wanted, canonical(state_dir)?.join(forge::FORGE_DIR)))
+                    .transpose()?,
                 swarm,
             })?)),
             _ => None,

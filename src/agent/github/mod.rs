@@ -115,7 +115,7 @@ impl Token {
         Ok(Self::new(token))
     }
 
-    fn secret(&self) -> &str {
+    pub(crate) fn secret(&self) -> &str {
         self.0.as_str()
     }
 }

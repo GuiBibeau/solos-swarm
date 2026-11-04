@@ -9,7 +9,9 @@
 use super::broker::{self, AgentBroker, WorkerSeat, browser, clip};
 use super::config::HarnessKind;
 use super::environment::{self, Launchable};
-use super::ports::{BoxFuture, Delivered, Delivery, Executor, Fact, FactSink, Launch};
+use super::ports::{
+    BoxFuture, Delivered, Delivery, Executor, Fact, FactSink, Forge, Launch, TicketDirs, Workspace,
+};
 use super::swarm_executor::SwarmExecutor;
 use crate::broker::write_json;
 use crate::harness::claude_code::ClaudeCodeHarness;
@@ -34,6 +36,9 @@ use tokio::task::JoinHandle;
 
 /// `run_code`'s `/work`, inside the Ticket's directory.
 pub const WORK_DIR: &str = "work";
+/// What the host writes about a repository Ticket, which `read` serves at
+/// `/host`.
+pub const HOST_DIR: &str = "host";
 /// Written once the prepare command succeeded, so it runs once per Ticket.
 const PREPARED: &str = "prepared";
 const PREPARE_WAIT: Duration = Duration::from_secs(300);
@@ -211,6 +216,25 @@ pub fn assignment_text(launch: &Launch, run_code: bool) -> String {
     text
 }
 
+fn repository_text(workspace: &Workspace) -> String {
+    let Workspace {
+        repo,
+        base,
+        base_commit,
+        notes,
+    } = workspace;
+    let short = base_commit.get(..7).unwrap_or(base_commit);
+    let mut text = format!(
+        "Repository: {repo}, base {base}. /work is a clone of it at {base}'s tip ({short}), with \
+         its history and your commit identity: run git and its code there with run_code, and \
+         read its files with read. /host/repo.json says the same."
+    );
+    if let Some(notes) = notes {
+        let _ = write!(text, "\nNotes on {repo}: {}", notes.trim());
+    }
+    text
+}
+
 /// A later prompt: Inputs that reached the Ticket after its assignment.
 pub fn delivery_text(ticket: &TicketId, inputs: &[Delivered]) -> String {
     let mut text = format!("New input on ticket {ticket}, oldest first:");
@@ -273,6 +297,8 @@ pub struct PiExecutorParts<H, C = ClaudeCodeHarness> {
     /// A shell command run once per Ticket in its directory before its
     /// first worker, with `SOLOS_TICKET` and `SOLOS_WORK_DIR` set.
     pub prepare: Option<String>,
+    /// Clones a repository Ticket's `work`; without it such a Ticket fails.
+    pub forge: Option<Arc<dyn Forge>>,
     /// Runs `Plan::Swarm` Assignments; without it they fail.
     pub swarm: Option<SwarmExecutor<H>>,
 }
@@ -540,28 +566,55 @@ where
         let parts = &self.parts;
         let dir = self.ticket_dir(&launch.ticket)?;
         let work = dir.join(WORK_DIR);
+        let host = dir.join(HOST_DIR);
         let named = environment::named(&launch.plan);
         let environments = parts.broker.environments();
+        let workspace = match &launch.repo {
+            None => None,
+            Some(repo) => {
+                ensure!(
+                    environments.is_local(named),
+                    "a ticket on a repository runs on this host only"
+                );
+                let forge = parts
+                    .forge
+                    .as_ref()
+                    .with_context(|| format!("this agent has no forge to clone {repo} from"))?;
+                private_dir(&host)?;
+                let dirs = TicketDirs {
+                    work: &work,
+                    host: &host,
+                };
+                let cloned = forge.prepare(repo, dirs).await;
+                Some(cloned.with_context(|| format!("{repo} was not cloned"))?)
+            }
+        };
         // A node's /work is its own, so this host's prepare has nothing to set up there.
         if environments.is_local(named) {
             self.prepare(&launch.ticket, &dir, &work).await?;
         }
         let token = broker::new_token();
-        let grants: Vec<String> = parts
-            .broker
-            .worker_tools(named)
-            .into_iter()
-            .map(String::from)
-            .collect();
-        let run_code = grants.iter().any(|tool| tool == "run_code");
-        let seat = WorkerSeat::new(
+        let mut seat = WorkerSeat::new(
             launch.ticket.clone(),
             launch.assignment.clone(),
             work,
             launch.budget_microusd,
         )
         .in_environment(named.map(str::to_owned));
+        if workspace.is_some() {
+            seat = seat.on_repository(host);
+        }
+        let grants: Vec<String> = parts
+            .broker
+            .seat_tools(&seat)
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let run_code = grants.iter().any(|tool| tool == "run_code");
         let mut prompt = system_prompt(launch.budget_microusd, &grants);
+        if let Some(workspace) = &workspace {
+            prompt = format!("{prompt}\n\n{}", repository_text(workspace));
+        }
         let mut assignment = assignment_text(launch, run_code);
         if let Some(pstack) = parts.broker.pstack() {
             let run_code_has_pstack = run_code && environments.is_local(named);
@@ -1070,6 +1123,7 @@ mod tests {
                 model: "deepseek-flash".into(),
                 max_workers,
                 prepare: prepare.map(String::from),
+                forge: None,
                 swarm: None,
             })
             .unwrap();
@@ -1552,6 +1606,7 @@ mod tests {
             model: "deepseek-flash".into(),
             max_workers: 1,
             prepare: None,
+            forge: None,
             swarm: None,
         })
         .unwrap();

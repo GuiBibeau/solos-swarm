@@ -576,11 +576,11 @@ async fn a_claude_code_workers_tools_list_and_run_on_its_node() {
         "job_stop",
         "fetch_url",
     ];
-    assert_eq!(w.broker.worker_tools(Some("laptop")), on_the_node);
+    assert_eq!(w.broker.worker_tools(Some("laptop"), false), on_the_node);
     let listed = through_mcp(&w, &here, &[]).await;
     assert_eq!(
         names(&listed[0]),
-        w.broker.worker_tools(None),
+        w.broker.worker_tools(None, false),
         "this host's"
     );
     let calls = if sandbox() {

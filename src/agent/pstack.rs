@@ -290,7 +290,6 @@ fn js_trim(text: &str) -> &str {
 pub struct Pstack {
     tree: Tree,
     entry: Skill,
-    reader: Reader,
 }
 
 impl Pstack {
@@ -299,12 +298,7 @@ impl Pstack {
     pub fn open(pi_root: &Path, entry: &str) -> Result<Self> {
         let tree = Tree::open(&pi_root.join(VENDORED))?;
         let entry = tree.skill(entry)?;
-        let reader = Reader::new(&[(MOUNT, tree.root())])?;
-        Ok(Self {
-            tree,
-            entry,
-            reader,
-        })
+        Ok(Self { tree, entry })
     }
 
     /// A worker's first prompt: the entry skill, then `text`.
@@ -339,10 +333,6 @@ impl Pstack {
             "Every role runs on your own model, {model}. This host runs one model family."
         );
         text
-    }
-
-    pub fn reader(&self) -> &Reader {
-        &self.reader
     }
 
     pub fn root(&self) -> &Path {
@@ -890,6 +880,10 @@ mod tests {
         use std::os::unix::fs::symlink;
         use std::path::PathBuf;
 
+        fn vendored_reader() -> Reader {
+            Reader::new(&[(MOUNT, vendored().root())]).unwrap()
+        }
+
         fn world() -> (PathBuf, PathBuf, Reader) {
             let dir = scratch("reader");
             let root = dir.join("root");
@@ -972,10 +966,7 @@ mod tests {
                 let read = reader.read(path, None, None);
                 assert!(matches!(read, Err(Refused::NotText(_))), "{path}: {read:?}");
             }
-            let image =
-                vendored()
-                    .reader()
-                    .read("/pstack/docs/guide/images/router.jpg", None, None);
+            let image = vendored_reader().read("/pstack/docs/guide/images/router.jpg", None, None);
             assert!(matches!(image, Err(Refused::NotText(_))), "{image:?}");
             std::fs::remove_dir_all(dir).unwrap();
         }
@@ -1006,8 +997,7 @@ mod tests {
             );
             assert_eq!(listed["entries"][0]["bytes"], 13);
             assert_eq!(listed["truncated"], false);
-            let skills = vendored()
-                .reader()
+            let skills = vendored_reader()
                 .read("/pstack/skills", None, None)
                 .unwrap();
             assert!(

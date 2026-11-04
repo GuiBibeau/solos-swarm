@@ -1028,7 +1028,7 @@ async fn without_a_vault_vault_list_is_not_offered_and_a_key_is_refused() {
         w.listed("worker").await,
         ["worker_report", "worker_handback", "fetch_url"]
     );
-    assert_eq!(w.broker.worker_tools(None), w.listed("worker").await);
+    assert_eq!(w.broker.worker_tools(None, false), w.listed("worker").await);
     let no_vault = json!({"error": "no vault on this host"});
     assert_eq!(
         w.post("vault_list", "worker", json!({})).await,

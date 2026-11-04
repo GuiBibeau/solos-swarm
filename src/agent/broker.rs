@@ -14,7 +14,7 @@ use super::config::ExecutorConfig;
 use super::environment::{Environments, Nodes};
 use super::jobs::{Host, JobLimits, Jobs, Refused};
 use super::ports::{Applied, Fact, FactSink};
-use super::pstack::{self, Pstack};
+use super::pstack::{self, Pstack, Reader};
 use crate::broker::{FETCH_TOTAL_BYTES, fetch, now_ms};
 use crate::code::CodeExecutor;
 use crate::gateway::{self, PriceTable, Provider, Receipt, Upstream};
@@ -81,6 +81,11 @@ impl Principal {
     }
 }
 
+/// Where `read` serves a repository Ticket's clone, as `run_code` does.
+pub const WORK_MOUNT: &str = "/work";
+/// Where `read` serves what the host wrote about a repository Ticket.
+pub const HOST_MOUNT: &str = "/host";
+
 /// One Assignment's worker as the broker knows it. The executor that
 /// started the worker holds it too, to tell whether a turn reported.
 #[derive(Debug)]
@@ -91,6 +96,10 @@ pub struct WorkerSeat {
     pub work_dir: PathBuf,
     /// Where its commands run, as its Plan names it.
     environment: Option<String>,
+    /// A repository Ticket's `<ticket>/host`.
+    host_dir: Option<PathBuf>,
+    /// What `read` reaches, made when the seat is admitted.
+    reader: Option<Reader>,
     /// The Ticket's whole budget, which every Assignment of it shares.
     pub budget_microusd: MicroUsd,
     /// The Ticket account's spend from this time on is this Assignment's.
@@ -114,6 +123,8 @@ impl WorkerSeat {
             assignment,
             work_dir,
             environment: None,
+            host_dir: None,
+            reader: None,
             budget_microusd,
             since_ms: now_ms(),
             turn: Mutex::new(None),
@@ -127,6 +138,17 @@ impl WorkerSeat {
     pub fn in_environment(mut self, environment: Option<String>) -> Self {
         self.environment = environment;
         self
+    }
+
+    /// Its Ticket works on a repository: `work_dir` is the clone and
+    /// `host_dir` what the host wrote about it.
+    pub fn on_repository(mut self, host_dir: PathBuf) -> Self {
+        self.host_dir = Some(host_dir);
+        self
+    }
+
+    fn has_repository(&self) -> bool {
+        self.host_dir.is_some()
     }
 
     pub fn account(&self) -> Account {
@@ -499,7 +521,7 @@ impl AgentBroker {
     pub fn admit_worker(
         &self,
         token: String,
-        seat: WorkerSeat,
+        mut seat: WorkerSeat,
         system_prompt: String,
     ) -> Result<Arc<WorkerSeat>> {
         let parts = self
@@ -507,6 +529,19 @@ impl AgentBroker {
             .workers
             .as_ref()
             .context("this broker admits no workers")?;
+        let mut roots: Vec<(&'static str, &Path)> = Vec::new();
+        if let Some(tree) = &self.inner.pstack {
+            roots.push((pstack::MOUNT, tree.root()));
+        }
+        if let Some(host) = &seat.host_dir {
+            roots.extend([
+                (WORK_MOUNT, seat.work_dir.as_path()),
+                (HOST_MOUNT, host.as_path()),
+            ]);
+        }
+        seat.reader = (!roots.is_empty())
+            .then(|| Reader::new(&roots))
+            .transpose()?;
         let seat = Arc::new(seat);
         let grant = Grant {
             principal: Principal::Worker(seat.clone()),
@@ -530,13 +565,20 @@ impl AgentBroker {
     /// What a worker whose Plan names `environment` may call: the worker
     /// tools, less `run_code` and the job tools where that environment
     /// offers no `run_code`, less `vault_list` where this host has no
-    /// vault, and less `read` where it has no pstack. A worker's grants and
-    /// its `GET /tools`.
-    pub fn worker_tools(&self, environment: Option<&str>) -> Vec<&'static str> {
-        registry::offered(PrincipalKind::Worker, self.capabilities(environment))
+    /// vault, and less `read` where it has neither pstack nor, with
+    /// `repository`, a clone to read. A worker's grants and its `GET /tools`.
+    pub fn worker_tools(&self, environment: Option<&str>, repository: bool) -> Vec<&'static str> {
+        registry::offered(
+            PrincipalKind::Worker,
+            self.capabilities(environment, repository),
+        )
     }
 
-    fn capabilities(&self, environment: Option<&str>) -> Caps {
+    pub fn seat_tools(&self, seat: &WorkerSeat) -> Vec<&'static str> {
+        self.worker_tools(seat.environment.as_deref(), seat.has_repository())
+    }
+
+    fn capabilities(&self, environment: Option<&str>, repository: bool) -> Caps {
         let mut have = self.inner.environments.capabilities(environment);
         if self.vault().is_some() {
             have = have.with(Cap::Vault);
@@ -544,7 +586,7 @@ impl AgentBroker {
         if self.browser().is_some() && self.inner.environments.is_local(environment) {
             have = have.with(Cap::Browser);
         }
-        if self.inner.pstack.is_some() {
+        if self.inner.pstack.is_some() || repository {
             have = have.with(Cap::Read);
         }
         have
@@ -577,7 +619,7 @@ impl AgentBroker {
             Principal::Router => (None, Caps::NONE),
             Principal::Worker(seat) => {
                 let named = seat.environment.as_deref();
-                (named, self.capabilities(named))
+                (named, self.capabilities(named, seat.has_repository()))
             }
         };
         let missing = registry::unmet(principal.kind(), name, have)?;
@@ -713,7 +755,7 @@ async fn tools(State(broker): State<AgentBroker>, headers: HeaderMap) -> Reply {
     let kind = grant.principal.kind();
     let callable = match &grant.principal {
         Principal::Router => ROUTER_TOOLS.to_vec(),
-        Principal::Worker(seat) => broker.worker_tools(seat.environment.as_deref()),
+        Principal::Worker(seat) => broker.seat_tools(seat),
     };
     let offered: Vec<_> = registry::tools(kind)
         .into_iter()
@@ -911,7 +953,7 @@ async fn tool(
         }
         (Principal::Worker(seat), "fetch_url") => fetch_url(&broker, seat, args).await,
         (Principal::Worker(seat), "vault_list") => secrets::vault_list(&broker, seat).await,
-        (Principal::Worker(_), "read") => read_path(&broker, args).await,
+        (Principal::Worker(seat), "read") => read_path(seat, args).await,
         (
             Principal::Worker(seat),
             tool @ ("browser_open" | "browser_act" | "browser_login" | "browser_read"),
@@ -1277,28 +1319,30 @@ struct ReadPathArgs {
     limit: Option<usize>,
 }
 
-async fn read_path(broker: &AgentBroker, args: Value) -> Reply {
+async fn read_path(seat: &Arc<WorkerSeat>, args: Value) -> Reply {
     let ReadPathArgs {
         path,
         offset,
         limit,
     } = arguments(args)?;
-    let tree = broker
-        .pstack()
-        .cloned()
-        .ok_or_else(|| failed("read was admitted without pstack"))?;
-    tokio::task::spawn_blocking(move || tree.reader().read(&path, offset, limit))
-        .await
-        .map_err(failed)?
-        .map(Json)
-        .map_err(|refusal| match refusal {
-            pstack::Refused::Invalid(why) | pstack::Refused::NotText(why) => {
-                refuse(StatusCode::UNPROCESSABLE_ENTITY, why)
-            }
-            pstack::Refused::Leaves(why) => forbidden(why),
-            pstack::Refused::Missing(why) => refuse(StatusCode::NOT_FOUND, why),
-            pstack::Refused::Host(why) => failed(why),
-        })
+    let seat = seat.clone();
+    tokio::task::spawn_blocking(move || match &seat.reader {
+        Some(reader) => reader.read(&path, offset, limit),
+        None => Err(pstack::Refused::Host(
+            "read was admitted without a reader".into(),
+        )),
+    })
+    .await
+    .map_err(failed)?
+    .map(Json)
+    .map_err(|refusal| match refusal {
+        pstack::Refused::Invalid(why) | pstack::Refused::NotText(why) => {
+            refuse(StatusCode::UNPROCESSABLE_ENTITY, why)
+        }
+        pstack::Refused::Leaves(why) => forbidden(why),
+        pstack::Refused::Missing(why) => refuse(StatusCode::NOT_FOUND, why),
+        pstack::Refused::Host(why) => failed(why),
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
