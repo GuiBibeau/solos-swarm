@@ -25,7 +25,9 @@ pub struct HoldRequest<'a> {
     pub provider: &'a str,
     /// Spend from this time on counts against `cap_microusd`.
     pub since_ms: Ms,
-    pub cap_microusd: MicroUsd,
+    /// What the account may commit since `since_ms`. `None`: no cap, so the
+    /// call is held and recorded but never refused for spend.
+    pub cap_microusd: Option<MicroUsd>,
     pub hold_microusd: MicroUsd,
     pub at_ms: Ms,
 }
@@ -45,7 +47,8 @@ pub struct Charge<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reservation {
     Held(HoldId),
-    /// The hold would take the account past its cap. Nothing was written.
+    /// The hold would take the account past its cap, which only an account
+    /// with one can do. Nothing was written.
     Refused {
         committed: MicroUsd,
     },
@@ -147,9 +150,9 @@ const COMMITTED: &str = "SELECT COALESCE(SUM(CASE state WHEN 'held' THEN hold_mi
 
 impl SqliteStore {
     /// Hold for one call if what the account committed since
-    /// `request.since_ms`, plus this hold, stays within its cap. The check and
-    /// the hold are one transaction, so two calls cannot both take the last
-    /// of a cap.
+    /// `request.since_ms`, plus this hold, stays within its cap (an account
+    /// with none always gets its hold). The check and the hold are one
+    /// transaction, so two calls cannot both take the last of a cap.
     pub fn reserve(&mut self, request: &HoldRequest<'_>) -> Result<Reservation, StoreError> {
         let tx = self
             .conn
@@ -159,7 +162,9 @@ impl SqliteStore {
             params![request.account, request.since_ms],
             |row| row.get(0),
         )?;
-        if committed.saturating_add(request.hold_microusd) > request.cap_microusd {
+        if let Some(cap) = request.cap_microusd
+            && committed.saturating_add(request.hold_microusd) > cap
+        {
             return Ok(Reservation::Refused { committed });
         }
         tx.execute(

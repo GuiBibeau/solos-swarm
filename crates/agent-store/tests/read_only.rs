@@ -32,7 +32,7 @@ fn populate(db: &TempDb) {
         account: "router",
         provider: "deepseek",
         since_ms: 0,
-        cap_microusd: 1_000,
+        cap_microusd: Some(1_000),
         hold_microusd: 300,
         at_ms: 90_000,
     };

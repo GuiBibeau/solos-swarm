@@ -275,7 +275,8 @@ provider through the real broker. It runs on macOS too. Swarm mode is the first 
     and its broker tests, smoke and golden launch are unchanged.
   - The agent broker (`src/agent/broker.rs`) maps each bearer token to a `Grant`: a principal (the Router; a
     Worker per Assignment since P3d), an account and model terms. Accounts are `router` (capped per UTC day by
-    `budgets.router_daily_microusd`) and `ticket:<id>` (capped for life by the Mandate budget). Holds and
+    `budgets.router_daily_microusd`) and `ticket:<id>` (capped for life by the Mandate budget). Each cap is
+    optional, and an account without one is still held and settled: see [Budgets](#budgets). Holds and
     settlements are rows in the store's `spend` table, so a restart keeps every cap; a closed row is final.
   - Router tools: `router_decide` (one flat object: eval, decision, reason, and the accept or stop fields; an accept
     above the approval threshold stands only when Slack can take the approval, through a Slack channel and a
@@ -414,6 +415,7 @@ provider through the real broker. It runs on macOS too. Swarm mode is the first 
   - an Effect with 3 failed attempts, such as a Send stuck on one conversation;
   - 1 `unavailable` Decision in the last hour: the Router left an Eval undecided three times running;
   - an account at 80% of its cap: the Router's daily cap (known from agent.yaml) and each open Ticket's budget;
+    an account with no cap raises nothing;
   - a pause that the state directory's `control.json` or `PAUSE` has held for 1h, timed from the file. A pause set
     in agent.yaml, or the peak window, raises nothing.
 - Done: alert ids. An id is `wd_` and a hash of the kind, the subject and a bucket of `repeat` (6h). The subject
@@ -758,6 +760,48 @@ output cap, and Pi asked again until the budget ran out. A provider call could h
 expired. A refused decision on an expired Eval did not name the open one, so the Router retried stale ids (all
 three in #45). The four attempts cost $3.52 in all.
 
+## Budgets
+
+Every cap is configuration, and each is optional. The whole `budgets` section may be left out, which is what an agent
+that runs for its owner does; another operator sets the caps they want with the same binary.
+
+```yaml
+budgets:
+  session_microusd: 500000        # what a session Ticket gets; absent: a session has no budget
+  router_daily_microusd: 3000000  # a Pi Router's calls per UTC day; absent: no daily cap
+executor:
+  kind: pi
+  swarm:
+    default_budget_microusd: 1500000   # what a swarm accept that names no budget gets
+```
+
+**Where a cap is absent, nothing is capped there.** A session Ticket accepted with no `budgets.session_microusd` has no
+Mandate budget: its account `ticket:<id>` is never refused for spend, so no model call stops with "budget is
+reached", no accept waits for an Approve whatever `policy.auto_approve_microusd` is, and the worker is told its
+Ticket has no cap. With no `router_daily_microusd` the Router is never refused for spend either, and a Pi Router no
+longer needs one to start. `budget_microusd` on `router_decide` is for a swarm: a session takes one only where
+`session_microusd` is set, and otherwise the argument is not used. A repository's `budget_microusd` under `forge.repos`
+is the operator's own cap and still holds for that repository's Tickets, so leave it out for no cap there.
+
+**An uncapped account is still held and settled.** Each model call takes a hold and closes it at the receipt's cost,
+so the spend is in the ledger, `agent status` reads it (`committed $1.25, no cap`; in JSON, `budget_microusd` and
+`daily_cap_microusd` are `null`), and the Ticket's Reports carry it. The Watchdog's spend alert (80% of a cap) needs a
+cap, so it only fires for a capped account. A provider that bills more than a call's hold is an overrun: a capped
+account stops there, as before, and an account with no cap records the cost, logs it and goes on, since no cap relies
+on the hold.
+
+**A swarm always has a budget.** A swarm Ticket spends through its own governed broker, which needs a Goal cap, so its
+accept takes the Router's `budget_microusd`, else `executor.swarm.default_budget_microusd`, else
+`budgets.session_microusd`, and is refused if none is set. A swarm budget above `policy.auto_approve_microusd` still
+waits for an approver's Approve, a request from a Source that cannot show a button may still name at most the
+threshold, and the Goal's budget and a retry's remaining budget work as P5 of the roadmap describes. Goals run by
+`solos-swarm run` are not touched.
+
+**What stays.** A budget is fixed at accept time, so Tickets accepted before a change keep theirs. The pause (`PAUSE`
+or `control.json`) still stops every model call and every Effect, the loop guard still refuses a worker that repeats
+itself, and the model's input and output limits still apply. [production.md](production.md#the-production-config)
+shows the config of an agent with no caps.
+
 ## Slack app setup
 
 The agent connects out over Socket Mode, so the app needs no request URL and the host exposes nothing.
@@ -1004,7 +1048,8 @@ is the first line of README.md?"`. Within a minute a comment answers it, and its
   delete their entry from the file.
 - **Budgets.** A Ticket from GitHub, MCP or a schedule has no Approve button to wait on, so its accept may name at most
   `policy.auto_approve_microusd`, even where Discord or Slack takes approvals for requests that came from them. The
-  Router's prompt says so, and `router_decide` refuses more and names the cap.
+  Router's prompt says so, and `router_decide` refuses more and names the cap. Where sessions have no budget
+  ([Budgets](#budgets)) this concerns a swarm's or a repository's budget only.
 - **Suspended, uninstalled, removed.** Suspend the App under Settings, Applications, Installed GitHub Apps and every GitHub
   call waits five minutes and tries again, logged once per change of state. Nothing crashes, `serve` started while it is
   suspended keeps running, and unsuspending (or reinstalling, which makes a new installation id the agent finds again)

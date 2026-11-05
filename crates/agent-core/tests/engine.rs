@@ -81,7 +81,7 @@ fn accept(plan: Plan, budget: u64) -> Verdict {
         scope: "Reproduce and fix tests/broker_http.rs flake".into(),
         reason: "alice asked".into(),
         plan,
-        budget_microusd: budget,
+        budget_microusd: Some(budget),
         acknowledge: Acknowledge::Standard,
         rules: Vec::new(),
         repo: None,
@@ -436,6 +436,94 @@ fn a_swarm_over_the_auto_budget_waits_for_an_approver() {
     let t = &w.engine.repos().tickets[&ticket];
     assert!(matches!(t.approval, Approval::Granted { .. }));
     assert_eq!(t.stage(), Stage::Queued);
+}
+
+/// An accept with no budget, as an operator who sets none gets.
+fn uncapped(plan: Plan) -> Verdict {
+    let Verdict::Accept(accept) = accept(plan, 1) else {
+        unreachable!()
+    };
+    Verdict::Accept(Accept {
+        budget_microusd: None,
+        ..accept
+    })
+}
+
+#[test]
+fn a_session_with_no_budget_launches_at_once_whatever_the_approval_threshold_is() {
+    for threshold in [0, 2_000_000] {
+        let mut w = World::new(AllowlistPolicy {
+            auto_approve_microusd: threshold,
+            ..policy()
+        });
+        let eval = w.receive_and_start_eval(slack(
+            "t1",
+            Actor::person("alice"),
+            Addressed::Mention,
+            "th1",
+            "fix the flake",
+        ));
+        w.engine.decide(&eval, uncapped(session())).unwrap();
+        let effects = w.effects();
+        let [(ticket, _, plan)] = &launched(&effects)[..] else {
+            panic!("one launch at threshold {threshold}: {effects:?}")
+        };
+        assert_eq!(*plan, session());
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::Launch {
+                    budget_microusd: None,
+                    ..
+                }
+            )),
+            "the launch carries no budget: {effects:?}"
+        );
+        let t = &w.engine.repos().tickets[ticket];
+        assert_eq!(t.mandate.budget_microusd, None);
+        assert_eq!(t.approval, Approval::NotNeeded);
+        assert!(
+            sent(&effects)
+                .iter()
+                .all(|(kind, _)| *kind != MessageKind::Attention),
+            "nobody is asked to approve anything: {effects:?}"
+        );
+    }
+}
+
+#[test]
+fn a_swarm_needs_a_budget_and_a_session_may_go_without() {
+    let swarm = Plan::Swarm {
+        agents: 4,
+        goal_template: None,
+    };
+    let mut w = World::new(policy());
+    let eval = w.receive_and_start_eval(slack(
+        "t1",
+        Actor::person("alice"),
+        Addressed::Mention,
+        "th1",
+        "survey",
+    ));
+    w.effects();
+    let refused = w.engine.decide(&eval, uncapped(swarm)).unwrap_err();
+    assert!(
+        matches!(&refused, Error::Invalid(why) if why.contains("swarm needs a budget")),
+        "{refused:?}"
+    );
+    assert!(
+        w.engine.repos().tickets.is_empty() && w.engine.repos().effects.is_empty(),
+        "a refused accept commits nothing"
+    );
+    w.engine.decide(&eval, uncapped(session())).unwrap();
+}
+
+#[test]
+fn a_mandate_without_a_budget_stores_without_the_field_and_reads_back() {
+    let stored = r#"{"policy_version":"p1","scope":"fix it","strength":"explicit","rules":[],"requester":{"id":"alice","kind":"person"},"source":"slack"}"#;
+    let mandate: Mandate = serde_json::from_str(stored).unwrap();
+    assert_eq!(mandate.budget_microusd, None);
+    assert_eq!(serde_json::to_string(&mandate).unwrap(), stored);
 }
 
 #[test]

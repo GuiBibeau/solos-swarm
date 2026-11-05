@@ -275,8 +275,11 @@ pub struct Mandate {
     pub rules: Vec<String>,
     pub requester: Actor,
     pub source: String,
-    /// The Ticket's whole envelope across all of its Assignments.
-    pub budget_microusd: MicroUsd,
+    /// The Ticket's whole envelope across all of its Assignments. `None`:
+    /// the Ticket has no cap, so it needs no approval and its account has
+    /// no limit (a swarm plan always has one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_microusd: Option<MicroUsd>,
     /// The one repository its worker reads and changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<RepoName>,
@@ -591,7 +594,10 @@ pub struct Accept {
     pub scope: String,
     pub reason: String,
     pub plan: Plan,
-    pub budget_microusd: MicroUsd,
+    /// `None` for a session where the operator sets no budget; a swarm plan
+    /// must name one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_microusd: Option<MicroUsd>,
     #[serde(default)]
     pub acknowledge: Acknowledge,
     #[serde(default)]
@@ -688,7 +694,8 @@ pub enum Effect {
         ticket: TicketId,
         assignment: AssignmentId,
         plan: Plan,
-        budget_microusd: MicroUsd,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        budget_microusd: Option<MicroUsd>,
         /// A resume or restart: the worker checks its directory before repeating outside actions.
         recovery: bool,
     },
@@ -735,7 +742,8 @@ pub enum DomainEvent {
         ticket: TicketId,
         decision: DecisionId,
         plan: Plan,
-        budget_microusd: MicroUsd,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        budget_microusd: Option<MicroUsd>,
     },
     TicketApproved {
         ticket: TicketId,

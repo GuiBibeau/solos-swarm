@@ -67,20 +67,29 @@ pub fn system_prompt(
         .unwrap_or(DEFAULT_INSTRUCTIONS)
         .trim()
         .to_owned();
-    let _ = write!(
-        prompt,
-        "\n\nBudgets: an accept gets {} microusd unless it names budget_microusd",
-        decide.default_budget_microusd
-    );
-    let _ = match decide.max_budget_microusd {
-        Some(max) => write!(prompt, ", and may name at most {max}."),
-        None => write!(
-            prompt,
-            "; above {} its ticket waits for a person's approval.",
-            policy.auto_approve_microusd
+    match decide.default_budget_microusd {
+        Some(default) => {
+            let _ = write!(
+                prompt,
+                "\n\nBudgets: an accept gets {default} microusd unless it names budget_microusd"
+            );
+            let _ = match decide.max_budget_microusd {
+                Some(max) => write!(prompt, ", and may name at most {max}."),
+                None => write!(
+                    prompt,
+                    "; above {} its ticket waits for a person's approval.",
+                    policy.auto_approve_microusd
+                ),
+            };
+        }
+        None => prompt.push_str(
+            "\n\nBudgets: a session has no budget, so name none for one; only a swarm has a budget.",
         ),
-    };
-    if decide.max_budget_microusd.is_none() && !decide.approval_sources.is_empty() {
+    }
+    if decide.default_budget_microusd.is_some()
+        && decide.max_budget_microusd.is_none()
+        && !decide.approval_sources.is_empty()
+    {
         let sources: Vec<&str> = decide.approval_sources.iter().map(String::as_str).collect();
         let _ = write!(
             prompt,
@@ -113,6 +122,16 @@ pub fn system_prompt(
                      person's approval before it starts, so name what the work needs.",
                     policy.auto_approve_microusd
                 ),
+            };
+            let _ = match (
+                swarm.default_budget_microusd,
+                decide.default_budget_microusd,
+            ) {
+                (Some(default), _) => {
+                    write!(prompt, " It gets {default} microusd if it names none.")
+                }
+                (None, None) => write!(prompt, " It must name its budget_microusd."),
+                (None, Some(_)) => Ok(()),
             };
         }
     }
@@ -862,7 +881,7 @@ mod tests {
     #[test]
     fn the_system_prompt_adds_budgets_swarms_and_only_enabled_rules() {
         let decide = DecideTerms {
-            default_budget_microusd: 500_000,
+            default_budget_microusd: Some(500_000),
             max_budget_microusd: Some(2_000_000),
             swarm: None,
             repos: BTreeMap::new(),
@@ -891,6 +910,7 @@ mod tests {
         let swarm = Some(SwarmTerms {
             templates: vec!["audit".into(), "research".into()],
             default_template: Some("research".into()),
+            default_budget_microusd: None,
         });
         let capped = DecideTerms {
             swarm: swarm.clone(),
@@ -929,9 +949,76 @@ mod tests {
     }
 
     #[test]
+    fn the_system_prompt_tells_a_router_that_sessions_have_no_budget_and_swarms_do() {
+        let uncapped = DecideTerms {
+            default_budget_microusd: None,
+            max_budget_microusd: None,
+            approval_sources: ["discord".to_owned()].into(),
+            auto_approve_microusd: 500_000,
+            swarm: None,
+            ..DecideTerms::default()
+        };
+        let policy = AllowlistPolicy {
+            auto_approve_microusd: 500_000,
+            ..AllowlistPolicy::default()
+        };
+        let prompt = system_prompt(Some("Judge."), &policy, &BTreeMap::new(), &uncapped);
+        assert!(
+            prompt.starts_with(
+                "Judge.\n\nBudgets: a session has no budget, so name none for one; only a swarm \
+                 has a budget.\nThis agent runs no swarms"
+            ),
+            "{prompt}"
+        );
+        assert!(
+            !prompt.contains("microusd unless") && !prompt.contains("Only a request that came"),
+            "{prompt}"
+        );
+
+        let swarm = |default_budget_microusd| {
+            Some(SwarmTerms {
+                templates: vec!["research".into()],
+                default_template: Some("research".into()),
+                default_budget_microusd,
+            })
+        };
+        let named = system_prompt(
+            Some("Judge."),
+            &policy,
+            &BTreeMap::new(),
+            &DecideTerms {
+                swarm: swarm(None),
+                ..uncapped.clone()
+            },
+        );
+        assert!(
+            named.contains(
+                "above 500000 microusd the swarm waits for a person's approval before it \
+                 starts, so name what the work needs. It must name its budget_microusd.\n"
+            ),
+            "{named}"
+        );
+        let defaulted = system_prompt(
+            Some("Judge."),
+            &policy,
+            &BTreeMap::new(),
+            &DecideTerms {
+                swarm: swarm(Some(400_000)),
+                ..uncapped
+            },
+        );
+        assert!(
+            defaulted.contains(
+                "so name what the work needs. It gets 400000 microusd if it names none.\n"
+            ),
+            "{defaulted}"
+        );
+    }
+
+    #[test]
     fn the_system_prompt_says_which_sources_can_wait_for_an_approval() {
         let decide = DecideTerms {
-            default_budget_microusd: 500_000,
+            default_budget_microusd: Some(500_000),
             max_budget_microusd: None,
             approval_sources: ["discord".to_owned(), "slack".to_owned()].into(),
             auto_approve_microusd: 500_000,
@@ -965,7 +1052,7 @@ mod tests {
         };
         let name = |name: &str| RepoName::try_from(name.to_owned()).unwrap();
         let decide = DecideTerms {
-            default_budget_microusd: 500_000,
+            default_budget_microusd: Some(500_000),
             max_budget_microusd: None,
             swarm: None,
             approval_sources: Default::default(),

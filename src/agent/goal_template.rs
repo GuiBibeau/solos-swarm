@@ -398,6 +398,7 @@ mod tests {
             templates: BTreeMap::from([("research".to_owned(), dir.join("research.yaml"))]),
             default_template: Some("research".into()),
             max_runs: 1,
+            default_budget_microusd: None,
         };
         let t = GoalTemplates::load(&config, "deepseek").unwrap();
         assert_eq!(t.names().collect::<Vec<_>>(), ["research"]);

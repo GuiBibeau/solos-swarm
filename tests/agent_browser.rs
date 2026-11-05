@@ -457,7 +457,7 @@ impl World {
             provider: Arc::new(Silent),
             facts: runtime.facts(),
             decide: DecideTerms {
-                default_budget_microusd: BUDGET,
+                default_budget_microusd: Some(BUDGET),
                 max_budget_microusd: None,
                 swarm: None,
                 repos: BTreeMap::new(),

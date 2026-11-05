@@ -118,6 +118,11 @@ impl Scratch {
     /// Pi workers, a scripted Router, and a Watchdog that looks every
     /// second and calls a second of silence a stall.
     fn config(&self, retry_stalled: bool) -> AgentConfig {
+        self.config_under(retry_stalled, "budgets: {session_microusd: 500000}\n")
+    }
+    /// [`config`](Self::config) with `budgets` between the executor and the
+    /// Watchdog, which may be none.
+    fn config_under(&self, retry_stalled: bool, budgets: &str) -> AgentConfig {
         let yaml = format!(
             "policy:
   people: [slack:alice]
@@ -133,8 +138,7 @@ executor:
   model: deepseek-flash
   prices: {{input_microusd_per_million: 300000, output_microusd_per_million: 1200000, cache_hit_microusd_per_million: 6000}}
   max_output_tokens: 2048
-budgets: {{session_microusd: 500000}}
-watchdog:
+{budgets}watchdog:
   operator: {{source: ops, address: {{channel: D-OPS}}}}
   every: 1s
   retry_stalled: {retry_stalled}
@@ -367,6 +371,36 @@ async fn a_stalled_worker_alerts_the_operator_once_and_a_restart_tells_nothing_n
     let (text, _) = status(&scratch);
     assert!(text.contains("open tickets: 0\n"), "{text}");
     assert!(text.contains("alerts now: 0\n"), "{text}");
+}
+
+#[tokio::test]
+async fn a_ticket_with_no_cap_shows_no_cap_in_status_and_alerts_on_no_spend() {
+    let scratch = Scratch::new("uncapped");
+    scratch.ask("Fix the flaky retry test");
+    let config = scratch.config_under(false, "");
+    assert_eq!(config.budgets.router_daily_microusd, None);
+
+    scratch.serve_until_alerted(config, Model::new(usize::MAX), 1);
+
+    let ticket = scratch.ticket();
+    assert_eq!(ticket.mandate.budget_microusd, None);
+    let (text, report) = status(&scratch);
+    eprintln!("{text}");
+    assert!(
+        text.contains("router: $0.00") && text.contains("committed today (UTC), no cap\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("plan: one worker session; committed $") && text.contains(", no cap\n"),
+        "{text}"
+    );
+    assert!(!text.contains("budget\n"), "no budget is named: {text}");
+    assert!(text.contains("alerts now: 1\n  [stalled]"), "{text}");
+    assert!(report["tickets"][0]["budget_microusd"].is_null());
+    assert!(report["router"]["daily_cap_microusd"].is_null());
+    assert_eq!(report["router"]["cap_known"], true);
+    assert_eq!(report["alerts"].as_array().unwrap().len(), 1);
+    assert_eq!(report["alerts"][0]["kind"], "stalled");
 }
 
 #[tokio::test]

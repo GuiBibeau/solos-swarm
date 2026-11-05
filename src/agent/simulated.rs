@@ -281,7 +281,7 @@ mod tests {
                 environment: None,
                 method: None,
             },
-            budget_microusd: 1,
+            budget_microusd: Some(1),
             repo: None,
             recovery: false,
             inputs: Vec::new(),

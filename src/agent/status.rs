@@ -40,8 +40,10 @@ pub struct Status {
 #[derive(Debug, Serialize)]
 pub struct RouterSpend {
     pub committed_today_microusd: MicroUsd,
-    /// From the config; unknown without it.
+    /// From the config; `None` is no cap where `cap_known`.
     pub daily_cap_microusd: Option<MicroUsd>,
+    /// Whether the config was read, so that no cap is known to be none.
+    pub cap_known: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -52,7 +54,8 @@ pub struct TicketStatus {
     pub created_ms: Ms,
     pub age_ms: Ms,
     pub plan: Plan,
-    pub budget_microusd: MicroUsd,
+    /// `None`: the Ticket has no cap.
+    pub budget_microusd: Option<MicroUsd>,
     pub committed_microusd: MicroUsd,
     /// The question waiting for a person.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -164,6 +167,7 @@ pub fn read(state_dir: &Path, config: Option<&AgentConfig>, now: Ms) -> Result<S
         router: RouterSpend {
             committed_today_microusd: committed(None),
             daily_cap_microusd: known.router_daily_microusd,
+            cap_known: config.is_some(),
         },
         tickets,
         decisions: store.recent_decisions(0, RECENT_DECISIONS)?,
@@ -206,6 +210,9 @@ pub fn render(status: &Status) -> String {
             "router: {spent} committed today (UTC) of a {} daily cap",
             usd(cap)
         ),
+        None if status.router.cap_known => {
+            format!("router: {spent} committed today (UTC), no cap")
+        }
         None => format!("router: {spent} committed today (UTC), no daily cap known"),
     });
 
@@ -218,12 +225,19 @@ pub fn render(status: &Status) -> String {
             ago(ticket.created_ms),
             ticket.title
         ));
-        line(format!(
-            "    plan: {}; committed {} of a {} budget",
-            plan_label(&ticket.plan),
-            usd(ticket.committed_microusd),
-            usd(ticket.budget_microusd)
-        ));
+        line(match ticket.budget_microusd {
+            Some(budget) => format!(
+                "    plan: {}; committed {} of a {} budget",
+                plan_label(&ticket.plan),
+                usd(ticket.committed_microusd),
+                usd(budget)
+            ),
+            None => format!(
+                "    plan: {}; committed {}, no cap",
+                plan_label(&ticket.plan),
+                usd(ticket.committed_microusd)
+            ),
+        });
         if let Some(request) = &ticket.request {
             let thread = request
                 .thread
@@ -339,6 +353,7 @@ fn decision_name(kind: DecisionKind) -> &'static str {
 mod tests {
     use super::render;
     use crate::agent::watchdog::Thresholds;
+    use solos_agent_core::model::{Plan, Stage, TicketId};
 
     #[test]
     fn an_empty_agent_renders_every_section() {
@@ -350,6 +365,7 @@ mod tests {
             router: super::RouterSpend {
                 committed_today_microusd: 1_200,
                 daily_cap_microusd: Some(1_000_000),
+                cap_known: true,
             },
             tickets: Vec::new(),
             decisions: Vec::new(),
@@ -367,6 +383,68 @@ recent decisions: 0
 effects: 0 pending, 0 of them failing
 alerts now: 0
 "
+        );
+    }
+
+    fn ticket(budget_microusd: Option<u64>) -> super::TicketStatus {
+        super::TicketStatus {
+            id: TicketId::new("tk_1"),
+            title: "Fix it".into(),
+            stage: Stage::Working,
+            created_ms: 1_793_611_805_000,
+            age_ms: 0,
+            plan: Plan::Session {
+                harness: None,
+                environment: None,
+                method: None,
+            },
+            budget_microusd,
+            committed_microusd: 1_250_000,
+            attention: None,
+            request: None,
+            assignment: None,
+        }
+    }
+
+    fn status(daily_cap_microusd: Option<u64>, cap_known: bool) -> super::Status {
+        super::Status {
+            at_ms: 1_793_611_805_000,
+            state_dir: "/srv/agent".into(),
+            schema_version: 3,
+            pause: None,
+            router: super::RouterSpend {
+                committed_today_microusd: 1_200,
+                daily_cap_microusd,
+                cap_known,
+            },
+            tickets: vec![ticket(Some(2_000_000)), ticket(None)],
+            decisions: Vec::new(),
+            effects: Vec::new(),
+            thresholds: Thresholds::default(),
+            alerts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn an_account_with_no_cap_says_so_instead_of_of_a_budget() {
+        let text = render(&status(None, true));
+        assert!(
+            text.contains("router: $0.0012 committed today (UTC), no cap\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("plan: one worker session; committed $1.25 of a $2.00 budget\n"),
+            "a capped Ticket reads as before: {text}"
+        );
+        assert!(
+            text.contains("plan: one worker session; committed $1.25, no cap\n"),
+            "{text}"
+        );
+        assert!(!text.contains("of a $0.00"), "{text}");
+        let unread = render(&status(None, false));
+        assert!(
+            unread.contains("router: $0.0012 committed today (UTC), no daily cap known\n"),
+            "without the config, no cap is not known to be none: {unread}"
         );
     }
 }

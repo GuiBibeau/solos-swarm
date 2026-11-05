@@ -981,7 +981,7 @@ mod tests {
                 environment: None,
                 method: None,
             },
-            budget_microusd,
+            budget_microusd: Some(budget_microusd),
             acknowledge: Acknowledge::Standard,
             rules: Vec::new(),
             repo: None,

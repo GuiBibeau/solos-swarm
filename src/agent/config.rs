@@ -35,6 +35,9 @@ pub struct AgentConfig {
     pub channels: Vec<ChannelConfig>,
     pub router: RouterConfig,
     pub executor: ExecutorConfig,
+    /// Without it, nothing the agent does is capped except a swarm, which
+    /// always needs a budget.
+    #[serde(default)]
     pub budgets: Budgets,
     /// Without it, no Watchdog runs.
     #[serde(default)]
@@ -500,6 +503,11 @@ pub struct SwarmConfig {
     /// many sessions, so this is apart from `max_workers`.
     #[serde(default = "default_max_swarms")]
     pub max_runs: usize,
+    /// What a swarm accept that names no budget gets, before
+    /// `budgets.session_microusd`. A swarm always has a budget, so with
+    /// neither set, an accept must name one.
+    #[serde(default)]
+    pub default_budget_microusd: Option<MicroUsd>,
 }
 
 /// What a worker's `run_code` sandbox mounts and how many run at once.
@@ -601,6 +609,9 @@ const MAX_WORKERS: usize = 64;
 const DAY_MS: u64 = 86_400_000;
 /// The most swarms one agent may run at once.
 const MAX_SWARMS: usize = 8;
+/// The budget a Goal template is rendered with to check it, where config
+/// names no swarm budget.
+const SAMPLE_SWARM_BUDGET_MICROUSD: MicroUsd = 500_000;
 
 /// What the shape from before the GitHub App said, which no longer exists.
 /// Serde would answer "unknown field" and not say what replaced it, so the
@@ -643,12 +654,20 @@ fn refuse_token_files(yaml: &serde_yaml::Value) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+/// The agent's caps. Each is optional: where one is absent, what it would
+/// cap is not capped, though its model calls are still held and settled in
+/// the ledger, so the spend is recorded.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Budgets {
-    /// What the Router gives a `Plan::Session` Ticket.
-    pub session_microusd: MicroUsd,
-    /// The most a Pi Router's model calls may commit in one UTC day.
+    /// What the Router gives a `Plan::Session` Ticket. Absent: a session
+    /// Ticket has no budget, so it needs no approval and its account has no
+    /// cap. A swarm always has a budget (`executor.swarm.default_budget_microusd`
+    /// or the Router's), which this is the fallback for.
+    #[serde(default)]
+    pub session_microusd: Option<MicroUsd>,
+    /// The most a Pi Router's model calls may commit in one UTC day. Absent:
+    /// no daily cap.
     #[serde(default)]
     pub router_daily_microusd: Option<MicroUsd>,
 }
@@ -730,7 +749,11 @@ impl AgentConfig {
             for path in swarm.templates.values_mut() {
                 *path = base.join(&*path);
             }
-            GoalTemplates::load(swarm, provider)?.check(config.budgets.session_microusd)?;
+            let sample = swarm
+                .default_budget_microusd
+                .or(config.budgets.session_microusd)
+                .unwrap_or(SAMPLE_SWARM_BUDGET_MICROUSD);
+            GoalTemplates::load(swarm, provider)?.check(sample)?;
         }
         Ok(config)
     }
@@ -793,10 +816,16 @@ impl AgentConfig {
             "browser.idle_secs must be above zero"
         );
         ensure!(
-            self.budgets.session_microusd > 0,
-            "budgets.session_microusd must be above zero"
+            self.budgets.session_microusd != Some(0),
+            "budgets.session_microusd must be above zero, or absent for no cap"
         );
-        if self.budgets.session_microusd > self.policy.auto_approve_microusd {
+        ensure!(
+            self.budgets.router_daily_microusd != Some(0),
+            "budgets.router_daily_microusd must be above zero, or absent for no cap"
+        );
+        if let Some(session) = self.budgets.session_microusd
+            && session > self.policy.auto_approve_microusd
+        {
             let gated = "budgets.session_microusd is above policy.auto_approve_microusd, so every \
                          Ticket waits for an approval";
             ensure!(
@@ -806,6 +835,17 @@ impl AgentConfig {
             ensure!(
                 self.takes_approvals(),
                 "{gated}, and policy.approvers names nobody on a source whose channel has buttons"
+            );
+        }
+        if let ExecutorConfig::Pi {
+            swarm: Some(swarm), ..
+        } = &self.executor
+            && let Some(budget) = swarm.default_budget_microusd
+        {
+            ensure!(
+                self.takes_approvals() || budget <= self.policy.auto_approve_microusd,
+                "executor.swarm.default_budget_microusd {budget} is above \
+                 policy.auto_approve_microusd, and nobody here can approve a budget"
             );
         }
         if let RouterConfig::Pi {
@@ -829,12 +869,6 @@ impl AgentConfig {
             ensure!(
                 (1..=64).contains(max_batch),
                 "router.max_batch must be 1..=64"
-            );
-            ensure!(
-                self.budgets
-                    .router_daily_microusd
-                    .is_some_and(|cap| cap > 0),
-                "a pi router needs budgets.router_daily_microusd above zero"
             );
             for name in rules.keys() {
                 ensure!(
@@ -1142,6 +1176,10 @@ impl SwarmConfig {
             (1..=MAX_SWARMS).contains(&self.max_runs),
             "executor.swarm.max_runs must be 1..={MAX_SWARMS}"
         );
+        ensure!(
+            self.default_budget_microusd != Some(0),
+            "executor.swarm.default_budget_microusd must be above zero"
+        );
         Ok(())
     }
 }
@@ -1149,8 +1187,8 @@ impl SwarmConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentConfig, ChannelConfig, ClaudeConfig, ExecutorConfig, ForgeConfig, GithubConfig,
-        HarnessKind, JobLimits, RepoConfig, RouterConfig, SourceConfig,
+        AgentConfig, Budgets, ChannelConfig, ClaudeConfig, ExecutorConfig, ForgeConfig,
+        GithubConfig, HarnessKind, JobLimits, RepoConfig, RouterConfig, SourceConfig,
     };
     use solos_agent_core::change::{Deliverable, RepoName};
     use std::collections::BTreeMap;
@@ -1188,7 +1226,7 @@ budgets: {session_microusd: 500000}
         let config = AgentConfig::load(&path).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(config.policy.people.contains("slack:alice"));
-        assert_eq!(config.budgets.session_microusd, 500_000);
+        assert_eq!(config.budgets.session_microusd, Some(500_000));
         assert_eq!(
             config.sources,
             [SourceConfig::Jsonl {
@@ -1334,12 +1372,43 @@ budgets: {session_microusd: 500000}
     }
 
     #[test]
+    fn a_config_without_budgets_loads_for_a_pi_router_and_caps_nothing() {
+        let bare = |yaml: String| {
+            yaml.replace(
+                "budgets: {session_microusd: 500000, router_daily_microusd: 1000000}\n",
+                "",
+            )
+        };
+        let yaml = pi(bare);
+        assert!(!yaml.contains("budgets"), "{yaml}");
+        let config = parse(&yaml).unwrap();
+        assert_eq!(config.budgets, Budgets::default());
+        assert_eq!(config.budgets.session_microusd, None);
+        assert_eq!(config.budgets.router_daily_microusd, None);
+        // Each cap is its own choice.
+        let daily_only = parse(&pi(|yaml| yaml.replace("session_microusd: 500000, ", ""))).unwrap();
+        assert_eq!(daily_only.budgets.session_microusd, None);
+        assert_eq!(daily_only.budgets.router_daily_microusd, Some(1_000_000));
+        let session_only = parse(&pi(|yaml| {
+            yaml.replace(", router_daily_microusd: 1000000", "")
+        }))
+        .unwrap();
+        assert_eq!(session_only.budgets.session_microusd, Some(500_000));
+        assert_eq!(session_only.budgets.router_daily_microusd, None);
+        // An empty section is the same as none.
+        let empty = parse(&pi(|yaml| {
+            yaml.replace(
+                "budgets: {session_microusd: 500000, router_daily_microusd: 1000000}",
+                "budgets: {}",
+            )
+        }))
+        .unwrap();
+        assert_eq!(empty.budgets, Budgets::default());
+    }
+
+    #[test]
     fn a_pi_router_refuses_what_it_cannot_run_under() {
         for (case, yaml) in [
-            (
-                "no daily cap",
-                pi(|yaml| yaml.replace(", router_daily_microusd: 1000000", "")),
-            ),
             (
                 "zero daily cap",
                 pi(|yaml| {
@@ -2005,9 +2074,46 @@ forge:
                 with(&|s| s.replace("goals/research.yaml", "goals/gone.yaml")),
             ),
             ("an unknown field", with(&|s| format!("{s}    agents: 3\n"))),
+            (
+                "a zero default budget",
+                with(&|s| format!("{s}    default_budget_microusd: 0\n")),
+            ),
+            (
+                "a default budget above the threshold that nobody can approve",
+                with(&|s| format!("{s}    default_budget_microusd: 9000000\n")),
+            ),
         ] {
             assert!(load(yaml.clone()).is_err(), "{case}: accepted\n{yaml}");
         }
+        let budgeted = load(with(&|s| {
+            format!("{s}    default_budget_microusd: 1500000\n")
+        }))
+        .unwrap();
+        let ExecutorConfig::Pi {
+            swarm: Some(swarm), ..
+        } = &budgeted.executor
+        else {
+            panic!("{:?}", budgeted.executor)
+        };
+        assert_eq!(swarm.default_budget_microusd, Some(1_500_000));
+        assert_eq!(
+            budgeted.budgets.session_microusd,
+            Some(500_000),
+            "a swarm's own default does not touch a session's"
+        );
+        let uncapped = load(with(&|s| s).replace(
+            "budgets: {session_microusd: 500000, router_daily_microusd: 1000000}",
+            "budgets: {}",
+        ))
+        .unwrap();
+        assert_eq!(uncapped.budgets, Budgets::default());
+        assert!(
+            matches!(
+                &uncapped.executor,
+                ExecutorConfig::Pi { swarm: Some(_), .. }
+            ),
+            "swarm templates still check against a sample budget with no session budget"
+        );
         std::fs::write(
             dir.join("goals/research.yaml"),
             template.replace("{% for n in range(agents) %}", "{% for n in range(2) %}"),
@@ -2089,11 +2195,16 @@ forge:
             "channels:\n  - {kind: jsonl, source: slack, path: other.jsonl}\n",
         );
         let free = VALID.replace("session_microusd: 500000", "session_microusd: 0");
+        let free_router = VALID.replace(
+            "session_microusd: 500000",
+            "session_microusd: 500000, router_daily_microusd: 0",
+        );
         let gated = VALID.replace("session_microusd: 500000", "session_microusd: 50000000");
         for (case, yaml) in [
             ("no source", no_source),
             ("one source twice", twice),
             ("zero budget", free),
+            ("zero router cap", free_router),
             ("budget above the approval threshold", gated),
         ] {
             assert_ne!(yaml, VALID, "{case}: the case did not change the config");

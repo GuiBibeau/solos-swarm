@@ -343,7 +343,8 @@ async fn a_question_about_a_repository_gets_a_worker_on_a_clone_it_reads_and_com
         "the repository's owes, since the Router named none"
     );
     assert_eq!(
-        ticket.mandate.budget_microusd, 400_000,
+        ticket.mandate.budget_microusd,
+        Some(400_000),
         "the repository's budget"
     );
     assert_eq!(

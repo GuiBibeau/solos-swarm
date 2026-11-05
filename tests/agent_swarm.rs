@@ -188,14 +188,19 @@ impl Scratch {
     /// A Pi Router and Pi workers that run swarms from `goal.yaml`, with
     /// `swarm` added to the swarm settings.
     fn config(&self, swarm: &str) -> AgentConfig {
+        let budgets = "budgets: {session_microusd: 500000, router_daily_microusd: 1000000}\n";
+        self.config_under(swarm, budgets)
+    }
+    /// [`config`](Self::config) with `budgets` as its last lines, which may
+    /// be none.
+    fn config_under(&self, swarm: &str, budgets: &str) -> AgentConfig {
         let yaml = format!(
             "policy:\n  people: [slack:alice]\n\
              sources:\n  - {{kind: jsonl, path: triggers.jsonl}}\n\
              channels:\n  - {{kind: jsonl, source: slack, path: outbox.jsonl}}\n\
              router:\n  kind: pi\n  provider: deepseek\n  model: deepseek-flash\n  prices: {PRICES}\n\
              executor:\n  kind: pi\n  provider: deepseek\n  model: deepseek-flash\n  prices: {PRICES}\n\
-             \x20 swarm:\n    templates: {{research: goal.yaml}}\n    default_template: research\n{swarm}\
-             budgets: {{session_microusd: 500000, router_daily_microusd: 1000000}}\n"
+             \x20 swarm:\n    templates: {{research: goal.yaml}}\n    default_template: research\n{swarm}{budgets}"
         );
         let path = self.root.join("agent.yaml");
         std::fs::write(&path, yaml).unwrap();
@@ -354,6 +359,44 @@ async fn a_swarm_ticket_runs_its_goal_and_answers_once_with_the_artifact() {
         "the Ticket's account holds the run's spend"
     );
     assert_eq!(store.committed(&account, 0).unwrap(), ready.spent_microusd);
+    assert_settled(&store);
+}
+
+/// No `budgets` at all: a session would be uncapped, but a swarm always has
+/// a budget, here `executor.swarm`'s own default, and its Goal is held to it.
+#[tokio::test]
+async fn a_swarm_with_no_budgets_in_the_config_gets_the_swarms_default_budget_and_is_held_to_it() {
+    let scratch = Scratch::new("uncapped");
+    scratch.ask(
+        "t-ask",
+        "T1",
+        "Survey every paper that cites the swarm paper",
+    );
+    let config = scratch.config_under("    default_budget_microusd: 400000\n", "");
+    assert_eq!(config.budgets.session_microusd, None);
+
+    scratch
+        .serve(config, scratch.host(swarm(2), Model::new(2)))
+        .await;
+
+    let ticket = scratch.tickets().remove(0);
+    assert_eq!(ticket.mandate.budget_microusd, Some(400_000));
+    assert_eq!(
+        ticket.ended.as_ref().map(|e| e.outcome),
+        Some(TicketOutcome::Completed)
+    );
+    assert_eq!(
+        budget_line(&scratch.run_dir(&ticket, 0)),
+        "budget_microusd: 400000",
+        "the Goal's budget is the Ticket's, not unlimited"
+    );
+    let store = scratch.store();
+    let account = format!("ticket:{}", ticket.id);
+    assert_eq!(
+        store.committed(&account, 0).unwrap(),
+        270,
+        "its spend counts"
+    );
     assert_settled(&store);
 }
 

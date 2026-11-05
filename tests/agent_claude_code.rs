@@ -174,7 +174,7 @@ fn serve(scratch: &Scratch, budget_microusd: u64) -> Served {
         provider: provider.clone(),
         facts,
         decide: DecideTerms {
-            default_budget_microusd: 500_000,
+            default_budget_microusd: Some(500_000),
             max_budget_microusd: None,
             swarm: None,
             repos: BTreeMap::new(),
@@ -200,7 +200,7 @@ fn serve(scratch: &Scratch, budget_microusd: u64) -> Served {
     let router = Grant {
         principal: Principal::Router,
         account: Account::Router {
-            daily_microusd: 1_000_000,
+            daily_microusd: Some(1_000_000),
         },
         terms: terms(),
         system_prompt: None,

@@ -324,12 +324,19 @@ where
         let parts = &self.parts;
         dir_name(launch.ticket.as_str())?;
         self.book_earlier(&launch.ticket).await?;
+        // The Engine refuses a swarm accept with no budget, so this is a
+        // Ticket that no longer holds one.
+        let Some(budget) = launch.budget_microusd else {
+            bail!(
+                "{} is a swarm with no budget, and a swarm needs one",
+                launch.ticket
+            );
+        };
         let committed = parts.broker.ticket_committed(&launch.ticket).await?;
-        let remaining = launch.budget_microusd.saturating_sub(committed);
+        let remaining = budget.saturating_sub(committed);
         ensure!(
             remaining > 0,
-            "the ticket's budget of {} microusd is spent",
-            launch.budget_microusd
+            "the ticket's budget of {budget} microusd is spent"
         );
         let fill = Fill {
             ticket: launch.ticket.as_str(),
@@ -697,6 +704,7 @@ mod tests {
                 templates: BTreeMap::from([("research".to_owned(), dir.join("goal.yaml"))]),
                 default_template: Some("research".into()),
                 max_runs,
+                default_budget_microusd: None,
             };
             let (facts, inbound) = FactSink::channel();
             let broker = AgentBroker::new(BrokerParts {
@@ -705,7 +713,7 @@ mod tests {
                 provider: Arc::new(Scripted),
                 facts: facts.clone(),
                 decide: DecideTerms {
-                    default_budget_microusd: 1,
+                    default_budget_microusd: Some(1),
                     max_budget_microusd: None,
                     swarm: None,
                     repos: BTreeMap::new(),
@@ -824,7 +832,7 @@ mod tests {
                 agents,
                 goal_template: None,
             },
-            budget_microusd: 500_000,
+            budget_microusd: Some(500_000),
             repo: None,
             recovery: false,
             inputs: Vec::new(),
@@ -991,6 +999,26 @@ mod tests {
             "{}",
             report.text
         );
+    }
+
+    #[tokio::test]
+    async fn a_swarm_launched_without_a_budget_is_failed_and_runs_nothing() {
+        let mut w = World::new(filing(), 1, TEMPLATE);
+        let mut unbudgeted = launch("tk_1", "as_1", 2);
+        unbudgeted.budget_microusd = None;
+        w.launch(unbudgeted).await;
+        assert!(started(&w.fact().await, "as_1"));
+        let report = w.report().await;
+        assert_eq!(report.status, ReportStatus::Failed);
+        assert!(
+            report
+                .text
+                .contains("a swarm with no budget, and a swarm needs one"),
+            "{}",
+            report.text
+        );
+        assert!(!w.run_dir("tk_1", "as_1").exists(), "no run started");
+        assert_eq!(w.committed("tk_1").await, 0);
     }
 
     #[tokio::test]

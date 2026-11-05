@@ -178,7 +178,7 @@ fn accept_rules(budget: u64, rules: Vec<String>) -> Verdict {
             environment: None,
             method: None,
         },
-        budget_microusd: budget,
+        budget_microusd: Some(budget),
         acknowledge: Acknowledge::Silent,
         rules,
         repo: None,
