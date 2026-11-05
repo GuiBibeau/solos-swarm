@@ -6,7 +6,8 @@ result on the same thread.
 
 ## Sub-features
 
-- `acknowledge`: an accepted request gets an `acknowledgement` reply that names the work ("On it: …").
+- `acknowledge`: an accepted first request gets an `acknowledgement` reply, one short natural sentence in the asker's tone ("Looking into it." when the Router writes none), never a title label such as "On it: …". The Router may send none for a small follow-up on a thread that already has a ticket, so only a first request must have one.
+- `natural-reply`: the `result` leads with the answer in plain sentences, with no "Goal:" line, no "Verification:" or "Skipped in solos-swarm:" lines and no principle names, and a short question gets a short answer.
 - `real-work`: the worker calls a real tool, and the result reports what the tool returned.
 - `known-answer`: a request whose answer is checkable gets that exact answer.
 - `ticket-closes`: a `ready` result ends the Ticket (`ticket_ended` with `completed`).

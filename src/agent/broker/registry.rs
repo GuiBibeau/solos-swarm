@@ -98,8 +98,9 @@ pub(super) const WORKER: &[Tool<WorkerOp>] = &[
         name: "worker_report",
         op: WorkerOp::Report,
         description: "Report on your ticket. progress: still working, nobody is told. waiting: your \
-                      turn is over and nothing is outstanding. ready: the result, sent to whoever \
-                      asked; it ends the ticket. blocked or failed: you need a person; say why. \
+                      turn is over and nothing is outstanding. ready: your reply, posted as you \
+                      write it in the chat thread of whoever asked; it ends the ticket. blocked or \
+                      failed: you need a person; say why. \
                       dropped: nothing to do; ends the ticket silently. A refused report comes back \
                       as an error that says why.",
         input_schema: worker_report,
@@ -305,7 +306,7 @@ fn router_decide() -> Value {
                 "minimum": 1,
                 "description": "accept: the Ticket's whole budget in microusd. Omit it for the default.",
             },
-            "acknowledge": string("accept: the first reply, instead of the standard one. An empty string sends none."),
+            "acknowledge": string("accept: the first reply, in your own words instead of the standard \"Looking into it.\": one short natural sentence in the asker's language and tone, never the title, a label or \"On it: ...\". An empty string sends none, for a small follow-up in a conversation the answer will continue."),
             "rules": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -340,8 +341,8 @@ fn worker_report() -> Value {
                 "type": "string",
                 "enum": ["progress", "waiting", "ready", "blocked", "failed", "dropped"],
             },
-            "text": required_string("For ready, the complete result for the person who asked; otherwise what happened, briefly."),
-            "question": string("One concrete question for a person, when only a person can answer it."),
+            "text": required_string("For ready, your reply to the person who asked, as a chat message: the answer first, in plain sentences and their tone, with no restated goal or report headings. Otherwise what happened, briefly."),
+            "question": string("One plain question, the way you would ask a person in chat, when only a person can answer it."),
         },
     })
 }

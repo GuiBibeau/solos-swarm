@@ -1514,7 +1514,7 @@ async fn a_request_is_answered_as_a_reply_with_a_nonce_and_no_mentions() {
         assert!(nonce_of(post).len() <= 25, "{}", nonce_of(post));
         assert!(post["body"].get("components").is_none());
     }
-    assert_eq!(text_of(&posts[0]), "On it: draft the release notes.");
+    assert_eq!(text_of(&posts[0]), "Looking into it.");
     assert!(text_of(&posts[1]).starts_with("Done: draft the release notes."));
     assert_ne!(
         nonce_of(&posts[0]),
@@ -1558,7 +1558,7 @@ async fn a_request_in_a_thread_is_answered_in_that_thread() {
         assert_eq!(post["channel"], "1500000000000000001");
         assert!(post["body"].get("message_reference").is_none());
     }
-    assert_eq!(text_of(&posts[0]), "On it: look into the flake.");
+    assert_eq!(text_of(&posts[0]), "Looking into it.");
 }
 
 #[tokio::test]
@@ -2089,7 +2089,7 @@ async fn a_crash_after_discord_took_a_post_does_not_post_it_twice() {
     .runtime();
     tokio::select! {
         ended = first.run(std::future::pending()) => panic!("the runtime ended: {ended:?}"),
-        posts = fake.until_posts(1) => assert_eq!(text_of(&posts[0]), "On it: Fix the flaky test."),
+        posts = fake.until_posts(1) => assert_eq!(text_of(&posts[0]), "Looking into it."),
     }
     assert_eq!(fake.discord().messages.len(), 1, "Discord holds the post");
     let acknowledged = nonce_of_post(&fake.discord().posts[0]).to_owned();
@@ -2883,7 +2883,7 @@ budgets: {{session_microusd: {BUDGET}}}
 
     let summary = summary.unwrap();
     assert_eq!((summary.triggers_received, summary.effects_pending), (1, 0));
-    assert_eq!(text_of(&posts[0]), "On it: summarise the incident.");
+    assert_eq!(text_of(&posts[0]), "Looking into it.");
     assert!(text_of(&posts[1]).starts_with("Done: summarise the incident."));
     for post in &posts {
         assert_eq!(post["channel"], CHAN);

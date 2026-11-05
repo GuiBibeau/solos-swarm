@@ -818,7 +818,7 @@ async fn a_disconnect_or_a_cut_socket_reconnects_and_replies_go_in_the_thread() 
             (&json!("C1"), &json!("500.000001"))
         );
     }
-    assert_eq!(posts[0]["text"], "On it: draft the release notes.");
+    assert_eq!(posts[0]["text"], "Looking into it.");
     assert!(
         posts[1]["text"]
             .as_str()
@@ -1009,7 +1009,7 @@ async fn a_crash_after_a_post_and_before_its_done_mark_does_not_post_twice() {
     .runtime();
     tokio::select! {
         ended = first.run(std::future::pending()) => panic!("the runtime ended: {ended:?}"),
-        posts = fake.until_posts(1) => assert_eq!(posts[0]["text"], "On it: Fix the flaky test."),
+        posts = fake.until_posts(1) => assert_eq!(posts[0]["text"], "Looking into it."),
     }
     let acknowledged = message_id(&fake.slack().posts[0].body).to_owned();
     let pending =
@@ -1730,7 +1730,7 @@ budgets: {{session_microusd: {BUDGET}}}
     let summary = summary.unwrap();
     assert_eq!((summary.triggers_received, summary.effects_pending), (1, 0));
     let texts: Vec<&str> = posts.iter().map(|p| p["text"].as_str().unwrap()).collect();
-    assert_eq!(texts[0], "On it: summarise the incident.");
+    assert_eq!(texts[0], "Looking into it.");
     assert!(
         texts[1].starts_with("Done: summarise the incident."),
         "{}",

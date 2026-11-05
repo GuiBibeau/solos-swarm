@@ -1313,7 +1313,7 @@ impl<R: Repositories> Tx<'_, R> {
             budget_microusd: ticket.mandate.budget_microusd,
         });
         let ack = match accept.acknowledge {
-            Acknowledge::Standard => Some(format!("On it: {}.", ticket.title)),
+            Acknowledge::Standard => Some(crate::model::STANDARD_ACKNOWLEDGEMENT.to_owned()),
             Acknowledge::Silent => None,
             Acknowledge::Text(text) => Some(text),
         };

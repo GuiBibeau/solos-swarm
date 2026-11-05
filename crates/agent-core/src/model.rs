@@ -601,10 +601,18 @@ pub struct Accept {
     pub repo: Option<RepoName>,
 }
 
-/// The first reply on an accepted Ticket. A rule can ask for silence.
+/// What `Acknowledge::Standard` says. It is one short line a person would
+/// say, and it does not repeat the Ticket's title, which reads like a label
+/// in chat.
+pub const STANDARD_ACKNOWLEDGEMENT: &str = "Looking into it.";
+
+/// The first reply on an accepted Ticket. The Router writes `Text` in the
+/// asker's words, or asks for `Silent` when the answer itself should be the
+/// first reply; a rule can ask for silence too.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "text", rename_all = "snake_case")]
 pub enum Acknowledge {
+    /// [`STANDARD_ACKNOWLEDGEMENT`].
     #[default]
     Standard,
     Silent,

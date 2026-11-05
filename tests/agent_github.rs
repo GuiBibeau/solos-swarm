@@ -2007,7 +2007,7 @@ async fn a_crash_after_a_post_and_before_its_done_mark_does_not_post_twice() {
     let ids: Vec<&str> = hub.posts.iter().map(|p| message_id(&p.body)).collect();
     assert_eq!(ids.len(), 2, "the acknowledgement once, then the result");
     assert_eq!(ids[0], acknowledged);
-    assert!(hub.posts[0].body.starts_with("On it: Fix the flaky test."));
+    assert!(hub.posts[0].body.starts_with("Looking into it."));
     assert!(hub.posts[1].body.starts_with("Done: Fix the flaky test."));
     assert!(hub.posts.iter().all(|p| p.number == 7));
     drop(hub);
@@ -3162,19 +3162,11 @@ async fn agent_serve_answers_on_github_as_the_app_and_a_schedule_reports_on_its_
     };
     let asked = on(7);
     assert_eq!(asked.len(), 2, "{asked:?}");
-    assert!(
-        asked[0].starts_with("On it: summarise the incident."),
-        "{}",
-        asked[0]
-    );
+    assert!(asked[0].starts_with("Looking into it."), "{}", asked[0]);
     assert!(asked[1].contains("It was a bad deploy."), "{}", asked[1]);
     let swept = on(1);
     assert_eq!(swept.len(), 2, "{swept:?}");
-    assert!(
-        swept[0].starts_with("On it: Triage the new issues."),
-        "{}",
-        swept[0]
-    );
+    assert!(swept[0].starts_with("Looking into it."), "{}", swept[0]);
     for body in asked.iter().chain(&swept) {
         message_id(body);
     }
