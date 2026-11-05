@@ -299,6 +299,24 @@ provider through the real broker. It runs on macOS too. Swarm mode is the first 
     `recovery` a note to check `/work` before repeating outside actions), then with each later batch of Inputs
     between turns. A turn that ends with no Report, or with `progress` only, counts as `waiting`. A session that
     dies reports `failed` and ends its Assignment, so the next reply starts a new one.
+  - A turn that ends because its last model call failed, with no Report and no `progress` beyond that, is not
+    `waiting`: the broker keeps why the call failed on the worker's seat (`ModelFailure`), and the host reports in the
+    worker's place. A budget with no room for another call reports `blocked`, any other failure (the provider, its
+    call limit, the model limit) `failed`, and the Engine sends the text to the Ticket's Channels like any such
+    Report, once: it says in plain words what stopped the work (`I stopped before finishing: this request's budget
+    ($0.50) cannot cover another model call ...`, or `the model call failed (...)`) and how to go on. The Report is
+    recorded with the Ticket, which now waits for a person, so a restart ends the Assignment and starts nothing. A
+    reply on the thread goes to the live session on a failure and starts a new Assignment after a restart; a budget
+    is fixed at accept time, so the budget text asks for a new request that names a bigger one.
+  - The broker stops a worker that loops (`src/agent/broker/repeat.rs`). A circle is one call, or up to three calls
+    in turn, repeated three times with byte-identical arguments (`A A A`, `A B A B A B`); the call that closes the
+    third round is refused with a reason (HTTP 429, read by the model as the tool's error) that asks it to change its
+    approach or report `ready`, `blocked` or `failed`. The refused call is never run, and while the circle goes on
+    every call of it stays refused. A call that comes back among others that differ, such as a test run between
+    edits, is no circle, and a new turn starts the count again. A tool whose registry entry says `repeatable` is
+    never refused and ends any circle it falls into: `job_wait`, `browser_act` and `browser_read` (what they answer
+    moves between calls), `worker_report` and `worker_handback` (which must always get through) and the Router's
+    tools. `repeatable` is not part of the tool schema, so `extensions/agent-tools.json` does not carry it.
   - At start, an Assignment the last run left running, or pending with its Launch performed, ends with "host
     restarted", oldest Ticket first. One that was working starts again with `recovery` through
     `Engine::restart` (the end and the new launch in one transaction); one that waited for input, an answer or a

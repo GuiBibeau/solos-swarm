@@ -1843,6 +1843,7 @@ struct KeyedBroker {
     client: reqwest::Client,
     url: String,
     server: JoinHandle<()>,
+    seat: Mutex<Option<Arc<WorkerSeat>>>,
 }
 
 impl KeyedBroker {
@@ -1915,6 +1916,7 @@ impl KeyedBroker {
             client,
             url: format!("http://{}/v1/models", site.host),
             server,
+            seat: Mutex::new(None),
         }
     }
 
@@ -1924,10 +1926,21 @@ impl KeyedBroker {
         })
         .await;
         let seat = WorkerSeat::new(ticket, assignment, PathBuf::from("/nowhere"), BUDGET);
-        self.broker
+        let seat = self
+            .broker
             .admit_worker("worker".into(), seat, "You are a worker.".into())
             .unwrap();
+        *self.seat.lock().unwrap() = Some(seat);
         "worker".into()
+    }
+
+    /// New input reached the worker, so it is prompted again: its next
+    /// call is not a repeat of the last turn's. A worker told to wait for
+    /// a person's answer ends its turn, and the answer starts the next.
+    fn new_turn(&self) {
+        if let Some(seat) = &*self.seat.lock().unwrap() {
+            seat.begin_turn();
+        }
     }
 
     async fn fetch(&self, token: &str) -> (u16, Value) {
@@ -1997,6 +2010,7 @@ async fn a_keyed_fetch_waits_for_a_click_on_allow_and_typed_allow_grants_nothing
             (!worker.typed().is_empty()).then_some(())
         })
         .await;
+        keyed.new_turn();
         let (status, still) = keyed.fetch(&token).await;
         assert_eq!(status, 409, "typed allow grants nothing: {still}");
         assert!(
@@ -2010,6 +2024,7 @@ async fn a_keyed_fetch_waits_for_a_click_on_allow_and_typed_allow_grants_nothing
             (!worker.verdicts().is_empty()).then_some(())
         })
         .await;
+        keyed.new_turn();
         keyed.fetch(&token).await
     };
     let (_, (status, fetched)) = drive(runtime, driver).await;

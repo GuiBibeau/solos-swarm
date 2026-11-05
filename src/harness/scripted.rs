@@ -35,6 +35,7 @@ pub type Script = Vec<Vec<Call>>;
 pub struct ScriptedHarness {
     scripts: BTreeMap<String, Script>,
     every_turn: Vec<Call>,
+    model_errors_end_the_turn: bool,
 }
 
 impl ScriptedHarness {
@@ -42,6 +43,7 @@ impl ScriptedHarness {
         Self {
             scripts,
             every_turn: Vec::new(),
+            model_errors_end_the_turn: false,
         }
     }
 
@@ -51,7 +53,27 @@ impl ScriptedHarness {
         self.every_turn = calls;
         self
     }
+
+    /// Play a refused or failed model call as Pi does: the turn ends on the
+    /// error with no tool call, and the session waits for its next prompt.
+    /// Without this, the error ends the session.
+    pub fn ending_the_turn_on_a_model_error(mut self) -> Self {
+        self.model_errors_end_the_turn = true;
+        self
+    }
 }
+
+/// A model call the broker refused or that failed upstream.
+#[derive(Debug)]
+struct ModelFailed(String);
+
+impl std::fmt::Display for ModelFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ModelFailed {}
 
 impl AgentHarness for ScriptedHarness {
     type Session = ScriptedSession;
@@ -70,6 +92,7 @@ impl AgentHarness for ScriptedHarness {
                 .build()?,
             claimed: None,
             findings: None,
+            model_errors_end_the_turn: self.model_errors_end_the_turn,
         };
         let script = self.scripts.get(&spec.id).cloned().unwrap_or_default();
         let (prompts, inbox) = mpsc::unbounded_channel();
@@ -118,11 +141,13 @@ struct Agent {
     client: reqwest::Client,
     claimed: Option<String>,
     findings: Option<Value>,
+    model_errors_end_the_turn: bool,
 }
 
 impl Agent {
     /// Play one turn per prompt, in order, until the session is stopped. A
-    /// failed call ends the stream with that error.
+    /// failed call ends the stream with that error, except a model call
+    /// that ends only its turn where the harness plays it so.
     async fn run(
         mut self,
         script: Script,
@@ -133,7 +158,9 @@ impl Agent {
         let mut turns = script.into_iter();
         while let Some(prompt) = inbox.recv().await {
             let calls = turns.next().unwrap_or_else(|| every_turn.clone());
-            if let Err(error) = self.turn(&prompt, &calls, &events).await {
+            if let Err(error) = self.turn(&prompt, &calls, &events).await
+                && !(self.model_errors_end_the_turn && error.is::<ModelFailed>())
+            {
                 events.send((self.id, Err(error))).await.ok();
                 return;
             }
@@ -204,7 +231,8 @@ impl Agent {
 
     async fn model(&self, prompt: &str) -> Result<Value> {
         let body = json!({"model":self.model,"messages":[{"role":"user","content":prompt}]});
-        self.post("model", body).await
+        let refused = |error: anyhow::Error| anyhow::Error::new(ModelFailed(format!("{error:#}")));
+        self.post("model", body).await.map_err(refused)
     }
 
     async fn post(&self, path: &str, body: Value) -> Result<Value> {

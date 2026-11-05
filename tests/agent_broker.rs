@@ -14,8 +14,8 @@ use solos_agent_store::{SpendState, SqliteStore};
 use solos_swarm::agent::broker::browser::{BrowserParts, LocalBrowser};
 use solos_swarm::agent::broker::registry::{self, PrincipalKind};
 use solos_swarm::agent::broker::{
-    self, Account, AgentBroker, BrokerParts, DecideTerms, Grant, ModelTerms, Principal,
-    ROUTER_TOOLS, VaultParts, WORKER_TOOLS, WorkerParts, WorkerSeat,
+    self, Account, AgentBroker, BrokerParts, DecideTerms, Grant, ModelFailure, ModelTerms,
+    Principal, ROUTER_TOOLS, VaultParts, WORKER_TOOLS, WorkerParts, WorkerSeat,
 };
 use solos_swarm::agent::environment::{ExecutionEnvironment, Nodes, Offline, Work};
 use solos_swarm::agent::jobs::JobLimits;
@@ -26,6 +26,7 @@ use solos_swarm::agent::ports::{
 use solos_swarm::agent::pstack::Pstack;
 use solos_swarm::agent::scripted::{ScriptedExecutor, ScriptedRouter};
 use solos_swarm::agent::trail::{BlobStore, TrailStoreConfig};
+use solos_swarm::agent::watchdog::usd;
 use solos_swarm::agent::{Adapters, AgentConfig, RunOptions, Runtime, STORE_FILE};
 use solos_swarm::browse::fake::FakeCdp;
 use solos_swarm::browse::{BrowserConfig, Browsers, Launcher, TrailSigner};
@@ -1186,6 +1187,215 @@ async fn a_worker_past_its_ticket_budget_is_refused_and_the_router_still_calls()
 }
 
 #[tokio::test]
+async fn a_seat_keeps_why_its_latest_model_call_failed_and_tells_it_once() {
+    let scratch = Scratch::new("worker-failure");
+    let provider = Scripted::new();
+    let (_runtime, served) = model_only(&scratch, provider.clone(), 1_000_000);
+    let admit = |token: &str, ticket: &str, budget: u64| {
+        let seat = WorkerSeat::new(
+            TicketId::new(ticket),
+            AssignmentId::new("as_1"),
+            scratch.state(),
+            budget,
+        );
+        let prompt = "You are a worker.".into();
+        served.broker.admit_worker(token.into(), seat, prompt)
+    };
+    let asks = |token: &'static str| {
+        served.post(
+            "model",
+            Some(token),
+            model_request_for("worker_report", "fix it"),
+        )
+    };
+    let roomy = admit(WORKER, "tk_roomy", 500_000).unwrap();
+    // One call fits; a second hold on top of the first call's cost does not.
+    let tight = hold_for("fix it") + COST - 1;
+    let tiny = admit("worker-tiny", "tk_tiny", tight).unwrap();
+
+    roomy.begin_turn();
+    assert_eq!(asks(WORKER).await.0, 200);
+    assert_eq!(roomy.take_model_failure(), None, "a call that went through");
+
+    provider.set(Behaviour::Fail);
+    let (status, refused) = asks(WORKER).await;
+    assert_eq!(status, 403, "{refused}");
+    let why = "provider transport failure; outcome unknown".to_owned();
+    assert_eq!(
+        roomy.take_model_failure(),
+        Some(ModelFailure::Failed(why.clone()))
+    );
+    assert_eq!(roomy.take_model_failure(), None, "told once");
+
+    assert_eq!(asks(WORKER).await.0, 403);
+    provider.set(Behaviour::Answer);
+    assert_eq!(asks(WORKER).await.0, 200);
+    assert_eq!(
+        roomy.take_model_failure(),
+        None,
+        "a later call that went through is what the turn ended on"
+    );
+
+    std::fs::write(scratch.state().join("PAUSE"), "").unwrap();
+    assert_eq!(asks(WORKER).await.0, 503);
+    std::fs::remove_file(scratch.state().join("PAUSE")).unwrap();
+    assert_eq!(
+        roomy.take_model_failure(),
+        None,
+        "a pause is waited out, it is not a failure"
+    );
+
+    provider.set(Behaviour::Fail);
+    assert_eq!(asks(WORKER).await.0, 403);
+    roomy.begin_turn();
+    assert_eq!(roomy.take_model_failure(), None, "a new turn starts clean");
+
+    tiny.begin_turn();
+    assert_eq!(asks("worker-tiny").await.0, 403, "the provider still fails");
+    assert_eq!(
+        tiny.take_model_failure(),
+        Some(ModelFailure::Failed(why)),
+        "a call that fails at the provider is no budget failure"
+    );
+    provider.set(Behaviour::Answer);
+    assert_eq!(asks("worker-tiny").await.0, 200);
+    let (status, refused) = asks("worker-tiny").await;
+    assert_eq!(status, 403, "{refused}");
+    let failure = tiny.take_model_failure().unwrap();
+    assert_eq!(
+        failure,
+        ModelFailure::BudgetReached {
+            committed: COST,
+            budget: tight
+        },
+        "the budget refusal names the numbers"
+    );
+    let (status, text) = failure.report();
+    assert_eq!(status, ReportStatus::Blocked);
+    let cap = usd(tight);
+    for says in [
+        cap.as_str(),
+        "cannot cover another model call",
+        "new request",
+    ] {
+        assert!(text.contains(says), "{says:?} is not in {text}");
+    }
+}
+
+#[tokio::test]
+async fn a_worker_that_sends_the_same_call_over_and_over_is_refused_and_told_what_to_do() {
+    let scratch = Scratch::new("worker-repeat");
+    let (_runtime, served) = model_only(&scratch, Scripted::new(), 1_000_000);
+    let seat = WorkerSeat::new(
+        TicketId::new("tk_loop"),
+        AssignmentId::new("as_1"),
+        scratch.state(),
+        500_000,
+    );
+    let seat = served
+        .broker
+        .admit_worker(WORKER.into(), seat, "You are a worker.".into())
+        .unwrap();
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = hits.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let app = axum::Router::new().fallback(move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+        async { "page" }
+    });
+    let web = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let fetch = |path: &str| {
+        let page = json!({"url": format!("{url}{path}")});
+        served.post("tool/fetch_url", Some(WORKER), page)
+    };
+
+    for call in 1..=2 {
+        let (status, page) = fetch("status").await;
+        assert_eq!(status, 200, "call {call}: {page}");
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    let (status, refused) = fetch("status").await;
+    assert_eq!(status, 429, "{refused}");
+    let why = refused["error"].as_str().unwrap();
+    for says in [
+        "fetch_url refused",
+        "3 times in a row",
+        "Change your approach",
+        "worker_report",
+    ] {
+        assert!(why.contains(says), "{says:?} is not in {why}");
+    }
+    assert_eq!(fetch("status").await.0, 429, "it stays refused");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "a refused call is never sent"
+    );
+
+    assert_eq!(fetch("other").await.0, 200, "another call is not refused");
+    assert_eq!(
+        fetch("status").await.0,
+        200,
+        "the run of the same call ended"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
+
+    // A new turn starts the count again, even in the middle of a run.
+    for _ in 0..2 {
+        assert_eq!(fetch("again").await.0, 200);
+    }
+    seat.begin_turn();
+    for call in 1..=2 {
+        assert_eq!(fetch("again").await.0, 200, "a new turn, call {call}");
+    }
+    web.abort();
+}
+
+#[tokio::test]
+async fn a_repeat_is_normal_for_a_job_a_report_and_a_page_that_moves_but_not_for_the_rest() {
+    let scratch = Scratch::new("repeatable");
+    let (_runtime, served, _fake) = serve_with_a_node_a_vault_and_a_browser(&scratch);
+    let report = json!({"status": "progress", "text": " "});
+
+    for (tool, token, args) in [
+        ("job_wait", THERE, json!({"job": "job_1"})),
+        ("worker_report", HERE, report),
+        ("browser_read", HERE, json!({})),
+        (
+            "browser_act",
+            HERE,
+            json!({"action": "scroll", "text": "down"}),
+        ),
+    ] {
+        for call in 1..=8 {
+            let (status, reply) = served
+                .post(&format!("tool/{tool}"), Some(token), args.clone())
+                .await;
+            assert_ne!(status, 429, "{tool}, call {call}: {reply}");
+        }
+    }
+    for (tool, token, args) in [
+        ("vault_list", HERE, json!({})),
+        ("run_code", THERE, json!({"code": "rg -n for_config src"})),
+    ] {
+        for call in 1..=2 {
+            let (status, reply) = served
+                .post(&format!("tool/{tool}"), Some(token), args.clone())
+                .await;
+            assert_ne!(status, 429, "{tool}, call {call}: {reply}");
+        }
+        let (status, refused) = served
+            .post(&format!("tool/{tool}"), Some(token), args)
+            .await;
+        assert_eq!(status, 429, "{tool}: {refused}");
+        assert!(refused["error"].as_str().unwrap().contains(tool));
+    }
+}
+
+#[tokio::test]
 async fn a_handed_back_follow_up_reaches_a_fresh_eval_once() {
     let scratch = Scratch::new("handback");
     scratch.append(&request("t-ask", "T1", "Fix the flaky retry test"));
@@ -1295,17 +1505,22 @@ async fn fetch_url_keeps_swarm_modes_limits_for_a_worker() {
     assert_eq!(page["status"], 200);
     assert_eq!(page["body_bytes"], 98_304, "the per-call default bound");
     assert_eq!(page["truncated"], true);
-    let whole = json!({"url": url, "max_bytes": 8 * mebibyte});
+    // Each page is its own URL: the same call over and over is a loop the broker refuses.
+    let whole = |page: u32| json!({"url": format!("{url}?page={page}"), "max_bytes": 8 * mebibyte});
     let mut read = 98_304;
+    let mut page = 0;
     while read < solos_swarm::broker::FETCH_TOTAL_BYTES {
-        let (status, page) = served
-            .post("tool/fetch_url", Some(WORKER), whole.clone())
+        page += 1;
+        let (status, body) = served
+            .post("tool/fetch_url", Some(WORKER), whole(page))
             .await;
-        assert_eq!(status, 200, "{page}");
-        assert_eq!(page["body_bytes"], mebibyte, "no call reads past 1 MiB");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["body_bytes"], mebibyte, "no call reads past 1 MiB");
         read += mebibyte as u64;
     }
-    let (status, refused) = served.post("tool/fetch_url", Some(WORKER), whole).await;
+    let (status, refused) = served
+        .post("tool/fetch_url", Some(WORKER), whole(page + 1))
+        .await;
     assert_eq!(status, 403);
     let why = refused["error"].as_str().unwrap();
     assert!(why.contains("read budget exhausted after 32 MiB"), "{why}");

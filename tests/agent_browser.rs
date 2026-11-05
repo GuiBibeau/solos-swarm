@@ -952,7 +952,7 @@ async fn a_login_waits_for_an_allow_click_and_the_retry_fills_it() {
     let label = format!("sign in to {SITE} as gui (login {LOGIN})");
     let runtime = w.runtime.take().unwrap();
     with_runtime(runtime, async {
-        let (token, _seat) = w.admit_worker().await;
+        let (token, seat) = w.admit_worker().await;
         let open = json!({"url": format!("{SITE}/login")});
         let (status, reply) = w.call("browser_open", &token, open).await;
         assert_eq!(status, 200, "{reply}");
@@ -999,6 +999,8 @@ async fn a_login_waits_for_an_allow_click_and_the_retry_fills_it() {
                 .then_some(())
         })
         .await;
+        // The worker ended its turn to wait, and the answer starts its next.
+        seat.begin_turn();
         let (status, reply) = w.call("browser_login", &token, login).await;
         assert_eq!(status, 200, "{reply}");
         assert_eq!(reply["url"], format!("{SITE}/session"));

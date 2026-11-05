@@ -7,8 +7,8 @@
 
 use serde_json::{Value, json};
 use solos_agent_core::model::{
-    AssignmentState, DecisionKind, InputBody, MessageKind, OutboundMessage, ReportStatus, Ticket,
-    TicketOutcome, TriggerId,
+    AssignmentState, DecisionKind, InputBody, MessageKind, OutboundMessage, ReportStatus, Stage,
+    Ticket, TicketOutcome, TriggerId,
 };
 use solos_agent_store::{SpendState, SqliteStore};
 use solos_swarm::agent::pi_executor::WORK_DIR;
@@ -21,7 +21,7 @@ use solos_swarm::harness::{AgentHarness, Observation, PiHarness, Session, Sessio
 use solos_swarm::vault::{SandboxView, Vault, VaultConfig};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{Notify, mpsc};
@@ -57,6 +57,8 @@ struct Model {
     hang: Option<Arc<Notify>>,
     /// How long a worker call takes.
     delay: Duration,
+    /// Every worker call fails, as the provider's would while it is down.
+    failing: AtomicBool,
 }
 
 impl Model {
@@ -66,7 +68,11 @@ impl Model {
             bodies: Mutex::new(Vec::new()),
             hang: None,
             delay: Duration::ZERO,
+            failing: AtomicBool::new(false),
         })
+    }
+    fn fail_workers(&self, failing: bool) {
+        self.failing.store(failing, Ordering::SeqCst);
     }
     fn prompts(&self) -> Vec<String> {
         let bodies = self.bodies.lock().unwrap();
@@ -168,7 +174,11 @@ impl Provider for Model {
         };
         let hang = self.hang.clone().filter(|_| !router);
         let delay = if router { Duration::ZERO } else { self.delay };
+        let failing = !router && self.failing.load(Ordering::SeqCst);
         Box::pin(async move {
+            if failing {
+                return Err(anyhow::anyhow!("deepseek is down"));
+            }
             if let Some(hang) = hang {
                 hang.notify_one();
                 std::future::pending::<()>().await;
@@ -470,6 +480,133 @@ async fn a_worker_at_its_tickets_budget_is_refused_and_the_router_still_judges()
     assert_settled(&scratch.store());
 }
 
+/// As Pi plays a model call that is refused or fails: the turn ends on the
+/// error and the session waits, instead of the session dying.
+fn scripted_as_pi() -> ScriptedHarness {
+    scripted().ending_the_turn_on_a_model_error()
+}
+
+#[tokio::test]
+async fn a_turn_that_ends_on_a_refused_budget_tells_the_person_once_and_a_restart_repeats_nothing()
+{
+    let scratch = Scratch::new("silent-budget");
+    scratch.ask("t-tiny", "T1", "Do this on a tiny budget please");
+    let model = Model::new(Box::new(|_| vec![report("ready", "Done.")]));
+    let serve = || async {
+        let host = scratch.host(scripted_as_pi(), model.clone());
+        scratch.serve(scratch.config(true, ""), host).await;
+    };
+
+    serve().await;
+
+    assert_eq!(
+        scratch.replies(),
+        [
+            ("T1".to_owned(), MessageKind::Acknowledgement),
+            ("T1".to_owned(), MessageKind::Attention)
+        ],
+        "an acknowledgement, then exactly one reply that says why nothing came"
+    );
+    let told = scratch.sent()[1].text.clone();
+    let start = "I stopped before finishing: this request's budget ($0.0001) cannot cover another";
+    assert!(told.starts_with(start), "{told}");
+    assert!(told.contains("make a new request"), "{told}");
+    let tickets = scratch.tickets();
+    let [ticket] = &tickets[..] else {
+        panic!("{tickets:?}")
+    };
+    let report = ticket.latest_report().unwrap();
+    assert_eq!(
+        (report.status, &report.text),
+        (ReportStatus::Blocked, &told)
+    );
+    assert_eq!(ticket.stage(), Stage::Blocked);
+    assert!(ticket.ended.is_none(), "a person may still answer");
+    assert!(
+        model.worker_prompts().is_empty(),
+        "the refused call never reached the model"
+    );
+    assert_settled(&scratch.store());
+
+    serve().await;
+
+    assert_eq!(scratch.sent().len(), 2, "a restart tells nothing again");
+    let tickets = scratch.tickets();
+    let [ticket] = &tickets[..] else {
+        panic!("{tickets:?}")
+    };
+    let assignments: Vec<_> = ticket
+        .assignments
+        .iter()
+        .map(|a| (a.state, a.ended_reason.clone()))
+        .collect();
+    assert_eq!(
+        assignments,
+        [(AssignmentState::Ended, Some(HOST_RESTARTED.to_owned()))],
+        "the ticket waits for a person, so no new worker starts and spends"
+    );
+    assert!(model.worker_prompts().is_empty());
+    assert_settled(&scratch.store());
+}
+
+#[tokio::test]
+async fn a_turn_that_ends_on_a_failed_model_call_tells_the_person_once_and_a_reply_goes_on() {
+    let scratch = Scratch::new("silent-provider");
+    scratch.ask("t-ask", "T1", "Summarise the incident report");
+    let model = Model::new(Box::new(|_| vec![report("ready", "Summarised.")]));
+    let serve = || async {
+        let host = scratch.host(scripted_as_pi(), model.clone());
+        scratch.serve(scratch.config(false, ""), host).await;
+    };
+    model.fail_workers(true);
+
+    serve().await;
+
+    assert_eq!(
+        scratch.replies(),
+        [
+            ("T1".to_owned(), MessageKind::Acknowledgement),
+            ("T1".to_owned(), MessageKind::Attention)
+        ]
+    );
+    let told = scratch.sent()[1].text.clone();
+    assert_eq!(
+        told,
+        "I stopped before finishing: the model call failed (deepseek is down). Reply here and \
+         I will try again."
+    );
+    let tickets = scratch.tickets();
+    let report = tickets[0].latest_report().unwrap();
+    assert_eq!(report.status, ReportStatus::Failed);
+    assert_eq!(tickets[0].stage(), Stage::Failed);
+    assert_eq!(
+        scratch
+            .store()
+            .committed(&format!("ticket:{}", tickets[0].id), 0)
+            .unwrap(),
+        0,
+        "a call that failed is not charged"
+    );
+
+    serve().await;
+    assert_eq!(scratch.sent().len(), 2, "a restart tells nothing again");
+
+    model.fail_workers(false);
+    scratch.ask("t-again", "T1", "The provider is back; please try again");
+    serve().await;
+
+    assert_eq!(
+        scratch.replies(),
+        [
+            ("T1".to_owned(), MessageKind::Acknowledgement),
+            ("T1".to_owned(), MessageKind::Attention),
+            ("T1".to_owned(), MessageKind::Result)
+        ]
+    );
+    assert_eq!(scratch.sent()[2].text, "Summarised.");
+    assert_settled(&scratch.store());
+}
+
 #[tokio::test]
 async fn a_follow_up_the_worker_hands_back_reaches_a_fresh_eval() {
     let scratch = Scratch::new("handback");
@@ -548,6 +685,7 @@ async fn a_crash_during_a_running_assignment_restarts_it_as_a_recovery_without_r
         bodies: Mutex::new(Vec::new()),
         hang: Some(hung.clone()),
         delay: Duration::ZERO,
+        failing: AtomicBool::new(false),
     });
     // Its own runtime, dropped whole as a crash would: every task, the
     // broker and the worker session go with it.
@@ -836,6 +974,7 @@ async fn no_more_workers_live_than_the_limit_and_every_ticket_is_still_answered(
         bodies: Mutex::new(Vec::new()),
         hang: None,
         delay: Duration::from_millis(150),
+        failing: AtomicBool::new(false),
     });
     let (live, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     let harness = Counting {
