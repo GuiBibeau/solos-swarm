@@ -147,7 +147,7 @@ fn accept(rules: Vec<String>) -> Verdict {
             environment: None,
             method: None,
         },
-        budget_microusd: 1_000_000,
+        budget_microusd: Some(1_000_000),
         acknowledge: Acknowledge::Silent,
         rules,
         repo: None,

@@ -106,8 +106,9 @@ pub struct WorkerSeat {
     environment: Option<String>,
     /// A repository Ticket's `<ticket>/host`.
     host_dir: Option<PathBuf>,
-    /// The Ticket's whole budget, which every Assignment of it shares.
-    pub budget_microusd: MicroUsd,
+    /// The Ticket's whole budget, which every Assignment of it shares, or
+    /// `None` where it has no cap.
+    pub budget_microusd: Option<MicroUsd>,
     /// The Ticket account's spend from this time on is this Assignment's.
     pub since_ms: Ms,
     /// The latest status the Engine took in the current turn.
@@ -129,7 +130,7 @@ impl WorkerSeat {
         ticket: TicketId,
         assignment: AssignmentId,
         work_dir: PathBuf,
-        budget_microusd: MicroUsd,
+        budget_microusd: impl Into<Option<MicroUsd>>,
     ) -> Self {
         Self {
             ticket,
@@ -137,7 +138,7 @@ impl WorkerSeat {
             work_dir,
             environment: None,
             host_dir: None,
-            budget_microusd,
+            budget_microusd: budget_microusd.into(),
             since_ms: now_ms(),
             turn: Mutex::new(None),
             model_failure: Mutex::new(None),
@@ -318,13 +319,15 @@ impl ModelFailure {
 /// Who pays for a model call, and how much it may commit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Account {
-    /// The Router's judging, capped per UTC day.
-    Router { daily_microusd: MicroUsd },
+    /// The Router's judging, capped per UTC day, or not capped where
+    /// `budgets.router_daily_microusd` is absent.
+    Router { daily_microusd: Option<MicroUsd> },
     /// One Ticket's work, capped for its whole life by its Mandate's budget,
-    /// which is fixed at accept time.
+    /// which is fixed at accept time. A Ticket whose Mandate has none is not
+    /// capped: its calls are still held and settled, so its spend is recorded.
     Ticket {
         id: TicketId,
-        budget_microusd: MicroUsd,
+        budget_microusd: Option<MicroUsd>,
     },
 }
 
@@ -343,14 +346,19 @@ impl Account {
         format!("ticket:{ticket}")
     }
 
-    /// Spend from the first time on counts against the cap.
-    pub fn allowance(&self, now_ms: Ms) -> (Ms, MicroUsd) {
+    /// Spend from the first time on counts against the cap, if there is one.
+    pub fn allowance(&self, now_ms: Ms) -> (Ms, Option<MicroUsd>) {
         match self {
             Self::Router { daily_microusd } => (now_ms - now_ms % DAY_MS, *daily_microusd),
             Self::Ticket {
                 budget_microusd, ..
             } => (0, *budget_microusd),
         }
+    }
+
+    /// Whether a call on this account can be refused for spend.
+    fn capped(&self) -> bool {
+        self.allowance(0).1.is_some()
     }
 
     fn cap_reached(&self, committed: MicroUsd, cap: MicroUsd) -> String {
@@ -390,8 +398,11 @@ pub struct Grant {
 /// The budgets and plans a Router's accept may name.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DecideTerms {
-    /// An accept that names no budget gets this.
-    pub default_budget_microusd: MicroUsd,
+    /// What a session accept that names no budget gets
+    /// (`budgets.session_microusd`). `None`: a session has no budget, so it
+    /// needs no approval and its account has no cap, and a budget the
+    /// Router names for one is not used. A swarm always has a budget.
+    pub default_budget_microusd: Option<MicroUsd>,
     /// The most an accept may name, or no cap. Above the Policy's approval
     /// threshold a Ticket waits for a person's approval, so where nobody can
     /// give one the threshold is the cap, instead of a Ticket that waits
@@ -419,6 +430,10 @@ pub struct SwarmTerms {
     pub templates: Vec<String>,
     /// The one a swarm plan that names none gets.
     pub default_template: Option<String>,
+    /// What a swarm plan that names no budget gets
+    /// (`executor.swarm.default_budget_microusd`), before the session
+    /// default.
+    pub default_budget_microusd: Option<MicroUsd>,
 }
 
 impl SwarmTerms {
@@ -480,6 +495,7 @@ impl DecideTerms {
             } => Some(SwarmTerms {
                 templates: swarm.templates.keys().cloned().collect(),
                 default_template: swarm.default_template.clone(),
+                default_budget_microusd: swarm.default_budget_microusd,
             }),
             _ => None,
         };
@@ -978,7 +994,9 @@ impl Call {
             ));
         }
         self.admitted.map_err(forbidden)?;
-        if broker.inner.overrun.load(Ordering::SeqCst) {
+        // An account with no cap relies on no hold to bound its spend, so
+        // an overrun stops only the accounts that have one.
+        if grant.account.capped() && broker.inner.overrun.load(Ordering::SeqCst) {
             return Err(forbidden(
                 "an earlier call cost more than its hold, so model calls are stopped",
             ));
@@ -1005,6 +1023,8 @@ impl Call {
         let id = match reservation {
             Reservation::Held(id) => id,
             Reservation::Refused { committed } => {
+                // Only an account with a cap is refused for spend.
+                let cap = cap.unwrap_or_default();
                 *named = Some(ModelFailure::BudgetReached {
                     committed,
                     budget: cap,
@@ -1083,10 +1103,19 @@ async fn dispatch(
         .await
         .map_err(failed)?;
     if cost > hold {
-        broker.inner.overrun.store(true, Ordering::SeqCst);
-        return Err(forbidden(
-            "provider exceeded reservation; admission stopped",
-        ));
+        if grant.account.capped() {
+            broker.inner.overrun.store(true, Ordering::SeqCst);
+            return Err(forbidden(
+                "provider exceeded reservation; admission stopped",
+            ));
+        }
+        // No cap means nothing here is bounded by the hold: the settlement
+        // above is the record, and the call stands.
+        eprintln!(
+            "agent: a call on {} cost {cost} microusd, above its {hold} hold; it has no cap, so \
+             the cost is recorded and the call stands",
+            grant.account.key()
+        );
     }
     response["swarm_cost_microusd"] = json!(cost);
     Ok(Json(response))
@@ -1283,11 +1312,29 @@ impl DecideArgs {
                     }
                     (PlanKind::Swarm, None) => return Err("a swarm plan names its agents".into()),
                 };
-                let budget = self
-                    .budget_microusd
-                    .or(repo.as_ref().and_then(|(_, terms)| terms.budget_microusd))
-                    .unwrap_or(terms.default_budget_microusd);
-                if let Some(max) = terms.ceiling(origin)
+                let repo_budget = repo.as_ref().and_then(|(_, terms)| terms.budget_microusd);
+                let budget = match (&plan, terms.default_budget_microusd) {
+                    (Plan::Swarm { .. }, session_default) => Some(
+                        self.budget_microusd
+                            .or(terms
+                                .swarm
+                                .as_ref()
+                                .and_then(|swarm| swarm.default_budget_microusd))
+                            .or(session_default)
+                            .ok_or(
+                                "a swarm plan needs budget_microusd, and this agent sets no \
+                                 default budget for one",
+                            )?,
+                    ),
+                    (Plan::Session { .. }, Some(default)) => {
+                        Some(self.budget_microusd.or(repo_budget).unwrap_or(default))
+                    }
+                    // No session budget is configured, so none is named: a
+                    // repository's own budget, set by the operator, still holds.
+                    (Plan::Session { .. }, None) => repo_budget,
+                };
+                if let Some(budget) = budget
+                    && let Some(max) = terms.ceiling(origin)
                     && budget > max
                 {
                     return Err(match terms.max_budget_microusd {
@@ -1794,11 +1841,12 @@ mod tests {
 
     fn terms() -> DecideTerms {
         DecideTerms {
-            default_budget_microusd: 500_000,
+            default_budget_microusd: Some(500_000),
             max_budget_microusd: Some(2_000_000),
             swarm: Some(SwarmTerms {
                 templates: vec!["audit".into(), "research".into()],
                 default_template: Some("research".into()),
+                default_budget_microusd: None,
             }),
             repos: BTreeMap::new(),
             ..DecideTerms::default()
@@ -1816,16 +1864,36 @@ mod tests {
 
     #[test]
     fn accounts_have_stable_keys_and_their_own_windows() {
-        let router = Account::Router { daily_microusd: 7 };
+        let router = Account::Router {
+            daily_microusd: Some(7),
+        };
         let day = 86_400_000;
         assert_eq!(router.key(), "router");
-        assert_eq!(router.allowance(3 * day + 5), (3 * day, 7));
+        assert_eq!(router.allowance(3 * day + 5), (3 * day, Some(7)));
         let ticket = Account::Ticket {
             id: TicketId::new("tk_1"),
-            budget_microusd: 9,
+            budget_microusd: Some(9),
         };
         assert_eq!(ticket.key(), "ticket:tk_1");
-        assert_eq!(ticket.allowance(3 * day + 5), (0, 9));
+        assert_eq!(ticket.allowance(3 * day + 5), (0, Some(9)));
+        assert!(router.capped() && ticket.capped());
+    }
+
+    #[test]
+    fn an_account_with_no_cap_keeps_its_key_and_window_and_is_not_capped() {
+        let day = 86_400_000;
+        let router = Account::Router {
+            daily_microusd: None,
+        };
+        assert_eq!(router.key(), "router");
+        assert_eq!(router.allowance(3 * day + 5), (3 * day, None));
+        let ticket = Account::Ticket {
+            id: TicketId::new("tk_1"),
+            budget_microusd: None,
+        };
+        assert_eq!(ticket.key(), "ticket:tk_1");
+        assert_eq!(ticket.allowance(3 * day + 5), (0, None));
+        assert!(!router.capped() && !ticket.capped());
     }
 
     #[test]
@@ -1844,7 +1912,7 @@ mod tests {
                 method: None,
             }
         );
-        assert_eq!(accept.budget_microusd, 500_000);
+        assert_eq!(accept.budget_microusd, Some(500_000));
         assert_eq!(accept.acknowledge, Acknowledge::Standard);
         let Verdict::Accept(remote) = verdict(json!({
             "eval":"ev_1","decision":"accept","reason":"asked","title":"T","scope":"S",
@@ -1962,6 +2030,7 @@ mod tests {
             swarm: Some(SwarmTerms {
                 templates: vec!["audit".into()],
                 default_template: None,
+                default_budget_microusd: None,
             }),
             ..terms()
         };
@@ -2007,14 +2076,18 @@ mod tests {
         };
         assert_eq!(defaulted.repo, Some(widgets.clone()));
         assert_eq!(defaulted.plan, owes(Deliverable::PullRequest));
-        assert_eq!(defaulted.budget_microusd, 1_500_000, "the repo's budget");
+        assert_eq!(
+            defaulted.budget_microusd,
+            Some(1_500_000),
+            "the repo's budget"
+        );
         let Ok(Verdict::Accept(named)) =
             accept(json!({"deliverable":"answer","budget_microusd":700_000}))
         else {
             panic!("refused")
         };
         assert_eq!(named.plan, owes(Deliverable::Answer));
-        assert_eq!(named.budget_microusd, 700_000);
+        assert_eq!(named.budget_microusd, Some(700_000));
 
         for (extra, why) in [
             (
@@ -2043,6 +2116,134 @@ mod tests {
         assert_eq!(
             verdict(elsewhere),
             Err("this agent works on no repository; accept the work without a repo".to_owned())
+        );
+    }
+
+    /// What an operator who sets no `budgets.session_microusd` gets.
+    fn uncapped_sessions() -> DecideTerms {
+        DecideTerms {
+            default_budget_microusd: None,
+            ..terms()
+        }
+    }
+
+    fn accepted(terms: &DecideTerms, extra: serde_json::Value) -> Result<Option<u64>, String> {
+        let mut args = json!({"eval":"ev_1","decision":"accept","reason":"asked","title":"T",
+                              "scope":"S"});
+        for (key, value) in extra.as_object().unwrap() {
+            args[key] = value.clone();
+        }
+        match verdict_under(terms, args)? {
+            Verdict::Accept(accept) => Ok(accept.budget_microusd),
+            other => panic!("not an accept: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_session_has_no_budget_where_the_operator_sets_none_and_a_named_one_is_not_used() {
+        let terms = uncapped_sessions();
+        assert_eq!(accepted(&terms, json!({})), Ok(None));
+        assert_eq!(
+            accepted(&terms, json!({"budget_microusd": 700_000})),
+            Ok(None),
+            "a budget is for a swarm here"
+        );
+        assert_eq!(
+            accepted(&terms, json!({"budget_microusd": 9_000_000})),
+            Ok(None),
+            "so even one above the ceiling is not a refusal"
+        );
+        let capped = terms_with_default(Some(500_000));
+        assert_eq!(accepted(&capped, json!({})), Ok(Some(500_000)));
+        assert_eq!(
+            accepted(&capped, json!({"budget_microusd": 700_000})),
+            Ok(Some(700_000)),
+            "where one is set, a session still takes the Router's"
+        );
+    }
+
+    fn terms_with_default(default_budget_microusd: Option<u64>) -> DecideTerms {
+        DecideTerms {
+            default_budget_microusd,
+            ..terms()
+        }
+    }
+
+    #[test]
+    fn a_repository_budget_the_operator_sets_still_holds_without_a_session_budget() {
+        let widgets = RepoName::try_from("acme/widgets".to_owned()).unwrap();
+        let repo = |budget_microusd| {
+            BTreeMap::from([(
+                widgets.clone(),
+                RepoConfig {
+                    about: "Widgets.".into(),
+                    base: "main".into(),
+                    budget_microusd,
+                    notes: None,
+                    owes: Deliverable::Answer,
+                },
+            )])
+        };
+        let with = |budget| DecideTerms {
+            repos: repo(budget),
+            ..uncapped_sessions()
+        };
+        let on_repo = json!({"repo": "acme/widgets", "budget_microusd": 700_000});
+        assert_eq!(
+            accepted(&with(Some(1_500_000)), on_repo.clone()),
+            Ok(Some(1_500_000))
+        );
+        assert_eq!(accepted(&with(None), on_repo), Ok(None));
+    }
+
+    #[test]
+    fn a_swarm_always_has_a_budget_from_the_router_the_swarm_or_the_session_default() {
+        let swarm = |extra: serde_json::Value| {
+            let mut args = json!({"plan": "swarm", "agents": 3});
+            for (key, value) in extra.as_object().unwrap() {
+                args[key] = value.clone();
+            }
+            args
+        };
+        let none = uncapped_sessions();
+        let refused = accepted(&none, swarm(json!({}))).unwrap_err();
+        assert!(
+            refused.contains("a swarm plan needs budget_microusd"),
+            "{refused}"
+        );
+        assert_eq!(
+            accepted(&none, swarm(json!({"budget_microusd": 1_500_000}))),
+            Ok(Some(1_500_000)),
+            "the Router names it"
+        );
+        let defaulted = DecideTerms {
+            swarm: Some(SwarmTerms {
+                templates: vec!["research".into()],
+                default_template: Some("research".into()),
+                default_budget_microusd: Some(1_000_000),
+            }),
+            ..uncapped_sessions()
+        };
+        assert_eq!(
+            accepted(&defaulted, swarm(json!({}))),
+            Ok(Some(1_000_000)),
+            "executor.swarm names it"
+        );
+        assert_eq!(
+            accepted(&defaulted, swarm(json!({"budget_microusd": 1_500_000}))),
+            Ok(Some(1_500_000)),
+            "and the Router's wins"
+        );
+        assert_eq!(
+            accepted(&terms(), swarm(json!({}))),
+            Ok(Some(500_000)),
+            "without one of its own, a swarm gets the session default as before"
+        );
+        let refused =
+            accepted(&defaulted, swarm(json!({"budget_microusd": 2_000_001}))).unwrap_err();
+        assert!(
+            refused.contains("is above 2000000"),
+            "a swarm's budget keeps its ceiling: {refused}"
         );
     }
 

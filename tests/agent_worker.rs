@@ -7,8 +7,8 @@
 
 use serde_json::{Value, json};
 use solos_agent_core::model::{
-    AssignmentState, DecisionKind, InputBody, MessageKind, OutboundMessage, ReportStatus, Stage,
-    Ticket, TicketOutcome, TriggerId,
+    Approval, AssignmentState, DecisionKind, InputBody, MessageKind, OutboundMessage, ReportStatus,
+    Stage, Ticket, TicketOutcome, TriggerId,
 };
 use solos_agent_store::{SpendState, SqliteStore};
 use solos_swarm::agent::pi_executor::WORK_DIR;
@@ -249,17 +249,28 @@ impl Scratch {
     /// A config with a Pi Router when `router`, else a scripted one, and
     /// Pi workers with `executor` added to their settings.
     fn config(&self, router: bool, executor: &str) -> AgentConfig {
+        let budgets = "budgets: {session_microusd: 500000, router_daily_microusd: 1000000}\n";
+        self.config_under(router, executor, "", budgets)
+    }
+    /// [`config`](Self::config) with `policy` lines added to the Policy and
+    /// `budgets` as the config's last lines, which may be none.
+    fn config_under(
+        &self,
+        router: bool,
+        executor: &str,
+        policy: &str,
+        budgets: &str,
+    ) -> AgentConfig {
         let router = if router {
             ROUTER
         } else {
             "router: {kind: scripted}\n"
         };
         let yaml = format!(
-            "policy:\n  people: [slack:alice]\n\
+            "policy:\n  people: [slack:alice]\n{policy}\
              sources:\n  - {{kind: jsonl, path: triggers.jsonl}}\n\
              channels:\n  - {{kind: jsonl, source: slack, path: outbox.jsonl}}\n\
-             {router}{WORKERS}{executor}\
-             budgets: {{session_microusd: 500000, router_daily_microusd: 1000000}}\n"
+             {router}{WORKERS}{executor}{budgets}"
         );
         let path = self.root.join("agent.yaml");
         std::fs::write(&path, yaml).unwrap();
@@ -430,7 +441,7 @@ async fn a_worker_at_its_tickets_budget_is_refused_and_the_router_still_judges()
     let [tiny] = &tickets[..] else {
         panic!("{tickets:?}")
     };
-    assert_eq!(tiny.mandate.budget_microusd, 100);
+    assert_eq!(tiny.mandate.budget_microusd, Some(100));
     let sent = scratch.sent();
     assert_eq!(
         scratch.replies(),
@@ -478,6 +489,69 @@ async fn a_worker_at_its_tickets_budget_is_refused_and_the_router_still_judges()
         "the refused Ticket waits for a person"
     );
     assert_settled(&scratch.store());
+}
+
+/// No `budgets` at all, and a threshold of one microusd with nobody to
+/// approve anything: a capped Ticket could neither run nor ask.
+#[tokio::test]
+async fn with_no_budgets_a_ticket_is_never_capped_asks_no_approval_and_its_spend_is_recorded() {
+    let scratch = Scratch::new("uncapped");
+    scratch.ask("t-tiny", "T1", "Do this on a tiny budget please");
+    scratch.ask("t-next", "T2", "Summarise the incident report");
+    let model = Model::new(Box::new(|_| vec![report("ready", "Done.")]));
+    let config = scratch.config_under(true, "", "  auto_approve_microusd: 1\n", "");
+    assert_eq!(
+        config.budgets,
+        solos_swarm::agent::config::Budgets::default()
+    );
+
+    let summary = scratch
+        .serve(config, scratch.host(scripted(), model.clone()))
+        .await;
+
+    assert_eq!((summary.triggers_received, summary.effects_pending), (2, 0));
+    let tickets = scratch.tickets();
+    assert_eq!(tickets.len(), 2);
+    for ticket in &tickets {
+        assert_eq!(
+            ticket.mandate.budget_microusd, None,
+            "even the request that named a tiny budget, which a session does not take here"
+        );
+        assert_eq!(ticket.approval, Approval::NotNeeded);
+        assert_eq!(
+            ticket.ended.as_ref().map(|e| e.outcome),
+            Some(TicketOutcome::Completed),
+            "{ticket:?}"
+        );
+    }
+    let replies = scratch.replies();
+    assert_eq!(replies.len(), 4, "{replies:?}");
+    assert!(
+        replies
+            .iter()
+            .all(|(_, kind)| *kind != MessageKind::Attention),
+        "nobody was asked to approve or told a budget ran out: {replies:?}"
+    );
+    let store = scratch.store();
+    for ticket in &tickets {
+        let account = format!("ticket:{}", ticket.id);
+        let rows = store.spend(&account).unwrap();
+        let [row] = &rows[..] else { panic!("{rows:?}") };
+        assert_eq!((row.state, row.cost_microusd), (SpendState::Settled, 90));
+        assert!(
+            row.hold_microusd > 100,
+            "a call the old tiny budget would have refused"
+        );
+        assert_eq!(
+            ticket.latest_report().unwrap().spent_microusd,
+            90,
+            "the report's spend is the ledger's"
+        );
+    }
+    let router_rows = store.spend("router").unwrap();
+    assert!(!router_rows.is_empty());
+    assert!(router_rows.iter().all(|r| r.state == SpendState::Settled));
+    assert_settled(&store);
 }
 
 /// As Pi plays a model call that is refused or fails: the turn ends on the

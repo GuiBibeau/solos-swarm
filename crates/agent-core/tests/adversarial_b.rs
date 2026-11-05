@@ -67,7 +67,7 @@ fn accept(plan: Plan, budget: u64) -> Verdict {
         scope: "Reproduce and fix tests/broker_http.rs flake".into(),
         reason: "alice asked".into(),
         plan,
-        budget_microusd: budget,
+        budget_microusd: Some(budget),
         acknowledge: Acknowledge::Standard,
         rules: Vec::new(),
         repo: None,

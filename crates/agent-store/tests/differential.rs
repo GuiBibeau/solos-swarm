@@ -307,7 +307,7 @@ fn gen_accept(rng: &mut Lcg) -> Accept {
         scope: "scope".into(),
         reason: "asked".into(),
         plan,
-        budget_microusd: rng.pick(&[0, 400_000, 1_500_000, 3_000_000, 8_000_000]),
+        budget_microusd: Some(rng.pick(&[0, 400_000, 1_500_000, 3_000_000, 8_000_000])),
         acknowledge: rng.pick(&[
             Acknowledge::Standard,
             Acknowledge::Silent,

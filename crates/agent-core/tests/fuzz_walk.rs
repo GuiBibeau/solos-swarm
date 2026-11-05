@@ -541,7 +541,7 @@ fn gen_accept(rng: &mut Lcg) -> Accept {
         scope: if rng.chance(4) { "  " } else { "scope" }.into(),
         reason: "asked".into(),
         plan,
-        budget_microusd: budget,
+        budget_microusd: Some(budget),
         acknowledge: rng.pick(&[
             Acknowledge::Standard,
             Acknowledge::Silent,
@@ -2202,7 +2202,7 @@ fn show(cmd: &Op) -> String {
         ),
         Op::EvaluateDue => "evaluate_due".into(),
         Op::Decide(e, Verdict::Accept(a)) => format!(
-            "decide {e} accept plan={} budget={} title={:?} scope={:?} ack={:?} rules={:?}",
+            "decide {e} accept plan={} budget={:?} title={:?} scope={:?} ack={:?} rules={:?}",
             show_plan(&a.plan),
             a.budget_microusd,
             a.title,

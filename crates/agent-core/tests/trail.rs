@@ -147,7 +147,7 @@ fn running_ticket(
             environment: None,
             method: None,
         },
-        budget_microusd: 1_000_000,
+        budget_microusd: Some(1_000_000),
         acknowledge: Acknowledge::Standard,
         rules: Vec::new(),
         repo: None,

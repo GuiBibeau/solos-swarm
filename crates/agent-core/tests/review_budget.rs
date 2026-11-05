@@ -47,7 +47,7 @@ fn verdict(plan: Plan, budget: u64) -> Verdict {
         scope: "Do the task".into(),
         reason: "asked".into(),
         plan,
-        budget_microusd: budget,
+        budget_microusd: Some(budget),
         acknowledge: Acknowledge::Standard,
         rules: Vec::new(),
         repo: None,

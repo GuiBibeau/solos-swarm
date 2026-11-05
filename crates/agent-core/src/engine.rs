@@ -694,7 +694,10 @@ fn allowed_person(policy: &impl Policy, trigger: &Trigger) -> bool {
 
 fn needs_approval(ticket: &Ticket, policy: &impl Policy) -> bool {
     !matches!(ticket.approval, Approval::Granted { .. })
-        && ticket.mandate.budget_microusd > policy.auto_approve_microusd()
+        && ticket
+            .mandate
+            .budget_microusd
+            .is_some_and(|budget| budget > policy.auto_approve_microusd())
 }
 
 fn may_resume(policy: &impl Policy, owner: bool, ticket: &Ticket) -> bool {
@@ -712,8 +715,12 @@ fn validate(accept: &Accept) -> Result<(), Error> {
             "a swarm has 1 to {MAX_SWARM_AGENTS} agents, not {agents}"
         )));
     }
-    if accept.budget_microusd == 0 {
-        return Err(Error::Invalid("an accept needs a budget".into()));
+    match (accept.budget_microusd, &accept.plan) {
+        (Some(0), _) => return Err(Error::Invalid("an accept needs a budget".into())),
+        (None, Plan::Swarm { .. }) => {
+            return Err(Error::Invalid("a swarm needs a budget".into()));
+        }
+        _ => {}
     }
     match (&accept.plan, &accept.repo) {
         (Plan::Swarm { .. }, Some(_)) => Err(Error::Invalid(
@@ -910,7 +917,7 @@ impl<R: Repositories> Tx<'_, R> {
                 "{} needs approval first: {} with a budget of {}.",
                 ticket.title,
                 plan_label(&ticket.plan),
-                usd(ticket.mandate.budget_microusd)
+                usd(ticket.mandate.budget_microusd.unwrap_or_default())
             );
             ticket.attention = Some(ask.clone());
             self.send(ticket, MessageKind::Attention, ask, Some(Ask::Budget));

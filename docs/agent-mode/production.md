@@ -43,7 +43,10 @@ message sent during the few seconds the agent is down is lost (a new Gateway ses
 
 **Rollback and the schema.** A release that migrated `agent.db` to a newer schema cannot be rolled back to a binary
 that knows only the older one: the older binary refuses the file and `rollback` says so. Then stop the agent, copy
-the matching `agent.db*` back from `backups/` into `state/`, and roll back.
+the matching `agent.db*` back from `backups/` into `state/`, and roll back. A Ticket accepted without a budget (no
+`budgets:` section) stores none, and a binary from before budgets were optional fails to read it. The schema version
+is the same, so `rollback` does not notice: roll back only when no such Ticket is open, or restore `agent.db*` from
+`backups/` as above.
 
 ## The production config
 
@@ -52,7 +55,7 @@ the matching `agent.db*` back from `backups/` into `state/`, and roll back.
 policy:
   people: [discord:<your user id>, mcp:<your name>]
   approvers: [discord:<your user id>]
-  auto_approve_microusd: 500000           # above this a Ticket's budget waits for Approve
+  auto_approve_microusd: 500000           # above this a swarm's budget waits for Approve
 sources:
   - kind: discord
     guilds: [<server id>]
@@ -74,7 +77,10 @@ executor:
   max_workers: 4
   run_code: {}
 pstack: {}
-budgets: {session_microusd: 500000, router_daily_microusd: 3000000}
+# No `budgets:` section: a session Ticket and the Router have no cap, and a swarm's budget is named by the Router
+# (or `executor.swarm.default_budget_microusd`). To cap them, add
+#   budgets: {session_microusd: 500000, router_daily_microusd: 3000000}
+# and see "Budgets" in README.md.
 watchdog:
   operator: {source: discord, address: {channel: <a channel id you read>}}
   every: 1m

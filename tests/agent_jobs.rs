@@ -145,7 +145,7 @@ impl World {
             provider: Arc::new(Silent),
             facts: runtime.facts(),
             decide: DecideTerms {
-                default_budget_microusd: 500_000,
+                default_budget_microusd: Some(500_000),
                 max_budget_microusd: None,
                 swarm: None,
                 repos: BTreeMap::new(),
@@ -162,7 +162,7 @@ impl World {
         let router = Grant {
             principal: Principal::Router,
             account: Account::Router {
-                daily_microusd: 1_000_000,
+                daily_microusd: Some(1_000_000),
             },
             terms: terms(),
             system_prompt: None,

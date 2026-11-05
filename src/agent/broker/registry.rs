@@ -304,7 +304,7 @@ fn router_decide() -> Value {
             "budget_microusd": {
                 "type": "integer",
                 "minimum": 1,
-                "description": "accept: the Ticket's whole budget in microusd. Omit it for the default.",
+                "description": "accept: the Ticket's whole budget in microusd. Omit it for the default. It is for a swarm: a session has a budget only where the operator sets one, and otherwise this is not used.",
             },
             "acknowledge": string("accept: the first reply, in your own words instead of the standard \"Looking into it.\": one short natural sentence in the asker's language and tone, never the title, a label or \"On it: ...\". An empty string sends none, for a small follow-up in a conversation the answer will continue."),
             "rules": {

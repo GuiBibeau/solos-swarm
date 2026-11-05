@@ -12,7 +12,7 @@ fn request(account: &str, cap: u64, hold: u64, at_ms: u64) -> HoldRequest<'_> {
         account,
         provider: "deepseek",
         since_ms: at_ms - at_ms % DAY,
-        cap_microusd: cap,
+        cap_microusd: Some(cap),
         hold_microusd: hold,
         at_ms,
     }
@@ -30,6 +30,41 @@ const TOKENS: Tokens = Tokens {
     cached_input: 90,
     output: 50,
 };
+
+#[test]
+fn an_account_with_no_cap_is_held_and_recorded_but_never_refused() {
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let now = 10 * DAY + 5;
+    let uncapped = |hold, at_ms| HoldRequest {
+        cap_microusd: None,
+        ..request("ticket:tk_1", 0, hold, at_ms)
+    };
+    let first = held(&mut store, &uncapped(4_000_000_000, now));
+    let second = held(&mut store, &uncapped(4_000_000_000, now));
+    assert_eq!(
+        store.committed("ticket:tk_1", 0).unwrap(),
+        8_000_000_000,
+        "open holds count at their hold"
+    );
+    store
+        .settle(first, 5_000_000_000, TOKENS, "receipt-1", now + 1)
+        .unwrap();
+    store.release(second, now + 2).unwrap();
+    assert_eq!(
+        store.committed("ticket:tk_1", 0).unwrap(),
+        5_000_000_000,
+        "a settlement above its hold is kept as billed"
+    );
+    let rows = store.spend("ticket:tk_1").unwrap();
+    let states: Vec<_> = rows.iter().map(|r| (r.state, r.cost_microusd)).collect();
+    assert_eq!(
+        states,
+        [
+            (SpendState::Settled, 5_000_000_000),
+            (SpendState::Released, 0)
+        ]
+    );
+}
 
 #[test]
 fn open_holds_count_at_their_hold_and_closed_ones_at_their_cost() {
