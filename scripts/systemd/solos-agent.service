@@ -1,0 +1,43 @@
+# Agent mode in production: `solos-swarm agent serve` as a systemd user unit, installed and restarted by
+# scripts/agent-deploy (which copies this file to ~/.config/systemd/user/ on every deploy).
+#
+# Layout under ~/agent: current -> releases/<sha> (an immutable build: bin/solos-swarm, node_modules, extensions,
+# vendor/pstack), agent.yaml (the owner's config, not in git), state/ (agent.db, tickets, ...), tokens/ (one file per
+# one-use credential, 0600), backups/ (agent.db before each deploy).
+#
+# agent serve reads each token file once and deletes it, so ExecStartPre copies tokens/ into this unit's private
+# tmpfs runtime directory before every start, crash restarts included. agent.yaml points its token_file entries at
+# /run/user/<uid>/solos-agent/<name>; the model key is model.key. The runtime directory is removed when the unit
+# stops, so a copy serve never read does not outlive it. No sandbox sees ~/agent/tokens or the runtime directory.
+[Unit]
+Description=solos-swarm agent mode (Discord, Router, sandboxed workers)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=900
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h/agent
+RuntimeDirectory=solos-agent
+RuntimeDirectoryMode=0700
+UMask=0077
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStartPre=/bin/sh -c 'for f in "$HOME"/agent/tokens/*; do [ -f "$f" ] && cp "$f" "$RUNTIME_DIRECTORY/" || true; done'
+ExecStart=%h/agent/current/bin/solos-swarm agent serve --config %h/agent/agent.yaml --state-dir %h/agent/state --pi-root %h/agent/current --node %h/.local/opt/node-v24.18.0-linux-x64/bin/node --credential-file %t/solos-agent/model.key
+KillSignal=SIGTERM
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=15
+# The box runs other production services: stay below them.
+Nice=5
+CPUWeight=50
+IOWeight=50
+MemoryMax=64G
+TasksMax=8192
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=solos-agent
+
+[Install]
+WantedBy=default.target
