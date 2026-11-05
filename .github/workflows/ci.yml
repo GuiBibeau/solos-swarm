@@ -104,6 +104,8 @@ jobs:
         with:
           path: nextest-archive.tar.zst
           key: nextest-archive-${{ github.run_id }}-${{ github.run_attempt }}
+          # "Re-run failed jobs" starts attempt 2 without re-running `build`: take attempt 1's archive.
+          restore-keys: nextest-archive-${{ github.run_id }}-
           fail-on-cache-miss: true
       - name: Rust tests (shard ${{ matrix.shard }} of ${{ strategy.job-total }})
         run: >
@@ -141,6 +143,8 @@ jobs:
         with:
           path: nextest-archive.tar.zst
           key: nextest-archive-${{ github.run_id }}-${{ github.run_attempt }}
+          # "Re-run failed jobs" starts attempt 2 without re-running `build`: take attempt 1's archive.
+          restore-keys: nextest-archive-${{ github.run_id }}-
           fail-on-cache-miss: true
       # Nothing may fall between the shards and these jobs. The `ci` profile's default filter and `ci-isolated`'s
       # are complements; if a rename made one stop matching, a test would silently stop running. This fails instead.
