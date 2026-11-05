@@ -97,7 +97,7 @@ jobs:
           --workspace-remap . --profile ci --partition count:${{ matrix.shard }}/${{ strategy.job-total }}
 
   # Four tests that assert on the wall clock fail when other tests share the runner (see .config/nextest.toml). They
-  # run one at a time, each on a runner of its own, beside the shards: the condition they had in the serial run.
+  # run one at a time, on runners of their own, beside the shards: the condition they had in the serial run.
   test-isolated:
     needs: build
     runs-on: ubuntu-24.04
@@ -105,7 +105,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [1, 2, 3, 4]
+        include:
+          - name: raft
+            filter: 'test(/^cluster::tests::actual_raft_over_mtls_quic/)'
+          - name: certificates
+            filter: 'test(/^cluster::tests::(expired_three_voter|signed_checkpoint)/)'
+          - name: bench
+            filter: 'test(the_scripted_bench_runs_every_design_and_shows_what_each_one_changes)'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -123,22 +129,27 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: nextest-archive
-      # The `ci` profile's default filter and `ci-isolated`'s are complements. If a test were renamed so that one
-      # no longer matched, it would silently stop running; this fails instead.
+      # Nothing may fall between the shards and these jobs. The `ci` profile's default filter and `ci-isolated`'s
+      # are complements; the three filters above must together select all of `ci-isolated`. If a rename made any of
+      # these stop matching, a test would silently stop running; this fails instead.
       - name: The shards and the isolated tests together list every test, once
-        if: ${{ matrix.part == 1 }}
+        if: ${{ matrix.name == 'raft' }}
+        env:
+          PARTS: >-
+            test(/^cluster::tests::actual_raft_over_mtls_quic/) | test(/^cluster::tests::(expired_three_voter|signed_checkpoint)/)
+            | test(the_scripted_bench_runs_every_design_and_shows_what_each_one_changes)
         run: |
           count() {
             cargo nextest list --archive-file nextest-archive.tar.zst --extract-to . --extract-overwrite \
-              --workspace-remap . --profile "$1" --message-format oneline 2>/dev/null | wc -l
+              --workspace-remap . --profile "$1" --message-format oneline "${@:2}" 2>/dev/null | wc -l
           }
-          all=$(count default); shards=$(count ci); isolated=$(count ci-isolated)
-          echo "tests: $all; in the shards: $shards; isolated: $isolated"
-          [ "$isolated" -eq 4 ] && [ $((shards + isolated)) -eq "$all" ]
-      - name: Isolated Rust tests (${{ matrix.part }} of ${{ strategy.job-total }})
+          all=$(count default); shards=$(count ci); isolated=$(count ci-isolated); parts=$(count ci-isolated -E "$PARTS")
+          echo "tests: $all; in the shards: $shards; isolated: $isolated; selected by the three jobs: $parts"
+          [ "$isolated" -eq 4 ] && [ "$parts" -eq "$isolated" ] && [ $((shards + isolated)) -eq "$all" ]
+      - name: Isolated Rust tests (${{ matrix.name }})
         run: >
           cargo nextest run --archive-file nextest-archive.tar.zst --extract-to . --extract-overwrite
-          --workspace-remap . --profile ci-isolated --partition count:${{ matrix.part }}/${{ strategy.job-total }}
+          --workspace-remap . --profile ci-isolated -E '${{ matrix.filter }}'
 
   scripts:
     runs-on: ubuntu-24.04
