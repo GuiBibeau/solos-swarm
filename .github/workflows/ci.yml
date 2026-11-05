@@ -96,6 +96,50 @@ jobs:
           cargo nextest run --archive-file nextest-archive.tar.zst --extract-to . --extract-overwrite
           --workspace-remap . --profile ci --partition count:${{ matrix.shard }}/${{ strategy.job-total }}
 
+  # Four tests that assert on the wall clock fail when other tests share the runner (see .config/nextest.toml). They
+  # run one at a time, each on a runner of its own, beside the shards: the condition they had in the serial run.
+  test-isolated:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.18.0
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: nextest@0.9.140
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: work/tokenizers
+          key: tokenizers-${{ hashFiles('scripts/bootstrap_tokenizers.py', 'assets/tokenizers/**') }}
+      - name: Verify pinned tokenizer assets
+        run: python3 scripts/bootstrap_tokenizers.py --output work/tokenizers
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nextest-archive
+      # The `ci` profile's default filter and `ci-isolated`'s are complements. If a test were renamed so that one
+      # no longer matched, it would silently stop running; this fails instead.
+      - name: The shards and the isolated tests together list every test, once
+        if: ${{ matrix.part == 1 }}
+        run: |
+          count() {
+            cargo nextest list --archive-file nextest-archive.tar.zst --extract-to . --extract-overwrite \
+              --workspace-remap . --profile "$1" --message-format oneline 2>/dev/null | wc -l
+          }
+          all=$(count default); shards=$(count ci); isolated=$(count ci-isolated)
+          echo "tests: $all; in the shards: $shards; isolated: $isolated"
+          [ "$isolated" -eq 4 ] && [ $((shards + isolated)) -eq "$all" ]
+      - name: Isolated Rust tests (${{ matrix.part }} of ${{ strategy.job-total }})
+        run: >
+          cargo nextest run --archive-file nextest-archive.tar.zst --extract-to . --extract-overwrite
+          --workspace-remap . --profile ci-isolated --partition count:${{ matrix.part }}/${{ strategy.job-total }}
+
   scripts:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -118,7 +162,7 @@ jobs:
   # The one result to watch (and to require in branch protection): green only when every job above is.
   check:
     if: ${{ always() }}
-    needs: [lint, build, test, scripts]
+    needs: [lint, build, test, test-isolated, scripts]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
