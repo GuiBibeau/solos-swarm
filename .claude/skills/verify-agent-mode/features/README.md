@@ -41,7 +41,8 @@ harness it uses), and `Gotchas`.
 | [Use an API key the model never sees](./keyed-fetch.md) | 2026-11-04, v20261104-1815, 04ceeec | passed: probe 401 without, 200 with the vault key, `key_used` on the chain, no test value in state |
 | [Chat on Discord with approvals](./discord-chat.md) | 2026-11-04, zelix, b04f9f2, scripted Router | passed: approval buttons, Approve, result |
 | [Follow up on a running request](./follow-up.md) | not yet | seeded |
+| [Work on GitHub as the App's own bot](./github-app-auth.md) | not yet | seeded (needs the App created by hand) |
 
-Not yet mapped, each a real surface: Swarm Tickets (`executor.swarm`, the Router choosing `Plan::Swarm`), the GitHub
-Source and Channel, schedules, remote nodes, Claude Code workers, the Watchdog's alerts, Slack, `agent bench`, and
-swarm mode itself (`solos-swarm run`, verified by the repo's `skills/verify-solos-swarm`).
+Not yet mapped, each a real surface: Swarm Tickets (`executor.swarm`, the Router choosing `Plan::Swarm`), schedules,
+remote nodes, Claude Code workers, the Watchdog's alerts, Slack, `agent bench`, and swarm mode itself (`solos-swarm run`, verified by
+the repo's `skills/verify-solos-swarm`).

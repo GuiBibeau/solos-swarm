@@ -1,0 +1,10 @@
+github:
+  app_id: 0   # the App's numeric id: replace before launching
+  key_file: secrets/github-app.pem
+forge:
+  kind: github
+  repos:
+    GuiBibeau/solos-swarm-sandbox:
+      about: A throwaway repository for agent-mode proofs.
+      base: main
+      budget_microusd: 500000

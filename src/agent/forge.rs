@@ -2,12 +2,11 @@
 //! `host/repo.json` exists, `work/` is the worker's.
 
 use super::config::{ForgeConfig, Identity, RepoConfig};
-use super::github::Token;
+use super::github::{Access, GithubApp, InstallToken, Minter};
 use super::pi_executor::private_dir;
 use super::ports::{BoxFuture, Forge, TicketDirs, Workspace};
 use crate::broker::write_json;
 use anyhow::{Context, Result, anyhow, bail};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use solos_agent_core::change::RepoName;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -23,27 +22,34 @@ use zeroize::Zeroizing;
 pub const FORGE_DIR: &str = "forge";
 /// `<ticket>/host/repo.json`. Written last, so it also marks the clone done.
 pub const REPO_JSON: &str = "repo.json";
-const GIT_WAIT: Duration = Duration::from_secs(600);
+/// The longest a git command may run. A GitHub token is refreshed with more
+/// than this left, so a fetch that starts with one finishes before it expires.
+pub(crate) const GIT_WAIT: Duration = Duration::from_secs(600);
 const STDERR_CHARS: usize = 400;
 
-/// The forge `config` names, with its mirrors under `dir`. A GitHub token
-/// file is read and deleted here.
-pub fn open(config: &ForgeConfig, dir: PathBuf) -> Result<Arc<dyn Forge>> {
+/// The forge `config` names, with its mirrors under `dir`. GitHub's goes
+/// through the App `github` opened, whose key was read once.
+pub fn open(
+    config: &ForgeConfig,
+    dir: PathBuf,
+    github: Option<&GithubApp>,
+) -> Result<Arc<dyn Forge>> {
     Ok(match config {
-        ForgeConfig::Github {
-            token_file,
-            identity,
-            repos,
-        } => Arc::new(GithubForge {
-            mirrors: Mirrors::new(dir, identity, repos),
-            token: Token::take(token_file).context("forge.token_file")?,
-        }),
+        ForgeConfig::Github { repos } => {
+            let github = github.context("forge: github needs the github: section's App")?;
+            Arc::new(GithubForge {
+                mirrors: Mirrors::new(dir, repos),
+                minter: github.minter.clone(),
+                git_base: github.git_base.clone(),
+            })
+        }
         ForgeConfig::Local {
             remote,
             identity,
             repos,
         } => Arc::new(LocalForge {
-            mirrors: Mirrors::new(dir, identity, repos),
+            mirrors: Mirrors::new(dir, repos),
+            identity: identity.clone(),
             // Git runs in the mirror, so it would read a relative path from
             // there, not from where the agent was started.
             remote: remote
@@ -53,22 +59,29 @@ pub fn open(config: &ForgeConfig, dir: PathBuf) -> Result<Arc<dyn Forge>> {
     })
 }
 
-/// GitHub over https. The token goes in git's environment for the mirror's
-/// fetch alone, never in its argv, which any local user can read.
+/// GitHub, as the App. The mirror fetches with a token narrowed to the one
+/// repository and to read access, which goes in git's environment for that
+/// fetch alone, never in its argv, which any local user can read. The clone's
+/// commits are by the App's bot.
 pub struct GithubForge {
     mirrors: Mirrors,
-    token: Token,
+    minter: Arc<Minter>,
+    /// Ends in `/`; a mirror fetches `<git_base><owner>/<name>.git`.
+    git_base: String,
 }
 
-impl GithubForge {
-    fn remote(&self, repo: &RepoName) -> (String, Zeroizing<String>) {
-        let basic = Zeroizing::new(format!("x-access-token:{}", self.token.secret()));
-        let header = format!("Authorization: Basic {}", STANDARD.encode(basic.as_bytes()));
-        (
-            format!("https://github.com/{repo}.git"),
-            Zeroizing::new(header),
-        )
-    }
+/// Where a mirror fetches `repo` from, and the git config key and value that
+/// authenticate that fetch: the token as an `extraheader` for that base alone.
+fn github_remote(
+    git_base: &str,
+    repo: &RepoName,
+    token: &InstallToken,
+) -> (String, String, Zeroizing<String>) {
+    (
+        format!("{git_base}{repo}.git"),
+        format!("http.{git_base}.extraheader"),
+        token.git_header(),
+    )
 }
 
 impl Forge for GithubForge {
@@ -78,12 +91,20 @@ impl Forge for GithubForge {
         dirs: TicketDirs<'a>,
     ) -> BoxFuture<'a, Result<Workspace>> {
         Box::pin(async move {
-            let (url, header) = self.remote(repo);
+            // A finished clone needs nothing from GitHub, so a recovery does
+            // not wait on a suspended installation.
+            if let Some(done) = prepared(&dirs.host.join(REPO_JSON))? {
+                return Ok(done);
+            }
+            let token = self.minter.token(repo, Access::Read).await?;
+            let (name, email) = self.minter.bot().await?.commit_identity();
+            let (url, key, header) = github_remote(&self.git_base, repo, &token);
             let remote = Remote {
                 url: &url,
-                auth: Some(("http.https://github.com/.extraheader", &header)),
+                auth: Some((&key, &header)),
             };
-            self.mirrors.prepare(repo, dirs, &remote).await
+            let identity = Identity { name, email };
+            self.mirrors.prepare(repo, dirs, &remote, &identity).await
         })
     }
 }
@@ -92,6 +113,7 @@ impl Forge for GithubForge {
 /// whole path runs offline.
 pub struct LocalForge {
     mirrors: Mirrors,
+    identity: Identity,
     remote: PathBuf,
 }
 
@@ -110,7 +132,9 @@ impl Forge for LocalForge {
                 .to_str()
                 .with_context(|| format!("{} is not UTF-8", bare.display()))?;
             let remote = Remote { url, auth: None };
-            self.mirrors.prepare(repo, dirs, &remote).await
+            self.mirrors
+                .prepare(repo, dirs, &remote, &self.identity)
+                .await
         })
     }
 }
@@ -125,15 +149,13 @@ struct Remote<'a> {
 
 struct Mirrors {
     dir: PathBuf,
-    identity: Identity,
     repos: BTreeMap<RepoName, (RepoConfig, Mutex<()>)>,
 }
 
 impl Mirrors {
-    fn new(dir: PathBuf, identity: &Identity, repos: &BTreeMap<RepoName, RepoConfig>) -> Self {
+    fn new(dir: PathBuf, repos: &BTreeMap<RepoName, RepoConfig>) -> Self {
         Self {
             dir,
-            identity: identity.clone(),
             repos: repos
                 .iter()
                 .map(|(repo, terms)| (repo.clone(), (terms.clone(), Mutex::new(()))))
@@ -146,6 +168,7 @@ impl Mirrors {
         repo: &RepoName,
         dirs: TicketDirs<'_>,
         remote: &Remote<'_>,
+        identity: &Identity,
     ) -> Result<Workspace> {
         let marker = dirs.host.join(REPO_JSON);
         if let Some(done) = prepared(&marker)? {
@@ -186,8 +209,8 @@ impl Mirrors {
                 .with_context(|| format!("cannot clear {}", dirs.work.display()))?;
         }
         private_dir(dirs.work)?;
-        let name = format!("user.name={}", self.identity.name);
-        let email = format!("user.email={}", self.identity.email);
+        let name = format!("user.name={}", identity.name);
+        let email = format!("user.email={}", identity.email);
         run(
             git([
                 "-c".as_ref(),
@@ -394,15 +417,15 @@ async fn run(mut git: Command, what: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GithubForge, LocalForge, Mirrors, REPO_JSON, fetch, open};
+    use super::{LocalForge, Mirrors, REPO_JSON, fetch, github_remote, open};
     use crate::agent::config::{ForgeConfig, Identity, RepoConfig};
-    use crate::agent::github::Token;
+    use crate::agent::github::{Access, InstallToken};
     use crate::agent::ports::{Forge, TicketDirs, Workspace};
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use solos_agent_core::change::{Deliverable, RepoName};
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
 
     fn widgets() -> RepoName {
         RepoName::try_from("acme/widgets".to_owned()).unwrap()
@@ -478,7 +501,8 @@ mod tests {
                 ],
             );
             let forge = LocalForge {
-                mirrors: Mirrors::new(root.join("forge"), &identity(), &repos()),
+                mirrors: Mirrors::new(root.join("forge"), &repos()),
+                identity: identity(),
                 remote,
             };
             Self {
@@ -735,7 +759,7 @@ mod tests {
             repos: repos(),
         };
 
-        let forge = open(&config(relative), w.root.join("mirrors")).unwrap();
+        let forge = open(&config(relative), w.root.join("mirrors"), None).unwrap();
 
         let (work, host) = w.ticket("tk_1");
         let dirs = TicketDirs {
@@ -754,7 +778,11 @@ mod tests {
                 .to_str()
                 .unwrap()
         );
-        let missing = open(&config(PathBuf::from("no/such/remote")), w.root.join("x"));
+        let missing = open(
+            &config(PathBuf::from("no/such/remote")),
+            w.root.join("x"),
+            None,
+        );
         let err = missing.err().unwrap();
         assert!(
             err.to_string()
@@ -773,7 +801,8 @@ mod tests {
         let mut terms = repos();
         terms.get_mut(&widgets()).unwrap().base = "trunk".into();
         let forge = LocalForge {
-            mirrors: Mirrors::new(w.root.join("forge"), &identity(), &terms),
+            mirrors: Mirrors::new(w.root.join("forge"), &terms),
+            identity: identity(),
             remote: w.root.join("remote"),
         };
         let (work, host) = w.ticket("tk_2");
@@ -788,15 +817,17 @@ mod tests {
 
     #[test]
     fn githubs_token_reaches_git_in_its_environment_and_never_in_its_argv() {
-        let canary = "github_pat_canary0123456789";
-        let forge = GithubForge {
-            mirrors: Mirrors::new(PathBuf::from("/forge"), &identity(), &repos()),
-            token: Token::new(canary),
-        };
-        let (url, header) = forge.remote(&widgets());
+        let canary = "ghs_canary0123456789";
+        let token = InstallToken::new(
+            canary,
+            widgets(),
+            Access::Read,
+            SystemTime::now() + Duration::from_secs(3_600),
+        );
+        let (url, key, header) = github_remote("https://github.com/", &widgets(), &token);
         let remote = super::Remote {
             url: &url,
-            auth: Some(("http.https://github.com/.extraheader", &header)),
+            auth: Some((&key, &header)),
         };
 
         let command = fetch("/forge/acme/widgets.git".as_ref(), &remote);
@@ -823,6 +854,11 @@ mod tests {
         assert_eq!(
             env["GIT_CONFIG_KEY_0"],
             "http.https://github.com/.extraheader"
+        );
+        assert_eq!(
+            format!("{token:?}"),
+            "InstallToken(acme/widgets Read, ..)",
+            "a token's Debug never shows it"
         );
     }
 }

@@ -340,6 +340,36 @@ enum AgentCommand {
         #[arg(long)]
         dir: PathBuf,
     },
+    /// The agent's GitHub App.
+    Github {
+        #[command(subcommand)]
+        command: GithubCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum GithubCommand {
+    /// Whether the App, as agent.yaml configures it, can do what the agent
+    /// asks: the key is accepted, it is installed on each `forge.repos`
+    /// repository with exactly the permissions the agent uses (and neither
+    /// `workflows` nor `administration`), a read and a write token can be
+    /// minted, and each base branch exists. Reads the key and deletes
+    /// nothing; exits 1 on any miss.
+    Check {
+        /// The agent's `agent.yaml`.
+        #[arg(long)]
+        config: PathBuf,
+        /// The key to check, instead of `github.key_file`. On the box
+        /// `serve` has deleted that copy, so name the durable one in
+        /// `~/agent/tokens`.
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+        /// The agent's state directory. With it the Policy's GitHub logins
+        /// are pinned to their account ids there, as `serve` does; without
+        /// it they are looked up and shown, and nothing is written.
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -754,6 +784,29 @@ async fn execute(command: Action) -> Result<()> {
             };
             let summary = solos_swarm::agent::serve(&config, &state_dir, options).await?;
             println!("{}", json!(summary));
+            Ok(())
+        }
+        Action::Agent {
+            command:
+                AgentCommand::Github {
+                    command:
+                        GithubCommand::Check {
+                            config,
+                            key_file,
+                            state_dir,
+                        },
+                },
+        } => {
+            let args = solos_swarm::agent::github::CheckArgs {
+                config,
+                key_file,
+                state_dir,
+            };
+            let passed =
+                solos_swarm::agent::github::check(args, &mut std::io::stdout().lock()).await?;
+            if !passed {
+                std::process::exit(1);
+            }
             Ok(())
         }
         Action::Agent {

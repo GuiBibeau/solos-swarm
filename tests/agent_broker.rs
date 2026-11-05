@@ -53,6 +53,8 @@ const LIMIT: Duration = Duration::from_secs(30);
 const TERMS: DecideTerms = DecideTerms {
     default_budget_microusd: 500_000,
     max_budget_microusd: Some(2_000_000),
+    approval_sources: BTreeSet::new(),
+    auto_approve_microusd: 0,
     swarm: None,
     repos: BTreeMap::new(),
 };

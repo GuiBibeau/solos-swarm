@@ -1,14 +1,16 @@
 //! The settings and checks of the `discord`, `github` and `schedule` kinds.
 
-use super::{AgentConfig, ChannelConfig, SourceConfig};
+use super::{AgentConfig, ChannelConfig, ForgeConfig, GITHUB_APP_DOC, SourceConfig};
 use crate::agent::schedule::Schedule;
 use crate::agent::{discord, github, slack};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
+use solos_agent_core::change::RepoName;
 use solos_agent_core::model::{ChannelRef, Ms, ThreadKey};
 use std::collections::BTreeSet;
 
 const MIN_POLL_SECS: u64 = 10;
+const MIN_RECONCILE_SECS: u64 = 60;
 const MIN_PERIOD_MS: Ms = 60_000;
 const DAY_MS: Ms = 86_400_000;
 
@@ -198,36 +200,11 @@ impl AgentConfig {
     }
 
     pub(super) fn validate_github(&self) -> Result<()> {
-        let mut github_sources = 0;
-        for source in &self.sources {
-            let SourceConfig::Github {
-                repos,
-                api_base,
-                poll_secs,
-                ..
-            } = source
-            else {
-                continue;
-            };
-            github_sources += 1;
-            ensure!(!repos.is_empty(), "the github source reads no repository");
-            for repo in repos {
-                ensure!(
-                    github::valid_repo(repo),
-                    "github repository {repo:?} is not owner/name"
-                );
-            }
-            let url = reqwest::Url::parse(api_base)
-                .with_context(|| format!("invalid github api_base {api_base}"))?;
-            ensure!(
-                matches!(url.scheme(), "https" | "http"),
-                "github api_base {api_base} is not an http(s) URL"
-            );
-            ensure!(
-                *poll_secs >= MIN_POLL_SECS,
-                "the github source must not poll more often than every {MIN_POLL_SECS}s"
-            );
-        }
+        let github_sources = self
+            .sources
+            .iter()
+            .filter(|source| matches!(source, SourceConfig::Github {}))
+            .count();
         ensure!(
             github_sources <= 1,
             "the agent config names two github sources"
@@ -236,10 +213,119 @@ impl AgentConfig {
             .channels
             .iter()
             .any(|channel| matches!(channel, ChannelConfig::Github {}));
+        let github_forge = matches!(self.forge, Some(ForgeConfig::Github { .. }));
+        let used = github_sources == 1 || github_channel || github_forge;
+        let Some(github) = &self.github else {
+            ensure!(
+                !used,
+                "the github source, channel and forge act as a GitHub App: add a github: section \
+                 ({GITHUB_APP_DOC})"
+            );
+            return self.validate_github_logins();
+        };
         ensure!(
-            !github_channel || github_sources == 1,
-            "the github channel needs the github source's token"
+            used,
+            "the github: section is unused: add a github source, a github channel or forge: \
+             github, or remove it"
         );
+        ensure!(github.app_id > 0, "github.app_id is the App's numeric id");
+        ensure!(
+            !github.key_file.as_os_str().is_empty(),
+            "github.key_file is empty"
+        );
+        ensure!(
+            github.poll_secs >= MIN_POLL_SECS,
+            "github.poll_secs must not poll more often than every {MIN_POLL_SECS}s"
+        );
+        ensure!(
+            github.reconcile_secs >= MIN_RECONCILE_SECS,
+            "github.reconcile_secs must be at least {MIN_RECONCILE_SECS}"
+        );
+        let url = reqwest::Url::parse(&github.api_base)
+            .with_context(|| format!("invalid github.api_base {}", github.api_base))?;
+        ensure!(
+            matches!(url.scheme(), "https" | "http"),
+            "github.api_base {} is not an http(s) URL",
+            github.api_base
+        );
+        let url = reqwest::Url::parse(&github.git_base)
+            .with_context(|| format!("invalid github.git_base {}", github.git_base))?;
+        ensure!(
+            matches!(url.scheme(), "https" | "http" | "file"),
+            "github.git_base {} is not an https://, http:// or file:// URL",
+            github.git_base
+        );
+        // The App's tokens are minted for forge.repos alone, so every
+        // repository the agent names on GitHub is one of them.
+        let Some(forge) = &self.forge else {
+            bail!(
+                "the github: section acts on forge.repos, the one list of repositories: add a \
+                 forge: section ({GITHUB_APP_DOC})"
+            );
+        };
+        ensure!(
+            github_sources == 0 || !forge.repos().is_empty(),
+            "the github source reads forge.repos, which is empty"
+        );
+        let listed = |repo: &str| {
+            RepoName::try_from(repo.to_owned()).is_ok_and(|repo| forge.repos().contains_key(&repo))
+        };
+        if github_channel {
+            for source in &self.sources {
+                let SourceConfig::Schedule { schedules } = source else {
+                    continue;
+                };
+                for schedule in schedules {
+                    if let Some(ReplyTo::Github { repo, .. }) = &schedule.reply_to
+                        && github::valid_repo(repo)
+                    {
+                        ensure!(
+                            listed(repo),
+                            "schedule {} replies on {repo}, which is not in forge.repos, so the \
+                             App holds no token for it",
+                            schedule.name
+                        );
+                    }
+                }
+            }
+            if let Some(watchdog) = &self.watchdog
+                && watchdog.operator.source == github::SOURCE
+                && let Some(repo) = watchdog.operator.address.get("repo")
+                && github::valid_repo(repo)
+            {
+                ensure!(
+                    listed(repo),
+                    "watchdog.operator is on {repo}, which is not in forge.repos, so the App \
+                     holds no token for it"
+                );
+            }
+        }
+        self.validate_github_logins()
+    }
+
+    /// The Policy's `github:` entries are logins, which are pinned to their
+    /// accounts at start.
+    fn validate_github_logins(&self) -> Result<()> {
+        let policy = &self.policy;
+        for who in policy
+            .people
+            .iter()
+            .chain(&policy.approvers)
+            .chain(&policy.bots)
+        {
+            let Some(login) = who.strip_prefix("github:") else {
+                continue;
+            };
+            let name = login.strip_suffix("[bot]").unwrap_or(login);
+            ensure!(
+                !name.is_empty()
+                    && name.len() <= 39
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')),
+                "policy lists github:{login}, which is not a GitHub login"
+            );
+        }
         Ok(())
     }
 
@@ -319,10 +405,11 @@ mod tests {
     const GITHUB: &str = "
 policy:
   people: [github:alice]
+github:
+  app_id: 123456
+  key_file: secrets/github-app.pem
 sources:
   - kind: github
-    repos: [acme/widgets]
-    token_file: secrets/github
   - kind: schedule
     schedules:
       - name: triage
@@ -335,7 +422,11 @@ sources:
 channels:
   - kind: github
 router: {kind: scripted}
-executor: {kind: scripted}
+executor: {kind: pi, provider: deepseek, model: deepseek-flash, prices: {input_microusd_per_million: 300000, output_microusd_per_million: 1200000}, run_code: {}}
+forge:
+  kind: github
+  repos:
+    acme/widgets: {about: \"Widgets.\", base: main}
 budgets: {session_microusd: 500000}
 ";
 
@@ -347,15 +438,20 @@ budgets: {session_microusd: 500000}
         std::fs::write(&path, GITHUB).unwrap();
         let config = AgentConfig::load(&path).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(config.sources[0], SourceConfig::Github {});
+        let app = config.github.unwrap();
         assert_eq!(
-            config.sources[0],
-            SourceConfig::Github {
-                repos: ["acme/widgets".to_owned()].into(),
-                token_file: dir.join("secrets/github"),
-                api_base: "https://api.github.com/".into(),
-                poll_secs: 60,
-            }
+            (app.app_id, app.key_file, app.poll_secs, app.writes),
+            (123456, dir.join("secrets/github-app.pem"), 60, true)
         );
+        let repos: Vec<String> = config
+            .forge
+            .unwrap()
+            .repos()
+            .keys()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(repos, ["acme/widgets"], "the source reads forge.repos");
         let SourceConfig::Schedule { schedules } = &config.sources[1] else {
             panic!("{:?}", config.sources[1])
         };
@@ -436,43 +532,58 @@ budgets: {session_microusd: 500000}
         let cases = [
             (
                 "an unknown github field",
-                GITHUB.replace("token_file:", "tokn: x\n    token_file:"),
+                GITHUB.replace("app_id: 123456", "app_id: 123456\n  tokn: x"),
             ),
             (
                 "no repository",
-                GITHUB.replace("repos: [acme/widgets]", "repos: []"),
-            ),
-            (
-                "a repository path",
-                GITHUB.replace("repos: [acme/widgets]", "repos: [acme/w/x]"),
-            ),
-            (
-                "two github sources",
                 GITHUB.replace(
-                    "sources:\n",
-                    "sources:\n  - {kind: github, repos: [a/b], token_file: t}\n",
+                    "  repos:\n    acme/widgets: {about: \"Widgets.\", base: main}\n",
+                    "  repos: {}\n",
                 ),
             ),
             (
-                "a github channel without a github source",
+                "a repository path",
+                GITHUB.replace("acme/widgets: {", "acme/w/x: {"),
+            ),
+            (
+                "two github sources",
+                GITHUB.replace("sources:\n", "sources:\n  - kind: github\n"),
+            ),
+            (
+                "a github source with a field",
+                GITHUB.replace("  - kind: github\n  - kind: schedule", "  - {kind: github, repos: [a/b]}\n  - kind: schedule"),
+            ),
+            (
+                "a github channel without the github: section",
                 GITHUB.replace(
-                    "  - kind: github\n    repos: [acme/widgets]\n    token_file: secrets/github\n",
+                    "github:\n  app_id: 123456\n  key_file: secrets/github-app.pem\n",
+                    "",
+                ),
+            ),
+            (
+                "a github source without the forge whose repos it reads",
+                GITHUB.replace(
+                    "forge:\n  kind: github\n  repos:\n    acme/widgets: {about: \"Widgets.\", base: main}\n",
                     "",
                 ),
             ),
             (
                 "an api base that is not a URL",
                 GITHUB.replace(
-                    "token_file: secrets/github",
-                    "token_file: t\n    api_base: nowhere",
+                    "key_file: secrets/github-app.pem",
+                    "key_file: secrets/github-app.pem\n  api_base: nowhere",
                 ),
             ),
             (
                 "a poll every second",
                 GITHUB.replace(
-                    "token_file: secrets/github",
-                    "token_file: t\n    poll_secs: 1",
+                    "key_file: secrets/github-app.pem",
+                    "key_file: secrets/github-app.pem\n  poll_secs: 1",
                 ),
+            ),
+            (
+                "a schedule that replies where the App holds no token",
+                GITHUB.replace("repo: acme/widgets, number: 1", "repo: acme/other, number: 1"),
             ),
             (
                 "both every and daily_at",
@@ -528,6 +639,12 @@ budgets: {session_microusd: 500000}
                 GITHUB.replace(
                     "{kind: github, repo: acme/widgets, number: 1}",
                     "{kind: slack, channel: C1}",
+                ),
+            ),
+            (
+                "a watchdog that alerts where the App holds no token",
+                format!(
+                    "{GITHUB}watchdog:\n  operator: {{source: github, address: {{repo: acme/other, number: \"3\"}}}}\n"
                 ),
             ),
             (

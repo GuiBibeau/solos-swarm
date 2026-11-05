@@ -80,6 +80,16 @@ pub fn system_prompt(
             policy.auto_approve_microusd
         ),
     };
+    if decide.max_budget_microusd.is_none() && !decide.approval_sources.is_empty() {
+        let sources: Vec<&str> = decide.approval_sources.iter().map(String::as_str).collect();
+        let _ = write!(
+            prompt,
+            " Only a request that came from {} can wait for that approval; an accept for a \
+             request from any other source may name at most {}.",
+            sources.join(" or "),
+            decide.auto_approve_microusd
+        );
+    }
     match &decide.swarm {
         None => prompt.push_str("\nThis agent runs no swarms: plan every accept as a session."),
         Some(swarm) => {
@@ -856,6 +866,7 @@ mod tests {
             max_budget_microusd: Some(2_000_000),
             swarm: None,
             repos: BTreeMap::new(),
+            ..DecideTerms::default()
         };
         let policy = AllowlistPolicy {
             rules: ["ci-red".to_owned(), "stale-pr".to_owned()].into(),
@@ -918,6 +929,32 @@ mod tests {
     }
 
     #[test]
+    fn the_system_prompt_says_which_sources_can_wait_for_an_approval() {
+        let decide = DecideTerms {
+            default_budget_microusd: 500_000,
+            max_budget_microusd: None,
+            approval_sources: ["discord".to_owned(), "slack".to_owned()].into(),
+            auto_approve_microusd: 500_000,
+            ..DecideTerms::default()
+        };
+        let policy = AllowlistPolicy {
+            auto_approve_microusd: 500_000,
+            ..AllowlistPolicy::default()
+        };
+
+        let prompt = system_prompt(Some("Judge."), &policy, &BTreeMap::new(), &decide);
+
+        assert!(
+            prompt.contains(
+                "above 500000 its ticket waits for a person's approval. Only a request that came \
+                 from discord or slack can wait for that approval; an accept for a request from \
+                 any other source may name at most 500000."
+            ),
+            "{prompt}"
+        );
+    }
+
+    #[test]
     fn the_system_prompt_lists_the_repositories_and_counts_a_question_about_one_as_work() {
         let repo = |about: &str, budget, owes| RepoConfig {
             about: about.into(),
@@ -931,6 +968,8 @@ mod tests {
             default_budget_microusd: 500_000,
             max_budget_microusd: None,
             swarm: None,
+            approval_sources: Default::default(),
+            auto_approve_microusd: 0,
             repos: BTreeMap::from([
                 (
                     name("acme/widgets"),

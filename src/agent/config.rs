@@ -61,10 +61,51 @@ pub struct AgentConfig {
     /// names a repository.
     #[serde(default)]
     pub forge: Option<ForgeConfig>,
+    /// The GitHub App the agent acts as. Present whenever a github Source, a
+    /// github Channel or `forge: github` is.
+    #[serde(default)]
+    pub github: Option<GithubConfig>,
 }
 
 fn pass_through() -> bool {
     true
+}
+
+/// Where the setup is written down, for the sentences that tell an owner of
+/// the old shape what replaced it.
+const GITHUB_APP_DOC: &str = "docs/agent-mode/README.md#github-app";
+
+/// `github:` in agent.yaml: the GitHub App every GitHub call is made as. The
+/// Source, the Channel and the forge share it; the repositories they act on
+/// are `forge.repos`.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GithubConfig {
+    /// The App's numeric id, at the top of its settings page.
+    pub app_id: u64,
+    /// The App's private key (PEM), a one-use token file like every other:
+    /// read once and deleted, the parsed key kept in memory. It must not sit
+    /// under a path any sandbox can read.
+    pub key_file: PathBuf,
+    /// The Source's interval. A quiet poll costs 304s, which GitHub does not
+    /// count against the rate limit.
+    #[serde(default = "github_poll_secs")]
+    pub poll_secs: u64,
+    /// How often every open change is read again, whatever the listings said.
+    #[serde(default = "github_reconcile_secs")]
+    pub reconcile_secs: u64,
+    /// `false`: no write token is ever minted, so the agent reads and writes
+    /// nothing on GitHub (a restart applies it).
+    #[serde(default = "github_writes")]
+    pub writes: bool,
+    /// Test seam: GitHub's REST root, or GitHub Enterprise Server's
+    /// `https://HOST/api/v3/`.
+    #[serde(default = "github_api_base")]
+    pub api_base: String,
+    /// Test seam: where the host's mirrors fetch `<owner>/<name>.git` from.
+    /// `https://github.com/` by default; the offline tests use `file://`.
+    #[serde(default = "github_git_base")]
+    pub git_base: String,
 }
 
 /// `forge:` in agent.yaml: the repositories a Ticket may name, and where
@@ -72,11 +113,9 @@ fn pass_through() -> bool {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ForgeConfig {
-    /// GitHub, with a token of the agent's own account, read once and
-    /// deleted. It is not the github Source's token.
+    /// GitHub, through the App of the `github:` section. The clone's commits
+    /// are by the App's bot.
     Github {
-        token_file: PathBuf,
-        identity: Identity,
         repos: BTreeMap<RepoName, RepoConfig>,
     },
     /// Bare repositories on this disk, `<remote>/<owner>/<name>.git`, for
@@ -95,9 +134,11 @@ impl ForgeConfig {
         }
     }
 
-    pub fn identity(&self) -> &Identity {
+    /// Who a local clone's commits are by. GitHub's come from the App.
+    pub fn identity(&self) -> Option<&Identity> {
         match self {
-            Self::Github { identity, .. } | Self::Local { identity, .. } => identity,
+            Self::Github { .. } => None,
+            Self::Local { identity, .. } => Some(identity),
         }
     }
 }
@@ -200,20 +241,9 @@ pub enum SourceConfig {
         #[serde(default = "discord_api_base")]
         api_base: String,
     },
-    /// GitHub over REST polling; its Triggers name source `github`. Only
-    /// the listed repositories are read. The token file is read once and
-    /// deleted.
-    Github {
-        /// `owner/name`.
-        repos: BTreeSet<String>,
-        /// A personal access token of the agent's own account, which the
-        /// `github` channel uses too.
-        token_file: PathBuf,
-        #[serde(default = "github_api_base")]
-        api_base: String,
-        #[serde(default = "github_poll_secs")]
-        poll_secs: u64,
-    },
+    /// GitHub over REST polling; its Triggers name source `github`. It
+    /// takes no fields: it reads `forge.repos` as the `github:` section's App.
+    Github {},
     /// Named schedules that fire as System Triggers of source `schedule`.
     Schedule { schedules: Vec<ScheduleConfig> },
     /// Requests that operators file with `solos-swarm mcp --state-dir`, as
@@ -268,6 +298,18 @@ fn github_poll_secs() -> u64 {
     60
 }
 
+fn github_reconcile_secs() -> u64 {
+    300
+}
+
+fn github_writes() -> bool {
+    true
+}
+
+fn github_git_base() -> String {
+    github::DEFAULT_GIT_BASE.to_owned()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ChannelConfig {
@@ -280,8 +322,8 @@ pub enum ChannelConfig {
     /// Posts in Discord with the bot token and API base of the `discord`
     /// Source. Serves replies to source `discord`.
     Discord {},
-    /// Comments on issues and pull requests with the token and API base of
-    /// the `github` Source. Serves replies to source `github`.
+    /// Comments on issues and pull requests as the `github:` section's App.
+    /// Serves replies to source `github`.
     Github {},
     /// Appends replies to an outbox in the state directory, which
     /// `solos-swarm mcp --state-dir` reads. Serves replies to source `mcp`.
@@ -560,6 +602,47 @@ const DAY_MS: u64 = 86_400_000;
 /// The most swarms one agent may run at once.
 const MAX_SWARMS: usize = 8;
 
+/// What the shape from before the GitHub App said, which no longer exists.
+/// Serde would answer "unknown field" and not say what replaced it, so the
+/// raw YAML is read first.
+fn refuse_token_files(yaml: &serde_yaml::Value) -> Result<()> {
+    fn kind(value: &serde_yaml::Value) -> Option<&str> {
+        value.get("kind").and_then(serde_yaml::Value::as_str)
+    }
+    let sources = yaml
+        .get("sources")
+        .and_then(serde_yaml::Value::as_sequence)
+        .into_iter()
+        .flatten();
+    for source in sources.filter(|source| kind(source) == Some("github")) {
+        ensure!(
+            source.get("token_file").is_none(),
+            "the github source's token_file is gone, since the agent acts as a GitHub App whose \
+             key is github.key_file: see {GITHUB_APP_DOC}"
+        );
+        for field in ["repos", "api_base", "poll_secs"] {
+            ensure!(
+                source.get(field).is_none(),
+                "the github source no longer takes {field}, since its repositories are forge.repos \
+                 and its poll_secs and api_base are in the github: section: see {GITHUB_APP_DOC}"
+            );
+        }
+    }
+    if let Some(forge) = yaml
+        .get("forge")
+        .filter(|forge| kind(forge) == Some("github"))
+    {
+        for field in ["token_file", "identity"] {
+            ensure!(
+                forge.get(field).is_none(),
+                "forge: github no longer takes {field}, since the GitHub App replaced token files \
+                 and the clone's identity is the App's bot: see {GITHUB_APP_DOC}"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Budgets {
@@ -576,6 +659,9 @@ impl AgentConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let bytes =
             std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+        if let Ok(raw) = serde_yaml::from_slice::<serde_yaml::Value>(&bytes) {
+            refuse_token_files(&raw)?;
+        }
         let mut config: Self = serde_yaml::from_slice(&bytes)
             .with_context(|| format!("invalid agent config {}", path.display()))?;
         config.validate()?;
@@ -591,9 +677,8 @@ impl AgentConfig {
                     *app_token_file = base.join(&*app_token_file);
                     *bot_token_file = base.join(&*bot_token_file);
                 }
-                SourceConfig::Discord { token_file, .. }
-                | SourceConfig::Github { token_file, .. } => *token_file = base.join(&*token_file),
-                SourceConfig::Schedule { .. } | SourceConfig::Mcp {} => {}
+                SourceConfig::Discord { token_file, .. } => *token_file = base.join(&*token_file),
+                SourceConfig::Github {} | SourceConfig::Schedule { .. } | SourceConfig::Mcp {} => {}
             }
         }
         for channel in &mut config.channels {
@@ -618,9 +703,23 @@ impl AgentConfig {
         }
         config.trail.path = config.trail.path.as_ref().map(|path| base.join(path));
         match &mut config.forge {
-            Some(ForgeConfig::Github { token_file, .. }) => *token_file = base.join(&*token_file),
             Some(ForgeConfig::Local { remote, .. }) => *remote = base.join(&*remote),
-            None => {}
+            Some(ForgeConfig::Github { .. }) | None => {}
+        }
+        if let Some(github) = &mut config.github {
+            github.key_file = base.join(&github.key_file);
+        }
+        // GitHub logins are case-blind, and the Policy spells them in lower
+        // case, as the Source does.
+        let policy = &mut config.policy;
+        for who in [&mut policy.people, &mut policy.approvers, &mut policy.bots] {
+            *who = std::mem::take(who)
+                .into_iter()
+                .map(|entry| match entry.strip_prefix("github:") {
+                    Some(login) => format!("github:{}", login.to_ascii_lowercase()),
+                    None => entry,
+                })
+                .collect();
         }
         if let ExecutorConfig::Pi {
             provider,
@@ -768,12 +867,13 @@ impl AgentConfig {
             "executor.prepare runs git worktree add into the work dir, and the forge clones each \
              repository ticket's work dir itself: drop the worktree add"
         );
-        let Identity { name, email } = forge.identity();
-        for (field, value) in [("name", name), ("email", email)] {
-            ensure!(
-                !value.trim().is_empty() && !value.chars().any(char::is_control),
-                "forge.identity.{field} must be one line of text"
-            );
+        if let Some(Identity { name, email }) = forge.identity() {
+            for (field, value) in [("name", name), ("email", email)] {
+                ensure!(
+                    !value.trim().is_empty() && !value.chars().any(char::is_control),
+                    "forge.identity.{field} must be one line of text"
+                );
+            }
         }
         ensure!(!forge.repos().is_empty(), "forge names no repos");
         for (repo, terms) in forge.repos() {
@@ -942,6 +1042,20 @@ impl AgentConfig {
         Ok(())
     }
 
+    /// The GitHub logins the Policy lists, lowercased and without the
+    /// `github:` prefix: the accounts whose ids are pinned.
+    pub fn github_logins(&self) -> BTreeSet<String> {
+        let policy = &self.policy;
+        policy
+            .people
+            .iter()
+            .chain(&policy.approvers)
+            .chain(&policy.bots)
+            .filter_map(|who| who.strip_prefix("github:"))
+            .map(str::to_ascii_lowercase)
+            .collect()
+    }
+
     /// The provider and model whose credential `--credential-file` holds:
     /// the Pi Router's, else the Pi workers'. `None` when nothing is Pi.
     pub fn pi_upstream(&self) -> Option<(&str, &str)> {
@@ -1035,8 +1149,8 @@ impl SwarmConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentConfig, ChannelConfig, ClaudeConfig, ExecutorConfig, ForgeConfig, HarnessKind,
-        JobLimits, RepoConfig, RouterConfig, SourceConfig,
+        AgentConfig, ChannelConfig, ClaudeConfig, ExecutorConfig, ForgeConfig, GithubConfig,
+        HarnessKind, JobLimits, RepoConfig, RouterConfig, SourceConfig,
     };
     use solos_agent_core::change::{Deliverable, RepoName};
     use std::collections::BTreeMap;
@@ -1358,10 +1472,10 @@ budgets: {session_microusd: 500000}
         }
     }
 
-    const FORGE: &str = "forge:
+    const APP: &str = "github: {app_id: 7, key_file: secrets/github-app.pem}\n";
+    const FORGE: &str = "github: {app_id: 7, key_file: secrets/github-app.pem}
+forge:
   kind: github
-  token_file: secrets/forge-token
-  identity: {name: solos-bot, email: bot@example.com}
   repos:
     acme/widgets:
       about: Widgets, in Rust.
@@ -1378,34 +1492,49 @@ budgets: {session_microusd: 500000}
         format!("{workers}{}", edit(FORGE.to_owned()))
     }
 
+    /// The forge on bare repositories on this disk instead, which has no App.
+    fn local(yaml: String) -> String {
+        yaml.replace(
+            "github: {app_id: 7, key_file: secrets/github-app.pem}\nforge:\n  kind: github",
+            "forge:\n  kind: local\n  remote: remotes\n  identity: {name: solos-bot, email: bot@example.com}",
+        )
+    }
+
     #[test]
     fn a_forge_loads_its_repositories_with_its_files_beside_the_config() {
         let dir = std::env::temp_dir().join(format!("agent-config-forge-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("agent.yaml");
-        let local = |yaml: String| {
-            yaml.replace(
-                "kind: github\n  token_file: secrets/forge-token",
-                "kind: local\n  remote: remotes",
-            )
-        };
         let load = |yaml: String| {
             std::fs::write(&path, yaml).unwrap();
-            AgentConfig::load(&path).unwrap().forge.unwrap()
+            AgentConfig::load(&path).unwrap()
         };
-        let github = load(forged(|yaml| yaml));
+        let app = load(forged(|yaml| yaml));
+        let (github, settings) = (app.forge.unwrap(), app.github.unwrap());
         let on_disk = load(forged(local));
+        assert_eq!(on_disk.github, None, "a local forge has no App");
+        let on_disk = on_disk.forge.unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
 
-        let ForgeConfig::Github { token_file, .. } = &github else {
-            panic!("{github:?}")
-        };
-        assert_eq!(*token_file, dir.join("secrets/forge-token"));
+        assert!(matches!(github, ForgeConfig::Github { .. }), "{github:?}");
+        assert_eq!(
+            settings,
+            GithubConfig {
+                app_id: 7,
+                key_file: dir.join("secrets/github-app.pem"),
+                poll_secs: 60,
+                reconcile_secs: 300,
+                writes: true,
+                api_base: "https://api.github.com/".into(),
+                git_base: "https://github.com/".into(),
+            }
+        );
+        assert_eq!(github.identity(), None, "the clone's identity is the App's");
         let ForgeConfig::Local { remote, .. } = &on_disk else {
             panic!("{on_disk:?}")
         };
         assert_eq!(*remote, dir.join("remotes"));
-        assert_eq!(github.identity().email, "bot@example.com");
+        assert_eq!(on_disk.identity().unwrap().email, "bot@example.com");
         let repo = |name: &str| RepoName::try_from(name.to_owned()).unwrap();
         assert_eq!(
             *github.repos(),
@@ -1486,7 +1615,7 @@ budgets: {session_microusd: 500000}
                  policy.auto_approve_microusd, and nobody here can approve a budget",
             ),
             (
-                forged(|yaml| yaml.replace("name: solos-bot", "name: \"\"")),
+                forged(|yaml| local(yaml).replace("name: solos-bot", "name: \"\"")),
                 "forge.identity.name must be one line of text",
             ),
             (
@@ -1495,12 +1624,146 @@ budgets: {session_microusd: 500000}
             ),
             (
                 forged(|yaml| yaml.replace("kind: github", "kind: local")),
-                "unknown field `token_file`",
+                "missing field `remote`",
             ),
         ] {
             let refused = format!("{:#}", parse(&yaml).unwrap_err());
             assert!(refused.contains(why), "{refused}");
         }
+    }
+
+    #[test]
+    fn the_old_token_file_shape_is_refused_with_the_sentence_that_says_what_replaced_it() {
+        let dir = std::env::temp_dir().join(format!("agent-config-old-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.yaml");
+        let old_source = |fields: &str| {
+            let yaml = format!(
+                "{}sources:\n  - kind: github\n{fields}",
+                VALID.split("sources:").next().unwrap(),
+            );
+            format!(
+                "{yaml}channels: []\nrouter: {{kind: scripted}}\nexecutor: {{kind: scripted}}\nbudgets: {{session_microusd: 500000}}\n"
+            )
+        };
+        let cases = [
+            (
+                old_source("    repos: [acme/widgets]\n    token_file: secrets/github\n"),
+                "the github source's token_file is gone",
+            ),
+            (
+                old_source("    token_file: secrets/github\n"),
+                "the github source's token_file is gone",
+            ),
+            (
+                old_source("    repos: [acme/widgets]\n"),
+                "the github source no longer takes repos",
+            ),
+            (
+                old_source("    api_base: https://api.github.com/\n"),
+                "the github source no longer takes api_base",
+            ),
+            (
+                old_source("    poll_secs: 30\n"),
+                "the github source no longer takes poll_secs",
+            ),
+            (
+                forged(|yaml| {
+                    yaml.replace(
+                        "kind: github\n",
+                        "kind: github\n  token_file: secrets/forge-token\n",
+                    )
+                }),
+                "forge: github no longer takes token_file",
+            ),
+            (
+                forged(|yaml| {
+                    yaml.replace(
+                        "kind: github\n",
+                        "kind: github\n  identity: {name: bot, email: bot@example.com}\n",
+                    )
+                }),
+                "forge: github no longer takes identity",
+            ),
+        ];
+        for (yaml, why) in cases {
+            std::fs::write(&path, &yaml).unwrap();
+            let refused = format!("{:#}", AgentConfig::load(&path).unwrap_err());
+            assert!(refused.contains(why), "{why}: {refused}");
+            assert!(
+                refused.ends_with("see docs/agent-mode/README.md#github-app")
+                    && refused.lines().count() == 1,
+                "one sentence naming the migration doc: {refused}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_github_section_goes_with_what_uses_it_and_the_policys_logins_are_lowercased() {
+        let dir = std::env::temp_dir().join(format!("agent-config-gh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.yaml");
+        let lowered = forged(|yaml| yaml).replace(
+            "policy:\n  people: [slack:alice]",
+            "policy:\n  people: [slack:alice, \"github:Alice\"]\n  approvers: [github:BOB]",
+        );
+        assert_ne!(lowered, forged(|yaml| yaml));
+        std::fs::write(&path, &lowered).unwrap();
+        let config = AgentConfig::load(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(config.policy.people.contains("github:alice"));
+        assert!(config.policy.people.contains("slack:alice"), "others stay");
+        assert!(config.policy.approvers.contains("github:bob"));
+        assert_eq!(
+            config.github_logins(),
+            ["alice".to_owned(), "bob".to_owned(), "ci".to_owned()].into()
+        );
+        for (yaml, why) in [
+            (
+                forged(|yaml| yaml.replace(APP, "")),
+                "add a github: section",
+            ),
+            (format!("{VALID}{APP}"), "the github: section is unused"),
+            (
+                forged(|yaml| yaml.replace("app_id: 7", "app_id: 0")),
+                "github.app_id is the App's numeric id",
+            ),
+            (
+                forged(|yaml| yaml.replace("app_id: 7", "app_id: 7, poll_secs: 2")),
+                "github.poll_secs must not poll more often than every 10s",
+            ),
+            (
+                forged(|yaml| yaml.replace("app_id: 7", "app_id: 7, reconcile_secs: 30")),
+                "github.reconcile_secs must be at least 60",
+            ),
+            (
+                forged(|yaml| yaml.replace("app_id: 7", "app_id: 7, api_base: nowhere")),
+                "invalid github.api_base nowhere",
+            ),
+            (
+                forged(|yaml| yaml.replace("app_id: 7", "app_id: 7, git_base: ftp://x/")),
+                "github.git_base ftp://x/ is not an https://, http:// or file:// URL",
+            ),
+            (
+                forged(|yaml| yaml.replace("app_id: 7", "app_id: 7, token: x")),
+                "unknown field `token`",
+            ),
+            (
+                forged(|yaml| yaml).replace("people: [slack:alice]", "people: [\"github:a b\"]"),
+                "policy lists github:a b, which is not a GitHub login",
+            ),
+        ] {
+            let refused = format!("{:#}", parse(&yaml).unwrap_err());
+            assert!(refused.contains(why), "{why}: {refused}");
+        }
+        // forge.repos is the one list: the github Source needs it.
+        let needs_forge = format!("{VALID}{APP}").replace(
+            "sources:\n  - kind: jsonl\n    path: triggers.jsonl",
+            "sources:\n  - kind: github",
+        );
+        let refused = format!("{:#}", parse(&needs_forge).unwrap_err());
+        assert!(refused.contains("add a forge: section"), "{refused}");
     }
 
     #[test]

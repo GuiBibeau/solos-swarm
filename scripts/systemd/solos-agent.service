@@ -6,9 +6,10 @@
 # one-use credential, 0600), backups/ (agent.db before each deploy).
 #
 # agent serve reads each token file once and deletes it, so ExecStartPre copies tokens/ into this unit's private
-# tmpfs runtime directory before every start, crash restarts included. agent.yaml points its token_file entries at
-# /run/user/<uid>/solos-agent/<name>; the model key is model.key. The runtime directory is removed when the unit
-# stops, so a copy serve never read does not outlive it. No sandbox sees ~/agent/tokens or the runtime directory.
+# tmpfs runtime directory before every start, crash restarts included. agent.yaml points its token_file entries (and
+# github.key_file, the GitHub App's private key) at /run/user/<uid>/solos-agent/<name>; the model key is model.key.
+# The runtime directory is removed when the unit stops, so a copy serve never read does not outlive it. No sandbox
+# sees ~/agent/tokens or the runtime directory.
 [Unit]
 Description=solos-swarm agent mode (Discord, Router, sandboxed workers)
 After=network-online.target

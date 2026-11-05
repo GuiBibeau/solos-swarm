@@ -2,29 +2,45 @@
 //! and a Channel that comments on issues and pull requests. Triggers name
 //! source [`SOURCE`]; an issue or pull request is the Thread
 //! `github:<owner>/<repo>#<number>`.
+//!
+//! The agent acts as a GitHub App's bot and holds no other credential. Every
+//! call names a repository and gets a token minted for that repository alone,
+//! with the access its HTTP method needs (see [`app`]).
 
+mod app;
 mod channel;
+mod check;
+mod identities;
 mod source;
 
+pub use app::{
+    Access, AppId, AppKey, Bot, InstallState, InstallToken, Minter, MinterConfig, Now, Preflight,
+    REFRESH_MARGIN, SUSPENDED_WAIT,
+};
 pub use channel::GithubChannel;
+pub use check::{CheckArgs, check};
+pub use identities::{IDENTITIES_FILE, Identities};
 pub use source::{GithubSource, OVERLAP};
 
+use super::config::GithubConfig;
 use super::ports::RetryAfter;
 use anyhow::{Context, Result, bail, ensure};
 use reqwest::header::{ACCEPT, ETAG, HeaderMap, IF_NONE_MATCH, LINK, RETRY_AFTER};
-use reqwest::{Method, RequestBuilder, StatusCode};
+use reqwest::{Method, StatusCode};
 use serde_json::Value;
+use solos_agent_core::change::RepoName;
 use solos_agent_core::model::{ChannelRef, MessageId, ThreadKey};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::OnceCell;
-use zeroize::Zeroizing;
 
 /// The Source name GitHub Triggers and replies carry.
 pub const SOURCE: &str = "github";
 pub const DEFAULT_API_BASE: &str = "https://api.github.com/";
+/// Where the host's mirrors fetch from, unless a test points `git_base` at a
+/// directory of bare repositories.
+pub const DEFAULT_GIT_BASE: &str = "https://github.com/";
 /// The Source's read position, in the state directory.
 pub const CURSOR_FILE: &str = "github-cursor.json";
 
@@ -74,70 +90,56 @@ pub fn marker(id: &MessageId) -> String {
 
 pub(crate) const MARKER_PREFIX: &str = "<!-- solos-swarm message ";
 
-/// A GitHub token, held in memory only. Its `Debug` never shows it.
-#[derive(Clone)]
-pub struct Token(Arc<Zeroizing<String>>);
+/// What `agent serve` builds from the `github:` section: the one Minter
+/// (the only holder of the App's key), the REST client the Source and the
+/// Channel share, and where the forge's mirrors fetch from.
+pub struct GithubApp {
+    pub api: Arc<GithubApi>,
+    pub minter: Arc<Minter>,
+    /// Ends in `/`; a mirror fetches `<git_base><owner>/<name>.git`.
+    pub git_base: String,
+}
 
-impl Token {
-    pub fn new(secret: impl Into<String>) -> Self {
-        Self(Arc::new(Zeroizing::new(secret.into())))
-    }
-
-    /// Read the file once and delete it, so the token lives only in this
-    /// process. It must be a personal access token, because the agent learns
-    /// its own account from `GET /user`.
-    pub fn take(path: &Path) -> Result<Self> {
-        let read = std::fs::read_to_string(path);
-        let _ = std::fs::remove_file(path);
-        let raw =
-            Zeroizing::new(read.with_context(|| {
-                format!("cannot read the GitHub token file {}", path.display())
-            })?);
-        let token = raw.trim();
-        ensure!(
-            !token.starts_with("ghs_"),
-            "the GitHub token in {} is an app installation token; use a personal access token \
-             of the agent's own account",
-            path.display()
-        );
-        let legacy = token.len() == 40 && token.bytes().all(|b| b.is_ascii_hexdigit());
-        let personal = ["ghp_", "github_pat_", "gho_", "ghu_"]
-            .iter()
-            .any(|prefix| token.starts_with(prefix))
-            && token
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_');
-        ensure!(
-            legacy || personal,
-            "the GitHub token in {} is not a personal access token (ghp_ or github_pat_)",
-            path.display()
-        );
-        Ok(Self::new(token))
-    }
-
-    pub(crate) fn secret(&self) -> &str {
-        self.0.as_str()
+impl GithubApp {
+    /// Read the key file once and delete it, as every token file is. `repos`
+    /// is `forge.repos`, the only repositories a token is minted for;
+    /// `listed` the Policy's `github:` logins, whose account ids are pinned
+    /// in `state_dir`.
+    pub fn open(
+        config: &GithubConfig,
+        repos: BTreeSet<RepoName>,
+        state_dir: &Path,
+        listed: BTreeSet<String>,
+    ) -> Result<Self> {
+        let key = AppKey::take(&config.key_file).context("github.key_file")?;
+        let minter =
+            MinterConfig::new(AppId(config.app_id), &config.api_base, config.writes, repos);
+        let minter = Arc::new(Minter::new(minter, key, Arc::new(SystemTime::now))?);
+        let identities = Identities::load(state_dir.join(IDENTITIES_FILE), listed)?;
+        let api = Arc::new(GithubApi::new(minter.clone(), Arc::new(identities))?);
+        let mut git_base = config.git_base.trim().to_owned();
+        if !git_base.ends_with('/') {
+            git_base.push('/');
+        }
+        Ok(Self {
+            api,
+            minter,
+            git_base,
+        })
     }
 }
 
-impl std::fmt::Debug for Token {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Token(..)")
-    }
-}
-
-/// The REST API with one token, shared by the Source and the Channel so a
-/// rate limit one meets holds the other back too.
+/// The REST API, shared by the Source and the Channel so a rate limit one
+/// meets holds the other back too (and the Minter's own calls with them).
+/// `repo` selects the token and the HTTP method its access: a GET carries a
+/// read token and nothing else can.
 pub struct GithubApi {
-    base: String,
-    http: reqwest::Client,
-    token: Token,
-    /// No request leaves before this instant.
-    hold: Mutex<Option<Instant>>,
-    login: OnceCell<String>,
+    transport: Arc<Transport>,
+    minter: Arc<Minter>,
+    identities: Arc<Identities>,
 }
 
-/// An answer that arrived. Rate limits, 401 and 5xx are errors instead.
+/// An answer that arrived. Rate limits and 5xx are errors instead.
 pub(crate) enum Got {
     Ok(Page),
     /// 304: the `If-None-Match` ETag still holds.
@@ -155,8 +157,8 @@ pub(crate) struct Page {
     pub(crate) links: BTreeMap<String, String>,
 }
 
-/// Retrying cannot help until the operator acts: GitHub refused the token,
-/// or the token cannot see what the config names.
+/// Retrying cannot help until the operator acts: GitHub refused the App's
+/// key, or the App cannot see what the config names.
 #[derive(Debug)]
 pub(crate) struct Fatal(pub(crate) String);
 
@@ -178,10 +180,122 @@ pub(crate) fn retry_after(err: &anyhow::Error) -> Option<Duration> {
         .map(|after| after.0)
 }
 
+/// Whether GitHub's refusal says the installation is suspended.
+fn suspended(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("suspended")
+}
+
 impl GithubApi {
+    pub fn new(minter: Arc<Minter>, identities: Arc<Identities>) -> Result<Self> {
+        Ok(Self {
+            transport: minter.transport(),
+            minter,
+            identities,
+        })
+    }
+
+    pub(crate) fn url(&self, path: &str) -> String {
+        self.transport.url(path)
+    }
+
+    /// Whether a token may be minted for `repo`: it is in `forge.repos`.
+    pub(crate) fn allows(&self, repo: &RepoName) -> bool {
+        self.minter.allows(repo)
+    }
+
+    /// GET `url` on behalf of `repo`, conditional on `etag` when given.
+    pub(crate) async fn get(&self, repo: &RepoName, url: &str, etag: Option<&str>) -> Result<Got> {
+        self.call(repo, Method::GET, url, etag, None).await
+    }
+
+    /// POST, PATCH, PUT or DELETE on behalf of `repo`: always a write token.
+    pub(crate) async fn send(
+        &self,
+        repo: &RepoName,
+        method: Method,
+        url: &str,
+        body: Option<&Value>,
+    ) -> Result<Got> {
+        self.call(repo, method, url, None, body).await
+    }
+
+    /// A GET of something public, such as a user, with a read token of a
+    /// configured repository the App can read now.
+    pub(crate) async fn get_public(&self, path: &str) -> Result<Got> {
+        let repo = self.minter.readable_repo().await?;
+        self.get(&repo, &self.url(path), None).await
+    }
+
+    /// The agent's own account: the App's bot.
+    pub(crate) async fn bot(&self) -> Result<Bot> {
+        self.minter.bot().await.cloned()
+    }
+
+    pub(crate) fn identities(&self) -> &Arc<Identities> {
+        &self.identities
+    }
+
+    pub(crate) fn minter(&self) -> &Arc<Minter> {
+        &self.minter
+    }
+
+    /// One call with a token narrowed to `repo`. A 401 means the token was
+    /// revoked or its installation changed: the cached one is dropped and
+    /// the call is made once more with a fresh mint. A suspended
+    /// installation is a wait, not a failure.
+    async fn call(
+        &self,
+        repo: &RepoName,
+        method: Method,
+        url: &str,
+        etag: Option<&str>,
+        body: Option<&Value>,
+    ) -> Result<Got> {
+        let access = Access::for_method(&method);
+        let mut retried = false;
+        loop {
+            let token = self.minter.token(repo, access).await?;
+            let got = self
+                .transport
+                .send(method.clone(), url, token.bearer(), etag, body)
+                .await?;
+            match got {
+                Got::Refused { status, message } if status == StatusCode::UNAUTHORIZED => {
+                    self.minter.forget(&token);
+                    if !retried {
+                        retried = true;
+                        continue;
+                    }
+                    bail!(
+                        "github {method} {url}: GitHub refused a fresh installation token (HTTP 401: {message})"
+                    );
+                }
+                Got::Refused { status, message }
+                    if status == StatusCode::FORBIDDEN && suspended(&message) =>
+                {
+                    self.minter.forget(&token);
+                    return Err(self.minter.suspended(repo));
+                }
+                other => return Ok(other),
+            }
+        }
+    }
+}
+
+/// HTTP to one API base with a bearer the caller chooses: an installation
+/// token for the REST calls, the App's JWT for the Minter's. Holds the one
+/// process-wide rate-limit pause.
+pub(crate) struct Transport {
+    base: String,
+    http: reqwest::Client,
+    /// No request leaves before this instant.
+    hold: Mutex<Option<Instant>>,
+}
+
+impl Transport {
     /// `base` is the REST root, [`DEFAULT_API_BASE`] unless a test points it
     /// at a fake.
-    pub fn new(base: &str, token: Token) -> Result<Self> {
+    pub(crate) fn new(base: &str) -> Result<Self> {
         let mut base = base.trim().to_owned();
         if !base.ends_with('/') {
             base.push('/');
@@ -196,62 +310,12 @@ impl GithubApi {
         Ok(Self {
             base,
             http,
-            token,
             hold: Mutex::new(None),
-            login: OnceCell::new(),
         })
     }
 
     pub(crate) fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base)
-    }
-
-    /// GET `url`, conditional on `etag` when given.
-    pub(crate) async fn get(&self, url: &str, etag: Option<&str>) -> Result<Got> {
-        let mut request = self.request(Method::GET, url)?;
-        if let Some(etag) = etag {
-            request = request.header(IF_NONE_MATCH, etag);
-        }
-        self.send("GET", url, request).await
-    }
-
-    pub(crate) async fn post(&self, url: &str, body: &Value) -> Result<Got> {
-        let request = self.request(Method::POST, url)?.json(body);
-        self.send("POST", url, request).await
-    }
-
-    /// The agent's own account.
-    pub(crate) async fn login(&self) -> Result<String> {
-        let login = self
-            .login
-            .get_or_try_init(|| async {
-                match self.get(&self.url("user"), None).await? {
-                    Got::Ok(page) => page.body["login"]
-                        .as_str()
-                        .map(str::to_owned)
-                        .context("github GET user named no login"),
-                    Got::Refused { status, message } => Err(Fatal(format!(
-                        "github GET user: HTTP {status}: {message}; the token must be a personal \
-                         access token"
-                    ))
-                    .into()),
-                    Got::NotModified => bail!("github GET user: an unasked 304"),
-                }
-            })
-            .await?;
-        Ok(login.clone())
-    }
-
-    fn request(&self, method: Method, url: &str) -> Result<RequestBuilder> {
-        // Every URL comes from the base or a Link header checked against it,
-        // so the token never leaves for another host.
-        ensure!(url.starts_with(&self.base), "a GitHub URL off the API base");
-        Ok(self
-            .http
-            .request(method, url)
-            .bearer_auth(self.token.secret())
-            .header(ACCEPT, "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", API_VERSION))
     }
 
     fn held(&self) -> Option<Duration> {
@@ -266,11 +330,36 @@ impl GithubApi {
         *hold = Some(hold.map_or(until, |held| held.max(until)));
     }
 
-    async fn send(&self, method: &str, url: &str, request: RequestBuilder) -> Result<Got> {
+    /// `method` `url` with `bearer`, conditional on `etag` when given. A 401
+    /// is a [`Got::Refused`] like any other answer: what it means depends on
+    /// what the bearer was.
+    pub(crate) async fn send(
+        &self,
+        method: Method,
+        url: &str,
+        bearer: &str,
+        etag: Option<&str>,
+        body: Option<&Value>,
+    ) -> Result<Got> {
+        // Every URL comes from the base or a Link header checked against it,
+        // so a bearer never leaves for another host.
+        ensure!(url.starts_with(&self.base), "a GitHub URL off the API base");
         let path = url.strip_prefix(&self.base).unwrap_or(url);
         let what = format!("github {method} {}", path.split('?').next().unwrap_or(path));
         if let Some(wait) = self.held() {
             return Err(limited(wait, &what));
+        }
+        let mut request = self
+            .http
+            .request(method, url)
+            .bearer_auth(bearer)
+            .header(ACCEPT, "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", API_VERSION);
+        if let Some(etag) = etag {
+            request = request.header(IF_NONE_MATCH, etag);
+        }
+        if let Some(body) = body {
+            request = request.json(body);
         }
         let response = request
             .send()
@@ -284,9 +373,6 @@ impl GithubApi {
                 self.hold_for(wait);
             }
             return Ok(Got::NotModified);
-        }
-        if status == StatusCode::UNAUTHORIZED {
-            return Err(Fatal(format!("{what}: GitHub refused the token (HTTP 401)")).into());
         }
         let bytes = response
             .bytes()

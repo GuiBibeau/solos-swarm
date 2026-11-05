@@ -5,8 +5,9 @@
 use super::{GithubApi, Got, Page, marker, valid_repo};
 use crate::agent::ports::{BoxFuture, Channel, SendOptions, SendOutcome};
 use anyhow::{Result, bail};
-use reqwest::{StatusCode, Url};
+use reqwest::{Method, StatusCode, Url};
 use serde_json::{Value, json};
+use solos_agent_core::change::RepoName;
 use solos_agent_core::model::{ChannelRef, MessageId, MessageKind, OutboundMessage};
 use std::sync::Arc;
 
@@ -38,18 +39,30 @@ impl GithubChannel {
             eprintln!("agent: github: message {} names no issue", message.id);
             return Ok(SendOutcome::Gone);
         };
+        if !self.api.allows(&repo) {
+            eprintln!(
+                "agent: github: message {} is for {repo}, which is not in forge.repos, so the \
+                 App holds no token for it",
+                message.id
+            );
+            return Ok(SendOutcome::Gone);
+        }
         let url = self
             .api
             .url(&format!("repos/{repo}/issues/{number}/comments"));
         if options.repeat {
-            match self.find(&url, &message.id).await? {
+            match self.find(&repo, &url, &message.id).await? {
                 Found::Posted => return Ok(SendOutcome::Sent),
                 Found::Gone => return Ok(SendOutcome::Gone),
                 Found::Missing => {}
             }
         }
         let body = json!({ "body": body(&message) });
-        match self.api.post(&url, &body).await? {
+        match self
+            .api
+            .send(&repo, Method::POST, &url, Some(&body))
+            .await?
+        {
             Got::Ok(_) => Ok(SendOutcome::Sent),
             Got::Refused {
                 status,
@@ -69,10 +82,10 @@ impl GithubChannel {
     }
 
     /// Whether the conversation already holds the agent's comment `id`.
-    async fn find(&self, url: &str, id: &MessageId) -> Result<Found> {
-        let me = self.api.login().await?;
+    async fn find(&self, repo: &RepoName, url: &str, id: &MessageId) -> Result<Found> {
+        let me = self.api.bot().await?.login;
         let marker = marker(id);
-        let Some(first) = self.comments(url, 1).await? else {
+        let Some(first) = self.comments(repo, url, 1).await? else {
             return Ok(Found::Gone);
         };
         if holds(&first.body, &me, &marker) {
@@ -85,7 +98,7 @@ impl GithubChannel {
             .unwrap_or(1);
         // GitHub lists oldest first, and an earlier attempt is among the newest.
         for page in (2..=last).rev().take(MAX_PAGES) {
-            let Some(found) = self.comments(url, page).await? else {
+            let Some(found) = self.comments(repo, url, page).await? else {
                 return Ok(Found::Gone);
             };
             if holds(&found.body, &me, &marker) {
@@ -99,10 +112,10 @@ impl GithubChannel {
     }
 
     /// One page of the conversation, or `None` when it is gone.
-    async fn comments(&self, url: &str, page: u64) -> Result<Option<Page>> {
+    async fn comments(&self, repo: &RepoName, url: &str, page: u64) -> Result<Option<Page>> {
         let query = [("per_page", PER_PAGE), ("page", &page.to_string())];
         let paged = Url::parse_with_params(url, query)?;
-        match self.api.get(paged.as_str(), None).await? {
+        match self.api.get(repo, paged.as_str(), None).await? {
             Got::Ok(found) => Ok(Some(found)),
             Got::Refused { status, message } if gone(status, &message) => {
                 eprintln!("agent: github: cannot read {url}: {status}: {message}");
@@ -124,11 +137,12 @@ impl Channel for GithubChannel {
     }
 }
 
-fn address(channel: &ChannelRef) -> Option<(&str, u64)> {
+fn address(channel: &ChannelRef) -> Option<(RepoName, u64)> {
     let repo = channel
         .address
         .get("repo")
         .filter(|repo| valid_repo(repo))?;
+    let repo = RepoName::try_from(repo.clone()).ok()?;
     let number = channel.address.get("number")?.parse().ok()?;
     Some((repo, number))
 }

@@ -4,7 +4,8 @@
 //! repository costs 304s, which GitHub does not count against the rate limit.
 
 use super::{
-    Fatal, GithubApi, Got, MARKER_PREFIX, SOURCE, is_fatal, reply_to, retry_after, thread,
+    Bot, Fatal, GithubApi, Got, Identities, InstallState, MARKER_PREFIX, SOURCE, is_fatal,
+    reply_to, retry_after, thread,
 };
 use crate::agent::ports::{BoxFuture, FactSink, Source, TriggerSink};
 use crate::agent::utc;
@@ -13,6 +14,7 @@ use anyhow::{Context, Result, bail};
 use reqwest::{StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use solos_agent_core::change::RepoName;
 use solos_agent_core::model::{Actor, ActorKind, Addressed, Ms, Trigger, TriggerId};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -32,11 +34,11 @@ const FAILED: [&str; 3] = ["failure", "timed_out", "startup_failure"];
 /// The account GitHub Actions acts as.
 const ACTIONS: &str = "github-actions[bot]";
 
-/// Reads the configured repositories only; the agent's own comments are
-/// dropped before they reach the Engine.
+/// Reads the configured repositories only, on tokens narrowed to each; the
+/// agent's own comments are dropped before they reach the Engine.
 pub struct GithubSource {
     api: Arc<GithubApi>,
-    repos: Vec<String>,
+    repos: Vec<RepoName>,
     cursor: PathBuf,
     follow: bool,
     poll: Duration,
@@ -45,12 +47,12 @@ pub struct GithubSource {
 }
 
 impl GithubSource {
-    /// `repos` are `owner/name`; the read position is the file `cursor`.
+    /// `repos` are `forge.repos`; the read position is the file `cursor`.
     /// With `follow` it polls every minute until stopped; without, it reads
     /// once and ends, for tests and dry runs.
     pub fn new(
         api: Arc<GithubApi>,
-        repos: impl IntoIterator<Item = String>,
+        repos: impl IntoIterator<Item = RepoName>,
         cursor: impl Into<PathBuf>,
         follow: bool,
     ) -> Self {
@@ -82,8 +84,19 @@ impl GithubSource {
 }
 
 impl Source for GithubSource {
+    /// A failure waiting cannot mend (GitHub refuses the App's key, or the
+    /// App cannot read a configured repository) stops this Source and says
+    /// so; the rest of the agent keeps running.
     fn run(self: Box<Self>, sink: TriggerSink, _: FactSink) -> BoxFuture<'static, Result<()>> {
-        Box::pin(async move { self.serve(&sink).await })
+        Box::pin(async move {
+            match self.serve(&sink).await {
+                Err(err) if is_fatal(&err) => {
+                    eprintln!("agent: github: the source stopped: {err:#}");
+                    Ok(())
+                }
+                other => other,
+            }
+        })
     }
 }
 
@@ -194,7 +207,7 @@ struct Position {
 impl Cursor {
     /// A repository read for the first time starts at `now`, and that start
     /// is saved at once.
-    fn load(path: &Path, repos: &[String], now: Ms) -> Result<Self> {
+    fn load(path: &Path, repos: &[RepoName], now: Ms) -> Result<Self> {
         let mut cursor: Self = match std::fs::read(path) {
             Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| {
                 format!(
@@ -207,10 +220,12 @@ impl Cursor {
                 return Err(err).with_context(|| format!("cannot read {}", path.display()));
             }
         };
-        cursor.repos.retain(|repo, _| repos.contains(repo));
+        cursor
+            .repos
+            .retain(|repo, _| repos.iter().any(|known| known.as_str() == repo));
         let mut fresh = false;
         for repo in repos {
-            let feeds = cursor.repos.entry(repo.clone()).or_default();
+            let feeds = cursor.repos.entry(repo.to_string()).or_default();
             for feed in Feed::ALL {
                 feeds.entry(feed.key().to_owned()).or_insert_with(|| {
                     fresh = true;
@@ -227,9 +242,9 @@ impl Cursor {
         Ok(cursor)
     }
 
-    fn position(&mut self, repo: &str, feed: Feed) -> &mut Position {
+    fn position(&mut self, repo: &RepoName, feed: Feed) -> &mut Position {
         self.repos
-            .entry(repo.to_owned())
+            .entry(repo.to_string())
             .or_default()
             .entry(feed.key().to_owned())
             .or_default()
@@ -257,7 +272,7 @@ struct State {
     /// The ETag of each first page read, by its URL.
     etags: BTreeMap<String, String>,
     /// Repositories whose workflow runs the token cannot read.
-    no_runs: BTreeSet<String>,
+    no_runs: BTreeSet<RepoName>,
 }
 
 enum Listing {
@@ -268,7 +283,7 @@ enum Listing {
 
 impl GithubSource {
     async fn serve(&self, sink: &TriggerSink) -> Result<()> {
-        let me = self.begin().await?;
+        let bot = self.begin().await?;
         let cursor = Cursor::load(&self.cursor, &self.repos, now_ms())?;
         let mut saved = cursor.clone();
         let mut state = State {
@@ -280,7 +295,8 @@ impl GithubSource {
         loop {
             // The read moves the position only once its batch is handed on.
             let mut next = state.clone();
-            match self.poll(&me, &mut next).await {
+            self.pin_missing().await;
+            match self.poll(&bot, &mut next).await {
                 Ok(batch) => {
                     failures = 0;
                     if !batch.is_empty() && sink.send(batch).await.is_err() {
@@ -338,12 +354,12 @@ impl GithubSource {
         Ok(wait)
     }
 
-    /// The agent's login, once the token reads every configured repository.
-    async fn begin(&self) -> Result<String> {
+    /// The agent's account, once the App reads every configured repository.
+    async fn begin(&self) -> Result<Bot> {
         let mut failures = 0;
         loop {
             let err = match self.start().await {
-                Ok(me) => return Ok(me),
+                Ok(bot) => return Ok(bot),
                 Err(err) => err,
             };
             let wait = self.retry(err, failures)?;
@@ -352,21 +368,73 @@ impl GithubSource {
         }
     }
 
-    async fn start(&self) -> Result<String> {
-        let me = self.api.login().await?;
+    async fn start(&self) -> Result<Bot> {
+        let bot = self.api.bot().await?;
+        self.preflight().await?;
+        self.pin_missing().await;
         for repo in &self.repos {
             let url = self.api.url(&format!("repos/{repo}"));
-            if let Got::Refused { status, message } = self.api.get(&url, None).await? {
-                let why = format!("the GitHub token cannot read {repo}: HTTP {status}: {message}");
+            if let Got::Refused { status, message } = self.api.get(repo, &url, None).await? {
+                let why = format!("the GitHub App cannot read {repo}: HTTP {status}: {message}");
                 return Err(Fatal(why).into());
             }
         }
-        Ok(me)
+        Ok(bot)
+    }
+
+    /// One line per repository on how the App stands there. It only logs: a
+    /// missing or suspended installation is a wait, so an owner who suspends
+    /// the App and restarts the box does not get a crash loop.
+    async fn preflight(&self) -> Result<()> {
+        for found in self.api.minter().preflight(&self.repos).await? {
+            let repo = &found.repo;
+            match found.state {
+                InstallState::Installed { missing, extra, .. }
+                    if missing.is_empty() && extra.is_empty() => {}
+                InstallState::Installed { missing, extra, .. } => {
+                    if !missing.is_empty() {
+                        eprintln!(
+                            "agent: github: the App's installation on {repo} lacks {}",
+                            missing.join(", ")
+                        );
+                    }
+                    if !extra.is_empty() {
+                        eprintln!(
+                            "agent: github: the App's installation on {repo} holds {}, which \
+                             the agent never uses; remove it",
+                            extra.join(", ")
+                        );
+                    }
+                }
+                InstallState::Suspended => {
+                    eprintln!("agent: github: the App is suspended on {repo}; calls wait");
+                }
+                InstallState::NotInstalled { install_url } => {
+                    eprintln!(
+                        "agent: github: the App is not installed on {repo}; install it at \
+                         {install_url}; calls wait"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Pin the Policy's logins to their account ids, as many as can be now.
+    async fn pin_missing(&self) {
+        let identities = self.api.identities();
+        if identities.missing().is_empty() {
+            return;
+        }
+        if let Err(err) = identities.pin_missing(&self.api).await {
+            eprintln!("agent: github: the account pins were not saved: {err:#}");
+        }
     }
 
     /// One read of every listing: the new Triggers, oldest first. `state`
     /// moves past what was read.
-    async fn poll(&self, me: &str, state: &mut State) -> Result<Vec<Trigger>> {
+    async fn poll(&self, bot: &Bot, state: &mut State) -> Result<Vec<Trigger>> {
+        let identities = self.api.identities().as_ref();
         let mut etags = BTreeMap::new();
         let mut batch = Vec::new();
         for repo in &self.repos {
@@ -402,9 +470,11 @@ impl GithubSource {
                     let time = feed.time(item).filter(|time| *time >= since);
                     let trigger = match feed {
                         _ if time.is_none() => None,
-                        Feed::Issues => opened(repo, item, me),
-                        Feed::Comments => commented(repo, item, me, false),
-                        Feed::ReviewComments => commented(repo, item, me, true),
+                        Feed::Issues => opened(repo.as_str(), item, bot, identities),
+                        Feed::Comments => commented(repo.as_str(), item, bot, identities, false),
+                        Feed::ReviewComments => {
+                            commented(repo.as_str(), item, bot, identities, true)
+                        }
                         Feed::Runs => self.failed(repo, item, &mut pulls).await?,
                     };
                     let position = state.cursor.position(repo, feed);
@@ -430,16 +500,17 @@ impl GithubSource {
     /// The items of one listing since `since`, following its pages.
     async fn list(
         &self,
-        repo: &str,
+        repo: &RepoName,
         feed: Feed,
         since: Ms,
         known: &BTreeMap<String, String>,
         etags: &mut BTreeMap<String, String>,
     ) -> Result<Listing> {
-        let url = Url::parse_with_params(&self.api.url(&feed.path(repo)), feed.query(since))?;
+        let url =
+            Url::parse_with_params(&self.api.url(&feed.path(repo.as_str())), feed.query(since))?;
         let url = url.to_string();
         let etag = known.get(&url);
-        let page = match self.api.get(&url, etag.map(String::as_str)).await? {
+        let page = match self.api.get(repo, &url, etag.map(String::as_str)).await? {
             Got::Ok(page) => page,
             Got::NotModified => {
                 if let Some(etag) = etag {
@@ -461,7 +532,7 @@ impl GithubSource {
         let mut items = feed.items(page.body);
         for _ in 1..feed.pages() {
             let Some(url) = next.take() else { break };
-            match self.api.get(&url, None).await? {
+            match self.api.get(repo, &url, None).await? {
                 Got::Ok(page) => {
                     items.extend(feed.items(page.body));
                     next = page.links.get("next").cloned();
@@ -478,7 +549,7 @@ impl GithubSource {
     /// request, so their head commit is looked up among the open ones.
     async fn failed(
         &self,
-        repo: &str,
+        repo: &RepoName,
         run: &Value,
         pulls: &mut Option<Vec<(u64, String)>>,
     ) -> Result<Option<Trigger>> {
@@ -503,13 +574,13 @@ impl GithubSource {
                 .map(|(number, _)| *number)
                 .collect();
         }
-        Ok(run_trigger(repo, run, &numbers))
+        Ok(run_trigger(repo.as_str(), run, &numbers))
     }
 
-    async fn open_pulls(&self, repo: &str) -> Result<Vec<(u64, String)>> {
+    async fn open_pulls(&self, repo: &RepoName) -> Result<Vec<(u64, String)>> {
         let query = [("state", "open"), ("per_page", PER_PAGE)];
         let url = Url::parse_with_params(&self.api.url(&format!("repos/{repo}/pulls")), query)?;
-        match self.api.get(url.as_str(), None).await? {
+        match self.api.get(repo, url.as_str(), None).await? {
             Got::Ok(page) => Ok(page
                 .body
                 .as_array()
@@ -531,25 +602,11 @@ impl GithubSource {
     }
 }
 
-fn actor(user: &Value) -> Option<Actor> {
-    let login = user["login"].as_str()?;
-    let kind = if user["type"] == "Bot" || login.ends_with("[bot]") {
-        ActorKind::Bot
-    } else {
-        ActorKind::Person
-    };
-    Some(Actor {
-        id: login.to_owned(),
-        kind,
-        name: None,
-    })
-}
-
 /// A new issue or pull request.
-fn opened(repo: &str, issue: &Value, me: &str) -> Option<Trigger> {
+fn opened(repo: &str, issue: &Value, bot: &Bot, identities: &Identities) -> Option<Trigger> {
     let number = issue["number"].as_u64()?;
-    let actor = actor(&issue["user"])?;
-    if actor.id.eq_ignore_ascii_case(me) {
+    let actor = identities.actor(&issue["user"])?;
+    if bot.is(&actor.id) {
         return None;
     }
     let title = issue["title"].as_str().unwrap_or_default().trim();
@@ -579,7 +636,7 @@ fn opened(repo: &str, issue: &Value, me: &str) -> Option<Trigger> {
         source: SOURCE.into(),
         at_ms: utc::parse(issue["created_at"].as_str()?)?,
         actor,
-        addressed: addressed(&text, me),
+        addressed: addressed(&text, bot),
         text,
         threads: vec![thread(repo, number)],
         reply_to: vec![reply_to(repo, number)],
@@ -590,7 +647,13 @@ fn opened(repo: &str, issue: &Value, me: &str) -> Option<Trigger> {
 /// A comment on an issue or a pull request's conversation, or with
 /// `review`, on a pull request's diff. The two kinds number their ids
 /// apart, so their Trigger ids say which.
-fn commented(repo: &str, comment: &Value, me: &str, review: bool) -> Option<Trigger> {
+fn commented(
+    repo: &str,
+    comment: &Value,
+    bot: &Bot,
+    identities: &Identities,
+    review: bool,
+) -> Option<Trigger> {
     let id = comment["id"].as_u64()?;
     let on = if review {
         "pull_request_url"
@@ -598,9 +661,9 @@ fn commented(repo: &str, comment: &Value, me: &str, review: bool) -> Option<Trig
         "issue_url"
     };
     let number = comment[on].as_str()?.rsplit('/').next()?.parse().ok()?;
-    let actor = actor(&comment["user"])?;
+    let actor = identities.actor(&comment["user"])?;
     let body = comment["body"].as_str().unwrap_or_default();
-    if actor.id.eq_ignore_ascii_case(me) || body.contains(MARKER_PREFIX) {
+    if bot.is(&actor.id) || body.contains(MARKER_PREFIX) {
         return None;
     }
     let kind = if review { "review_comment" } else { "comment" };
@@ -634,8 +697,8 @@ fn commented(repo: &str, comment: &Value, me: &str, review: bool) -> Option<Trig
         source: SOURCE.into(),
         at_ms: utc::parse(comment["created_at"].as_str()?)?,
         actor,
-        addressed: addressed(body, me),
-        text: unmention(body, me),
+        addressed: addressed(body, bot),
+        text: bot.unmention(body),
         threads: vec![thread(repo, number)],
         reply_to: vec![reply_to(repo, number)],
         meta,
@@ -686,73 +749,10 @@ fn run_trigger(repo: &str, run: &Value, numbers: &[u64]) -> Option<Trigger> {
     })
 }
 
-fn addressed(text: &str, me: &str) -> Addressed {
-    if mentions(text, me) {
+fn addressed(text: &str, bot: &Bot) -> Addressed {
+    if bot.mentioned_in(text) {
         Addressed::Mention
     } else {
         Addressed::Unaddressed
-    }
-}
-
-fn name_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/')
-}
-
-/// Whether `text` mentions `@login` as GitHub links it: not inside a word or
-/// an email address, and not as the start of a longer name or a team.
-fn mentions(text: &str, login: &str) -> bool {
-    let text = text.to_ascii_lowercase();
-    let needle = format!("@{}", login.to_ascii_lowercase());
-    text.match_indices(&needle).any(|(at, _)| {
-        let before = text[..at].chars().next_back();
-        let after = text[at + needle.len()..].chars().next();
-        !before.is_some_and(|c| c.is_alphanumeric() || c == '_') && !after.is_some_and(name_char)
-    })
-}
-
-/// The text without the `@login` people open a comment to the agent with.
-fn unmention(text: &str, login: &str) -> String {
-    let text = text.trim();
-    let mention = format!("@{login}");
-    let rest = text
-        .get(..mention.len())
-        .filter(|head| head.eq_ignore_ascii_case(&mention))
-        .map(|_| &text[mention.len()..])
-        .filter(|rest| !rest.chars().next().is_some_and(name_char));
-    match rest {
-        Some(rest) => rest.trim_start_matches([',', ':']).trim().to_owned(),
-        None => text.to_owned(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{mentions, unmention};
-
-    #[test]
-    fn a_mention_is_the_login_alone_and_any_case() {
-        for (text, mentioned) in [
-            ("@solos-bot fix it", true),
-            ("ping @SOLOS-BOT.", true),
-            ("(@solos-bot)", true),
-            ("mail alice@solos-bot.dev", false),
-            ("@solos-bots fix it", false),
-            ("@solos-bot-2 fix it", false),
-            ("@solos-bot/team", false),
-            ("no mention", false),
-        ] {
-            assert_eq!(mentions(text, "solos-bot"), mentioned, "{text}");
-        }
-        assert_eq!(
-            unmention("  @Solos-Bot, fix the test ", "solos-bot"),
-            "fix the test"
-        );
-        assert_eq!(unmention("@solos-bot: x", "solos-bot"), "x");
-        assert_eq!(unmention("@solos-bots x", "solos-bot"), "@solos-bots x");
-        assert_eq!(
-            unmention("thanks @solos-bot", "solos-bot"),
-            "thanks @solos-bot"
-        );
-        assert_eq!(unmention("é", "solos-bot"), "é");
     }
 }
