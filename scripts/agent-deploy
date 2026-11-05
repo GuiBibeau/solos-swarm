@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# Deploy agent mode to the big box and operate it, from the Mac. Usage: scripts/agent-deploy <command>
+#
+#   deploy [REV]      build REV (default origin/main) on the box as an immutable release, back up agent.db, switch,
+#                     restart and wait until healthy; if it does not come up, switch back and restore agent.db
+#   rollback          switch to the previous release and restart
+#   status            the unit, the release it runs, and `agent status`
+#   logs [ARGS]       journalctl for the unit (default: the last 100 lines; `logs -f` follows)
+#   token NAME        store a one-use credential read from stdin as ~/agent/tokens/NAME (0600); prints nothing of it
+#   start|stop|restart
+#   releases          list releases, marking current and previous
+#
+# The box (AGENT_HOST, default remote-ai) keeps everything under ~/agent; see scripts/systemd/solos-agent.service.
+set -euo pipefail
+HOST=${AGENT_HOST:-remote-ai}
+UNIT=solos-agent
+
+SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 "$HOST")
+# This script runs on the box too: each command first installs it as ~/agent/.agent-deploy, so stdin stays free
+# for data (a release archive, a token).
+push_self() { "${SSH[@]}" "mkdir -p -m 0700 ~/agent && cat > ~/agent/.agent-deploy" < "$0"; }
+host() { "${SSH[@]}" "bash ~/agent/.agent-deploy --on-host $*"; }
+
+if [[ ${1:-} == --on-host ]]; then
+	shift
+	cmd=$1
+	shift
+	A=$HOME/agent
+	NODE=$HOME/.local/opt/node-v24.18.0-linux-x64/bin/node
+	export PATH=$HOME/.cargo/bin:$HOME/.local/opt/node-v24.18.0-linux-x64/bin:/usr/local/bin:/usr/bin:/bin
+	sc() { systemctl --user "$@"; }
+	healthy() { # 0 once the unit has stayed up with its broker socket for 20 s
+		local pid
+		for _ in $(seq 1 45); do
+			if sc is-active -q $UNIT && [[ -S $A/state/broker.sock ]]; then
+				pid=$(sc show -p MainPID --value $UNIT)
+				sleep 20
+				sc is-active -q $UNIT && [[ $(sc show -p MainPID --value $UNIT) == "$pid" ]] && return 0
+				return 1
+			fi
+			sc is-failed -q $UNIT && return 1
+			sleep 2
+		done
+		return 1
+	}
+	backup() { # copy agent.db (and its WAL) while the unit is stopped
+		[[ -f $A/state/agent.db ]] || return 0
+		local b=$A/backups/$(date -u +%Y%m%dT%H%M%SZ)-$(basename "$(readlink "$A/current" 2>/dev/null || echo none)")
+		mkdir -p "$b" && cp -a "$A"/state/agent.db* "$b"/ && echo "$b"
+		ls -1dt "$A"/backups/*/ 2>/dev/null | tail -n +21 | xargs -r rm -rf
+	}
+	switch() { # point current at release $1, remembering the old one as previous
+		local old
+		old=$(readlink "$A/current" 2>/dev/null || true)
+		ln -sfn "$1" "$A/current.new" && mv -T "$A/current.new" "$A/current"
+		[[ -n $old && $old != "$1" ]] && ln -sfn "$old" "$A/previous.new" && mv -T "$A/previous.new" "$A/previous"
+		install -m 0644 "$A/current/scripts/systemd/$UNIT.service" "$HOME/.config/systemd/user/$UNIT.service"
+		sc daemon-reload
+		sc enable -q $UNIT
+	}
+	case $cmd in
+	receive) # stdin: git archive of release $1
+		rel=$A/releases/$1
+		[[ -f $rel/.complete ]] && { cat > /dev/null; echo "release $1 is already built"; exit 0; }
+		rm -rf "$rel.tmp" && mkdir -p "$rel.tmp" && tar -xf - -C "$rel.tmp"
+		;;
+	build)
+		rel=$A/releases/$1
+		[[ -f $rel/.complete ]] && exit 0
+		free=$(df -BG --output=avail "$A" | tail -1 | tr -dc 0-9)
+		((free >= 30)) || { echo "only ${free} GB free on the box; refusing to build" >&2; exit 1; }
+		cd "$rel.tmp"
+		npm ci --no-audit --no-fund > npm.log 2>&1 || { tail -20 npm.log >&2; exit 1; }
+		CARGO_TARGET_DIR=$A/target RUSTUP_TOOLCHAIN=1.96.0 CARGO_BUILD_JOBS=24 nice -n 10 \
+			cargo build --locked --release --bin solos-swarm 2>&1 | tail -3
+		mkdir -p bin && cp "$A/target/release/solos-swarm" bin/solos-swarm
+		echo "$1" > REVISION
+		bin/solos-swarm doctor --pi-root "$rel.tmp" --node "$NODE" > /dev/null
+		touch .complete && chmod -R a-w . && chmod u+w . && mv -T "$rel.tmp" "$rel" && chmod u-w "$rel"
+		echo "built release $1"
+		;;
+	switch)
+		rel=$A/releases/$1
+		[[ -f $rel/.complete ]] || { echo "no built release $1" >&2; exit 1; }
+		[[ -f $A/agent.yaml ]] || { echo "no $A/agent.yaml: write the config first" >&2; exit 1; }
+		sc stop $UNIT 2> /dev/null || true
+		b=$(backup)
+		[[ -n $b ]] && echo "backed up agent.db to $b"
+		switch "$rel"
+		sc reset-failed $UNIT 2> /dev/null || true
+		sc start $UNIT
+		if healthy; then
+			echo "release $1 is serving (pid $(sc show -p MainPID --value $UNIT))"
+		else
+			echo "release $1 did not come up; its log:" >&2
+			journalctl --user -u $UNIT -n 30 --no-pager -o cat >&2
+			prev=$(readlink "$A/previous" 2>/dev/null || true)
+			sc stop $UNIT || true
+			if [[ -n $prev ]]; then
+				switch "$prev"
+				[[ -n $b ]] && cp -a "$b"/agent.db* "$A/state/"
+				sc reset-failed $UNIT 2> /dev/null || true
+				sc start $UNIT && healthy && echo "switched back to $(basename "$prev") and restored agent.db" >&2
+			fi
+			exit 1
+		fi
+		ls -1dt "$A"/releases/*/ | tail -n +6 | while read -r r; do
+			r=${r%/}
+			[[ $r == "$(readlink "$A/current")" || $r == "$(readlink "$A/previous" 2> /dev/null)" ]] && continue
+			chmod -R u+w "$r" && rm -rf "$r"
+		done
+		;;
+	rollback)
+		prev=$(readlink "$A/previous" 2>/dev/null) || { echo "no previous release" >&2; exit 1; }
+		sc stop $UNIT || true
+		backup > /dev/null
+		switch "$prev"
+		sc reset-failed $UNIT 2> /dev/null || true
+		sc start $UNIT
+		healthy && echo "rolled back to $(basename "$prev")" || {
+			echo "the previous release did not come up (a newer agent.db schema refuses an older binary; restore one from $A/backups/):" >&2
+			journalctl --user -u $UNIT -n 20 --no-pager -o cat >&2
+			exit 1
+		}
+		;;
+	status)
+		echo "release: $(basename "$(readlink "$A/current" 2>/dev/null || echo none)") (previous: $(basename "$(readlink "$A/previous" 2>/dev/null || echo none)"))"
+		sc status $UNIT --no-pager -n 0 | sed -n 1,5p || true
+		[[ -f $A/state/agent.db ]] && "$A/current/bin/solos-swarm" agent status --state-dir "$A/state" --config "$A/agent.yaml" || true
+		;;
+	logs) (($#)) || set -- -n 100; journalctl --user -u $UNIT --no-pager -o short-iso "$@" ;;
+	token)
+		[[ $1 =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad token name" >&2; exit 1; }
+		mkdir -p -m 0700 "$A/tokens" && (umask 077 && cat > "$A/tokens/$1.new") && mv "$A/tokens/$1.new" "$A/tokens/$1"
+		[[ -s $A/tokens/$1 ]] || { rm -f "$A/tokens/$1"; echo "empty token refused" >&2; exit 1; }
+		echo "stored token $1; restart the agent to use it"
+		;;
+	start | stop | restart) sc "$cmd" $UNIT && echo "$cmd: $(sc is-active $UNIT)" ;;
+	releases)
+		cur=$(readlink "$A/current" 2>/dev/null || true)
+		prev=$(readlink "$A/previous" 2>/dev/null || true)
+		ls -1dt "$A"/releases/*/ 2>/dev/null | while read -r r; do
+			r=${r%/}
+			tag=""; [[ $r == "$cur" ]] && tag=" (current)"; [[ $r == "$prev" ]] && tag=" (previous)"
+			echo "$(basename "$r")$tag"
+		done
+		;;
+	*) echo "unknown host command $cmd" >&2; exit 2 ;;
+	esac
+	exit 0
+fi
+
+cmd=${1:-}
+shift || true
+case $cmd in
+deploy)
+	rev=${1:-origin/main}
+	repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+	git -C "$repo" fetch -q origin
+	sha=$(git -C "$repo" rev-parse --short=12 "$rev^{commit}")
+	echo "deploying $sha: $(git -C "$repo" log -1 --format=%s "$sha")"
+	push_self
+	git -C "$repo" archive "$sha" | host receive "$sha"
+	host build "$sha"
+	host switch "$sha"
+	;;
+rollback | status | releases | start | stop | restart) push_self && host "$cmd" ;;
+logs) push_self && host logs "$@" ;;
+token)
+	[[ ${1:-} =~ ^[A-Za-z0-9._-]+$ ]] || { echo "usage: agent-deploy token NAME < file" >&2; exit 2; }
+	push_self && host token "$1"
+	;;
+*) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac
