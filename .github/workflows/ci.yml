@@ -45,29 +45,40 @@ jobs:
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: nextest@0.9.140
-      # The pinned tokenizer assets come from huggingface.co. One job fetches them, once per change of the pin;
-      # the shards restore them from the cache, so no shard depends on huggingface being up.
+      - name: Build the test binaries
+        run: cargo nextest archive --locked --workspace --archive-file nextest-archive.tar.zst
+      # The archive goes to the shards through the cache, not as an artifact: measured on runners, restoring 400 MB
+      # took 3-10 s against 5-43 s to download the same bytes as an artifact. The key is per run and attempt.
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: nextest-archive.tar.zst
+          key: nextest-archive-${{ github.run_id }}-${{ github.run_attempt }}
+      # `cargo test` also ran doc tests, which nextest does not. There are none today (every crate reports 0), so
+      # this costs nothing; the day a doc comment has a code block, they run again.
+      - name: Doc tests, if any
+        run: |
+          if grep -rqE '^\s*//[/!]\s*```' src crates --include='*.rs'; then
+            cargo test --locked --workspace --doc
+          else
+            echo "no doc comment has a code block: no doc tests"
+          fi
+
+  # The pinned tokenizer assets come from huggingface.co. This job fetches them, once per change of the pin; the
+  # shards restore them from the cache, so no shard depends on huggingface being up.
+  tokenizers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: work/tokenizers
           key: tokenizers-${{ hashFiles('scripts/bootstrap_tokenizers.py', 'assets/tokenizers/**') }}
       - name: Verify pinned tokenizer assets
         run: python3 scripts/bootstrap_tokenizers.py --output work/tokenizers
-      - name: Build the test binaries
-        run: cargo nextest archive --locked --workspace --archive-file nextest-archive.tar.zst
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: nextest-archive
-          path: nextest-archive.tar.zst
-          compression-level: 0
-          retention-days: 1
-          if-no-files-found: error
-      # `cargo test` also ran doc tests, which nextest does not. There are none today; this keeps it that way.
-      - name: Doc tests
-        run: cargo test --locked --workspace --doc
 
   test:
-    needs: build
+    needs: [build, tokenizers]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -86,11 +97,14 @@ jobs:
         with:
           path: work/tokenizers
           key: tokenizers-${{ hashFiles('scripts/bootstrap_tokenizers.py', 'assets/tokenizers/**') }}
+          fail-on-cache-miss: true
       - name: Verify pinned tokenizer assets
         run: python3 scripts/bootstrap_tokenizers.py --output work/tokenizers
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          name: nextest-archive
+          path: nextest-archive.tar.zst
+          key: nextest-archive-${{ github.run_id }}-${{ github.run_attempt }}
+          fail-on-cache-miss: true
       - name: Rust tests (shard ${{ matrix.shard }} of ${{ strategy.job-total }})
         run: >
           cargo nextest run --archive-file nextest-archive.tar.zst --extract-to . --extract-overwrite
@@ -99,7 +113,7 @@ jobs:
   # Three raft tests assert on the wall clock and fail when other tests share the runner (see .config/nextest.toml).
   # They run one at a time, on runners of their own, beside the shards: the condition they had in the serial run.
   test-isolated:
-    needs: build
+    needs: [build, tokenizers]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -122,11 +136,14 @@ jobs:
         with:
           path: work/tokenizers
           key: tokenizers-${{ hashFiles('scripts/bootstrap_tokenizers.py', 'assets/tokenizers/**') }}
+          fail-on-cache-miss: true
       - name: Verify pinned tokenizer assets
         run: python3 scripts/bootstrap_tokenizers.py --output work/tokenizers
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          name: nextest-archive
+          path: nextest-archive.tar.zst
+          key: nextest-archive-${{ github.run_id }}-${{ github.run_attempt }}
+          fail-on-cache-miss: true
       # Nothing may fall between the shards and these jobs. The `ci` profile's default filter and `ci-isolated`'s
       # are complements; the filters above must together select all of `ci-isolated`. If a rename made any of
       # these stop matching, a test would silently stop running; this fails instead.
@@ -170,7 +187,7 @@ jobs:
   # The one result to watch (and to require in branch protection): green only when every job above is.
   check:
     if: ${{ always() }}
-    needs: [lint, build, test, test-isolated, scripts]
+    needs: [lint, build, tokenizers, test, test-isolated, scripts]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

@@ -20,6 +20,12 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 # The shards run everything except the three raft tests below, which run in `ci-isolated`.
 default-filter = 'not test(/^cluster::tests::(actual_raft_over_mtls_quic|expired_three_voter|signed_checkpoint)/)'
 
+# The two slowest tests left are plain CPU work (hashing and sealing 33 MB; a seeded SQLite walk) with nothing
+# timed in them. Starting them first keeps them from being what a shard waits for at its end.
+[[profile.ci.overrides]]
+filter = 'test(/^qa::tests::large_observation/) | test(sqlite_store_matches_memory_store_on_seeded_walks)'
+priority = 100
+
 # Three raft tests assert on the wall clock and fail when the machine is busy with other tests, not when the code
 # is wrong: heartbeats every 200 ms, elections within 800-1400 ms, certificates that live 4 s. On a runner shared
 # with three other tests they failed in measured runs (see the PR), and one took 34 s instead of 0.2 s. Run one

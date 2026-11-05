@@ -2885,6 +2885,18 @@ impl Cluster {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A leader is known as soon as the election is won, but it can only confirm a read or commit a write once
+    /// the first round of heartbeats has come back from a quorum, which on a busy machine is a moment later.
+    /// A read has no effect, so this waits for one to be confirmed before a test makes its first quorum call.
+    async fn until_quorum(node: &Cluster) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while node.read("quorum-ready").await.is_err() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the cluster never confirmed a quorum");
+    }
     struct OwnedLogTestDir(PathBuf);
     impl OwnedLogTestDir {
         fn create() -> Self {
@@ -3285,7 +3297,7 @@ mod tests {
             cluster.push(Cluster::open(config.clone()).await.unwrap());
         }
         cluster[0].initialize([1, 2, 3].into()).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if cluster[0].leader().await.is_some() {
                     break;
@@ -3295,6 +3307,7 @@ mod tests {
         })
         .await
         .unwrap();
+        until_quorum(&cluster[0]).await;
         assert!(
             cluster[0]
                 .transact(Transaction::new(
@@ -3731,6 +3744,7 @@ mod tests {
         // and revoking an authoritative lease over the separate control connection.
         let leader = cluster[0].leader().await.unwrap();
         let leader_node = cluster.iter().find(|node| node.node_id == leader).unwrap();
+        until_quorum(leader_node).await;
         let follower = cluster
             .iter()
             .find(|node| node.node_id != leader)
