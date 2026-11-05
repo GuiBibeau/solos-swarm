@@ -5,9 +5,14 @@ fn inference(text: &str) -> Value {
     json!({"model":"m1","messages":[{"role":"user","content":text}],"max_tokens":16})
 }
 
+// The drain window is 5 s from the held-out job's issue. A test that expects it open must not race it: a loaded
+// machine can take longer than 5 s over the few requests such a test makes. Those tests issue the job this far in
+// the future (a negative elapsed time), which keeps the window open for the whole test.
+const WINDOW_OPEN: i64 = -40_000;
+
 // This receiver regression installs a signed held-out job as an explicit test fixture.
 // It tests broker authority and lifecycle edges, not protected scoring or runtime qualification.
-async fn final_completion_fixture(h: &Harness, elapsed_ms: u64, status: &str) -> String {
+async fn final_completion_fixture(h: &Harness, elapsed_ms: i64, status: &str) -> String {
     use crate::evaluator::{Candidate, EvaluationAction, EvaluationPhase, EvaluationRequest};
     assert_eq!(
         h.send("drain-claim", "/tool/claim_task", json!({})).await.0,
@@ -39,7 +44,7 @@ async fn final_completion_fixture(h: &Harness, elapsed_ms: u64, status: &str) ->
     assert_eq!(code, 200, "{attempt}");
     let state = h.kernel.state().await.unwrap();
     let now = crate::cluster::now_ms();
-    let issued_ms = now.saturating_sub(elapsed_ms);
+    let issued_ms = now.saturating_add_signed(-elapsed_ms);
     let request = EvaluationRequest {
         request_id: "test-held-out-job".into(),
         goal_id: "g".into(),
@@ -91,7 +96,7 @@ async fn final_completion_fixture(h: &Harness, elapsed_ms: u64, status: &str) ->
 #[tokio::test]
 async fn final_selection_drains_only_existing_task_completion_even_after_goal_completion() {
     let h = Harness::open().await;
-    let finding_id = final_completion_fixture(&h, 0, "completed").await;
+    let finding_id = final_completion_fixture(&h, WINDOW_OPEN, "completed").await;
     assert_eq!(
         h.send("drain-no-model", "/model", inference("closed search"))
             .await
@@ -186,7 +191,7 @@ async fn final_completion_window_cannot_be_refreshed_and_stop_still_wins() {
     h.close().await;
 
     let h = Harness::open().await;
-    let finding_id = final_completion_fixture(&h, 0, "awaiting_evaluation").await;
+    let finding_id = final_completion_fixture(&h, WINDOW_OPEN, "awaiting_evaluation").await;
     h.kernel
         .apply_operator(
             h.fixture.operators[0].clone(),
@@ -228,7 +233,7 @@ async fn final_completion_window_cannot_be_refreshed_and_stop_still_wins() {
 #[tokio::test]
 async fn final_completion_cannot_use_security_retired_finding() {
     let h = Harness::open().await;
-    let finding_id = final_completion_fixture(&h, 0, "completed").await;
+    let finding_id = final_completion_fixture(&h, WINDOW_OPEN, "completed").await;
     h.kernel
         .commit(
             "test-retire-final-result-source",
