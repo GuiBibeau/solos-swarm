@@ -146,10 +146,7 @@ fn explicit_request_runs_to_a_result_in_the_same_thread() {
     assert_eq!(*plan, session());
     assert_eq!(
         sent(&effects),
-        vec![(
-            MessageKind::Acknowledgement,
-            "On it: Fix the flaky test.".to_owned()
-        )]
+        vec![(MessageKind::Acknowledgement, "Looking into it.".to_owned())]
     );
     let record = w.engine.repos().decisions[&decision].clone();
     assert_eq!(record.kind, DecisionKind::Accept);
@@ -185,6 +182,51 @@ fn explicit_request_runs_to_a_result_in_the_same_thread() {
         t.ended.as_ref().map(|e| e.outcome),
         Some(TicketOutcome::Completed)
     );
+}
+
+#[test]
+fn the_first_reply_is_a_natural_line_the_routers_own_words_or_nothing() {
+    use solos_agent_core::model::STANDARD_ACKNOWLEDGEMENT;
+    let first_reply = |acknowledge: Acknowledge| {
+        let mut w = World::new(policy());
+        let eval = w.receive_and_start_eval(slack(
+            "t1",
+            Actor::person("alice"),
+            Addressed::Mention,
+            "th1",
+            "@agent what is MAX_SWARM_AGENTS?",
+        ));
+        w.effects();
+        let Verdict::Accept(mut accept) = accept(session(), 1_000_000) else {
+            unreachable!()
+        };
+        accept.acknowledge = acknowledge;
+        w.engine.decide(&eval, Verdict::Accept(accept)).unwrap();
+        sent(&w.effects())
+    };
+
+    // The standard line is a sentence a person would say. It never carries the
+    // Ticket's title ("Fix the flaky test"), which read as a label.
+    assert_eq!(STANDARD_ACKNOWLEDGEMENT, "Looking into it.");
+    let standard = first_reply(Acknowledge::Standard);
+    assert_eq!(
+        standard,
+        [(MessageKind::Acknowledgement, "Looking into it.".to_owned())]
+    );
+    assert!(!standard[0].1.contains("On it"), "{standard:?}");
+    assert!(!standard[0].1.contains("flaky"), "{standard:?}");
+
+    // The Router's own words go out as written; silence sends nothing.
+    assert_eq!(
+        first_reply(Acknowledge::Text(
+            "Checking the constant and HEAD now.".into()
+        )),
+        [(
+            MessageKind::Acknowledgement,
+            "Checking the constant and HEAD now.".to_owned()
+        )]
+    );
+    assert!(first_reply(Acknowledge::Silent).is_empty());
 }
 
 #[test]

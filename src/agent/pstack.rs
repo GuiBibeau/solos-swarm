@@ -325,7 +325,9 @@ impl Pstack {
             "pstack. You work the pstack way. pstack is Lauren Tan's set of agent skills, at \
              {MOUNT} (pstack {}, read-only). Read its files with read. {run} pstack is written \
              in Cursor's names, and the solos-swarm adapter below maps them to this host. \
-             Wherever a skill tells you to read the Claude Code adapter, use this one instead.\
+             Wherever a skill tells you to read the Claude Code adapter, use this one instead. \
+             pstack's reply rules are written for a reviewer who reads a report, and the person \
+             here reads chat, so the adapter's \"Talking to people\" wins wherever they differ.\
              \n\n{}\n\nYour pstack-models rule:\n",
             self.tree.version(),
             ADAPTER.trim()
@@ -898,6 +900,58 @@ mod tests {
                 "the adapter names /pstack/{path}, which the tree lacks"
             );
         }
+    }
+
+    /// The adapter says how pstack's reply rules read in a chat. It quotes each
+    /// rule it overrides, so a pstack update that rewords one makes this fail
+    /// and sends the maintainer to the adapter, instead of letting the worker
+    /// follow a rule the adapter no longer matches.
+    #[test]
+    fn the_chat_section_overrides_only_reply_rules_pstack_still_has() {
+        let skill = std::fs::read_to_string(
+            checkout()
+                .join(VENDORED)
+                .join("skills/poteto-mode/SKILL.md"),
+        )
+        .unwrap();
+        let (_, chat) = ADAPTER.split_once("## Talking to people").unwrap();
+        let (chat, _) = chat.split_once("\n## ").unwrap();
+        for rule in [
+            "Your first message on a task",
+            "Open each final report with",
+            "your final reply included",
+            "name each principle that shaped a decision",
+            "every section the playbook's reply names stays",
+            "Every claim carries its evidence or its label in the same sentence",
+            "Writing the reply",
+            "Frame impact for the consumer and the maintainer",
+        ] {
+            assert!(skill.contains(rule), "pstack no longer says {rule:?}");
+            assert!(
+                chat.contains(rule),
+                "the chat section never quotes {rule:?}"
+            );
+        }
+        for told in [
+            "your `ready` text is posted to them as a message in their thread",
+            "Open with the answer or the outcome. Never restate the goal or the task.",
+            "Name one only when the person asks why you decided something.",
+            "no greeting, no recap, no new introduction",
+            "A short question gets a short answer",
+        ] {
+            assert!(ADAPTER.contains(told), "the adapter does not say {told:?}");
+        }
+        // The `Skipped in solos-swarm` line is operator bookkeeping: it goes in a
+        // `progress` report, which no person is told, never in a reply.
+        assert!(chat.contains("Send them in a `worker_report` with status `progress`"));
+        assert!(
+            ADAPTER.contains("put one line in a `progress` report, `Skipped in solos-swarm:"),
+            "the Not on this host section sends its line to the reply"
+        );
+        assert!(
+            !ADAPTER.contains("in your next report") && !ADAPTER.contains("in your report"),
+            "a bookkeeping line is sent to the person"
+        );
     }
 
     #[cfg(target_os = "linux")]

@@ -1145,6 +1145,28 @@ executor:
     # max_runs: 1                                # swarms at once
 ```
 
+## How the agent talks
+
+People read the agent in chat, so its words are meant to sound like a colleague's, not a ticket system's.
+
+- **First reply.** The Router writes `acknowledge` itself: one short sentence in the asker's language and tone, never
+  the Ticket's title. Left out, it is the Engine's standard `Looking into it.`. An empty string posts nothing; the
+  Router uses that only for a small follow-up on a Thread that already has a Ticket, so the answer is the next
+  message. Work that takes a while always gets a line, because no Channel shows a typing indicator.
+- **Results.** A worker's `ready` text is posted as written, so the worker is told to write a chat message: the answer
+  first, in plain sentences, in the person's language and tone, as long as the question needs. Lists, tables and
+  headings only when the content has that shape. No restated goal, greeting, process narration, `Verification:` line
+  or cited principle. For code work, what changed, where, and what it ran to check it, in a sentence. The same rules
+  are in `WORKER_INSTRUCTIONS` and, for pstack's own reply rules, in the adapter's "Talking to people"
+  (`docs/harness/solos-swarm.md`), which says how each rule reads in chat. pstack's `Skipped in solos-swarm` lines and
+  other notes on how the work went are sent as `progress` reports, which no person is told and `agent status` shows.
+- **Follow-ups.** A message on a running Ticket reaches its worker as the next turn of the same conversation, with no
+  recap. A message after the Ticket ended is a new Ticket, and the Router's scope says it continues the Thread.
+- **What the host writes itself** (a worker that could not finish, Watchdog alerts) is first person and plain.
+
+The Channels keep their limits (500 characters for a first reply or a question, 2,000 on Discord and 3,000 on Slack
+for a result), neutralize mentions, and carry the markers that make a repeated send safe.
+
 ## Watchdog
 
 The Watchdog writes to one conversation an operator reads, through a Channel the config already has.

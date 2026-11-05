@@ -353,16 +353,22 @@ fn waiting(ticket: &Ticket, now: Ms, limits: &Thresholds) -> Option<Alert> {
         .filter(|waited| *waited >= limits.waiting_ms)?;
     let waited_for = duration(waited);
     let what = match stage {
-        Stage::Approval => format!("has waited {waited_for} for a budget approval"),
-        Stage::Answer => format!("has waited {waited_for} for an answer"),
+        Stage::Approval => format!("has been waiting {waited_for} for a budget approval"),
+        Stage::Answer => format!("has been waiting {waited_for} for an answer"),
         Stage::Blocked => format!("has been blocked for {waited_for}"),
-        _ => format!("failed {waited_for} ago and waits for a person"),
+        _ => format!("failed {waited_for} ago and is waiting on a person"),
     };
     let detail = ticket
         .attention
         .clone()
         .or_else(|| ticket.latest_report().map(|r| r.text.clone()))
         .unwrap_or_default();
+    let said = match (stage, detail.trim().is_empty()) {
+        (_, true) => String::new(),
+        (Stage::Answer, false) => format!(" It asked: {}", ending(&clip(&detail))),
+        (Stage::Approval, false) => format!(" {}", ending(&clip(&detail))),
+        (_, false) => format!(" It said: {}", ending(&clip(&detail))),
+    };
     let nobody = if ticket.channels.is_empty() {
         " Its request named no reply channel, so nobody else was asked."
     } else {
@@ -381,12 +387,7 @@ fn waiting(ticket: &Ticket, now: Ms, limits: &Thresholds) -> Option<Alert> {
         subject,
         ticket: Some(ticket.id.clone()),
         since_ms: Some(since),
-        text: format!(
-            "{} \"{}\" {what}: {}.{nobody}",
-            ticket.id,
-            ticket.title,
-            clip(&detail)
-        ),
+        text: format!("\"{}\" ({}) {what}.{said}{nobody}", ticket.title, ticket.id),
         stalled: None,
     })
 }
@@ -447,9 +448,9 @@ fn stalled(ticket: &Ticket, unpaused: Option<Ms>, now: Ms, limits: &Thresholds) 
         ticket: Some(ticket.id.clone()),
         since_ms: Some(since),
         text: format!(
-            "{} \"{}\": its worker on {} has sent no report for {}.",
-            ticket.id,
+            "\"{}\" ({}) has gone quiet: its worker ({}) hasn't reported in {}.",
             ticket.title,
+            ticket.id,
             assignment.id,
             duration(quiet)
         ),
@@ -474,6 +475,10 @@ fn failing(queued: &QueuedEffect, now: Ms, limits: &Thresholds) -> Option<Alert>
         return None;
     }
     let subject = format!("effect:{}", queued.id);
+    let trouble = match &queued.effect {
+        Effect::Send(_) => "I couldn't deliver",
+        _ => "I'm stuck on",
+    };
     Some(Alert {
         id: alert_id(AlertKind::Failing, &subject, None, now, limits.repeat_ms),
         kind: AlertKind::Failing,
@@ -481,10 +486,10 @@ fn failing(queued: &QueuedEffect, now: Ms, limits: &Thresholds) -> Option<Alert>
         ticket: effect_ticket(&queued.effect).cloned(),
         since_ms: None,
         text: format!(
-            "Effect {} ({}) has failed {} attempts; the last: {}.",
-            queued.id,
+            "{trouble} {} (effect {}): it has failed {}. The last error: {}.",
             describe(&queued.effect),
-            queued.attempts,
+            queued.id,
+            times(u64::from(queued.attempts)),
             clip(queued.last_error.as_deref().unwrap_or("no error recorded"))
         ),
         stalled: None,
@@ -517,8 +522,9 @@ fn unavailable(decisions: &[Decision], now: Ms, limits: &Thresholds) -> Option<A
         ticket: None,
         since_ms: None,
         text: format!(
-            "The Router failed to decide {} time(s) in the last {}, on {}; the latest: {}.",
-            recent.len(),
+            "I couldn't decide what to do with new messages {} in the last {} (threads {}). \
+             The latest reason: {}.",
+            times(recent.len() as u64),
             duration(limits.unavailable_within_ms),
             threads.into_iter().collect::<Vec<_>>().join(", "),
             clip(&latest.reason)
@@ -591,7 +597,8 @@ fn paused_long(pause: &Pause, now: Ms, limits: &Thresholds) -> Option<Alert> {
         ticket: None,
         since_ms: Some(since),
         text: format!(
-            "The agent has been paused by {} for {}: nothing new is judged and no Effect runs until it lifts.",
+            "I've been paused by {} for {}, so I'm not picking up new messages or starting any \
+             work until that is lifted.",
             pause.by,
             duration(held)
         ),
@@ -681,6 +688,23 @@ pub fn duration(ms: Ms) -> String {
         format!("{minutes}m")
     } else {
         format!("{seconds}s")
+    }
+}
+
+/// `text` as a sentence: it ends in a full stop unless it already ends in a
+/// question or exclamation mark.
+fn ending(text: &str) -> String {
+    match text.chars().last() {
+        Some('?' | '!' | '.') => text.to_owned(),
+        _ => format!("{text}."),
+    }
+}
+
+/// "1 time", "3 times".
+fn times(n: u64) -> String {
+    match n {
+        1 => "1 time".to_owned(),
+        n => format!("{n} times"),
     }
 }
 
@@ -785,7 +809,7 @@ impl Watchdog {
             };
             let mut text = alert.text;
             if retry.is_some() {
-                text.push_str(" The watchdog retries it once.");
+                text.push_str(" I'll retry it once.");
             }
             let row = AlertRow {
                 id: alert.id.clone(),
@@ -1088,6 +1112,57 @@ mod tests {
     }
 
     #[test]
+    fn alerts_are_written_as_the_agent_telling_the_operator_not_as_log_lines() {
+        let limits = limits();
+        let base = running(ticket("tk1", T0), T0);
+
+        let asked = reported(
+            base.clone(),
+            ReportStatus::Waiting,
+            T0,
+            Some("Which branch?"),
+        );
+        let alert = fires_at(&of(vec![asked]), T0 + limits.waiting_ms, AlertKind::Waiting);
+        assert_eq!(
+            alert.text,
+            "\"Work tk1\" (tk1) has been waiting 1h 00m for an answer. It asked: Which branch?",
+            "a question keeps its own mark and gets no second full stop"
+        );
+
+        let failed = reported(base.clone(), ReportStatus::Failed, T0, None);
+        let alert = fires_at(
+            &of(vec![failed]),
+            T0 + limits.waiting_ms,
+            AlertKind::Waiting,
+        );
+        assert_eq!(
+            alert.text,
+            "\"Work tk1\" (tk1) failed 1h 00m ago and is waiting on a person. \
+             It said: Failed text."
+        );
+
+        let quiet = fires_at(&of(vec![base]), T0 + limits.stalled_ms, AlertKind::Stalled);
+        assert_eq!(
+            quiet.text,
+            "\"Work tk1\" (tk1) has gone quiet: its worker (as-tk1-1) hasn't reported in 30m."
+        );
+
+        let paused = Snapshot {
+            pause: Some(Pause {
+                by: "control.json (mode pause)".into(),
+                since_ms: Some(T0),
+            }),
+            ..Snapshot::default()
+        };
+        let alert = fires_at(&paused, T0 + limits.paused_ms, AlertKind::Paused);
+        assert_eq!(
+            alert.text,
+            "I've been paused by control.json (mode pause) for 1h 00m, so I'm not picking up \
+             new messages or starting any work until that is lifted."
+        );
+    }
+
+    #[test]
     fn an_answer_from_a_person_ends_the_wait_and_bot_input_does_not_restart_it() {
         let asked = reported(
             running(ticket("tk1", T0), T0),
@@ -1253,6 +1328,13 @@ mod tests {
             "{}",
             alerts[0].text
         );
+        assert!(
+            alerts[0].text.starts_with(
+                "I couldn't deliver a result to slack C1/T1 (effect 7): it has failed 3 times."
+            ),
+            "{}",
+            alerts[0].text
+        );
         let later = assess(&at(limits.failed_attempts + 4), T0 + MIN, &limits);
         assert_eq!(
             later[0].id, alerts[0].id,
@@ -1294,7 +1376,7 @@ mod tests {
         snapshot.decisions.push(unavailable(2, T0 + 10 * MIN));
         let alerts = assess(&snapshot, T0 + 10 * MIN, &limits);
         assert_eq!(kinds(&alerts), [AlertKind::Unavailable]);
-        assert!(alerts[0].text.contains("2 time(s)"), "{}", alerts[0].text);
+        assert!(alerts[0].text.contains("2 times"), "{}", alerts[0].text);
         assert!(alerts[0].text.contains("T1, T2"), "{}", alerts[0].text);
         let edge = T0 + limits.unavailable_within_ms;
         assert_eq!(

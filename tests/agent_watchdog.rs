@@ -284,8 +284,11 @@ async fn a_stalled_worker_alerts_the_operator_once_and_a_restart_tells_nothing_n
     assert_eq!(alert.channel.address["channel"], "D-OPS");
     assert_eq!(alert.ticket.as_ref(), Some(&ticket.id));
     assert!(alert.text.contains(stalled.id.as_str()), "{}", alert.text);
-    assert!(alert.text.contains("has sent no report"), "{}", alert.text);
-    assert!(!alert.text.contains("retries"), "no action is configured");
+    assert!(alert.text.contains("hasn't reported in"), "{}", alert.text);
+    assert!(
+        !alert.text.contains("I'll retry"),
+        "no action is configured"
+    );
     assert_eq!(
         scratch.replies(),
         [("T1".to_owned(), MessageKind::Acknowledgement)]
@@ -403,7 +406,7 @@ async fn the_retry_action_retries_a_stalled_assignment_once_per_ticket() {
         first.text
     );
     assert!(
-        first.text.ends_with("The watchdog retries it once."),
+        first.text.ends_with("I'll retry it once."),
         "{}",
         first.text
     );
@@ -412,7 +415,7 @@ async fn the_retry_action_retries_a_stalled_assignment_once_per_ticket() {
         "{}",
         second.text
     );
-    assert!(!second.text.contains("retries"), "{}", second.text);
+    assert!(!second.text.contains("I'll retry"), "{}", second.text);
     let retried: Vec<bool> = scratch
         .store()
         .alerts()
