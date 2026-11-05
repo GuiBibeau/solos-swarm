@@ -40,6 +40,8 @@ impl Resource {
 struct Bound<C> {
     spec: ToolSpec,
     call: C,
+    /// The table's `repeatable`.
+    repeatable: bool,
 }
 
 /// The tools of one principal's table. Each is either held, or refused with
@@ -71,6 +73,7 @@ impl<C> Toolbox<C> {
                 Ok(call) => toolbox.held.push(Bound {
                     spec: tool.spec(),
                     call,
+                    repeatable: tool.repeatable,
                 }),
                 Err(resource) => toolbox.refused.push((tool.name, why(resource))),
             }
@@ -89,6 +92,15 @@ impl<C> Toolbox<C> {
 
     pub fn holds(&self, name: &str) -> bool {
         self.held.iter().any(|bound| bound.spec.name == name)
+    }
+
+    /// Whether the same call of tool `name` again is normal, so a worker is
+    /// never stopped for it. A tool this toolbox does not hold has no such
+    /// leave.
+    pub fn repeatable(&self, name: &str) -> bool {
+        self.held
+            .iter()
+            .any(|bound| bound.spec.name == name && bound.repeatable)
     }
 
     pub fn get(&self, name: &str) -> Lookup<'_, C> {
@@ -284,18 +296,21 @@ mod tests {
             op: Op::Plain,
             description: "needs nothing",
             input_schema: schema,
+            repeatable: false,
         },
         Tool {
             name: "browse",
             op: Op::Browse,
             description: "needs a browser",
             input_schema: schema,
+            repeatable: true,
         },
         Tool {
             name: "pstack",
             op: Op::Pstack,
             description: "needs a pstack",
             input_schema: schema,
+            repeatable: true,
         },
     ];
 
@@ -314,6 +329,12 @@ mod tests {
         );
         assert_eq!(toolbox.names(), ["plain", "pstack"]);
         assert!(toolbox.holds("pstack") && !toolbox.holds("browse"));
+        assert!(toolbox.repeatable("pstack"), "as the table declares it");
+        assert!(!toolbox.repeatable("plain"), "as the table declares it");
+        assert!(
+            !toolbox.repeatable("browse"),
+            "a tool the toolbox does not hold has no leave to repeat"
+        );
         assert!(matches!(toolbox.get("plain"), Lookup::Held(&"plain")));
         assert!(matches!(
             toolbox.get("browse"),

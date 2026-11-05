@@ -7,6 +7,7 @@
 
 pub mod browser;
 pub mod registry;
+mod repeat;
 mod secrets;
 mod toolbox;
 
@@ -16,6 +17,7 @@ use super::environment::{Environments, ExecutionEnvironment, Nodes};
 use super::jobs::{Host, JobLimits, Jobs, Refused};
 use super::ports::{Applied, Fact, FactSink};
 use super::pstack::{self, Pstack, Reader};
+use super::watchdog::usd;
 use crate::broker::{FETCH_TOTAL_BYTES, fetch, now_ms};
 use crate::code::CodeExecutor;
 use crate::gateway::{self, PriceTable, Provider, Receipt, Upstream};
@@ -31,6 +33,7 @@ use axum::{
 use browser::Browse;
 use registry::{PrincipalKind, RouterOp};
 pub use registry::{ROUTER_TOOLS, WORKER_TOOLS};
+use repeat::RepeatGuard;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use solos_agent_core::change::{Deliverable, RepoName};
@@ -60,6 +63,7 @@ const READ_REASON_CHARS: usize = 300;
 const READ_RECENT: usize = 20;
 const REPORT_TEXT_CHARS: usize = 8_000;
 const QUESTION_CHARS: usize = 1_000;
+const FAILURE_CHARS: usize = 400;
 
 /// Who a session is.
 #[derive(Clone, Debug)]
@@ -108,6 +112,10 @@ pub struct WorkerSeat {
     pub since_ms: Ms,
     /// The latest status the Engine took in the current turn.
     turn: Mutex<Option<ReportStatus>>,
+    /// Why the turn's latest model call failed, if it did.
+    model_failure: Mutex<Option<ModelFailure>>,
+    /// The turn's latest tool calls, so a loop is refused.
+    repeats: Mutex<RepeatGuard>,
     fetched_bytes: AtomicU64,
     jobs: Arc<Jobs>,
     browser: browser::SeatBrowser,
@@ -132,6 +140,8 @@ impl WorkerSeat {
             budget_microusd,
             since_ms: now_ms(),
             turn: Mutex::new(None),
+            model_failure: Mutex::new(None),
+            repeats: Mutex::new(RepeatGuard::default()),
             fetched_bytes: AtomicU64::new(0),
             jobs: Arc::default(),
             browser: browser::SeatBrowser::default(),
@@ -168,6 +178,12 @@ impl WorkerSeat {
     pub fn begin_turn(&self) {
         if let Ok(mut turn) = self.turn.lock() {
             *turn = None;
+        }
+        if let Ok(mut failure) = self.model_failure.lock() {
+            *failure = None;
+        }
+        if let Ok(mut repeats) = self.repeats.lock() {
+            repeats.begin_turn();
         }
         self.jobs.begin_turn();
     }
@@ -209,9 +225,92 @@ impl WorkerSeat {
         })
     }
 
+    /// The turn ended on a failed model call and left no report to say so:
+    /// why the call failed, once. A model call that fails ends a Pi turn
+    /// with no tool call, so without this the Ticket would look as if the
+    /// worker had nothing more to say.
+    pub fn take_model_failure(&self) -> Option<ModelFailure> {
+        let failure = self.model_failure.lock().ok()?.take();
+        failure.filter(|_| self.quiet_turn())
+    }
+
     fn reported(&self, status: ReportStatus) {
         if let Ok(mut turn) = self.turn.lock() {
             *turn = Some(status);
+        }
+    }
+
+    /// A model call ended as `reply`: the turn's latest call failed, or did
+    /// not any more. `named` is the failure the call itself named.
+    fn model_called(&self, reply: &Reply, named: Option<ModelFailure>) {
+        let Ok(mut failure) = self.model_failure.lock() else {
+            return;
+        };
+        match reply {
+            Ok(_) => *failure = None,
+            // A pause is waited out by the session, and nothing failed.
+            Err((StatusCode::SERVICE_UNAVAILABLE, _)) => {}
+            Err((_, Json(body))) => {
+                *failure = named.or_else(|| {
+                    let why = body["error"].as_str().unwrap_or("refused");
+                    Some(ModelFailure::Failed(why.to_owned()))
+                });
+            }
+        }
+    }
+
+    /// Refuse a tool call that repeats the seat's latest calls too often.
+    fn repeat_refused(&self, tool: &str, args: &Value, repeatable: bool) -> Option<Refusal> {
+        let mut repeats = match self.repeats.lock() {
+            Ok(repeats) => repeats,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let repeated = repeats.call(tool, args, repeatable)?;
+        Some(refuse(StatusCode::TOO_MANY_REQUESTS, repeated.why(tool)))
+    }
+}
+
+/// Why a worker's model call did not go through, which its seat keeps until
+/// its turn ends, so the host can tell the person when the turn ends
+/// with nothing reported.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelFailure {
+    /// The Ticket's account has no room for another call.
+    BudgetReached {
+        committed: MicroUsd,
+        budget: MicroUsd,
+    },
+    /// Anything else: the provider's error or its call limit, the model
+    /// limit, or the stop after an overrun. The text is the broker's reason.
+    Failed(String),
+}
+
+impl ModelFailure {
+    /// The Report the host makes for the person in the worker's place: a
+    /// budget that has no room is blocked on a person, any other failure is
+    /// failed. The text goes to the person as it is, so it says in plain
+    /// words what stopped the work and how to go on.
+    pub fn report(&self) -> (ReportStatus, String) {
+        match self {
+            Self::BudgetReached { committed, budget } => (
+                ReportStatus::Blocked,
+                format!(
+                    "I stopped before finishing: this request's budget ({}) cannot cover \
+                     another model call ({} of it is already committed). A request's budget is \
+                     set when it is accepted, so to go on, make a new request (not a reply to \
+                     this one) and name a bigger budget.",
+                    usd(*budget),
+                    usd(*committed)
+                ),
+            ),
+            Self::Failed(why) => (
+                ReportStatus::Failed,
+                format!(
+                    "I stopped before finishing: the model call failed ({}). Reply here and I \
+                     will try again.",
+                    clip(why, FAILURE_CHARS).0
+                ),
+            ),
         }
     }
 }
@@ -847,10 +946,26 @@ struct Call {
 }
 
 impl Call {
-    /// Refuse the call past the model limit, while paused, outside the
-    /// contract, after an overrun or past the account's cap; else hold it,
-    /// send it upstream and settle it.
+    /// [`attempt`](Self::attempt) the call, and tell a worker's seat how it
+    /// went, so a turn that ends on a failed call can say why.
     async fn send(self, broker: &AgentBroker, grant: &Arc<Grant>) -> Reply {
+        let mut named = None;
+        let reply = self.attempt(broker, grant, &mut named).await;
+        if let Principal::Worker(seat) = &grant.principal {
+            seat.model_called(&reply, named);
+        }
+        reply
+    }
+
+    /// Refuse the call past the model limit, while paused, outside the
+    /// contract, after an overrun or past the account's cap (which it names
+    /// in `named`); else hold it, send it upstream and settle it.
+    async fn attempt(
+        self,
+        broker: &AgentBroker,
+        grant: &Arc<Grant>,
+        named: &mut Option<ModelFailure>,
+    ) -> Reply {
         let terms = &grant.terms;
         if self.input_bytes > terms.max_input_bytes {
             return Err(forbidden("request exceeds the model limit"));
@@ -890,6 +1005,10 @@ impl Call {
         let id = match reservation {
             Reservation::Held(id) => id,
             Reservation::Refused { committed } => {
+                *named = Some(ModelFailure::BudgetReached {
+                    committed,
+                    budget: cap,
+                });
                 return Err(forbidden(grant.account.cap_reached(committed, cap)));
             }
         };
@@ -987,7 +1106,14 @@ async fn tool(
                 .await
                 .map(IntoResponse::into_response)
         }
-        Principal::Worker(seat) => held(&seat.held, &name)?.run(&broker, seat, args).await,
+        Principal::Worker(seat) => {
+            let call = held(&seat.held, &name)?;
+            let repeatable = seat.held.repeatable(&name);
+            if let Some(refusal) = seat.repeat_refused(&name, &args, repeatable) {
+                return Err(refusal);
+            }
+            call.run(&broker, seat, args).await
+        }
     }
 }
 
@@ -1653,12 +1779,18 @@ mod messages;
 
 #[cfg(test)]
 mod tests {
-    use super::{Account, DecideArgs, DecideTerms, SwarmTerms, clip};
+    use super::{
+        Account, DecideArgs, DecideTerms, ModelFailure, Reply, SwarmTerms, WorkerSeat, clip, refuse,
+    };
     use crate::agent::config::RepoConfig;
+    use axum::{Json, http::StatusCode};
     use serde_json::json;
     use solos_agent_core::change::{Deliverable, RepoName};
-    use solos_agent_core::model::{Acknowledge, Method, Plan, TicketId, Verdict};
+    use solos_agent_core::model::{
+        Acknowledge, AssignmentId, Method, Plan, ReportStatus, TicketId, Verdict,
+    };
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
 
     fn terms() -> DecideTerms {
         DecideTerms {
@@ -1960,5 +2092,92 @@ mod tests {
     fn clipping_counts_characters_and_says_when_it_cut() {
         assert_eq!(clip("héllo", 5), ("héllo".into(), false));
         assert_eq!(clip("héllo", 2), ("hé...".into(), true));
+    }
+
+    fn seat() -> WorkerSeat {
+        WorkerSeat::new(
+            TicketId::new("tk_1"),
+            AssignmentId::new("as_1"),
+            PathBuf::from("/work"),
+            500_000,
+        )
+    }
+
+    fn refused(why: &str) -> Reply {
+        Err(refuse(StatusCode::FORBIDDEN, why))
+    }
+
+    #[test]
+    fn a_turn_that_said_nothing_tells_why_its_model_call_failed_and_one_that_reported_does_not() {
+        let seat = seat();
+        seat.model_called(&refused("the provider is down"), None);
+        assert_eq!(
+            seat.take_model_failure(),
+            Some(ModelFailure::Failed("the provider is down".into()))
+        );
+        assert_eq!(seat.take_model_failure(), None, "once");
+
+        seat.model_called(&refused("the provider is down"), None);
+        seat.reported(ReportStatus::Progress);
+        assert!(
+            seat.take_model_failure().is_some(),
+            "progress tells nobody, so the turn still said nothing"
+        );
+
+        for status in [
+            ReportStatus::Waiting,
+            ReportStatus::Ready,
+            ReportStatus::Blocked,
+            ReportStatus::Failed,
+            ReportStatus::Dropped,
+        ] {
+            seat.begin_turn();
+            seat.model_called(&refused("the provider is down"), None);
+            seat.reported(status);
+            assert_eq!(seat.take_model_failure(), None, "{status:?} said it");
+            assert_eq!(seat.take_model_failure(), None, "and it is not kept");
+        }
+
+        seat.begin_turn();
+        let paused = Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"paused": true})),
+        ));
+        seat.model_called(&paused, None);
+        assert_eq!(seat.take_model_failure(), None, "a pause is not a failure");
+        seat.model_called(&refused("no"), None);
+        seat.model_called(&Ok(Json(json!({}))), None);
+        assert_eq!(
+            seat.take_model_failure(),
+            None,
+            "the latest call went through"
+        );
+    }
+
+    #[test]
+    fn a_failed_model_call_is_reported_in_plain_words_for_the_person() {
+        let (status, text) = ModelFailure::BudgetReached {
+            committed: 344_865,
+            budget: 500_000,
+        }
+        .report();
+        assert_eq!(status, ReportStatus::Blocked, "a person must decide");
+        assert_eq!(
+            text,
+            "I stopped before finishing: this request's budget ($0.50) cannot cover another \
+             model call ($0.344865 of it is already committed). A request's budget is set when \
+             it is accepted, so to go on, make a new request (not a reply to this one) and \
+             name a bigger budget."
+        );
+
+        let (status, text) = ModelFailure::Failed("provider returned 503".into()).report();
+        assert_eq!(status, ReportStatus::Failed);
+        assert_eq!(
+            text,
+            "I stopped before finishing: the model call failed (provider returned 503). Reply \
+             here and I will try again."
+        );
+        let (_, long) = ModelFailure::Failed("x".repeat(5_000)).report();
+        assert!(long.chars().count() < 600, "a long reason is cut: {long}");
     }
 }

@@ -6,7 +6,7 @@
 //! it never talks to people. At most `max_workers` sessions live at once,
 //! and a launch past that waits for a slot.
 
-use super::broker::{self, AgentBroker, WorkerSeat, browser, clip};
+use super::broker::{self, AgentBroker, ModelFailure, WorkerSeat, browser, clip};
 use super::config::HarnessKind;
 use super::environment::{self, Launchable};
 use super::ports::{
@@ -819,12 +819,18 @@ impl Turns<'_> {
                 event = events.recv() => match event {
                     Some((_, Ok(SessionEvent::TurnEnded))) => {
                         in_turn = false;
+                        // Before the Notes below: a Ticket that waits for a
+                        // person holds automatic Inputs back.
+                        let stopped = seat.take_model_failure();
+                        if let Some(failure) = &stopped {
+                            self.stopped(failure).await?;
+                        }
                         let notes = seat.end_turn();
                         let woken = !notes.is_empty();
                         for note in notes {
                             self.facts.send(note).await?;
                         }
-                        if queued.is_empty() && !woken && seat.quiet_turn() {
+                        if stopped.is_none() && queued.is_empty() && !woken && seat.quiet_turn() {
                             self.quiet().await?;
                         }
                     }
@@ -837,6 +843,34 @@ impl Turns<'_> {
                 },
             }
         }
+    }
+
+    /// A model call failed and the turn ended on it with nothing reported:
+    /// the worker cannot say so, so the host reports in its place. The
+    /// Report asks the person (the Engine sends a `blocked` or `failed`
+    /// Report's text to the Ticket's Channels) and is recorded with the
+    /// Ticket, which then waits for a person, so a restart starts nothing
+    /// and tells nothing twice.
+    async fn stopped(&self, failure: &ModelFailure) -> Result<()> {
+        eprintln!(
+            "agent: the worker of {} on {} stopped on a failed model call: {failure:?}",
+            self.launch.assignment, self.launch.ticket
+        );
+        let spent = self.broker.spent(self.seat).await?;
+        let (status, text) = failure.report();
+        let report = ReportIn {
+            status,
+            text,
+            question: None,
+            spent_microusd: spent,
+        };
+        self.facts
+            .send(Fact::Report {
+                ticket: self.launch.ticket.clone(),
+                assignment: self.launch.assignment.clone(),
+                report,
+            })
+            .await
     }
 
     /// A turn left the Ticket as if working and nothing waits to be
