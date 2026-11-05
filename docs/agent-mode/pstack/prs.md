@@ -2,6 +2,8 @@
 
 The [Amendments](rationale.md#amendments) apply to every PR below, each folded into the PR that owns the file it changes.
 
+PRs 3, 4 and 7 below are superseded by [`../github-app/prs.md`](../github-app/prs.md) where they conflict.
+
 Each PR can be checked by itself, leaves `main` shippable, and ends in a behavior test that runs offline: the scripted harness against the real broker, a fake upstream, and `LocalForge` (a bare repository and a JSON file of pull requests on disk). Builds and tests run on the remote box, never on the Mac. "Unedited" means an existing test passes without a change.
 
 Each PR also adds one feature recipe to `.claude/skills/verify-agent-mode/features/` and runs it on remote-ai through `/verify-agent-mode`, with a real DeepSeek Router and real Pi workers, driven through `mcp.sh` as a person would. That recipe is the live proof. Its evidence must hold a side effect the model could not invent, per that skill's proof standard. Publishing recipes use a sandbox repository the operator owns (named `GuiBibeau/solos-swarm-sandbox` below), never solos-swarm itself, until PR 7. Keeping the recipes current is `/pstack:maintain-verification-skill`'s job.

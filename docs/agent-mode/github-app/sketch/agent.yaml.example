@@ -1,0 +1,45 @@
+# ~/agent/agent.yaml on the box, after the GitHub App (decision 7: setup UX).
+# Compare docs/agent-mode/production.md: the github: section replaces every
+# token_file for GitHub; forge.repos is the one repository list.
+policy:
+  people:    [github:alice, discord:123456789012345678]
+  approvers: [github:alice, discord:123456789012345678]   # who may click Merge, or approve a PR on GitHub
+  auto_approve_microusd: 500000                           # also the cap on every GitHub-origin Ticket's budget
+
+github:
+  app_id: 123456
+  key_file: /run/user/1000/solos-agent/github-app.pem      # copied from ~/agent/tokens by the unit, read once, deleted
+  # poll_secs: 60                                          # the listings; quiet polls are free 304s
+  # reconcile_secs: 300                                    # every open Change read again
+  # trigger_label: solos                                   # optional (PR 4): labelling an issue asks for work
+  # writes: true                                           # false = read-only kill switch (no write token is ever minted)
+
+forge:
+  kind: github
+  repos:
+    GuiBibeau/solos-swarm-sandbox:                         # the throwaway repository for the live proofs
+      about: Sandbox for agent-mode proofs
+      base: main
+      owes: pull_request
+      merge: ask
+      ci: expected
+      budget_microusd: 500000
+    GuiBibeau/solos-swarm:
+      about: The solos-swarm runtime itself
+      base: main
+      owes: pull_request
+      merge: ask                                            # never auto here
+      protected: [".github/**", "vendor/pstack/**"]
+      notes: Rust at /rust/bin and its crates at /cargo; build offline.
+
+sources:
+  - kind: discord
+    guilds: [123456789012345678]
+    token_file: /run/user/1000/solos-agent/discord-token
+  - kind: github          # no fields: reads forge.repos through the App
+  - kind: mcp
+channels:
+  - kind: discord
+  - kind: github
+  - kind: mcp
+# router, executor, pstack, budgets, watchdog: unchanged from production.md

@@ -1,0 +1,22 @@
+{
+  "name": "solos-bot",
+  "url": "https://github.com/GuiBibeau/solos-swarm",
+  "description": "solos-swarm agent mode: takes work from issues and mentions, opens pull requests as its own bot, repairs CI within a bound, and merges when a person allows it.",
+  "public": false,
+  "request_oauth_on_install": false,
+  "hook_attributes": {
+    "url": "https://solos-swarm.invalid/no-webhook",
+    "active": false
+  },
+  "redirect_url": "http://127.0.0.1:47123/created",
+  "default_permissions": {
+    "metadata": "read",
+    "contents": "write",
+    "pull_requests": "write",
+    "issues": "write",
+    "checks": "read",
+    "statuses": "read",
+    "actions": "read"
+  },
+  "default_events": []
+}
