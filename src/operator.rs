@@ -923,8 +923,12 @@ mod refresh_tests {
         let mut refresher =
             JwksRefresher::new(&issuer.config, Some(leaf.ca_pem.as_bytes())).unwrap();
         refresher.client = client();
+        let before = now();
         let (fresh, expires) = refresher.refresh(timestamp).await.unwrap();
-        assert!(expires > timestamp && expires <= timestamp + 120);
+        let after = now();
+        // The expiry is the clock at the fetch plus the 120 s `max-age`, not `timestamp + 120`:
+        // `timestamp` was read before the CA, the leaf and two TLS fetches, and the clock moves on.
+        assert!(expires > timestamp && (before + 120..=after + 120).contains(&expires));
         let mut config = issuer.config.clone();
         config.jwks_expires_unix = expires;
         let mut gateway = OperatorGateway::new(config, fresh, timestamp).unwrap();
