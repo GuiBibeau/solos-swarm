@@ -17,13 +17,13 @@ final-status-level = "slow"
 # A test that hangs is killed after 5 minutes (the slowest healthy test takes under a minute) instead of
 # holding the shard until the job's timeout.
 slow-timeout = { period = "60s", terminate-after = 5 }
-# The shards run everything except the three raft tests below, which run in `ci-isolated`.
-default-filter = 'not test(/^cluster::tests::(actual_raft_over_mtls_quic|expired_three_voter|signed_checkpoint)/)'
+# The shards run everything except the four tests below, which run in `ci-isolated`.
+default-filter = 'not (test(/^cluster::tests::(actual_raft_over_mtls_quic|expired_three_voter|signed_checkpoint)/) | test(/^qa::tests::large_observation/))'
 
-# The two slowest tests left are plain CPU work (hashing and sealing 33 MB; a seeded SQLite walk) with nothing
-# timed in them. Starting them first keeps them from being what a shard waits for at its end.
+# The slowest test left in the shards is plain CPU work (a seeded SQLite walk) with nothing timed in it. Starting it
+# first keeps it from being what a shard waits for at its end.
 [[profile.ci.overrides]]
-filter = 'test(/^qa::tests::large_observation/) | test(sqlite_store_matches_memory_store_on_seeded_walks)'
+filter = 'test(sqlite_store_matches_memory_store_on_seeded_walks)'
 priority = 100
 
 # Three raft tests assert on the wall clock and fail when the machine is busy with other tests, not when the code
@@ -33,10 +33,13 @@ priority = 100
 # pass. They are also the slowest tests in the suite (one waits out several elections: 45 s), so taking them out
 # of the shards is what lets the shards finish quickly.
 #
-# CI runs this profile in two jobs (see `test-isolated` in ci.yml). The expression is the complement of `ci`'s
+# The fourth is the archive test: hashing and sealing 33 MB. It takes 25-65 s depending on what shares its runner,
+# more than any other test that is left, so it too gets a runner to itself instead of ending a shard late.
+#
+# CI runs this profile in four jobs (see `test-isolated` in ci.yml). The expression is the complement of `ci`'s
 # `default-filter` above; the workflow checks that the two profiles together list exactly the tests the default
-# profile lists, and that its jobs together select all of this profile.
+# profile lists.
 [profile.ci-isolated]
 inherits = "ci"
 test-threads = 1
-default-filter = 'test(/^cluster::tests::(actual_raft_over_mtls_quic|expired_three_voter|signed_checkpoint)/)'
+default-filter = 'test(/^cluster::tests::(actual_raft_over_mtls_quic|expired_three_voter|signed_checkpoint)/) | test(/^qa::tests::large_observation/)'
