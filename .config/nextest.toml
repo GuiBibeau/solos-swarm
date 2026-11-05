@@ -1,0 +1,19 @@
+# cargo-nextest settings. CI builds the test binaries once (`cargo nextest archive`) and runs them across a
+# matrix of shards (`--partition count:N/M`); see .github/workflows/ci.yml. Locally: `cargo nextest run`.
+#
+# nextest runs every test in its own process. The in-process shared state `cargo test` has between tests of one
+# binary (statics, the working directory, the environment) cannot leak, so tests do not have to run one at a
+# time the way `cargo test -- --test-threads=1` ran them.
+
+[profile.default]
+# One failure does not hide the others: a PR sees every test it broke in one run.
+fail-fast = false
+
+[profile.ci]
+fail-fast = false
+# Every test, with its time, in the log: the slowest ones decide how the shards are balanced.
+status-level = "pass"
+final-status-level = "slow"
+# A test that hangs is killed after 5 minutes (the slowest healthy test takes under a minute) instead of
+# holding the shard until the job's timeout.
+slow-timeout = { period = "60s", terminate-after = 5 }

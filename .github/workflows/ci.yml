@@ -9,10 +9,17 @@ permissions:
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Debug info was most of the compile and link time of the 53 test binaries and of the size of target/ (and of the
+  # runner running out of disk). Panic messages carry their own file:line; backtraces keep function names.
+  CARGO_PROFILE_DEV_DEBUG: "0"
 jobs:
-  check:
+  # fmt + clippy. Nothing waits on it but the final `check`, so it runs beside the build.
+  lint:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249
@@ -20,18 +27,72 @@ jobs:
           toolchain: 1.96.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: 24.18.0
-          cache: 'npm'
-      - name: Verify pinned tokenizer assets
-        run: python3 scripts/bootstrap_tokenizers.py --output work/tokenizers
       - name: Rust format & clippy
         run: |
           cargo fmt --all -- --check
           cargo clippy --locked --all-targets -- -D warnings
-      - name: Rust tests
-        run: cargo test --locked -- --test-threads=1
+
+  # Compiles every test binary once and hands them to the shards as one archive.
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249
+        with:
+          toolchain: 1.96.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: nextest@0.9.140
+      - name: Build the test binaries
+        run: cargo nextest archive --locked --workspace --archive-file nextest-archive.tar.zst
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nextest-archive
+          path: nextest-archive.tar.zst
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+      # `cargo test` also ran doc tests, which nextest does not. There are none today; this keeps it that way.
+      - name: Doc tests
+        run: cargo test --locked --workspace --doc
+
+  test:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.18.0
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: nextest@0.9.140
+      - name: Verify pinned tokenizer assets
+        run: python3 scripts/bootstrap_tokenizers.py --output work/tokenizers
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nextest-archive
+      - name: Rust tests (shard ${{ matrix.shard }} of 4)
+        run: >
+          cargo nextest run --archive-file nextest-archive.tar.zst --extract-to . --extract-overwrite
+          --workspace-remap . --profile ci --partition count:${{ matrix.shard }}/4
+
+  scripts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.18.0
+          cache: 'npm'
       - name: Python tests
         run: |
           python3 -m venv work/dashboard-python
@@ -41,3 +102,19 @@ jobs:
         run: node --test tests/dashboard-*.test.mjs
       - name: Node broker & MVP tests
         run: npm ci --ignore-scripts --no-audit --no-fund && npm run test:broker
+
+  # The one result to watch (and to require in branch protection): green only when every job above is.
+  check:
+    if: ${{ always() }}
+    needs: [lint, build, test, scripts]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Every job passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "job results: $RESULTS"
+          for result in $RESULTS; do
+            [ "$result" = success ] || { echo "a job did not pass"; exit 1; }
+          done
