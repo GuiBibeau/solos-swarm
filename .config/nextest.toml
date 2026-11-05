@@ -17,3 +17,15 @@ final-status-level = "slow"
 # A test that hangs is killed after 5 minutes (the slowest healthy test takes under a minute) instead of
 # holding the shard until the job's timeout.
 slow-timeout = { period = "60s", terminate-after = 5 }
+
+# The slowest tests start first, so they overlap the rest of the shard instead of being the last thing it waits
+# for. The three raft tests are bound by election timeouts (about 40 s each however fast the machine is); the
+# archive test is bound by hashing and sealing 33 MB.
+[[profile.ci.overrides]]
+filter = 'test(/^cluster::tests::(actual_raft_over_mtls_quic|expired_three_voter|signed_checkpoint)/) | test(/^qa::tests::large_observation/)'
+priority = 100
+
+# Then the ones that take more than about 5 s.
+[[profile.ci.overrides]]
+filter = 'test(/^agent::swarm_executor::/) | test(/^broker::control_tests::resume/) | test(/^kernel::tests::quorum_commits/) | test(/^node::receiver_tests::actual_worker_claim/) | test(the_scripted_bench_runs_every_design) | test(remote_background_jobs_start_wait_and_stop) | test(seeded_random_walk) | test(sqlite_store_matches_memory_store) | test(five_outage_errors_pause)'
+priority = 50

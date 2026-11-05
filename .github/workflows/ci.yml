@@ -45,6 +45,14 @@ jobs:
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: nextest@0.9.140
+      # The pinned tokenizer assets come from huggingface.co. One job fetches them, once per change of the pin;
+      # the shards restore them from the cache, so no shard depends on huggingface being up.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: work/tokenizers
+          key: tokenizers-${{ hashFiles('scripts/bootstrap_tokenizers.py', 'assets/tokenizers/**') }}
+      - name: Verify pinned tokenizer assets
+        run: python3 scripts/bootstrap_tokenizers.py --output work/tokenizers
       - name: Build the test binaries
         run: cargo nextest archive --locked --workspace --archive-file nextest-archive.tar.zst
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -74,15 +82,19 @@ jobs:
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: nextest@0.9.140
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: work/tokenizers
+          key: tokenizers-${{ hashFiles('scripts/bootstrap_tokenizers.py', 'assets/tokenizers/**') }}
       - name: Verify pinned tokenizer assets
         run: python3 scripts/bootstrap_tokenizers.py --output work/tokenizers
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: nextest-archive
-      - name: Rust tests (shard ${{ matrix.shard }} of 4)
+      - name: Rust tests (shard ${{ matrix.shard }} of ${{ strategy.job-total }})
         run: >
           cargo nextest run --archive-file nextest-archive.tar.zst --extract-to . --extract-overwrite
-          --workspace-remap . --profile ci --partition count:${{ matrix.shard }}/4
+          --workspace-remap . --profile ci --partition count:${{ matrix.shard }}/${{ strategy.job-total }}
 
   scripts:
     runs-on: ubuntu-24.04
