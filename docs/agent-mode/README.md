@@ -21,7 +21,7 @@ and its MIT-licensed prototype `deepseek-ai/dsh-superagent-prototype` (docs 000-
 | P3b `agent serve` | Done (#22). `src/agent/`: the async shell ports `Source`, `Channel`, `Router` and `Executor`, a runtime with one task that owns the Engine on the SQLite Store, and `solos-swarm agent serve --config agent.yaml --state-dir DIR [--until-idle]`. The runtime stores Source Triggers, starts due Evals, hands each due Effect to its adapter, and marks it done or failed with exponential backoff. It applies adapter facts as `decide`, `assignment_started` and `report`, and holds every Effect while the Policy is paused. First adapters: `JsonlSource`, `JsonlChannel` (once per `MessageId`, safe after a crash), `ScriptedRouter` and `ScriptedExecutor`, so it runs with no model, Slack or sandbox. Tests cover a full run, a crash between a Launch and its done mark, a restart, retries, a pause and Thread context reaching the worker. |
 | P3c Pi Router | Done (#24). The Router is a long-lived Pi session behind the same `Router` port (`src/agent/pi_router.rs`): each Candidate becomes a compact card, the cards queued between turns go into prompts of at most `router.max_batch` cards (6 by default), oldest first, and a session that dies restarts while the core's Eval expiry brings back what it left undecided. A reply cut off at the output limit while it asks for decisions ends the session at once, since Pi would ask again with the same context until the Router's budget ran out. The cut-off cards go back to the front of the queue, in prompts of half as many cards, and the size grows back by one card after each full prompt that fits. A prompt of one card that is cut off is left to its Eval, which expires as usual. A Router model call is dropped after half of `policy.eval_timeout_ms` and charged at its hold, since the provider may still bill it, so a hung call frees the session while its Eval can still be asked again; workers' calls keep the transport's own limit. A decision on an Eval that is no longer running is refused with the Evals open now, by Thread, and each prompt says that only its own ids can be decided. It runs keyless in bwrap and calls the agent broker (`src/agent/broker.rs`), which speaks the swarm broker's wire on a socket in the state dir, holds and settles each model call against the Router's daily cap in the store's new spend ledger (schema v2), refuses calls while the state dir is paused, and serves the Router's two tools, `router_decide` (the Engine's answer, or its refusal, goes back to the model) and `router_read`. The pricing, request contract, providers and pause gate both brokers use moved to `src/gateway/`, with swarm mode unchanged. |
 | P4 Slack | Done (#23). `src/agent/slack/`: `SlackSource` (Socket Mode: an outbound WebSocket, nothing exposed) and `SlackChannel` (Web API), configured as `kind: slack` and read from token files that are deleted once read. Events from the listed channels become Triggers (`slack:<channel>:<ts>`, Thread `slack:<channel>:<thread_ts>`); the bot's own messages, other channels, edits and other events are dropped, and every envelope is acknowledged. The Source reconnects with backoff after a `disconnect` or an error. Replies go in the Trigger's thread, escaped, with acknowledgements and questions cut to 500 characters and results to 3,000 with a marker. Each post carries its `MessageId` as metadata; a repeated Send looks for it in the thread first, so a crash between a post and its done mark does not post twice. A deleted or archived conversation is `Gone`; rate limits and 5xx retry, after `Retry-After`. An approval request carries Approve and Stop buttons; a click is a `Fact::Command` the runtime applies as `approve` or `stop_ticket` and answers in the thread. A budget above `auto_approve_microusd` is now accepted when a Slack channel and a `slack:` approver are configured. New dependency: `tokio-tungstenite` 0.29.0 on the existing rustls. Tests run against a fake Slack, including one `agent serve` end to end. |
-| P8 GitHub and schedules | Done (#25). `src/agent/github/`: `GithubSource` polls each listed repository's issues and pull requests, issue and review comments `since` a cursor, and its latest workflow runs, over REST (nothing exposed); `GithubChannel` comments on the issue or pull request. Configured as `kind: github` with a personal access token file that is deleted once read. An issue or pull request is the Thread `github:<owner>/<repo>#<number>`; its opening, each comment (`github:<owner>/<repo>:comment:<id>`) and each failed workflow run on a pull request (a bot Trigger on that pull request's Thread) are Triggers. A mention of the agent's login addresses it, `[bot]` accounts are bots, and the agent's own comments are dropped. Listings are conditional (`ETag`), rate limits are waited out, and the read position is an atomic file in the state directory that a restart resumes from without sending a Trigger twice. Each comment ends with a hidden marker naming its `MessageId`, so a crash between a post and its done mark does not post twice. `src/agent/schedule.rs`: `ScheduleSource` (`kind: schedule`) fires named slots, `every` an interval or `daily_at` a UTC time, as System Triggers `schedule:<name>:<slot start>`: a restart cannot fire a slot twice, and missed slots fire once. A schedule may name a `reply_to`. No new dependencies. Tests run against a fake GitHub and a clock the test moves, including one `agent serve` end to end. |
+| P8 GitHub and schedules | Done (#25). `src/agent/github/`: `GithubSource` polls each listed repository's issues and pull requests, issue and review comments `since` a cursor, and its latest workflow runs, over REST (nothing exposed); `GithubChannel` comments on the issue or pull request. Configured as `kind: github` and the top-level `github:` section of a GitHub App (see [GitHub App](#github-app); it replaced the personal access token files). An issue or pull request is the Thread `github:<owner>/<repo>#<number>`; its opening, each comment (`github:<owner>/<repo>:comment:<id>`) and each failed workflow run on a pull request (a bot Trigger on that pull request's Thread) are Triggers. A mention of the agent's login addresses it, `[bot]` accounts are bots, and the agent's own comments are dropped. Listings are conditional (`ETag`), rate limits are waited out, and the read position is an atomic file in the state directory that a restart resumes from without sending a Trigger twice. Each comment ends with a hidden marker naming its `MessageId`, so a crash between a post and its done mark does not post twice. `src/agent/schedule.rs`: `ScheduleSource` (`kind: schedule`) fires named slots, `every` an interval or `daily_at` a UTC time, as System Triggers `schedule:<name>:<slot start>`: a restart cannot fire a slot twice, and missed slots fire once. A schedule may name a `reply_to`. No new dependencies. Tests run against a fake GitHub and a clock the test moves, including one `agent serve` end to end. |
 | P3d Pi workers | Done (#26). `src/agent/pi_executor.rs`: `PiExecutor` runs each `Plan::Session` Assignment as a keyless Pi worker session in bwrap, in its Ticket's directory under the state dir, with an optional prepare command run once per Ticket and at most `max_workers` sessions at once (`executor: {kind: pi, ...}`). The agent broker admits each worker as a `Worker` principal on its Ticket's account, so the Mandate budget caps every Assignment of the Ticket together, and serves `worker_report`, `worker_handback`, `run_code` and `fetch_url` (`SWARM_TOOLSET=worker`). A worker is prompted with its Assignment, then with new Inputs between turns; a quiet turn counts as `waiting`. A start ends what the last run left without a worker ("host restarted") and relaunches working Tickets with `recovery`, through the new `Engine::restart`. `run_code`'s mounts and scratch directory are configurable, with swarm runs' sandbox command pinned unchanged. `Plan::Swarm` reports `failed` until P5; background `run_code` jobs came with P3e. |
 | P6 Watchdog | Done (#27). `src/agent/watchdog.rs`: a pure `assess(snapshot, now, thresholds)` over what the Store already holds, with no model: a Ticket waiting for a person (1h), a working Assignment with no Report (30m), an Effect with 3 failed attempts, an `unavailable` Decision in the last hour, an account at 80% of its cap, and a pause file held for 1h. Each alert id hashes its kind, its subject (with the problem's start) and a 6h bucket. With a `watchdog` section in agent.yaml, `agent serve` runs it every minute, tells the operator's conversation each new alert once through its Channel, and records it in `watchdog_alerts` (schema v3), so a restart tells nothing new. `retry_stalled` retries a stalled Assignment once per Ticket through the runtime. `solos-swarm agent status` reports Tickets, Decisions, Effects, spend, the pause and the current alerts from a read-only Store. Judging with a model whether a worker drifts from its goal is later. |
 | P3e Background jobs | Done (#29). `src/agent/jobs.rs`: a worker with `run_code` also gets `job_start {code, timeout_s?}`, `job_wait {job, wait_s?}` and `job_stop {job}`. A job runs in its Ticket's `/work` under `run_code`'s sandbox and limits, returns its id at once and belongs to its Assignment: a stop, the Ticket's end, a dead session or a shutdown kills it, and a kill reaches every process of its sandbox, even in bwrap's first milliseconds. A `run_code` still running after `background_after_secs` (5) becomes a job when the Ticket has room; a short one returns exactly as before, and swarm runs keep their synchronous `run_code`. A job's end reaches the worker once: in a turn only its `job_wait` or `job_stop` takes it, and an end the turn left, or one that comes between turns, becomes a Note on the Ticket (`Fact::Note`, applied as `Engine::note`) that wakes the worker. No core change. |
@@ -496,7 +496,7 @@ provider through the real broker. It runs on macOS too. Swarm mode is the first 
 - Later: `swarm_run`, `ticket_*` and the ledger as host tools, so another harness's session can call a governed
   swarm.
 
-**P8: GitHub and schedules.** Done; setup in [GitHub token](#github-token).
+**P8: GitHub and schedules.** Done; setup in [GitHub App](#github-app).
 - Done: a polling Source (`kind: github`) for the listed repositories, not the notifications API, which only works
   with classic tokens and folds a conversation's comments into one notification. Each poll reads issues and pull
   requests, issue comments and review comments oldest first `since` a cursor, and the latest completed workflow runs.
@@ -504,7 +504,7 @@ provider through the real broker. It runs on macOS too. Swarm mode is the first 
   (`github:<owner>/<repo>#<number>`), each comment (`github:<owner>/<repo>:comment:<id>`; a review comment is
   `...:review_comment:<id>`, since GitHub numbers the two apart), and CI below. A mention of the agent's login
   (`@login`, any case, not inside a word or an email address) is `Addressed::Mention`; an account of type Bot or one
-  ending in `[bot]` is a bot. The agent's own comments are dropped; it learns its login from `GET /user`.
+  ending in `[bot]` is a bot. The agent's own comments are dropped; it learns its account from the App (`GET /app`), and `@slug` and `@slug[bot]` both address it.
 - Done: CI results as bot Triggers. A failed, timed-out or never-started workflow run on a pull request
   (`github:<owner>/<repo>:run:<id>:<attempt>`, actor `github-actions[bot]`) joins that pull request's Thread. A run
   from a fork names no pull request, so its head commit is matched against the open ones. A token without Actions
@@ -858,59 +858,152 @@ is acknowledged to Discord, allowed or not, and the outcome is posted as a reply
 refused the token: reset it and write the new one to the token file. Code 4014 means Message Content Intent is off.
 Code 4011 means the bot is in too many servers for one connection, which the agent does not shard.
 
-## GitHub token
+## GitHub App
 
-The agent polls GitHub with a token of its own account, so it can tell its comments from everyone else's
-(`GET /user`). Use a dedicated machine account, not a person's.
+The agent works on GitHub as the bot of a GitHub App and holds no other GitHub credential: no personal access token, no
+machine account. One App serves the `github` Source, the `github` Channel and the forge. The design is
+[github-app/rationale.md](github-app/rationale.md), built in the pull requests of [github-app/prs.md](github-app/prs.md);
+this is the first, so the agent reads, clones and comments as its own bot. Opening pull requests, repairing CI and
+merging are the later ones.
 
-1. Give the account access to each repository it should read. On a private repository the Read role is enough: it can
-   open and comment on issues and pull requests.
-2. Create a fine-grained personal access token (Settings, Developer settings, Personal access tokens, Fine-grained
-   tokens). Resource owner: the organization, whose owners may have to approve it. Repository access: only the
-   listed repositories. Repository permissions:
-   - Metadata: Read (every token has it);
-   - Issues: Read and write, to list issues and their comments and to post replies;
-   - Pull requests: Read and write, to list pull requests and review comments and to reply on pull requests;
-   - Actions: Read, for the workflow runs behind CI Triggers. Without it CI Triggers are off.
+What the App may do is set by you in two places, the repositories you install it on and the permissions you give it.
+The agent mints a short-lived token for one repository at a time, narrowed to that repository and to the access the
+call needs: a `GET` carries a read token, anything else a write token. A bug in a read path cannot write, and a
+repository outside `forge.repos` gets no token at all. The App never holds `workflows` (so GitHub itself refuses a push
+that edits `.github/workflows/**`) or `administration` (so it cannot touch branch protection).
 
-   Set an expiry and replace the token file before it.
-3. A classic token works too, with the `repo` scope (or `public_repo` for public repositories only). GitHub App
-   installation tokens (`ghs_`) are refused: they expire within the hour and `GET /user` cannot name their account.
-4. Write the token to a file readable only by the agent's user. Each start reads it and deletes it, so provide a fresh
-   file for every start.
+### Create and install the App (by hand, once)
+
+On github.com, Settings, Developer settings, GitHub Apps, New GitHub App.
+[`github-app/manifest.json`](github-app/manifest.json) is the same list as a GitHub App manifest, and a test pins its
+permissions to the ones the agent mints.
+
+1. **GitHub App name**: `solos-bot`, or any free name. People will write `@solos-bot`.
+2. **Homepage URL**: `https://github.com/GuiBibeau/solos-swarm`, or any URL.
+3. **Callback URL**: empty. **Request user authorization (OAuth) during installation**: off.
+4. **Webhook**: untick **Active**. The agent polls: it has no URL and no secret.
+5. **Repository permissions**:
+   - Contents: Read and write
+   - Pull requests: Read and write
+   - Issues: Read and write
+   - Checks: Read-only
+   - Commit statuses: Read-only
+   - Actions: Read-only
+   - Metadata: Read-only (GitHub sets it)
+   - Everything else: No access. In particular **Workflows: No access** and **Administration: No access**.
+6. **Organization permissions** and **Account permissions**: none. **Subscribe to events**: none.
+7. **Where can this GitHub App be installed?**: Only on this account.
+8. **Create GitHub App.** Note the **App ID** at the top of the next page.
+9. **Private keys, Generate a private key.** The browser downloads `<name>.<date>.private-key.pem`.
+10. **Install App**, choose your account, **Only select repositories**, and pick the repositories the agent may act
+    on. Start with a throwaway one.
+
+### Give the agent its key
+
+From the Mac, in this repository:
+
+```sh
+scripts/agent-deploy token github-app.pem < ~/Downloads/solos-bot.2026-11-05.private-key.pem
+rm -P ~/Downloads/solos-bot.2026-11-05.private-key.pem
+```
+
+The key is stored beside the other one-use token files, `~/agent/tokens/github-app.pem` (mode 0600). The production
+unit copies `tokens/` into its tmpfs runtime directory before every start; `agent serve` reads that copy once, deletes
+it, and keeps the parsed key in memory, zeroized when it drops. It is not a vault item and no sandbox can see it:
+`serve` refuses a `github.key_file` under any path a sandbox can read, before it reads it. GitHub keeps several keys
+per App, so a key rotates without downtime: generate a second one, store it, restart, then delete the first in the
+App's settings.
+
+### Configure it
 
 ```yaml
 policy:
-  people: [github:alice]                # GitHub logins who may ask for work
-  bots: ["github:github-actions[bot]"]  # CI failures become inferred candidates
+  people: [github:alice]               # logins who may ask for work; lowercase
+  approvers: [github:alice]
+github:
+  app_id: 123456                       # the App's numeric id
+  key_file: secrets/github-app.pem     # a one-use token file; in production /run/user/1000/solos-agent/github-app.pem
+  # poll_secs: 60                      # the Source's interval; a quiet poll costs 304s, which GitHub does not count
+  # reconcile_secs: 300                # how often every open change is read again (used from PR 3 of the design)
+  # writes: true                       # false: no write token is ever minted; the agent reads and comments nothing
+  # api_base: https://api.github.com/  # test seam; GitHub Enterprise Server is https://HOST/api/v3/
+  # git_base: https://github.com/      # test seam: where the mirrors fetch <owner>/<name>.git from
+forge:
+  kind: github                         # no token_file, no identity: the clone's commits are by the App's bot
+  repos:                               # the one list of repositories: the Source, the Channel and the forge use it
+    acme/widgets: {about: The widget service, base: main}
 sources:
-  - kind: github
-    repos: [acme/widgets]
-    token_file: secrets/github-token    # ghp_... or github_pat_..., relative to this file
-    # poll_secs: 60                     # each poll costs at most four requests per repository
-    # api_base: https://api.github.com/ # the default; GitHub Enterprise Server is https://HOST/api/v3/
+  - kind: github                       # no fields: it reads forge.repos
   - kind: schedule
     schedules:
       - name: triage
-        every: 6h                       # 00:00, 06:00, 12:00 and 18:00 UTC
+        every: 6h                      # 00:00, 06:00, 12:00 and 18:00 UTC
         text: Triage the issues opened since the last sweep.
-        reply_to: {kind: github, repo: acme/widgets, number: 1}
-      - name: standup
-        daily_at: "09:00"               # UTC
-        text: Summarise yesterday's merged pull requests.
-        reply_to: {kind: github, repo: acme/widgets, number: 2}
+        reply_to: {kind: github, repo: acme/widgets, number: 1}   # a repository of forge.repos
 channels:
-  - kind: github                        # comments with the github source's token
-router: {kind: scripted}
-executor: {kind: scripted}
-budgets: {session_microusd: 500000}
+  - kind: github                       # comments as the bot
+# router, executor (pi, with run_code, which the forge needs), budgets: as in production.md
 ```
 
-A schedule's `reply_to` can also be `{kind: slack, channel: C0123OPS}`, or a thread with `thread_ts`, when a channel
-serves slack. With a channel that serves discord it can be `{kind: discord, channel: "222222222222222222"}`, a channel or a
-thread's id, or a reply to a message with `message_id`, whose replies are then the Ticket's Thread. Anyone who can comment
-on a listed repository reaches the Policy gate, which admits requests only from `policy.people`. The hidden marker in each
-comment holds the agent's message id and nothing else.
+Then check it. On the box, where `serve` has deleted its copy of the key, name the durable one:
+
+```text
+$ ~/agent/current/bin/solos-swarm agent github check --config ~/agent/agent.yaml \
+      --key-file ~/agent/tokens/github-app.pem --state-dir ~/agent/state
+  app solos-bot (123456) acts as solos-bot[bot]; people write @solos-bot
+  acme/widgets  installation 7788  write: contents issues pull_requests
+                read: actions checks metadata statuses   workflows: absent (good)  administration: absent (good)
+                mint read ok  mint write ok (unused here)  base main exists
+  github:alice pinned to account 1234567 (/home/agent/agent/state/github-identities.json)
+  ok
+```
+
+`check` exits 1 on any miss and says what to do: the key GitHub refuses, an installation that is missing, suspended or
+short of a permission, one that holds `workflows` or `administration`, a base branch that does not exist, a pinned
+login that now names another account. It reads the key and deletes nothing. Without `--state-dir` it looks accounts up
+and shows them and pins nothing.
+
+The first live proof is one issue on the throwaway repository: `gh issue create -R <owner>/<repo> -t "@solos-bot what
+is the first line of README.md?"`. Within a minute a comment answers it, and its author is `solos-bot[bot]`.
+
+### What happens
+
+- **Identity.** The agent learns who it is from `GET /app` (the slug) and `GET /users/<slug>[bot]` (the bot's account id),
+  once. Its login is `<slug>[bot]`, its commit identity `<slug>[bot] <id>+<slug>[bot]@users.noreply.github.com`. The
+  Source drops that login's comments, and `@slug` and `@slug[bot]` both address it. It replaces `GET /user`, which an
+  installation token cannot answer.
+- **Tokens.** `POST /app/installations/{id}/access_tokens` with one repository and the permissions the call needs (a read
+  token holds nothing above read), signed by a JWT (RS256, issued 60 s in the past, valid 9 minutes). The installation
+  is found per repository (`GET /repos/{r}/installation`), never configured. A token is reused until 15 minutes before
+  it expires, longer than git's own 10-minute timeout, so a fetch never outlives its token. Concurrent callers share
+  one mint. A 401 on a cached token drops it and mints once more. The mirror's fetch uses a read token for its one
+  repository, in git's environment and never in an argument, a sandbox or the clone's config.
+- **People.** `github:<login>` entries in `policy.people`, `approvers` and `bots` are lowercased, and each person's
+  login is pinned to its numeric account id in `<state>/github-identities.json` the first time the agent looks it up
+  (mode 0600, never changed by itself). A comment from that login with another account id, which is what a renamed and
+  reclaimed login looks like, is the actor `alice#99`, which no Policy lists, so it is stored and rejected `not_listed`.
+  A listed login whose lookup failed is not admitted until it is pinned. To list someone who recreated their account,
+  delete their entry from the file.
+- **Budgets.** A Ticket from GitHub, MCP or a schedule has no Approve button to wait on, so its accept may name at most
+  `policy.auto_approve_microusd`, even where Discord or Slack takes approvals for requests that came from them. The
+  Router's prompt says so, and `router_decide` refuses more and names the cap.
+- **Suspended, uninstalled, removed.** Suspend the App under Settings, Applications, Installed GitHub Apps and every GitHub
+  call waits five minutes and tries again, logged once per change of state. Nothing crashes, `serve` started while it is
+  suspended keeps running, and unsuspending (or reinstalling, which makes a new installation id the agent finds again)
+  resumes the work without a restart. Only a key GitHub rejects stops the github Source, with a log line; the rest of the
+  agent keeps running.
+- **Kill switches.** Suspend or uninstall the App; `github.writes: false` and a restart (no write token is ever minted);
+  `policy.paused` holds every Effect with the rest of the agent; remove a repository from `forge.repos`.
+
+### Moving from token files
+
+The agent used to authenticate with two personal access tokens, one for the `github` Source (`sources[].token_file`) and
+one for the forge (`forge.token_file`), and named the forge's commit identity in `forge.identity`. All three are gone, and
+so are the github Source's own `repos`, `api_base` and `poll_secs`: a config that still says any of them fails to load
+with one sentence that points here. To move: create and install the App as above; store its key; add the `github:`
+section; make the Source `- kind: github` with no fields; move its `repos` into `forge.repos` (merge them with the
+forge's); drop `token_file` and `identity` from the forge; move `poll_secs` and `api_base` into `github:`; delete
+`forge-token` and the Source's token file from `~/agent/tokens`; run `agent github check`; deploy.
 
 ## Claude Code workers
 
@@ -1407,10 +1500,9 @@ requests come with PR 3 of [`pstack/prs.md`](pstack/prs.md).
 
    ```yaml
    # agent.yaml
+   github: {app_id: 123456, key_file: secrets/github-app.pem}   # the App; see "GitHub App"
    forge:
-     kind: github
-     token_file: secrets/forge-token          # relative to this file; read once and deleted
-     identity: {name: solos-swarm-bot, email: bot@example.com}   # who the clone's commits are by
+     kind: github                             # the clone's commits are by the App's bot
      repos:
        GuiBibeau/solos-swarm:
          about: The agent's own code, Rust and TypeScript.   # the Router reads this
@@ -1420,11 +1512,12 @@ requests come with PR 3 of [`pstack/prs.md`](pstack/prs.md).
          owes: pull_request                   # answer (the default), change or pull_request
    ```
 
-   `kind: local` takes `remote: <dir>` instead of `token_file`. Each repository is then the bare repository
-   `<dir>/<owner>/<name>.git` on this disk, so tests and dry runs need no network.
-2. Give the forge its own token. Use a fine-grained personal access token of the agent's machine account, on the
-   listed repositories only, with Contents: Read. It is not the github Source's token. Write it to a file readable
-   only by the agent's user, and provide a fresh one for every start.
+   `kind: local` takes `remote: <dir>` and `identity: {name, email}` (who its clone's commits are by) instead of the
+   `github:` section. Each repository is then the bare repository `<dir>/<owner>/<name>.git` on this disk, so tests and
+   dry runs need no network.
+2. Install the GitHub App on the listed repositories ([GitHub App](#github-app)). The forge has no credential of its
+   own: its mirror fetches with a read token the App mints for the one repository, and `forge.repos` is also the list
+   of repositories the github Source reads.
 3. Mount the toolchains a repository needs into `run_code` with `executor.run_code.mounts`, and say where they are
    in `notes`. `run_code` has no network, so a build must work offline.
 
@@ -1437,7 +1530,8 @@ What happens:
   `deliverable` with no repository.
 - The host keeps a bare mirror of each repository at `<state>/forge/<owner>/<name>.git`. Before a Ticket's first
   worker, it fetches the mirror and clones it into `<state>/tickets/<ticket>/work`. The clone has its history, the
-  forge's other branches as `origin/*`, a `.git` of its own, and the identity in its config. Then the host writes
+  forge's other branches as `origin/*`, a `.git` of its own, and the identity in its config (the App's bot for
+  `kind: github`). Then the host writes
   `<ticket>/host/repo.json`: the repository, its base, the commit the clone started from and the notes. A later
   Assignment of the same Ticket finds `repo.json` and keeps the tree as the last worker left it. The host makes a
   clone with no `repo.json` again, since no worker ran in it.

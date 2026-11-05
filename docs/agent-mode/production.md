@@ -9,7 +9,7 @@ switches releases from the Mac. Everything on the box is under `~/agent`:
 | `current`, `previous` | Links to the release that serves and the one before it. `--pi-root` is `current`. |
 | `agent.yaml` | The production config. It is not in git. |
 | `state/` | `agent.db`, `tickets/`, `router/`, `forge/`, `trail/`, `mcp/`, the broker socket. Kept across releases. |
-| `tokens/` | One file per one-use credential, mode 0600: `model.key` (the DeepSeek key), `discord-token`, later `forge-token`. |
+| `tokens/` | One file per one-use credential, mode 0600: `model.key` (the DeepSeek key), `discord-token`, `github-app.pem` (the GitHub App's private key). |
 | `backups/` | `agent.db` copied before every deploy and rollback, while the agent is stopped. The newest twenty are kept. |
 | `target/` | The cargo build cache. |
 
@@ -28,6 +28,7 @@ scripts/agent-deploy status            # the unit, its release, and `agent statu
 scripts/agent-deploy logs              # the last 100 log lines; `logs -f` follows, `logs --since 1h`
 scripts/agent-deploy restart           # also: start, stop, releases
 pbpaste | scripts/agent-deploy token discord-token   # store or rotate a token, then restart
+scripts/agent-deploy token github-app.pem < ~/Downloads/<name>.<date>.private-key.pem   # the GitHub App's key
 ```
 
 A deploy builds on the box with the pinned toolchain (`cargo build --locked`, `npm ci`), runs `doctor` on the new
@@ -79,9 +80,52 @@ watchdog:
   every: 1m
 ```
 
-To let workers clone a repository, add a `forge:` section (see "Repositories" in [README.md](README.md)) with
-`token_file: /run/user/1000/solos-agent/forge-token`, store the token with `scripts/agent-deploy token forge-token`,
-and restart.
+### GitHub
+
+The agent works on GitHub as a GitHub App's bot, with no personal access token. Create and install the App as
+[GitHub App](README.md#github-app) says (by hand, once), then store its key and add a `github:` section, a `forge:` of the
+repositories it may act on, and the `github` Source and Channel:
+
+```sh
+scripts/agent-deploy token github-app.pem < ~/Downloads/solos-bot.2026-11-05.private-key.pem
+rm -P ~/Downloads/solos-bot.2026-11-05.private-key.pem
+```
+
+```yaml
+# ~/agent/agent.yaml, beside the sections above
+policy:
+  people: [discord:<your user id>, github:<your login>]    # lowercase; each is pinned to its account id in state/github-identities.json
+  approvers: [discord:<your user id>, github:<your login>]
+github:
+  app_id: <the App's numeric id>
+  key_file: /run/user/1000/solos-agent/github-app.pem      # the unit copies tokens/github-app.pem here before each start; serve reads it once and deletes it
+forge:
+  kind: github                                             # no token_file and no identity: the commits are by the App's bot
+  repos:
+    <owner>/<repo>: {about: What the Router reads to tell which repository a request is about, base: main}
+sources:
+  - kind: github                                           # no fields: it reads forge.repos
+channels:
+  - kind: github
+```
+
+Deploy, then check from the box (the unit's copy of the key is gone, so name the durable one):
+
+```sh
+scripts/agent-deploy deploy
+ssh <box> '~/agent/current/bin/solos-swarm agent github check --config ~/agent/agent.yaml --key-file ~/agent/tokens/github-app.pem --state-dir ~/agent/state'
+```
+
+The key rests unencrypted at mode 0600 beside the other tokens. `serve` refuses a `key_file` under any path a sandbox can
+read, and mints every token for one repository of `forge.repos`, read for a `GET` and write for the rest. Rotate the key by
+generating a second one in the App's settings, storing it with `agent-deploy token github-app.pem`, restarting, and then
+deleting the first. To stop GitHub work, suspend the App under Settings, Applications, Installed GitHub Apps: every GitHub
+call then waits and retries every five minutes, and unsuspending resumes it with no restart. `github.writes: false` and a
+restart keeps the agent reading and writing nothing.
+
+A config that still has `token_file` on the github Source or on `forge: github`, or `identity` on `forge: github`, fails to
+load with a sentence that points at [Moving from token files](README.md#moving-from-token-files). The `forge-token` file is no
+longer read; delete it from `~/agent/tokens`.
 
 ## Not handled yet
 

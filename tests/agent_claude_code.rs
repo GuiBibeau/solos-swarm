@@ -178,6 +178,7 @@ fn serve(scratch: &Scratch, budget_microusd: u64) -> Served {
             max_budget_microusd: None,
             swarm: None,
             repos: BTreeMap::new(),
+            ..DecideTerms::default()
         },
         workers: Some(WorkerParts {
             terms: terms(),

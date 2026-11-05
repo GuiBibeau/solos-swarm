@@ -709,6 +709,7 @@ mod tests {
                     max_budget_microusd: None,
                     swarm: None,
                     repos: BTreeMap::new(),
+                    ..DecideTerms::default()
                 },
                 workers: None,
             })

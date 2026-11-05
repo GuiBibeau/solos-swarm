@@ -51,7 +51,7 @@ use config::{
     ChannelConfig, ClaudeConfig, ExecutorConfig, RouterConfig, RunCodeConfig, SourceConfig,
 };
 use discord::{DiscordApi, DiscordChannel, DiscordSource};
-use github::{GithubApi, GithubChannel, GithubSource};
+use github::{GithubApp, GithubChannel, GithubSource};
 use goal_template::GoalTemplates;
 use jsonl::{JsonlChannel, JsonlSource};
 use pi_executor::{PiExecutor, PiExecutorParts};
@@ -131,6 +131,8 @@ pub async fn serve_until(
         node,
         credential,
     } = options;
+    // The App's key is refused before it is read if a sandbox could read it.
+    check_key_path(&config, state_dir, pi_root.as_deref(), node.as_deref())?;
     // First, so the token files are consumed before anything else can fail.
     let io = Io::open(&config, state_dir, !until_idle)?;
     let host = match config.pi_upstream() {
@@ -170,6 +172,15 @@ where
     H: AgentHarness + Send + Sync + 'static,
     H::Session: Send + 'static,
 {
+    let paths = host
+        .as_ref()
+        .map(|host| (host.pi_root.as_path(), host.node.as_path()));
+    check_key_path(
+        &config,
+        state_dir,
+        paths.map(|(root, _)| root),
+        paths.map(|(_, node)| node),
+    )?;
     let io = Io::open(&config, state_dir, !until_idle)?;
     serve_io(config, state_dir, until_idle, io, host, shutdown()).await
 }
@@ -202,6 +213,7 @@ where
             host,
             facts.clone(),
             nodes.as_ref(),
+            io.github.as_deref(),
         )?),
     };
     let mut router: Arc<dyn Router> = match pi.as_ref().and_then(|pi| pi.router.clone()) {
@@ -306,6 +318,7 @@ where
         host: PiHost<H>,
         facts: ports::FactSink,
         nodes: Option<&Listener>,
+        github: Option<&GithubApp>,
     ) -> Result<Self> {
         let PiHost {
             harness,
@@ -490,7 +503,9 @@ where
                 forge: config
                     .forge
                     .as_ref()
-                    .map(|wanted| forge::open(wanted, canonical(state_dir)?.join(forge::FORGE_DIR)))
+                    .map(|wanted| {
+                        forge::open(wanted, canonical(state_dir)?.join(forge::FORGE_DIR), github)
+                    })
                     .transpose()?,
                 swarm,
             })?)),
@@ -695,11 +710,38 @@ where
 }
 
 /// The Sources and Channels the config names, opened before anything else
-/// can fail, since opening them reads and deletes the Slack, Discord and
-/// GitHub token files.
+/// can fail, since opening them reads and deletes the Slack and Discord token
+/// files and the GitHub App's key.
 struct Io {
     sources: Vec<Box<dyn Source>>,
     channels: BTreeMap<String, Arc<dyn Channel>>,
+    /// The App the github Source, the github Channel and the forge share.
+    github: Option<Arc<GithubApp>>,
+}
+
+/// Refused: the GitHub App's key sits under a path some sandbox can read.
+/// Judged before the key is read, with what is known then: the config's
+/// mounts and the state, Pi and node directories.
+fn check_key_path(
+    config: &AgentConfig,
+    state_dir: &Path,
+    pi_root: Option<&Path>,
+    node: Option<&Path>,
+) -> Result<()> {
+    let Some(github) = &config.github else {
+        return Ok(());
+    };
+    let canonical = |path: &Path| path.canonicalize().ok();
+    let host = Host {
+        state_dir: canonical(state_dir),
+        pi_root: pi_root.and_then(canonical),
+        node: node.and_then(canonical),
+        pstack: None,
+    };
+    Exposure::new(config, &host)
+        .view()
+        .hides(&github.key_file)
+        .context("github.key_file")
 }
 
 impl Io {
@@ -709,7 +751,22 @@ impl Io {
         let mut sources: Vec<Box<dyn Source>> = Vec::new();
         let mut slack_api = None;
         let mut discord_api = None;
-        let mut github_api = None;
+        let github = match &config.github {
+            None => None,
+            Some(github) => {
+                let repos = config
+                    .forge
+                    .iter()
+                    .flat_map(|forge| forge.repos().keys().cloned())
+                    .collect();
+                Some(Arc::new(GithubApp::open(
+                    github,
+                    repos,
+                    state_dir,
+                    config.github_logins(),
+                )?))
+            }
+        };
         for source in &config.sources {
             match source {
                 SourceConfig::Jsonl { path } => {
@@ -741,19 +798,18 @@ impl Io {
                     sources.push(Box::new(discord));
                     discord_api = Some(api);
                 }
-                SourceConfig::Github {
-                    repos,
-                    token_file,
-                    api_base,
-                    poll_secs,
-                } => {
-                    let token = github::Token::take(token_file)?;
-                    let api = Arc::new(GithubApi::new(api_base, token)?);
+                SourceConfig::Github {} => {
+                    let (Some(app), Some(settings)) = (&github, &config.github) else {
+                        bail!("the github source needs the github: section");
+                    };
+                    let repos = config
+                        .forge
+                        .iter()
+                        .flat_map(|forge| forge.repos().keys().cloned());
                     let cursor = state_dir.join(github::CURSOR_FILE);
-                    let source = GithubSource::new(api.clone(), repos.clone(), cursor, follow)
-                        .with_poll(Duration::from_secs(*poll_secs));
+                    let source = GithubSource::new(app.api.clone(), repos, cursor, follow)
+                        .with_poll(Duration::from_secs(settings.poll_secs));
                     sources.push(Box::new(source));
-                    github_api = Some(api);
                 }
                 SourceConfig::Schedule { schedules } => {
                     let schedules = schedules
@@ -783,9 +839,10 @@ impl Io {
                         .context("the discord channel needs a discord source")?,
                 )),
                 ChannelConfig::Github {} => Arc::new(GithubChannel::new(
-                    github_api
-                        .clone()
-                        .context("the github channel needs a github source")?,
+                    github
+                        .as_ref()
+                        .map(|app| app.api.clone())
+                        .context("the github channel needs the github: section")?,
                 )),
                 ChannelConfig::Mcp {} => {
                     mcp::open_dir(state_dir)?;
@@ -794,7 +851,11 @@ impl Io {
             };
             channels.insert(channel.source().to_owned(), adapter);
         }
-        Ok(Self { sources, channels })
+        Ok(Self {
+            sources,
+            channels,
+            github,
+        })
     }
 
     /// The runtime's adapters: these, `router` and `executor`.

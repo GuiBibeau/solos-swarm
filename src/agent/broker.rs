@@ -289,7 +289,7 @@ pub struct Grant {
 }
 
 /// The budgets and plans a Router's accept may name.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DecideTerms {
     /// An accept that names no budget gets this.
     pub default_budget_microusd: MicroUsd,
@@ -298,6 +298,16 @@ pub struct DecideTerms {
     /// give one the threshold is the cap, instead of a Ticket that waits
     /// forever.
     pub max_budget_microusd: Option<MicroUsd>,
+    /// Where `max_budget_microusd` is no cap because a person can approve,
+    /// the Sources whose Tickets can ask one: their Channel shows buttons
+    /// and an approver is on that Source. An accept from any other Source
+    /// (GitHub, MCP, a schedule) is capped at `auto_approve_microusd`, since
+    /// its Ticket would wait for a button that Source cannot show. Empty: no
+    /// per-source cap.
+    pub approval_sources: BTreeSet<String>,
+    /// The Policy's approval threshold: the cap on an accept from a Source
+    /// outside `approval_sources`.
+    pub auto_approve_microusd: MicroUsd,
     /// What a swarm plan may name, or `None` where no swarm runs.
     pub swarm: Option<SwarmTerms>,
     /// The repositories an accept may name, from `forge.repos`.
@@ -331,6 +341,17 @@ impl SwarmTerms {
 }
 
 impl DecideTerms {
+    /// The most an accept whose Ticket came from `origin` may name, or no
+    /// cap.
+    pub(crate) fn ceiling(&self, origin: Option<&str>) -> Option<MicroUsd> {
+        match self.max_budget_microusd {
+            Some(max) => Some(max),
+            None if self.approval_sources.is_empty() => None,
+            None if origin.is_some_and(|source| self.approval_sources.contains(source)) => None,
+            None => Some(self.auto_approve_microusd),
+        }
+    }
+
     fn repo(&self, name: &str) -> std::result::Result<(RepoName, &RepoConfig), String> {
         let found = RepoName::try_from(name.to_owned())
             .ok()
@@ -367,6 +388,8 @@ impl DecideTerms {
             default_budget_microusd: config.budgets.session_microusd,
             max_budget_microusd: (!config.takes_approvals())
                 .then_some(config.policy.auto_approve_microusd),
+            approval_sources: config.approval_sources(),
+            auto_approve_microusd: config.policy.auto_approve_microusd,
             swarm,
             repos: config
                 .forge
@@ -735,6 +758,28 @@ impl AgentBroker {
             .ok_or_else(|| forbidden("invalid identity"))
     }
 
+    /// The Source of the Trigger that gave `eval`'s batch its strength, which
+    /// decides how much an accept may ask for. `None` when the Eval is not
+    /// running, and then the tightest cap applies.
+    async fn origin_source(&self, eval: &EvalId) -> Option<String> {
+        use solos_agent_core::ports::Repositories as _;
+        let eval = eval.clone();
+        self.store(move |store| {
+            let Some(key) = store.thread_of_eval(&eval) else {
+                return Ok(None);
+            };
+            let Some(running) = store.read_thread(&key)?.and_then(|thread| thread.eval) else {
+                return Ok(None);
+            };
+            Ok(store
+                .read_trigger(&running.primary)?
+                .map(|trigger| trigger.source))
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// Run `work` on the broker's Store connection off the async threads.
     async fn store<T: Send + 'static>(
         &self,
@@ -1052,7 +1097,12 @@ struct DecideArgs {
 }
 
 impl DecideArgs {
-    fn verdict(self, terms: &DecideTerms) -> std::result::Result<(EvalId, Verdict), String> {
+    /// `origin`: the Source of the Trigger that gave the Eval its strength.
+    fn verdict(
+        self,
+        terms: &DecideTerms,
+        origin: Option<&str>,
+    ) -> std::result::Result<(EvalId, Verdict), String> {
         let reason = self.reason.trim().to_owned();
         if reason.is_empty() {
             return Err("a decision needs a reason".into());
@@ -1111,13 +1161,21 @@ impl DecideArgs {
                     .budget_microusd
                     .or(repo.as_ref().and_then(|(_, terms)| terms.budget_microusd))
                     .unwrap_or(terms.default_budget_microusd);
-                if let Some(max) = terms.max_budget_microusd
+                if let Some(max) = terms.ceiling(origin)
                     && budget > max
                 {
-                    return Err(format!(
-                        "budget_microusd {budget} is above {max}, the most an accept may grant \
-                         without a person's approval"
-                    ));
+                    return Err(match terms.max_budget_microusd {
+                        Some(_) => format!(
+                            "budget_microusd {budget} is above {max}, the most an accept may \
+                             grant without a person's approval"
+                        ),
+                        None => format!(
+                            "budget_microusd {budget} is above {max}, the most an accept may \
+                             grant for a request from {}: its ticket could not ask a person to \
+                             approve more. Name a budget of {max} or less",
+                            origin.unwrap_or("an unknown source")
+                        ),
+                    });
                 }
                 let acknowledge = match self.acknowledge {
                     None => Acknowledge::Standard,
@@ -1162,8 +1220,9 @@ async fn decide(broker: &AgentBroker, args: Value) -> Reply {
             "a ticket on a repository runs on this host only; name environment local",
         ));
     }
+    let origin = broker.origin_source(&args.eval).await;
     let (eval, verdict) = args
-        .verdict(&broker.inner.decide)
+        .verdict(&broker.inner.decide, origin.as_deref())
         .map_err(|why| refuse(StatusCode::UNPROCESSABLE_ENTITY, why))?;
     let answer = broker
         .inner
@@ -1610,6 +1669,7 @@ mod tests {
                 default_template: Some("research".into()),
             }),
             repos: BTreeMap::new(),
+            ..DecideTerms::default()
         }
     }
 
@@ -1619,7 +1679,7 @@ mod tests {
 
     fn verdict_under(terms: &DecideTerms, args: serde_json::Value) -> Result<Verdict, String> {
         let args: DecideArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
-        args.verdict(terms).map(|(_, verdict)| verdict)
+        args.verdict(terms, None).map(|(_, verdict)| verdict)
     }
 
     #[test]
@@ -1852,6 +1912,48 @@ mod tests {
             verdict(elsewhere),
             Err("this agent works on no repository; accept the work without a repo".to_owned())
         );
+    }
+
+    #[test]
+    fn a_request_from_a_source_that_cannot_show_a_button_may_not_name_a_budget_that_needs_one() {
+        let accept = |origin: Option<&str>, budget: u64| {
+            let args = json!({"eval":"ev_1","decision":"accept","reason":"asked","title":"T",
+                              "scope":"S","budget_microusd":budget});
+            let args: DecideArgs = serde_json::from_value(args).unwrap();
+            let terms = DecideTerms {
+                max_budget_microusd: None,
+                approval_sources: ["discord".to_owned()].into(),
+                auto_approve_microusd: 500_000,
+                ..terms()
+            };
+            args.verdict(&terms, origin).map(|_| ())
+        };
+
+        assert_eq!(
+            accept(Some("discord"), 9_000_000),
+            Ok(()),
+            "Discord has buttons"
+        );
+        assert_eq!(accept(Some("github"), 500_000), Ok(()), "at the threshold");
+        for origin in [Some("github"), Some("mcp"), Some("schedule"), None] {
+            let refused = accept(origin, 500_001).unwrap_err();
+            assert!(
+                refused.contains("above 500000")
+                    && refused.contains("its ticket could not ask a person"),
+                "{origin:?}: {refused}"
+            );
+        }
+        let everywhere = DecideTerms {
+            max_budget_microusd: None,
+            ..terms()
+        };
+        assert_eq!(
+            everywhere.ceiling(Some("github")),
+            None,
+            "no per-source cap without a set"
+        );
+        let nowhere = terms();
+        assert_eq!(nowhere.ceiling(Some("discord")), Some(2_000_000));
     }
 
     #[test]

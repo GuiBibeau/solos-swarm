@@ -461,6 +461,7 @@ impl World {
                 max_budget_microusd: None,
                 swarm: None,
                 repos: BTreeMap::new(),
+                ..DecideTerms::default()
             },
             workers: Some(WorkerParts {
                 terms: ModelTerms {
