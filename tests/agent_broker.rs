@@ -8,14 +8,14 @@ use serde_json::{Value, json};
 use solos_agent_core::AllowlistPolicy;
 use solos_agent_core::model::{
     Actor, Addressed, Approval, AssignmentId, Candidate, ChannelRef, DecisionKind, InputBody,
-    MessageKind, OutboundMessage, ReportStatus, ThreadKey, TicketId, Trigger, TriggerId,
+    MessageKind, OutboundMessage, Plan, ReportStatus, ThreadKey, TicketId, Trigger, TriggerId,
 };
 use solos_agent_store::{SpendState, SqliteStore};
 use solos_swarm::agent::broker::browser::{BrowserParts, LocalBrowser};
 use solos_swarm::agent::broker::registry::{self, PrincipalKind};
 use solos_swarm::agent::broker::{
     self, Account, AgentBroker, BrokerParts, DecideTerms, Grant, ModelFailure, ModelTerms,
-    Principal, ROUTER_TOOLS, VaultParts, WORKER_TOOLS, WorkerParts, WorkerSeat,
+    Principal, ROUTER_TOOLS, SwarmTerms, VaultParts, WORKER_TOOLS, WorkerParts, WorkerSeat,
 };
 use solos_swarm::agent::environment::{ExecutionEnvironment, Nodes, Offline, Work};
 use solos_swarm::agent::jobs::JobLimits;
@@ -52,7 +52,7 @@ const PRICES: PriceTable = PriceTable {
 const COST: u64 = 90;
 const LIMIT: Duration = Duration::from_secs(30);
 const TERMS: DecideTerms = DecideTerms {
-    default_budget_microusd: 500_000,
+    default_budget_microusd: Some(500_000),
     max_budget_microusd: Some(2_000_000),
     approval_sources: BTreeSet::new(),
     auto_approve_microusd: 0,
@@ -63,6 +63,8 @@ const TERMS: DecideTerms = DecideTerms {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Behaviour {
     Answer,
+    /// A receipt for far more than any hold.
+    Overrun,
     Fail,
     NoReceipt,
     Hang,
@@ -99,8 +101,13 @@ impl Provider for Scripted {
         Box::pin(async move {
             let usage =
                 json!({"prompt_tokens":100,"prompt_cache_hit_tokens":0,"completion_tokens":50});
+            let usage = if behaviour == Behaviour::Overrun {
+                json!({"prompt_tokens":1_000_000,"prompt_cache_hit_tokens":0,"completion_tokens":50})
+            } else {
+                usage
+            };
             match behaviour {
-                Behaviour::Answer | Behaviour::Slow => {
+                Behaviour::Answer | Behaviour::Overrun | Behaviour::Slow => {
                     if behaviour == Behaviour::Slow {
                         tokio::time::sleep(SLOW).await;
                     }
@@ -223,6 +230,12 @@ impl Scratch {
     /// outbox that cannot take an approval. Only its Policy and terms are
     /// used; the runtime keeps this scratch's jsonl adapters.
     fn config(&self, slack: bool) -> AgentConfig {
+        let budgets = "budgets: {session_microusd: 500000, router_daily_microusd: 1000000}\n";
+        self.config_under(slack, budgets)
+    }
+    /// [`config`](Self::config) with `budgets` as its last lines, which may
+    /// be none.
+    fn config_under(&self, slack: bool, budgets: &str) -> AgentConfig {
         let io = if slack {
             "sources:\n  - {kind: slack, channels: [C1], app_token_file: app, bot_token_file: bot}\n\
              channels:\n  - {kind: slack}\n"
@@ -234,8 +247,7 @@ impl Scratch {
             "policy:\n  people: [slack:alice]\n  approvers: [slack:boss]\n{io}\
              router:\n  kind: pi\n  provider: deepseek\n  model: deepseek-flash\n  \
              prices: {{input_microusd_per_million: 300000, output_microusd_per_million: 1200000}}\n\
-             executor: {{kind: scripted}}\n\
-             budgets: {{session_microusd: 500000, router_daily_microusd: 1000000}}\n"
+             executor: {{kind: scripted}}\n{budgets}"
         );
         let path = self.root.join("agent.yaml");
         std::fs::write(&path, yaml).unwrap();
@@ -279,7 +291,9 @@ fn terms() -> ModelTerms {
 fn grant(daily_microusd: u64) -> Grant {
     Grant {
         principal: Principal::Router,
-        account: Account::Router { daily_microusd },
+        account: Account::Router {
+            daily_microusd: Some(daily_microusd),
+        },
         terms: terms(),
         system_prompt: Some("You are the Router.".into()),
     }
@@ -873,13 +887,102 @@ async fn an_accept_above_the_threshold_waits_for_approval_only_where_slack_can_g
         let [ticket] = &tickets[..] else {
             panic!("{tickets:?}")
         };
-        assert_eq!(ticket.mandate.budget_microusd, GATED);
+        assert_eq!(ticket.mandate.budget_microusd, Some(GATED));
         assert_eq!(ticket.approval, Approval::Waiting);
         let sent = scratch.sent();
         let [ask] = &sent[..] else { panic!("{sent:?}") };
         assert_eq!(ask.kind, MessageKind::Attention);
         assert!(ask.text.contains("needs approval first"), "{}", ask.text);
     }
+}
+
+/// With no `budgets`, a session has no budget and no approval, while a swarm
+/// still needs a budget, and above the threshold it still waits for a person.
+#[tokio::test]
+async fn with_no_budgets_a_session_goes_uncapped_and_a_swarm_still_needs_a_budget_and_an_approval()
+{
+    let scratch = Scratch::new("uncapped-decide");
+    let config = scratch.config_under(true, "");
+    assert_eq!(config.budgets.session_microusd, None);
+    scratch.append(&request("t-session", "T1", "Rerun the load test"));
+    scratch.append(&request("t-swarm", "T2", "Survey every paper on swarms"));
+    let router = Arc::new(Holding::default());
+    let runtime = scratch.runtime_under(config.policy.clone(), router.clone(), false);
+    let decide = DecideTerms {
+        swarm: Some(SwarmTerms {
+            templates: vec!["research".into()],
+            default_template: Some("research".into()),
+            default_budget_microusd: None,
+        }),
+        ..DecideTerms::for_config(&config)
+    };
+    assert_eq!(decide.default_budget_microusd, None);
+    let served = serve_deciding(
+        &scratch,
+        Scripted::new(),
+        runtime.facts(),
+        1_000_000,
+        decide,
+    );
+    const BIG: u64 = 3_000_000;
+
+    with_runtime(runtime, async {
+        let evals = candidates(&router, 2).await;
+        let decide = |n: usize, extra: Value| {
+            let mut args = json!({"eval":evals[n].eval,"decision":"accept","reason":"alice asked",
+                                  "title":"Work","scope":"Do it"});
+            for (key, value) in extra.as_object().unwrap() {
+                args[key] = value.clone();
+            }
+            served.post("tool/router_decide", Some(TOKEN), args)
+        };
+        let swarm = json!({"plan":"swarm","agents":3});
+
+        let (status, refused) = decide(1, swarm.clone()).await;
+        assert_eq!(status, 422, "{refused}");
+        let why = refused["error"].as_str().unwrap();
+        assert!(why.contains("a swarm plan needs budget_microusd"), "{why}");
+
+        let (status, answer) = decide(0, json!({"budget_microusd": BIG})).await;
+        assert_eq!(status, 200, "a budget a session does not take: {answer}");
+
+        let mut big = swarm;
+        big["budget_microusd"] = json!(BIG);
+        let (status, answer) = decide(1, big).await;
+        assert_eq!(status, 200, "{answer}");
+        for _ in 0..500 {
+            if scratch.sent().len() >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+
+    let tickets = scratch.store().tickets().unwrap();
+    let (swarms, sessions): (Vec<_>, Vec<_>) = tickets
+        .iter()
+        .partition(|ticket| matches!(ticket.plan, Plan::Swarm { .. }));
+    let ([session], [swarm]) = (&sessions[..], &swarms[..]) else {
+        panic!("{tickets:?}")
+    };
+    assert_eq!(session.mandate.budget_microusd, None);
+    assert_eq!(session.approval, Approval::NotNeeded);
+    assert_eq!(swarm.mandate.budget_microusd, Some(BIG));
+    assert_eq!(swarm.approval, Approval::Waiting, "above the threshold");
+    let sent = scratch.sent();
+    let asked: Vec<_> = sent
+        .iter()
+        .filter(|message| message.kind == MessageKind::Attention)
+        .collect();
+    let [ask] = &asked[..] else {
+        panic!("{sent:?}")
+    };
+    assert!(
+        ask.text.contains("needs approval first") && ask.text.contains("a swarm of 3 agents"),
+        "only the swarm asks: {}",
+        ask.text
+    );
 }
 
 #[tokio::test]
@@ -1184,6 +1287,167 @@ async fn a_worker_past_its_ticket_budget_is_refused_and_the_router_still_calls()
     let store = scratch.store();
     assert_eq!(store.committed("ticket:tk_tiny", 0).unwrap(), COST);
     assert_eq!(store.committed("router", 0).unwrap(), COST);
+}
+
+/// What `COST` is at an overrun: a million prompt tokens and 50 completion
+/// tokens at `PRICES`.
+const OVERRUN: u64 = 300_060;
+
+fn admit_seat(served: &Served, scratch: &Scratch, token: &str, ticket: &str, budget: Option<u64>) {
+    let seat = WorkerSeat::new(
+        TicketId::new(ticket),
+        AssignmentId::new("as_1"),
+        scratch.state(),
+        budget,
+    );
+    served
+        .broker
+        .admit_worker(token.into(), seat, "You are a worker.".into())
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_ticket_with_no_budget_is_held_and_settled_but_never_refused_for_spend() {
+    let scratch = Scratch::new("worker-uncapped");
+    let provider = Scripted::new();
+    let (_runtime, served) = model_only(&scratch, provider.clone(), 1_000_000);
+    // What a cap of one call would be.
+    let budget = hold_for("fix it") + COST - 1;
+    admit_seat(
+        &served,
+        &scratch,
+        "worker-capped",
+        "tk_capped",
+        Some(budget),
+    );
+    admit_seat(&served, &scratch, "worker-open", "tk_open", None);
+    let asks = |token: &'static str| {
+        served.post(
+            "model",
+            Some(token),
+            model_request_for("worker_report", "fix it"),
+        )
+    };
+
+    assert_eq!(asks("worker-capped").await.0, 200);
+    assert_eq!(asks("worker-capped").await.0, 403, "the cap holds");
+    for _ in 0..5 {
+        let (status, reply) = asks("worker-open").await;
+        assert_eq!(status, 200, "{reply}");
+        assert_eq!(reply["swarm_cost_microusd"], COST);
+    }
+
+    let store = scratch.store();
+    let rows = store.spend("ticket:tk_open").unwrap();
+    assert_eq!(rows.len(), 5, "every call was held");
+    assert!(rows.iter().all(|r| r.state == SpendState::Settled
+        && r.hold_microusd == hold_for("fix it")
+        && r.cost_microusd == COST));
+    assert_eq!(
+        store.committed("ticket:tk_open", 0).unwrap(),
+        5 * COST,
+        "and its spend is recorded"
+    );
+    assert_eq!(provider.calls(), 6, "only the refused call never went out");
+
+    std::fs::write(scratch.state().join("PAUSE"), "").unwrap();
+    assert_eq!(
+        asks("worker-open").await.0,
+        503,
+        "the kill switch still stops it"
+    );
+    assert_eq!(store.spend("ticket:tk_open").unwrap().len(), 5);
+}
+
+#[tokio::test]
+async fn a_router_with_no_daily_cap_is_never_refused_for_spend_and_still_counts_its_account() {
+    let scratch = Scratch::new("router-uncapped");
+    let provider = Scripted::new();
+    // A cap of one call.
+    let cap = hold_for("judge") + COST - 1;
+    let (_runtime, served) = model_only(&scratch, provider.clone(), cap);
+    let open = Grant {
+        account: Account::Router {
+            daily_microusd: None,
+        },
+        ..grant(cap)
+    };
+    served.broker.admit("open-router".into(), open).unwrap();
+
+    assert_eq!(served.model("judge").await.0, 200);
+    assert_eq!(served.model("judge").await.0, 403, "the cap holds");
+    for _ in 0..4 {
+        let (status, reply) = served
+            .post("model", Some("open-router"), model_request("judge"))
+            .await;
+        assert_eq!(status, 200, "{reply}");
+    }
+
+    let store = scratch.store();
+    assert_eq!(store.spend("router").unwrap().len(), 5);
+    assert_eq!(store.committed("router", 0).unwrap(), 5 * COST);
+}
+
+#[tokio::test]
+async fn an_overrun_is_only_recorded_with_no_cap_and_stops_admission_where_there_is_one() {
+    let scratch = Scratch::new("overrun");
+    let provider = Scripted::new();
+    let (_runtime, served) = model_only(&scratch, provider.clone(), 1_000_000_000);
+    admit_seat(&served, &scratch, "worker-open", "tk_open", None);
+    let open = || {
+        served.post(
+            "model",
+            Some("worker-open"),
+            model_request_for("worker_report", "fix it"),
+        )
+    };
+
+    provider.set(Behaviour::Overrun);
+    let (status, reply) = open().await;
+    assert_eq!(status, 200, "no cap, so nothing to refuse: {reply}");
+    assert_eq!(reply["swarm_cost_microusd"], OVERRUN);
+    let store = scratch.store();
+    let rows = store.spend("ticket:tk_open").unwrap();
+    let [row] = &rows[..] else { panic!("{rows:?}") };
+    assert_eq!(
+        (row.state, row.cost_microusd),
+        (SpendState::Settled, OVERRUN),
+        "the cost the provider billed is the record"
+    );
+    assert!(row.cost_microusd > row.hold_microusd);
+    provider.set(Behaviour::Answer);
+    assert_eq!(
+        served.model("judge").await.0,
+        200,
+        "an overrun with no cap stops no one that has one"
+    );
+    assert_eq!(open().await.0, 200);
+
+    provider.set(Behaviour::Overrun);
+    let (status, reply) = served.model("judge").await;
+    assert_eq!(status, 403, "{reply}");
+    assert!(
+        reply["error"]
+            .as_str()
+            .unwrap()
+            .contains("provider exceeded reservation"),
+        "{reply}"
+    );
+    provider.set(Behaviour::Answer);
+    let (status, reply) = served.model("judge").await;
+    assert_eq!(status, 403, "{reply}");
+    assert!(
+        reply["error"]
+            .as_str()
+            .unwrap()
+            .contains("cost more than its hold"),
+        "{reply}"
+    );
+    assert_eq!(open().await.0, 200, "but an account with no cap goes on");
+    assert_eq!(
+        store.committed("ticket:tk_open", 0).unwrap(),
+        OVERRUN + 2 * COST
+    );
 }
 
 #[tokio::test]

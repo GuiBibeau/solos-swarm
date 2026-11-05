@@ -319,7 +319,7 @@ fn assert_decided(scratch: &Scratch, judge: &Judge) {
         tickets[0].title,
         "Summarise the incident report from last night"
     );
-    assert_eq!(tickets[0].mandate.budget_microusd, 500_000);
+    assert_eq!(tickets[0].mandate.budget_microusd, Some(500_000));
     let stranger = on("T2");
     assert!(stranger.eval.is_none() && stranger.reason.contains("not_listed"));
     let bot = on("T3");

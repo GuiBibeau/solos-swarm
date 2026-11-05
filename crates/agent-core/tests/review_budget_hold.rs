@@ -63,7 +63,7 @@ fn verdict(plan: Plan, budget: u64) -> Verdict {
         scope: "Do the task".into(),
         reason: "asked".into(),
         plan,
-        budget_microusd: budget,
+        budget_microusd: Some(budget),
         acknowledge: Acknowledge::Standard,
         rules: Vec::new(),
         repo: None,
@@ -87,7 +87,7 @@ fn rep(status: ReportStatus, question: Option<&str>) -> ReportIn {
     }
 }
 
-type Launch = (TicketId, AssignmentId, Plan, u64, bool);
+type Launch = (TicketId, AssignmentId, Plan, Option<u64>, bool);
 
 fn launches(effects: &[Effect]) -> Vec<Launch> {
     effects
@@ -356,7 +356,10 @@ fn c2_approve_only_waiting_only_listed_approver_then_launches() {
         .unwrap();
     let l = launches(&w.effects());
     assert_eq!(l.len(), 1);
-    assert_eq!((l[0].2.clone(), l[0].3, l[0].4), (swarm, 9_000_000, false));
+    assert_eq!(
+        (l[0].2.clone(), l[0].3, l[0].4),
+        (swarm, Some(9_000_000), false)
+    );
     assert!(matches!(w.ticket(&t).approval, Approval::Granted { .. }));
     assert!(matches!(
         w.engine.approve(&t, "slack", Actor::person("alice")),
@@ -641,7 +644,7 @@ fn c7_launch_carries_plan_budget_and_recovery_flag() {
     let mut seen: Vec<bool> = Vec::new();
     let mut check = |w: &World, eff: &[Effect]| {
         for (tk, _, p, b, rec) in launches(eff) {
-            assert_eq!((tk, p, b), (t.clone(), plan.clone(), 1_500_000));
+            assert_eq!((tk, p, b), (t.clone(), plan.clone(), Some(1_500_000)));
             let earlier = w.ticket(&t).assignments.len() > 1;
             assert_eq!(rec, earlier);
             seen.push(rec);
@@ -690,7 +693,7 @@ fn c7_launch_carries_plan_budget_and_recovery_flag() {
         .approve(&t2, "slack", Actor::person("alice"))
         .unwrap();
     let l = launches(&w.effects());
-    assert_eq!((l.len(), l[0].3, l[0].4), (1, 9_000_000, false));
+    assert_eq!((l.len(), l[0].3, l[0].4), (1, Some(9_000_000), false));
 }
 
 // ---------- observation (passes; documents current behaviour) ----------

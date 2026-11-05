@@ -147,7 +147,7 @@ fn accept(budget: u64, rules: Vec<String>) -> Verdict {
             environment: None,
             method: None,
         },
-        budget_microusd: budget,
+        budget_microusd: Some(budget),
         acknowledge: Acknowledge::Silent,
         rules,
         repo: None,
@@ -207,7 +207,7 @@ fn f1a_resume_launches_over_threshold_without_approval() {
         .filter(|e| matches!(e, Effect::Launch { .. }))
         .collect();
     println!(
-        "threshold=1000000 budget={} approval={:?} launches={launched:?}",
+        "threshold=1000000 budget={:?} approval={:?} launches={launched:?}",
         w.mem().tickets[&ticket].mandate.budget_microusd,
         w.mem().tickets[&ticket].approval
     );

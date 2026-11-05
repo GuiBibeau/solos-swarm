@@ -169,7 +169,9 @@ pub struct Spending {
     pub account: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ticket: Option<TicketId>,
-    /// The Router's daily cap is in the config, not the Store.
+    /// What the account is capped at, if it is: a Ticket's from its Mandate,
+    /// the Router's from the config, not the Store. Without a cap, no spend
+    /// alert is raised for it.
     pub cap_microusd: Option<MicroUsd>,
     /// Spend from this time on counts.
     pub since_ms: Ms,
@@ -226,7 +228,7 @@ impl Snapshot {
         }
         let window = now.saturating_sub(limits.unavailable_within_ms);
         let router = Account::Router {
-            daily_microusd: known.router_daily_microusd.unwrap_or_default(),
+            daily_microusd: known.router_daily_microusd,
         };
         let (today, _) = router.allowance(now);
         let mut accounts = vec![Spending {
@@ -245,7 +247,7 @@ impl Snapshot {
                 charges: charges(store, &account.key(), 0)?,
                 account: account.key(),
                 ticket: Some(ticket.id.clone()),
-                cap_microusd: Some(ticket.mandate.budget_microusd),
+                cap_microusd: ticket.mandate.budget_microusd,
                 since_ms: 0,
             });
         }
@@ -973,7 +975,7 @@ mod tests {
                 rules: Vec::new(),
                 requester: Actor::person("alice"),
                 source: "slack".into(),
-                budget_microusd: 1_000_000,
+                budget_microusd: Some(1_000_000),
                 repo: None,
             },
             plan: Plan::Session {

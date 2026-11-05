@@ -91,7 +91,8 @@ pub struct Launch {
     /// The proactive rules the Router matched, for inferred work.
     pub rules: Vec<String>,
     pub plan: Plan,
-    pub budget_microusd: MicroUsd,
+    /// The Ticket's whole budget, or `None` where it has no cap.
+    pub budget_microusd: Option<MicroUsd>,
     /// The repository the Mandate names, which the worker's `/work` is a
     /// clone of.
     pub repo: Option<RepoName>,

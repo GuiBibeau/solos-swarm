@@ -175,7 +175,12 @@ impl Measure<'_> {
             }
         }
 
-        let mut accounts = vec![Account::Router { daily_microusd: 0 }.key()];
+        let mut accounts = vec![
+            Account::Router {
+                daily_microusd: None,
+            }
+            .key(),
+        ];
         accounts.extend(tickets.iter().map(|t| Account::ticket_key(&t.id)));
         let (mut model_calls, mut released_calls, mut spend_microusd) = (0, 0, 0);
         let mut tokens = Tokens::default();

@@ -75,7 +75,7 @@
           "budget_microusd": {
             "type": "integer",
             "minimum": 1,
-            "description": "accept: the Ticket's whole budget in microusd. Omit it for the default."
+            "description": "accept: the Ticket's whole budget in microusd. Omit it for the default. It is for a swarm: a session has a budget only where the operator sets one, and otherwise this is not used."
           },
           "acknowledge": {
             "type": "string",

@@ -102,8 +102,8 @@ const APPROVE: &str = ". When a call says a person must approve, end your turn: 
 back as new input.";
 
 /// The worker's system prompt: its instructions, the tools it was granted
-/// and its budget.
-pub fn system_prompt(budget_microusd: MicroUsd, tools: &[String]) -> String {
+/// and its budget, if it has one.
+pub fn system_prompt(budget_microusd: Option<MicroUsd>, tools: &[String]) -> String {
     let has = |name: &str| tools.iter().any(|tool| tool == name);
     let mut text = Vec::new();
     if has("run_code") {
@@ -130,9 +130,15 @@ pub fn system_prompt(budget_microusd: MicroUsd, tools: &[String]) -> String {
         }
         .to_owned(),
     );
+    let budget = match budget_microusd {
+        Some(budget) => format!(
+            "{budget} microusd for the whole ticket, shared with any earlier work on it. A \
+             model call past it is refused."
+        ),
+        None => "this ticket has no cap.".to_owned(),
+    };
     format!(
-        "{WORKER_INSTRUCTIONS}\n\nTools: {}\nBudget: {budget_microusd} microusd for the whole \
-         ticket, shared with any earlier work on it. A model call past it is refused.",
+        "{WORKER_INSTRUCTIONS}\n\nTools: {}\nBudget: {budget}",
         text.join(" ")
     )
 }
@@ -1159,7 +1165,7 @@ mod tests {
                 provider: Arc::new(Silent),
                 facts: facts.clone(),
                 decide: DecideTerms {
-                    default_budget_microusd: 1,
+                    default_budget_microusd: Some(1),
                     max_budget_microusd: None,
                     swarm: None,
                     repos: BTreeMap::new(),
@@ -1274,7 +1280,7 @@ mod tests {
                 environment: None,
                 method: None,
             },
-            budget_microusd: 500_000,
+            budget_microusd: Some(500_000),
             repo: None,
             recovery: false,
             inputs: Vec::new(),
@@ -1289,7 +1295,7 @@ mod tests {
     fn the_system_prompt_tells_of_the_browser_and_the_vault_only_where_they_are_granted() {
         let granted = |tools: &[&str]| {
             let tools: Vec<String> = tools.iter().map(|tool| (*tool).to_owned()).collect();
-            system_prompt(1_000, &tools)
+            system_prompt(Some(1_000), &tools)
         };
         let bare = granted(&["worker_report", "fetch_url"]);
         assert!(bare.contains(
@@ -1385,7 +1391,10 @@ mod tests {
 
     #[test]
     fn the_worker_is_told_to_answer_people_in_chat_not_to_file_a_report() {
-        let prompt = system_prompt(1_000, &["worker_report".to_owned(), "fetch_url".to_owned()]);
+        let prompt = system_prompt(
+            Some(1_000),
+            &["worker_report".to_owned(), "fetch_url".to_owned()],
+        );
         // Every rule a person would notice missing: the answer first, the
         // asker's tone and length, structure only when it helps, no pstack
         // bookkeeping, and no second introduction in a thread.

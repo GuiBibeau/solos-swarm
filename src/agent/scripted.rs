@@ -13,14 +13,15 @@ const TITLE_CHARS: usize = 72;
 /// Accepts an explicit candidate as one worker session, titled by its first
 /// line and scoped by its text; ignores the rest.
 pub struct ScriptedRouter {
-    budget_microusd: MicroUsd,
+    budget_microusd: Option<MicroUsd>,
     ignore_follow_ups: bool,
 }
 
 impl ScriptedRouter {
-    pub fn new(budget_microusd: MicroUsd) -> Self {
+    /// Its accepts name `budget_microusd`, or no budget when it is `None`.
+    pub fn new(budget_microusd: impl Into<Option<MicroUsd>>) -> Self {
         Self {
-            budget_microusd,
+            budget_microusd: budget_microusd.into(),
             ignore_follow_ups: false,
         }
     }

@@ -619,10 +619,6 @@ fn router_session(
     else {
         bail!("the router is not a pi router");
     };
-    let daily_microusd = config
-        .budgets
-        .router_daily_microusd
-        .context("a pi router needs budgets.router_daily_microusd")?;
     let upstream = upstream_profile(provider, model)?;
     let half_an_eval = Duration::from_millis(config.policy.eval_timeout_ms / 2);
     let dir = state_dir.join(ROUTER_DIR);
@@ -648,7 +644,9 @@ fn router_session(
     };
     let grant = Grant {
         principal: Principal::Router,
-        account: broker::Account::Router { daily_microusd },
+        account: broker::Account::Router {
+            daily_microusd: config.budgets.router_daily_microusd,
+        },
         terms: ModelTerms {
             upstream,
             prices: *prices,
