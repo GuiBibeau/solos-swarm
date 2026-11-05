@@ -124,14 +124,14 @@ gui     @solos open a PR that adds --json to `agent status` in GuiBibeau/solos-s
 solos   Add --json to agent status needs approval first: a pstack session on GuiBibeau/solos-swarm, $1.50. [Approve] [Stop]
 gui     [Approve]
 solos   On it: Add --json to agent status.
-solos   <worker text>   PR https://github.com/GuiBibeau/solos-swarm/pull/62 · head 9c2e4aa · opened
-solos   CI passed on GuiBibeau/solos-swarm#62 at 9c2e4aa.
-solos   Merge #62 into main? head 9c2e4aa · CI passed (1 check)               [Merge] [Don't merge]
+solos   <worker text>   PR https://github.com/GuiBibeau/solos-swarm/pull/75 · head 9c2e4aa · opened
+solos   CI passed on GuiBibeau/solos-swarm#75 at 9c2e4aa.
+solos   Merge #75 into main? head 9c2e4aa · CI passed (1 check)               [Merge] [Don't merge]
 gui     [Merge]
-solos   Merged #62 as 51d0b7c.
+solos   Merged #75 as 51d0b7c.
 ```
 
-Everything above the `PR` line is the worker's text. The Merge click is `Order::Merge` through Discord's own button. Typed "merge" never grants anything. gui could also approve #62 on GitHub instead of clicking; either one is a yes for that head.
+Everything above the `PR` line is the worker's text. The Merge click is `Order::Merge` through Discord's own button. Typed "merge" never grants anything. gui could also approve #75 on GitHub instead of clicking; either one is a yes for that head.
 
 ### (d) CI fails on the bot's PR
 
