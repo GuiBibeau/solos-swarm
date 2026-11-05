@@ -9,10 +9,17 @@ permissions:
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Debug info was most of the compile and link time of the 53 test binaries and of the size of target/ (and of the
+  # runner running out of disk). Panic messages carry their own file:line; backtraces keep function names.
+  CARGO_PROFILE_DEV_DEBUG: "0"
 jobs:
-  check:
+  # fmt + clippy. Nothing waits on it but the final `check`, so it runs beside the build.
+  lint:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249
@@ -20,18 +27,151 @@ jobs:
           toolchain: 1.96.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: 24.18.0
-          cache: 'npm'
-      - name: Verify pinned tokenizer assets
-        run: python3 scripts/bootstrap_tokenizers.py --output work/tokenizers
       - name: Rust format & clippy
         run: |
           cargo fmt --all -- --check
           cargo clippy --locked --all-targets -- -D warnings
-      - name: Rust tests
-        run: cargo test --locked -- --test-threads=1
+
+  # Compiles every test binary once and hands them to the shards as one archive.
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249
+        with:
+          toolchain: 1.96.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: nextest@0.9.140
+      - name: Build the test binaries
+        run: cargo nextest archive --locked --workspace --archive-file nextest-archive.tar.zst
+      # The archive goes to the shards through the cache, not as an artifact: measured on runners, restoring 400 MB
+      # took 3-10 s against 5-43 s to download the same bytes as an artifact. The key is per run and attempt.
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: nextest-archive.tar.zst
+          key: nextest-archive-${{ github.run_id }}-${{ github.run_attempt }}
+      # `cargo test` also ran doc tests, which nextest does not. There are none today (every crate reports 0), so
+      # this costs nothing; the day a doc comment has a code block, they run again.
+      - name: Doc tests, if any
+        run: |
+          if grep -rqE '^\s*//[/!]\s*```' src crates --include='*.rs'; then
+            cargo test --locked --workspace --doc
+          else
+            echo "no doc comment has a code block: no doc tests"
+          fi
+
+  # The pinned tokenizer assets come from huggingface.co. This job fetches them, once per change of the pin; the
+  # shards restore them from the cache, so no shard depends on huggingface being up.
+  tokenizers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: work/tokenizers
+          key: tokenizers-${{ hashFiles('scripts/bootstrap_tokenizers.py', 'assets/tokenizers/**') }}
+      - name: Verify pinned tokenizer assets
+        run: python3 scripts/bootstrap_tokenizers.py --output work/tokenizers
+
+  test:
+    needs: [build, tokenizers]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.18.0
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: nextest@0.9.140
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: work/tokenizers
+          key: tokenizers-${{ hashFiles('scripts/bootstrap_tokenizers.py', 'assets/tokenizers/**') }}
+          fail-on-cache-miss: true
+      - name: Verify pinned tokenizer assets
+        run: python3 scripts/bootstrap_tokenizers.py --output work/tokenizers
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: nextest-archive.tar.zst
+          key: nextest-archive-${{ github.run_id }}-${{ github.run_attempt }}
+          # "Re-run failed jobs" starts attempt 2 without re-running `build`: take attempt 1's archive.
+          restore-keys: nextest-archive-${{ github.run_id }}-
+          fail-on-cache-miss: true
+      - name: Rust tests (shard ${{ matrix.shard }} of ${{ strategy.job-total }})
+        run: >
+          cargo nextest run --archive-file nextest-archive.tar.zst --extract-to . --extract-overwrite
+          --workspace-remap . --profile ci --partition count:${{ matrix.shard }}/${{ strategy.job-total }}
+
+  # Three raft tests assert on the wall clock and fail when other tests share the runner, and the archive test is
+  # the slowest left (see .config/nextest.toml). They run one at a time, one to a runner, beside the shards: the
+  # condition they had in the serial run. nextest numbers a partition within each test binary and all four are in
+  # the library's, so `count:N/4` hands each job exactly one.
+  test-isolated:
+    needs: [build, tokenizers]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.18.0
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: nextest@0.9.140
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: work/tokenizers
+          key: tokenizers-${{ hashFiles('scripts/bootstrap_tokenizers.py', 'assets/tokenizers/**') }}
+          fail-on-cache-miss: true
+      - name: Verify pinned tokenizer assets
+        run: python3 scripts/bootstrap_tokenizers.py --output work/tokenizers
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: nextest-archive.tar.zst
+          key: nextest-archive-${{ github.run_id }}-${{ github.run_attempt }}
+          # "Re-run failed jobs" starts attempt 2 without re-running `build`: take attempt 1's archive.
+          restore-keys: nextest-archive-${{ github.run_id }}-
+          fail-on-cache-miss: true
+      # Nothing may fall between the shards and these jobs. The `ci` profile's default filter and `ci-isolated`'s
+      # are complements; if a rename made one stop matching, a test would silently stop running. This fails instead.
+      - name: The shards and the isolated tests together list every test, once
+        if: ${{ matrix.part == 3 }}
+        run: |
+          count() {
+            cargo nextest list --archive-file nextest-archive.tar.zst --extract-to . --extract-overwrite \
+              --workspace-remap . --profile "$1" --message-format oneline 2>/dev/null | wc -l
+          }
+          all=$(count default); shards=$(count ci); isolated=$(count ci-isolated)
+          echo "tests: $all; in the shards: $shards; isolated: $isolated"
+          [ "$isolated" -eq 4 ] && [ $((shards + isolated)) -eq "$all" ]
+      - name: Isolated Rust tests (${{ matrix.part }} of ${{ strategy.job-total }})
+        run: >
+          cargo nextest run --archive-file nextest-archive.tar.zst --extract-to . --extract-overwrite
+          --workspace-remap . --profile ci-isolated --partition count:${{ matrix.part }}/${{ strategy.job-total }}
+
+  scripts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.18.0
+          cache: 'npm'
       - name: Python tests
         run: |
           python3 -m venv work/dashboard-python
@@ -41,3 +181,19 @@ jobs:
         run: node --test tests/dashboard-*.test.mjs
       - name: Node broker & MVP tests
         run: npm ci --ignore-scripts --no-audit --no-fund && npm run test:broker
+
+  # The one result to watch (and to require in branch protection): green only when every job above is.
+  check:
+    if: ${{ always() }}
+    needs: [lint, build, tokenizers, test, test-isolated, scripts]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Every job passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "job results: $RESULTS"
+          for result in $RESULTS; do
+            [ "$result" = success ] || { echo "a job did not pass"; exit 1; }
+          done

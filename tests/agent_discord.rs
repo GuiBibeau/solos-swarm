@@ -981,6 +981,14 @@ fn by_id<'a>(triggers: &'a [Trigger], id: &str) -> &'a Trigger {
         .unwrap_or_else(|| panic!("no trigger {id}"))
 }
 
+async fn until_settled(scratch: &Scratch) {
+    until_some("every queued effect to be done", || {
+        let effects = scratch.store().effects().unwrap();
+        (!effects.is_empty() && effects.iter().all(|q| q.done)).then_some(())
+    })
+    .await;
+}
+
 async fn until_triggers(scratch: &Scratch, n: usize) {
     tokio::time::timeout(LIMIT, async {
         while scratch.store().triggers().unwrap().len() < n {
@@ -1490,7 +1498,11 @@ async fn a_request_is_answered_as_a_reply_with_a_nonce_and_no_mentions() {
             "MESSAGE_CREATE",
             mention(CHAN, &m1, &alice(), "draft the release notes"),
         );
-        fake.until_posts(2).await
+        let posts = fake.until_posts(2).await;
+        // Discord has the second post when its request arrives; the agent marks the send done once the
+        // response is in. Stopping the run before that leaves the effect queued, which is not what is asserted.
+        until_settled(&scratch).await;
+        posts
     };
 
     let (summary, posts) = drive(serving(&fake, &scratch, BUDGET).runtime(), driver).await;

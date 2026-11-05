@@ -567,12 +567,16 @@ impl Harness {
                         .contains("__valid_receipt_invalid_choice__");
                     let missing_usage = body.to_string().contains("__missing_receipt_usage__");
                     let delayed = body.to_string().contains("__delayed_receipt__");
+                    let long_delayed = body.to_string().contains("__long_delayed_receipt__");
                     seen.lock().await.push(body);
                     if lost {
                         return;
                     }
                     if delayed {
                         tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                    if long_delayed {
+                        tokio::time::sleep(Duration::from_millis(1200)).await;
                     }
                     let mut response = json!({"id":format!("receipt-{}",uuid::Uuid::new_v4()),"object":"chat.completion","model":"m1","choices":[{"index":0,"message":{"role":"assistant","content":"synthetic answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":3}});
                     if malformed {

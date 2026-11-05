@@ -1849,16 +1849,16 @@ async fn concurrent_claims_and_paid_receipt_cross_second_without_backwards_audit
             .0,
         200
     );
-    // Keep the real network receipt in flight across the next wall-clock second.
-    let fraction = crate::cluster::now_ms() % 1000;
-    let wait = if fraction <= 800 {
-        800 - fraction
-    } else {
-        1800 - fraction
-    };
-    tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+    // Keep the real network receipt in flight across a wall-clock second. The upstream holds this one for 1.2 s,
+    // so a second always ticks over while it is in flight, wherever in the second the request is admitted and
+    // however long admission takes. (Aiming at the clock before sending, with the 0.5 s hold, passed only while
+    // admission was slow enough to land the flow's opening in the next second: faster, it never crossed.)
     let started_ms = crate::cluster::now_ms();
-    let model = h.send("clock-model", "/model", inference("__delayed_receipt__"));
+    let model = h.send(
+        "clock-model",
+        "/model",
+        inference("__long_delayed_receipt__"),
+    );
     let claims = async {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while h.upstream.lock().await.is_empty() {

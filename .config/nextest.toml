@@ -1,0 +1,45 @@
+# cargo-nextest settings. CI builds the test binaries once (`cargo nextest archive`) and runs them across a
+# matrix of shards (`--partition count:N/M`); see .github/workflows/ci.yml. Locally: `cargo nextest run`.
+#
+# nextest runs every test in its own process. The in-process shared state `cargo test` has between tests of one
+# binary (statics, the working directory, the environment) cannot leak, so tests do not have to run one at a
+# time the way `cargo test -- --test-threads=1` ran them.
+
+[profile.default]
+# One failure does not hide the others: a PR sees every test it broke in one run.
+fail-fast = false
+
+[profile.ci]
+fail-fast = false
+# Every test, with its time, in the log.
+status-level = "pass"
+final-status-level = "slow"
+# A test that hangs is killed after 5 minutes (the slowest healthy test takes under a minute) instead of
+# holding the shard until the job's timeout.
+slow-timeout = { period = "60s", terminate-after = 5 }
+# The shards run everything except the four tests below, which run in `ci-isolated`.
+default-filter = 'not (test(/^cluster::tests::(actual_raft_over_mtls_quic|expired_three_voter|signed_checkpoint)/) | test(/^qa::tests::large_observation/))'
+
+# The slowest test left in the shards is plain CPU work (a seeded SQLite walk) with nothing timed in it. Starting it
+# first keeps it from being what a shard waits for at its end.
+[[profile.ci.overrides]]
+filter = 'test(sqlite_store_matches_memory_store_on_seeded_walks)'
+priority = 100
+
+# Three raft tests assert on the wall clock and fail when the machine is busy with other tests, not when the code
+# is wrong: heartbeats every 200 ms, elections within 800-1400 ms, certificates that live 4 s. On a runner shared
+# with three other tests they failed in measured runs (see the PR), and one took 34 s instead of 0.2 s. Run one
+# at a time on a runner of their own, which is the condition `cargo test -- --test-threads=1` gave them, they
+# pass. They are also the slowest tests in the suite (one waits out several elections: 45 s), so taking them out
+# of the shards is what lets the shards finish quickly.
+#
+# The fourth is the archive test: hashing and sealing 33 MB. It takes 25-65 s depending on what shares its runner,
+# more than any other test that is left, so it too gets a runner to itself instead of ending a shard late.
+#
+# CI runs this profile in four jobs (see `test-isolated` in ci.yml). The expression is the complement of `ci`'s
+# `default-filter` above; the workflow checks that the two profiles together list exactly the tests the default
+# profile lists.
+[profile.ci-isolated]
+inherits = "ci"
+test-threads = 1
+default-filter = 'test(/^cluster::tests::(actual_raft_over_mtls_quic|expired_three_voter|signed_checkpoint)/) | test(/^qa::tests::large_observation/)'
