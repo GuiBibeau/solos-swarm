@@ -145,7 +145,7 @@ jobs:
       # Nothing may fall between the shards and these jobs. The `ci` profile's default filter and `ci-isolated`'s
       # are complements; if a rename made one stop matching, a test would silently stop running. This fails instead.
       - name: The shards and the isolated tests together list every test, once
-        if: ${{ matrix.part == 4 }}
+        if: ${{ matrix.part == 3 }}
         run: |
           count() {
             cargo nextest list --archive-file nextest-archive.tar.zst --extract-to . --extract-overwrite \

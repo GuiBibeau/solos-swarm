@@ -72,7 +72,7 @@ See [CHANGELOG.md](CHANGELOG.md) for what changed and when.
 # Build and verify contracts
 python3 scripts/bootstrap_tokenizers.py --output work/tokenizers
 cargo build --locked --release
-cargo test --locked -- --test-threads=1
+cargo test --locked -- --test-threads=1   # CI runs the same tests through cargo-nextest (.config/nextest.toml), in parallel
 python3 -m unittest discover -s tests -p 'test_*.py'
 npm ci --ignore-scripts --no-audit --no-fund && npm run test:broker
 ```
