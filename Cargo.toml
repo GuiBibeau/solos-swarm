@@ -97,3 +97,55 @@ workspace = true
 
 [profile.release]
 strip = true
+
+# The tests spend their CPU in these crates (hashing, sealing and signing evidence, SQLite, JSON), which a debug
+# build runs 10-50x slower than it needs to: the 33 MB archive test took 40 s, and a sealed store, an audit chain
+# or a signed raft entry costs milliseconds each. Optimising just them (not wasmtime and cranelift, which would
+# add minutes to every cold build) roughly halves the CPU time of the suite. Debug assertions and overflow checks
+# stay on, so what the tests check does not change.
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.digest]
+opt-level = 3
+[profile.dev.package.block-buffer]
+opt-level = 3
+[profile.dev.package.crypto-common]
+opt-level = 3
+[profile.dev.package.generic-array]
+opt-level = 3
+[profile.dev.package.subtle]
+opt-level = 3
+[profile.dev.package.zeroize]
+opt-level = 3
+[profile.dev.package.aes]
+opt-level = 3
+[profile.dev.package.aes-gcm]
+opt-level = 3
+[profile.dev.package.cipher]
+opt-level = 3
+[profile.dev.package.ctr]
+opt-level = 3
+[profile.dev.package.ghash]
+opt-level = 3
+[profile.dev.package.polyval]
+opt-level = 3
+[profile.dev.package.ed25519]
+opt-level = 3
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+[profile.dev.package.crypto-bigint]
+opt-level = 3
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+[profile.dev.package.rsa]
+opt-level = 3
+[profile.dev.package.ring]
+opt-level = 3
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3
+[profile.dev.package.rusqlite]
+opt-level = 3
+[profile.dev.package.serde_json]
+opt-level = 3
