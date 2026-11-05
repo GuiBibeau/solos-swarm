@@ -1391,7 +1391,10 @@ mod tests {
 
     #[test]
     fn the_worker_is_told_to_answer_people_in_chat_not_to_file_a_report() {
-        let prompt = system_prompt(Some(1_000), &["worker_report".to_owned(), "fetch_url".to_owned()]);
+        let prompt = system_prompt(
+            Some(1_000),
+            &["worker_report".to_owned(), "fetch_url".to_owned()],
+        );
         // Every rule a person would notice missing: the answer first, the
         // asker's tone and length, structure only when it helps, no pstack
         // bookkeeping, and no second introduction in a thread.
