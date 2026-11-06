@@ -7,3 +7,4 @@ next-env.d.ts
 .env*.local
 # The repository's root ignore file has .env*; the example is the one that is committed.
 !.env.example
+.vercel
