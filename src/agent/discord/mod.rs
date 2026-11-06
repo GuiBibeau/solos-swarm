@@ -265,6 +265,15 @@ impl DiscordApi {
             .await
     }
 
+    /// Read `channel`, which proves the network, the bot token and the bot's
+    /// access to it, and sends nothing. `agent health` asks it before it
+    /// depends on a post.
+    pub(crate) async fn get_channel(&self, channel: &str) -> Result<Reply> {
+        let request = self.http.get(self.url(&["channels", channel])?);
+        self.call("GET /channels/{id}", self.authorize(request)?)
+            .await
+    }
+
     /// Acknowledge a click with DEFERRED_UPDATE_MESSAGE, which leaves the
     /// message as it is. The interaction's own token is the credential, so
     /// the bot token stays out of the call.

@@ -4,11 +4,15 @@
 //! actor is the operator, so the Policy names it `mcp:<operator>` and admits
 //! it, or not, as it would a Slack person.
 
-use super::jsonl::JsonlChannel;
+use super::jsonl::{Cursor, JsonlChannel};
 use super::links::TicketLinks;
-use super::ports::{BoxFuture, Channel, SendOptions, SendOutcome};
+use super::ports::{
+    BoxFuture, Channel, Command, Fact, FactSink, Order, SendOptions, SendOutcome, Source,
+    TriggerSink,
+};
+use crate::broker::now_ms;
 use anyhow::{Context, Result, ensure};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use solos_agent_core::model::{
     Actor, Addressed, ChannelRef, MessageId, MessageKind, Ms, OutboundMessage, ThreadKey, TicketId,
     Trigger, TriggerId,
@@ -17,12 +21,23 @@ use std::collections::BTreeMap;
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// The Triggers' source, and the source the `mcp` channel serves.
 pub const SOURCE: &str = "mcp";
 const DIR: &str = "mcp";
 const INBOX: &str = "inbox.jsonl";
 const OUTBOX: &str = "outbox.jsonl";
+/// An operator's orders about a Ticket, which are Commands, never message
+/// text: the Router does not read them.
+const COMMANDS: &str = "commands.jsonl";
+/// An order older than this when the agent reads it is not applied, so a
+/// restart does not carry out last week's, and the operator who filed one
+/// while the agent was down is told to file it again.
+pub const COMMAND_TTL_MS: Ms = 10 * 60 * 1_000;
+/// The longest reason an operator gives for a stop.
+pub const REASON_CHARS: usize = 500;
+const POLL: Duration = Duration::from_millis(250);
 /// The longest operator or thread name.
 const NAME_CHARS: usize = 64;
 pub const REQUEST_CHARS: usize = 16_000;
@@ -35,6 +50,10 @@ pub fn inbox(state_dir: &Path) -> PathBuf {
 
 pub fn outbox(state_dir: &Path) -> PathBuf {
     state_dir.join(DIR).join(OUTBOX)
+}
+
+pub fn commands(state_dir: &Path) -> PathBuf {
+    state_dir.join(DIR).join(COMMANDS)
 }
 
 /// Create the directory both files live in, private like the state
@@ -54,6 +73,20 @@ pub fn open_dir(state_dir: &Path) -> Result<()> {
 pub fn open_inbox(state_dir: &Path) -> Result<PathBuf> {
     open_dir(state_dir)?;
     let path = inbox(state_dir);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("cannot create {}", path.display()))?;
+    Ok(path)
+}
+
+/// The commands file `agent serve` reads, created if missing. Only `agent
+/// serve` creates it, like the inbox.
+pub fn open_commands(state_dir: &Path) -> Result<PathBuf> {
+    open_dir(state_dir)?;
+    let path = commands(state_dir);
     std::fs::OpenOptions::new()
         .append(true)
         .create(true)
@@ -183,6 +216,166 @@ pub fn file(
         trigger: trigger.id,
         thread,
     })
+}
+
+/// What an operator orders about a Ticket.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "order", rename_all = "snake_case")]
+pub enum OperatorOrder {
+    /// Stop it, as a person's Stop does.
+    Stop { reason: String },
+}
+
+/// A line of the commands file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorCommand {
+    /// Unique, so a replayed line has the same reply.
+    pub id: String,
+    pub at_ms: Ms,
+    pub operator: String,
+    /// Where the Engine's answer is posted: the `mcp` Channel's outbox.
+    pub thread: String,
+    pub ticket: TicketId,
+    #[serde(flatten)]
+    pub order: OperatorOrder,
+}
+
+impl OperatorCommand {
+    /// The Command the Engine is asked, from `mcp:<operator>`.
+    pub fn command(&self) -> Command {
+        Command {
+            id: format!("{SOURCE}:{}", self.id),
+            order: match &self.order {
+                OperatorOrder::Stop { reason } => Order::StopBecause(reason.clone()),
+            },
+            ticket: self.ticket.clone(),
+            source: SOURCE.into(),
+            by: Actor::person(&self.operator),
+            reply_to: reply_to(&self.operator, &self.thread),
+        }
+    }
+}
+
+/// A command in the commands file.
+#[derive(Debug, Serialize)]
+pub struct FiledCommand {
+    pub id: String,
+    pub thread: String,
+}
+
+/// Append an order to stop `ticket`, from `operator`, to the commands file.
+/// The Policy decides whether `mcp:<operator>` may; the answer comes back on
+/// the returned thread.
+pub fn file_stop(
+    state_dir: &Path,
+    operator: &str,
+    ticket: &TicketId,
+    reason: &str,
+    now: Ms,
+) -> Result<FiledCommand> {
+    ensure!(valid_name(operator), "operator {operator:?} is not a name");
+    let reason = reason.trim();
+    ensure!(!reason.is_empty(), "a stop needs a reason");
+    ensure!(
+        reason.chars().count() <= REASON_CHARS,
+        "a reason is at most {REASON_CHARS} characters"
+    );
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let command = OperatorCommand {
+        id: id.clone(),
+        at_ms: now,
+        operator: operator.to_owned(),
+        thread: format!("stop-{}", &id[..12]),
+        ticket: ticket.clone(),
+        order: OperatorOrder::Stop {
+            reason: reason.to_owned(),
+        },
+    };
+    let path = commands(state_dir);
+    let mut file = match std::fs::OpenOptions::new().append(true).open(&path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => anyhow::bail!(
+            "no agent reads operator commands in {}: its agent.yaml needs `sources: [{{kind: mcp}}]` \
+             and `channels: [{{kind: mcp}}]`, and `agent serve` creates {} when it starts",
+            state_dir.display(),
+            path.display()
+        ),
+        Err(err) => return Err(err).with_context(|| format!("cannot open {}", path.display())),
+    };
+    let mut line = serde_json::to_vec(&command)?;
+    line.push(b'\n');
+    // The whole line in one append, as the inbox's.
+    file.write_all(&line)
+        .and_then(|()| file.sync_data())
+        .with_context(|| format!("cannot write {}", path.display()))?;
+    Ok(FiledCommand {
+        id,
+        thread: command.thread,
+    })
+}
+
+/// The `mcp` Source's second file: operator commands, sent to the runtime as
+/// [`Fact::Command`], so the Engine and the Policy decide them as they decide
+/// a person's click on a Stop button.
+pub struct CommandSource {
+    path: PathBuf,
+    follow: bool,
+    clock: fn() -> Ms,
+}
+
+impl CommandSource {
+    pub fn new(path: impl Into<PathBuf>, follow: bool) -> Self {
+        Self {
+            path: path.into(),
+            follow,
+            clock: now_ms,
+        }
+    }
+
+    /// Whether the line is fit to apply now: a name the Channel can answer
+    /// on, and not stale.
+    fn admit(&self, found: &OperatorCommand) -> bool {
+        if !valid_name(&found.operator) || !valid_name(&found.thread) {
+            eprintln!(
+                "agent: operator command {} names an operator or thread that is not a name, skipped",
+                found.id
+            );
+            return false;
+        }
+        let age = (self.clock)().saturating_sub(found.at_ms);
+        if age > COMMAND_TTL_MS {
+            eprintln!(
+                "agent: operator command {} for {} is {} s old, not applied: file it again",
+                found.id,
+                found.ticket,
+                age / 1_000
+            );
+            return false;
+        }
+        true
+    }
+}
+
+impl Source for CommandSource {
+    fn run(self: Box<Self>, _: TriggerSink, facts: FactSink) -> BoxFuture<'static, Result<()>> {
+        Box::pin(async move {
+            let mut cursor = Cursor::default();
+            loop {
+                let batch: Vec<OperatorCommand> = cursor
+                    .read(&self.path, !self.follow, "operator command")
+                    .await?;
+                for found in batch.iter().filter(|found| self.admit(found)) {
+                    if facts.send(Fact::Command(found.command())).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                if !self.follow {
+                    return Ok(());
+                }
+                tokio::time::sleep(POLL).await;
+            }
+        })
+    }
 }
 
 #[derive(Debug, Serialize)]

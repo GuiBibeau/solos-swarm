@@ -1,0 +1,12 @@
+# Runs solos-agent-health.service every three minutes, from two minutes after boot. OnUnitActiveSec counts from each
+# start, not from a success, so a failing check (which is the point of it) is run again just the same.
+[Unit]
+Description=solos-swarm agent mode: run the health check every few minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=3min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

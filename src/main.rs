@@ -234,6 +234,87 @@ enum AgentCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Check the agent from outside it, so someone hears when `agent serve`
+    /// itself is down: the unit is active and not restart-looping, the broker
+    /// socket answers `GET /api/hello`, the state directory's disk has room
+    /// (below `health.min_free_gb` it pauses new work by writing `PAUSE`, and
+    /// lifts that pause again once space returns), and the bot token can
+    /// reach the Watchdog's Discord channel. A failure posts once per
+    /// incident to that channel with no help from serve. Exits 1 while
+    /// anything fails. systemd runs it from a timer.
+    Health {
+        /// The agent's `agent.yaml`: the Watchdog's channel and `health`.
+        #[arg(long)]
+        config: PathBuf,
+        /// The agent's state directory.
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// The systemd user unit to ask about.
+        #[arg(long, default_value = "solos-agent")]
+        unit: String,
+        /// The Discord bot token, read (and not deleted: the unit's copy
+        /// goes with its runtime directory). Without it nothing is posted
+        /// and the Discord check is skipped.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+        /// Check and print, and change nothing: no post, no pause, no state.
+        #[arg(long)]
+        dry_run: bool,
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Take back the disk finished work leaves: for Tickets that ended more
+    /// than `--keep-days` ago, the worker's clone (`tickets/<id>/work`) and
+    /// transcripts; the forge mirrors not fetched into for that long; the
+    /// Router's old transcripts. Never an open Ticket, `agent.db`, or (unless
+    /// `--include-trail`) the trail's blobs. Prints what it frees. Opens the
+    /// Store read-only, so it is safe while the agent serves.
+    Prune {
+        /// The agent's state directory.
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// Prune what ended or was last used longer ago than this. At least 1.
+        #[arg(long)]
+        keep_days: u64,
+        /// Print what would be removed and remove nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Also remove those Tickets' trail blobs, which `agent trail` needs
+        /// to check their browser steps. With `--config`, where its
+        /// `trail.path` says.
+        #[arg(long)]
+        include_trail: bool,
+        /// agent.yaml, for `trail.path` when `--include-trail` is given.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop a Ticket as a person's Stop does, through the running agent: the
+    /// command is filed as `mcp:OPERATOR`, so `policy.people` or
+    /// `policy.approvers` must name that principal, and the Engine applies it
+    /// or refuses it. Prints the agent's answer. Exits 0 once the Ticket is
+    /// stopped, 1 if the agent refused, 2 if it did not answer in time.
+    Stop {
+        /// The agent's state directory (its `kind: mcp` Source must be
+        /// configured and `agent serve` running).
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// The `mcp:<operator>` the Policy is asked about.
+        #[arg(long)]
+        operator: String,
+        /// The Ticket to stop.
+        #[arg(long)]
+        ticket: String,
+        /// Why; kept in the Ticket's end reason.
+        #[arg(long)]
+        reason: String,
+        /// How long to wait for the agent's answer.
+        #[arg(long, default_value_t = 20)]
+        wait_secs: u64,
+    },
     /// Publish the agent's tickets to its web dashboard: a sidecar that opens
     /// the Store read-only, builds a JSON snapshot of each open and recently
     /// ended Ticket, and uploads the ones whose content changed to the
@@ -845,6 +926,91 @@ async fn execute(command: Action) -> Result<()> {
                 print!("{}", status::render(&report));
             }
             Ok(())
+        }
+        Action::Agent {
+            command:
+                AgentCommand::Health {
+                    config,
+                    state_dir,
+                    unit,
+                    token_file,
+                    dry_run,
+                    json,
+                },
+        } => {
+            use solos_swarm::agent::health;
+            let args = health::Args {
+                config,
+                state_dir,
+                unit,
+                token_file,
+                dry_run,
+            };
+            let report = health::check(&args, broker::now_ms()).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", health::render(&report));
+            }
+            if !report.ok {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Action::Agent {
+            command:
+                AgentCommand::Prune {
+                    state_dir,
+                    keep_days,
+                    dry_run,
+                    include_trail,
+                    config,
+                    json,
+                },
+        } => {
+            use solos_swarm::agent::{AgentConfig, prune};
+            ensure!(
+                config.is_none() || include_trail,
+                "--config only tells --include-trail where the trail is"
+            );
+            let mut options = prune::Options::new(&state_dir, keep_days);
+            options.dry_run = dry_run;
+            options.include_trail = include_trail;
+            if let Some(config) = config.as_deref() {
+                options.trail_root = Some(AgentConfig::load(config)?.trail.root(&state_dir));
+            }
+            let report = prune::run(&options, broker::now_ms())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", prune::render(&report));
+            }
+            prune::check(&report)
+        }
+        Action::Agent {
+            command:
+                AgentCommand::Stop {
+                    state_dir,
+                    operator,
+                    ticket,
+                    reason,
+                    wait_secs,
+                },
+        } => {
+            use solos_swarm::agent::stop;
+            let args = stop::Args {
+                state_dir,
+                operator,
+                ticket: ticket.clone(),
+                reason,
+                wait: Duration::from_secs(wait_secs),
+            };
+            let outcome = stop::run(&args).await?;
+            println!("{}", outcome.render(&ticket));
+            match outcome.exit_code() {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
         }
         Action::Agent {
             command:

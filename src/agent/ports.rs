@@ -274,6 +274,9 @@ pub enum Order {
     Approve,
     /// Stop the Ticket for good.
     Stop,
+    /// [`Order::Stop`], with the reason the person gave, which goes into the
+    /// Ticket's end reason. An operator's `agent stop` is one.
+    StopBecause(String),
     /// Allow or deny one vault item for the Ticket.
     Secret { secret: SecretId, allow: bool },
 }

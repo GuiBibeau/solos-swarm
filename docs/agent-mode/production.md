@@ -8,7 +8,7 @@ switches releases from the Mac. Everything on the box is under `~/agent`:
 | `releases/<sha>/` | One immutable build of a commit: `bin/solos-swarm`, `node_modules`, `extensions`, `vendor/pstack`. Read-only. The newest five are kept, plus current and previous. |
 | `current`, `previous` | Links to the release that serves and the one before it. `--pi-root` is `current`. |
 | `agent.yaml` | The production config. It is not in git. |
-| `state/` | `agent.db`, `tickets/`, `router/`, `forge/`, `trail/`, `mcp/`, the broker socket. Kept across releases. |
+| `state/` | `agent.db`, `tickets/`, `router/`, `forge/`, `trail/`, `mcp/`, the broker socket, and the operator's files: `health-state.json`, `health-hold`, `PAUSE`, `control.json`. Kept across releases; finished work is pruned daily ([Pruning state](#pruning-state-and-the-disk-floor)). |
 | `tokens/` | One file per one-use credential, mode 0600: `model.key` (the DeepSeek key), `discord-token`, `github-app.pem` (the GitHub App's private key), and `vercel-blob-token` (the dashboard publisher's, see [Dashboard](#dashboard)). |
 | `backups/` | `agent.db` copied before every deploy and rollback, while the agent is stopped. The newest twenty are kept. |
 | `target/` | The cargo build cache. |
@@ -21,26 +21,58 @@ directory. The tokens rest unencrypted at mode 0600 in the agent user's home, li
 ## Commands (from the Mac, in the repository)
 
 ```sh
-scripts/agent-deploy deploy            # build origin/main, back up agent.db, switch, restart, wait until healthy
+scripts/agent-deploy deploy            # build origin/main, drain, back up agent.db, switch, restart, wait until healthy
 scripts/agent-deploy deploy <rev>      # any commit, branch or tag
 scripts/agent-deploy rollback          # back to the previous release
-scripts/agent-deploy status            # the unit, its release, `agent status` (open Tickets, spend, alerts), and the dashboard publisher
+scripts/agent-deploy status            # the unit, its release, `agent status` (open Tickets, spend, alerts), the health check and prune timers, and the dashboard publisher
 scripts/agent-deploy logs              # the last 100 log lines; `logs -f` follows, `logs --since 1h`
 scripts/agent-deploy publish-logs      # the same for the dashboard publisher, when there is one
+scripts/agent-deploy health-logs       # the same for the health check
+scripts/agent-deploy prune-logs        # the same for the daily prune: its last line says what it freed
 scripts/agent-deploy restart           # also: start, stop, releases
+scripts/agent-deploy deploy --drain 300   # wait up to 5 minutes for running work to reach a Report (default 90 s)
+scripts/agent-deploy rollback --no-drain  # stop at once; for an emergency
 pbpaste | scripts/agent-deploy token discord-token   # store or rotate a token, then restart
 scripts/agent-deploy token github-app.pem < ~/Downloads/<name>.<date>.private-key.pem   # the GitHub App's key
 ```
 
 A deploy builds on the box with the pinned toolchain (`cargo build --locked`, `npm ci`), runs `doctor` on the new
-release, refuses to build with less than 30 GB free, then stops the agent, copies `agent.db`, switches `current`,
-installs the unit file from the release and starts it. Healthy means the unit is active with its broker socket and
-keeps the same process for 20 s. If the new release does not get there, the deploy switches back to the previous
-release, restores the `agent.db` it copied (a new release may have migrated it), starts that and exits 1.
+release, refuses to build with less than 30 GB free, drains the agent (below), stops it, copies `agent.db`, switches
+`current`, installs the unit files from the release and starts it. Healthy means the unit is active with its broker
+socket and keeps the same process for 20 s. If the new release does not get there, the deploy switches back to the
+previous release, restores the `agent.db` it copied (a new release may have migrated it), starts that and exits 1.
 
-**What a deploy does to work in flight.** Stopping kills the workers; the next start ends each lost Assignment as
-`host restarted` and starts a recovery Assignment that is told to check `/work` before repeating anything. A Discord
-message sent during the few seconds the agent is down is lost (a new Gateway session does not replay).
+### Draining on deploy
+
+`deploy`, `rollback`, `restart` and `stop` drain before they stop the unit:
+
+1. They write `state/control.json` as `{"mode":"pause","by":"agent-deploy",...}`, the pause gate `PAUSE` also is. The agent
+   starts no new Eval and performs no Effect, and the broker answers every worker's next model call with the pause
+   reply, so each worker finishes the call it is in and then waits.
+2. They ask `agent status --json` of the running release every 3 seconds, for up to 90 seconds, until each Assignment
+   that was running when the pause began has sent a Report (any status: a Report is a turn boundary the Store holds) or
+   has ended.
+3. They stop the unit and carry on as before. When the new release is healthy they remove `control.json`, but only a file
+   marked `"by":"agent-deploy"`: a pause a person wrote is never replaced or lifted. The agent that starts next after a
+   `stop` starts unpaused.
+
+Trade-offs, so nobody is surprised:
+
+- **It narrows the loss, it does not remove it.** A worker that is partway through a long tool call (a build, a test run)
+  does not reach a boundary in 90 seconds and is killed by the stop, as before; it recovers on the next start as `host
+  restarted` and is told to check `/work` before repeating anything. A drain that times out says how many Assignments were
+  still mid-turn and stops anyway: a deploy never waits forever.
+- **A deploy costs up to the drain time more.** The build happens before the drain, so the agent is paused from the
+  drain until the new release is healthy: the drain time, the restart, and 20 seconds. `--drain SECONDS` (or
+  `AGENT_DRAIN_SECS`) changes the wait; `--no-drain` skips it. Use `--no-drain` for an emergency rollback.
+- **Messages still arrive.** While paused the Sources keep reading and storing; they are judged after the pause lifts. A
+  Discord message sent during the few seconds the agent is down is lost (a new Gateway session does not replay).
+- **The pause is the same switch an operator has**, so `agent status` shows `pause: held by control.json (mode pause)`
+  during a drain, and the Watchdog's own pause alert (after an hour) would fire for a drain that was left behind. If a
+  deploy fails and the agent that is running was left paused, the script says so: look at `~/agent/state/control.json`
+  and, once the agent is right, `rm` it (it names `"by":"agent-deploy"` when it is the drain's).
+- **It uses only what every release has**: `agent status --json` of the release that is running, so the first deploy that
+  contains this already drains.
 
 **Rollback and the schema.** A release that migrated `agent.db` to a newer schema cannot be rolled back to a binary
 that knows only the older one: the older binary refuses the file and `rollback` says so. Then stop the agent, copy
@@ -83,9 +115,14 @@ pstack: {}
 #   budgets: {session_microusd: 500000, router_daily_microusd: 3000000}
 # and see "Budgets" in README.md.
 watchdog:
-  operator: {source: discord, address: {channel: <a channel id you read>}}
+  operator: {source: discord, address: {channel: <a channel id you read>}}   # also where the health check posts
   every: 1m
+health:
+  min_free_gb: 50        # below this much free space on the state directory's disk: pause new work and alert
 ```
+
+`mcp:<your name>` in `policy.people` is what lets you stop a Ticket from the box ([below](#stopping-a-ticket-by-hand)).
+`health:` is optional; its defaults are in [Pruning state and the disk floor](#pruning-state-and-the-disk-floor).
 
 ### GitHub
 
@@ -242,9 +279,136 @@ agent does not hold.
 Blob operations are billed (a put is an "advanced operation"). A working ticket changes its snapshot with each report and
 each reply, so a busy hour is tens of puts; an idle day is about 290.
 
+## Alerts from outside the agent
+
+The Watchdog runs inside `agent serve`, so it cannot say that serve itself is down or crash-looping. Two more units do:
+
+- `solos-agent-health.timer` runs `solos-agent-health.service` (`solos-swarm agent health`) two minutes after boot and
+  every three minutes after each start.
+- `solos-agent.service` has `OnFailure=solos-agent-health.service`, so the check also runs at once when systemd gives up on
+  the agent (five failed starts in 15 minutes).
+
+Each run asks, with no help from the agent:
+
+| Check | Fails when |
+|---|---|
+| `unit` | `systemctl --user show solos-agent` says anything but `active` (inactive, failed, or `activating` in its restart delay), the unit file is gone, or systemd cannot be asked |
+| `restarts` | systemd's `NRestarts` rose by `health.restart_burst` (3) or more since the last run: a crash loop that looks active when looked at |
+| `broker` | the unit has been up for 60 s and `GET /api/hello` on `state/broker.sock` does not answer 200 within 5 s |
+| `disk` | free space on the state directory's disk is under `health.min_free_gb` ([below](#the-disk-floor)) |
+| `discord` | the bot token cannot read the Watchdog's channel: the network is down, the token is refused, or the bot lost access. Nothing is sent to find out |
+| `config` | `agent.yaml` does not load, which is the likeliest reason for a crash loop right after an edit |
+
+A failure posts once per incident to the Watchdog's Discord channel (`watchdog.operator`, which must be `source: discord`
+for this), as the bot, through the Discord API root of the config's `discord` source. After that it says nothing more
+for the same kinds of trouble; it posts again only if a new kind joins the incident, and once when everything is well
+again ("`solos-agent` on `<host>` is healthy again after 12m."). A post that fails (Discord is down) is tried again at the
+next run, and nothing is told twice. `state/health-state.json` is its memory: the open incident, which kinds were told, the
+restart count, whether it made a pause, and the channel the last good config named, so that a config that no longer loads
+is still told to the right channel.
+
+**The token.** It is the agent's own: `ExecStartPre` copies `~/agent/tokens/discord-token` into the check's private tmpfs
+runtime directory, `/run/user/1000/solos-agent-health/`, before each run, and the directory goes when the run ends.
+`agent health` reads that copy and keeps it (the unit's copy is the one that goes), and does not use the agent's runtime
+directory, which is gone when the agent is. The token already rests at mode 0600 in `tokens/`; what this adds is a tmpfs
+file that lives for the length of one run. The check never starts, stops or restarts anything.
+
+**Deploys do not alert.** `scripts/agent-deploy` writes `state/health-hold` (an expiry time) while it stops and starts the
+agent. Until it expires the check records problems and tells nobody. A deploy, rollback or restart removes the hold when it
+finishes, so a deploy that went wrong is told by the next run; `stop` leaves the hold for 30 minutes, so an agent you
+stopped on purpose is told about only if it is still down half an hour later.
+
+**What it cannot do.** If Discord itself (or the token) is what is broken, there is nobody to tell: the check fails, which
+shows in the journal (`scripts/agent-deploy health-logs`) and in `systemctl --user --failed`, and tells Discord the next
+time it can. It runs on the same box as the agent, so a box that is off, or a user manager that is gone, alerts nobody.
+`scripts/agent-deploy status` shows the timers, the last result, any open incident, and runs `agent health --dry-run`
+(checks and prints, posts and changes nothing). Every deploy re-enables the timers; they cannot be left off.
+
+## Pruning state and the disk floor
+
+`state/` grows with every Ticket: each repository Ticket's clone, every worker's transcript, a mirror per repository, the
+Router's transcripts. The disk is shared with other production services, so
+`solos-agent-prune.timer` runs `solos-swarm agent prune --state-dir ~/agent/state --keep-days 14` daily at 04:30 (local
+time, up to 15 minutes late; `Persistent`, so a day the box was off is made up). It opens the Store read-only, runs at the
+lowest CPU and disk priority, and its last line says what it freed.
+
+```sh
+ssh <box> '~/agent/current/bin/solos-swarm agent prune --state-dir ~/agent/state --keep-days 14 --dry-run'
+scripts/agent-deploy prune-logs        # what the daily runs freed
+```
+
+| What | Removed when | Never |
+|---|---|---|
+| `tickets/<id>/work`, plus `host/repo.json` and `prepared` | the Ticket ended more than N days ago (its end time is in the Store) | an open Ticket; a directory the Store has no Ticket for; `pi-settings.json`; a swarm's `swarm/` books |
+| `tickets/<id>/*.rpc.jsonl`, `*.stderr` | the same | |
+| `forge/<owner>/<name>.git` | nothing has fetched into it for N days (`FETCH_HEAD`, `HEAD`, `config`, `packed-refs`) | a mirror used since. The next Ticket on that repository makes it again; clones are independent, so no clone needs it |
+| `router/*.rpc.jsonl`, `*.stderr` | not written for N days | the newest of each kind, which a live session may be writing |
+| `trail/<id>/` | **only with `--include-trail`**, for Tickets that ended more than N days ago. `agent trail` then reports their blobs missing | by default |
+| `agent.db` and its WAL, `tokens/`, `backups/`, `releases/`, the vault, `browser/` | | always |
+
+The markers go with the clone because a Ticket that ended can be resumed by a person's follow-up in its thread: with
+`repo.json` or `prepared` left behind the worker would find an empty `/work` and believe it was ready. Without them it clones
+again from the mirror (or from GitHub). A Ticket resumed *while a prune runs* is checked again just before its files are
+removed and keeps them. `--dry-run` prints exactly what a run would remove, with sizes (as allocated blocks, which is what
+removing frees). `--json` prints the report as JSON. A failed removal is listed, the rest goes ahead, and the exit
+status is 1, which shows the service as failed.
+
+Not pruned: `~/agent/target`, the cargo build cache, which is the other large grower (`cargo clean` by hand when the disk
+needs it), and old `releases/` (a deploy keeps the newest five) and `backups/` (twenty).
+
+### The disk floor
+
+`agent health` (above) also guards the disk. When free space on the state directory's filesystem is under
+`health.min_free_gb` (default 5; 0 turns the floor off), it writes `state/PAUSE`, starting with
+`paused by solos-agent-health: ...`, and alerts. That is the pause gate any operator has: no new Eval starts, no Effect is
+performed, and workers' next model calls wait. It frees nothing, so it is a stop before the disk is full, not a cleanup:
+run the prune by hand, or free space another way. The pause is lifted again, and only a `PAUSE` that starts with that
+line, once free space is back to `health.resume_free_gb` (default the floor plus a fifth of it, at least 1 GB more, so a
+disk hovering at the floor does not flap). A `PAUSE` a person wrote is never overwritten or lifted, and a `control.json`
+pause is a different file. The check runs every three minutes, so a disk that fills faster than that between two runs is not
+caught; the deploy also refuses to build under 30 GB free.
+
+```yaml
+health:
+  min_free_gb: 50       # this box's disk is 86% full: stop at 50 GB free rather than at none
+  # resume_free_gb: 60
+  # restart_burst: 3
+```
+
+## Stopping a Ticket by hand
+
+A stale Ticket (an Assignment that will never report, a request nobody wants any more) is stopped from the box the way a
+person's Stop button does it, through the running agent:
+
+```sh
+ssh <box> '~/agent/current/bin/solos-swarm agent stop --state-dir ~/agent/state --operator <your name> --ticket tk_0123456789abcdef --reason "stale after the deploy"'
+# tk_...: Stopped by <your name>.
+```
+
+The command is filed in `state/mcp/commands.jsonl` as the operator `mcp:<your name>`, which `agent serve` reads (the
+`kind: mcp` Source and Channel must be in `agent.yaml`, as in the example above). The Engine then asks the Policy whether
+that principal may stop work: `mcp:<your name>` must be in `policy.people` or `policy.approvers`, and anyone else is
+refused with "is not allowed to stop this work". The Ticket ends for good as `stopped` with the reason
+`stopped by <your name> on mcp: <reason>`, its Assignment ends exactly as it does for a person's Stop, and a later message in
+its thread does not resume it. The
+answer is posted on the command's own thread in the `mcp` Channel's outbox and printed here. Nothing writes the Store but
+the agent.
+
+| Exit | Meaning |
+|---|---|
+| 0 | stopped, or already stopped or ended (`completed`, `dropped`); nothing more to do |
+| 1 | the agent refused (the Policy does not name the operator), or the Ticket does not exist |
+| 2 | no answer within `--wait-secs` (20): the agent is not running or not reading. The command stays filed and a running agent applies it if it reads it within 10 minutes; older than that it is not applied, so a restart never carries out last week's |
+
+To clear stale Tickets, list the open ones (`scripts/agent-deploy status` prints them with their age) and stop each:
+
+```sh
+ssh <box> 'for t in tk_aaa tk_bbb; do ~/agent/current/bin/solos-swarm agent stop --state-dir ~/agent/state --operator <your name> --ticket $t --reason "stale after the deploy"; done'
+```
+
 ## Not handled yet
 
-- No drain: a deploy interrupts running Assignments, which recover.
-- Alerts go through the Watchdog, which runs inside the agent, so the agent being down is not itself alerted.
-  `systemctl --user status solos-agent` and `scripts/agent-deploy status` show it.
-- `state/` grows without pruning; the disk is shared with other production services.
+- The disk floor is checked by `agent health` every three minutes, not by `agent serve`, and it pauses; it does not free
+  space. `~/agent/target`, old releases and backups are not part of the prune.
+- The health check runs on the box it watches. Nothing alerts if the box or the user's systemd is gone.
+- A drain narrows what a deploy interrupts; a worker in the middle of a long tool call is still stopped.

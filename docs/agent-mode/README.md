@@ -1285,6 +1285,19 @@ like a thread reply, so a crash between a post and its record there can post one
 `nonce`, which Discord checks for a few minutes, so a repeat soon after is not posted again.
 `solos-swarm agent status --state-dir DIR --config agent.yaml` shows what it would raise now.
 
+The Watchdog runs inside `agent serve`, so it cannot tell anyone that serve is down. Three commands run outside it, for a
+production box ([production.md](production.md) has the units and the rollout):
+
+- `solos-swarm agent health --config agent.yaml --state-dir DIR --token-file F` checks the systemd unit, the broker socket,
+  free disk space and whether the bot can reach the Watchdog's Discord channel, and posts once per incident with no help
+  from serve. Below `health.min_free_gb` it pauses new work (`PAUSE`) and alerts. `--dry-run` only looks.
+- `solos-swarm agent prune --state-dir DIR --keep-days N [--dry-run] [--include-trail]` removes the clones and transcripts of
+  Tickets that ended more than N days ago, and forge mirrors and Router transcripts unused that long. Never an open Ticket,
+  `agent.db` or (without `--include-trail`) the trail's blobs.
+- `solos-swarm agent stop --state-dir DIR --operator NAME --ticket ID --reason TEXT` stops a Ticket as a person's Stop does:
+  the command is filed (`state/mcp/commands.jsonl`) as `mcp:NAME` and the running agent's Engine applies it only if the Policy
+  names that principal.
+
 ## Web dashboard
 
 ```yaml

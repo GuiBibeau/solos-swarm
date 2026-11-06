@@ -4,7 +4,8 @@
 use super::ports::{BoxFuture, Channel, FactSink, SendOptions, SendOutcome, Source, TriggerSink};
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
-use solos_agent_core::model::{MessageId, OutboundMessage, Trigger};
+use serde::de::DeserializeOwned;
+use solos_agent_core::model::{MessageId, OutboundMessage};
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, SeekFrom, Write};
@@ -37,7 +38,7 @@ impl Source for JsonlSource {
         Box::pin(async move {
             let mut cursor = Cursor::default();
             loop {
-                let batch = cursor.read(&self.path, !self.follow).await?;
+                let batch = cursor.read(&self.path, !self.follow, "Trigger").await?;
                 if !batch.is_empty() && sink.send(batch).await.is_err() {
                     return Ok(());
                 }
@@ -50,16 +51,22 @@ impl Source for JsonlSource {
     }
 }
 
+/// Where a reader of a JSON-lines file has got to.
 #[derive(Default)]
-struct Cursor {
+pub(crate) struct Cursor {
     offset: u64,
     line: usize,
 }
 
 impl Cursor {
-    /// The Triggers on whole lines past the cursor. With `to_end`, a last line
-    /// without a newline counts as whole.
-    async fn read(&mut self, path: &Path, to_end: bool) -> Result<Vec<Trigger>> {
+    /// The `what`s (Triggers, say) on whole lines past the cursor. With
+    /// `to_end`, a last line without a newline counts as whole.
+    pub(crate) async fn read<T: DeserializeOwned>(
+        &mut self,
+        path: &Path,
+        to_end: bool,
+        what: &str,
+    ) -> Result<Vec<T>> {
         let mut file = tokio::fs::File::open(path)
             .await
             .with_context(|| format!("cannot open trigger file {}", path.display()))?;
@@ -82,10 +89,10 @@ impl Cursor {
             if raw.trim_ascii().is_empty() {
                 continue;
             }
-            match serde_json::from_slice::<Trigger>(raw) {
-                Ok(trigger) => batch.push(trigger),
+            match serde_json::from_slice::<T>(raw) {
+                Ok(found) => batch.push(found),
                 Err(err) => eprintln!(
-                    "agent: {}:{}: not a Trigger, skipped: {err}",
+                    "agent: {}:{}: not a {what}, skipped: {err}",
                     path.display(),
                     self.line
                 ),
