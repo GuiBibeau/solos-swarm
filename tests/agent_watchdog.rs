@@ -313,7 +313,7 @@ async fn a_stalled_worker_alerts_the_operator_once_and_a_restart_tells_nothing_n
         "{text}"
     );
     assert!(text.contains("alerts now: 1\n  [stalled]"), "{text}");
-    assert_eq!(report["schema_version"], 6);
+    assert_eq!(report["schema_version"], 7);
     assert_eq!(report["tickets"][0]["stage"], "working");
     assert_eq!(
         report["tickets"][0]["request"]["text"],

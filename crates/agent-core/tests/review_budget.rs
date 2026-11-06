@@ -51,6 +51,7 @@ fn verdict(plan: Plan, budget: u64) -> Verdict {
         acknowledge: Acknowledge::Standard,
         rules: Vec::new(),
         repo: None,
+        forge: None,
     })
 }
 
@@ -68,6 +69,7 @@ fn rep(status: ReportStatus, question: Option<&str>) -> ReportIn {
         text: format!("{status:?} text"),
         question: question.map(str::to_owned),
         spent_microusd: 0,
+        harvest: None,
     }
 }
 

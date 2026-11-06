@@ -207,5 +207,6 @@ pub fn accept(title: &str, plan: Plan, budget: u64) -> Verdict {
         acknowledge: Acknowledge::Standard,
         rules: Vec::new(),
         repo: None,
+        forge: None,
     })
 }

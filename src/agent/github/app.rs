@@ -441,6 +441,11 @@ impl Minter {
         self.config.repos.contains(repo)
     }
 
+    /// Whether write tokens are minted at all (`github.writes`).
+    pub fn writes(&self) -> bool {
+        self.config.writes
+    }
+
     pub fn repos(&self) -> &BTreeSet<RepoName> {
         &self.config.repos
     }

@@ -18,6 +18,7 @@ pub use app::{
     REFRESH_MARGIN, SUSPENDED_WAIT,
 };
 pub use channel::GithubChannel;
+pub(crate) use channel::{quiet, shape};
 pub use check::{CheckArgs, check};
 pub use identities::{IDENTITIES_FILE, Identities};
 pub use source::{GithubSource, OVERLAP};

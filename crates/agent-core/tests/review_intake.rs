@@ -182,6 +182,7 @@ fn accept_rules(budget: u64, rules: Vec<String>) -> Verdict {
         acknowledge: Acknowledge::Silent,
         rules,
         repo: None,
+        forge: None,
     })
 }
 
@@ -213,6 +214,7 @@ fn report(status: ReportStatus) -> ReportIn {
         text: format!("{status:?}"),
         question: None,
         spent_microusd: 0,
+        harvest: None,
     }
 }
 

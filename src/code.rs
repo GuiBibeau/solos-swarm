@@ -53,6 +53,9 @@ pub const DEFAULT_MEMORY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const TMPFS_BYTES: u64 = 268_435_456;
 const FILE_SIZE_BYTES: u64 = 268_435_456;
 const MAX_OPEN_FILES: u64 = 512;
+/// What a host script on a worker's tree may use: CPU seconds and wall clock.
+const TREE_SCRIPT_CPU_SECONDS: u64 = 60;
+const TREE_SCRIPT_WAIT: Duration = Duration::from_secs(60);
 const DEFAULT_DATASET_ROOT: &str = "/home/debian/.local/share/solos-data/phoenix_decoded";
 const DEFAULT_REPO_ROOT: &str = "/home/debian/research/regimes/repo";
 const DEFAULT_VENV_ROOT: &str = "/home/debian/research/regimes/repo/.venv";
@@ -423,6 +426,83 @@ impl CodeExecutor {
             stdin: None,
         };
         Ok(self.start(scratch, request, bounds))
+    }
+    /// The host's own script in a sandbox the host builds, for reading a
+    /// worker's tree without trusting it: `work` is bound read-only at
+    /// `/work`, `out` (a directory the host just made) writable at `/out`, and
+    /// nothing else of the worker's choosing is there. The environment is
+    /// empty but for `PATH`, `HOME`, `TMPDIR`, the locale and `env`, so what
+    /// the worker wrote into its own `.git/config` is data to the script, not
+    /// a setting of the host's.
+    pub async fn run_on_tree(
+        &self,
+        work: &Path,
+        out: &Path,
+        env: &[(&str, &str)],
+        script: &str,
+    ) -> Result<Value> {
+        ensure!(
+            script.len() <= MAX_CODE_BYTES,
+            "the host script exceeds {MAX_CODE_BYTES} bytes"
+        );
+        let work = self.owned_scratch(work)?;
+        let out = fs::canonicalize(out)
+            .with_context(|| format!("run_code out is missing: {}", out.display()))?;
+        let _permit = self
+            .permits
+            .acquire()
+            .await
+            .context("run_code scheduler closed")?;
+        let command = self.tree_command(&work, &out, env, script);
+        execute(command, None, TREE_SCRIPT_WAIT).await
+    }
+    fn tree_command(&self, work: &Path, out: &Path, env: &[(&str, &str)], script: &str) -> Command {
+        let mut command = Command::new(&self.config.prlimit);
+        command.env_clear();
+        command
+            .arg(format!("--as={}", self.config.memory_bytes))
+            .arg(format!("--fsize={FILE_SIZE_BYTES}"))
+            .arg(format!("--cpu={TREE_SCRIPT_CPU_SECONDS}"))
+            .arg(format!("--nofile={MAX_OPEN_FILES}"))
+            .arg("--")
+            .arg(&self.config.bwrap)
+            .args(self.tree_args(work, out, env, script));
+        command
+    }
+    /// The bwrap arguments of [`run_on_tree`](Self::run_on_tree), apart from
+    /// the launch so the isolation contract can be asserted without Linux.
+    fn tree_args(
+        &self,
+        work: &Path,
+        out: &Path,
+        env: &[(&str, &str)],
+        script: &str,
+    ) -> Vec<OsString> {
+        let mut sandbox = Bwrap::new()
+            .unshare_all()
+            .die_with_parent()
+            .new_session()
+            .system_binds()
+            .symlink("usr/bin", "/bin")
+            .symlink("usr/sbin", "/sbin")
+            .proc("/proc")
+            .dev("/dev")
+            .tmpfs_sized(TMPFS_BYTES, "/tmp")
+            .dir("/work")
+            .ro_bind(work, "/work")
+            .dir("/out")
+            .bind(out, "/out")
+            .chdir("/work")
+            .clearenv()
+            .setenv("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .setenv("HOME", "/tmp")
+            .setenv("TMPDIR", "/tmp")
+            .setenv("LANG", "C")
+            .setenv("LC_ALL", "C");
+        for (name, value) in env {
+            sandbox = sandbox.setenv(name, value);
+        }
+        sandbox.exec("/usr/bin/bash", ["-c", script])
     }
     fn start(
         self: &Arc<Self>,
@@ -1332,6 +1412,37 @@ mod tests {
             "new"
         );
         fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn a_host_script_sees_the_tree_read_only_and_one_fresh_directory_and_nothing_of_the_hosts() {
+        let dir = scratch_dir();
+        let mut config = worker_config(&dir);
+        config.env = vec![("CANARY".into(), Secret::new("ghs_canary".into()))];
+        let args = executor(config).tree_args(
+            Path::new("/tickets/tk_1/work"),
+            Path::new("/tickets/tk_1/out/1"),
+            &[("BASE", "abc")],
+            "git bundle create /out/b HEAD",
+        );
+        let text = args
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("--unshare-all") && !text.contains("--share-net"));
+        assert!(
+            text.contains("--ro-bind\n/tickets/tk_1/work\n/work"),
+            "{text}"
+        );
+        assert!(text.contains("--bind\n/tickets/tk_1/out/1\n/out"), "{text}");
+        assert_eq!(text.matches("\n--bind\n").count(), 1, "one writable mount");
+        assert!(!text.contains("/data"), "no configured mount");
+        assert!(text.contains("--clearenv") && text.contains("--setenv\nBASE\nabc"));
+        assert!(
+            !text.contains("CANARY") && !text.contains("ghs_canary"),
+            "{text}"
+        );
+        assert!(!text.contains("broker.sock") && !text.contains("SWARM_"));
     }
     #[test]
     fn sandbox_has_no_network_broker_or_provider_environment() {

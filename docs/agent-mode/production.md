@@ -146,7 +146,7 @@ github:
 forge:
   kind: github                                             # no token_file and no identity: the commits are by the App's bot
   repos:
-    <owner>/<repo>: {about: What the Router reads to tell which repository a request is about, base: main}
+    <owner>/<repo>: {about: What the Router reads to tell which repository a request is about, base: main, owes: pull_request}
 sources:
   - kind: github                                           # no fields: it reads forge.repos
 channels:
@@ -166,6 +166,13 @@ generating a second one in the App's settings, storing it with `agent-deploy tok
 deleting the first. To stop GitHub work, suspend the App under Settings, Applications, Installed GitHub Apps: every GitHub
 call then waits and retries every five minutes, and unsuspending resumes it with no restart. `github.writes: false` and a
 restart keeps the agent reading and writing nothing.
+
+`owes: pull_request` on a repository is what makes a worker's `ready` open a pull request there, and it is also the most the
+agent does there (`owes: answer` makes the repository read-only whatever the Router asks). The pull request is opened as the
+bot, ready for review, on a branch `solos/<ticket>/<slug>` that only the agent writes, and never touches `.github/**`
+(`protected` is the list, per repository). Nothing merges: merging is later work. A config with `owes: pull_request` and
+`github.writes: false` does not load. Tickets that deliver a change or a pull request need schema V7 of `agent.db`; an older
+build refuses a store that has them, so roll the binary forward with the store, not back.
 
 A config that still has `token_file` on the github Source or on `forge: github`, or `identity` on `forge: github`, fails to
 load with a sentence that points at [Moving from token files](README.md#moving-from-token-files). The `forge-token` file is no

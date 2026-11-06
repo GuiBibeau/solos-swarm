@@ -256,6 +256,7 @@ where
         ..RunOptions::default()
     };
     let watchdog = watchdog::Running::start(&config, state_dir, &io.channels, &facts)?;
+    let forge = pi.as_ref().and_then(|pi| pi.forge.clone());
     let runtime = Runtime::with_sink(
         store,
         config.policy.clone(),
@@ -264,6 +265,7 @@ where
         (facts, inbound),
     )
     .with_control_dir(state_dir)
+    .with_forge(forge)
     .with_pass_through(config.pass_through);
     let served = match pi {
         Some(pi) => Some(pi.serve(state_dir)?),
@@ -311,6 +313,9 @@ fn private_dir(dir: &Path) -> Result<()> {
 /// Assignment starts, a worker's.
 struct PiParts<H> {
     broker: AgentBroker,
+    /// Clones, admits and publishes; the same forge for the executor, the
+    /// broker and the runtime.
+    forge: Option<Arc<dyn ports::Forge>>,
     router: Option<Arc<PiRouter>>,
     executor: Option<Arc<PiExecutor<H>>>,
     browsers: Option<Arc<Browsers>>,
@@ -450,6 +455,14 @@ where
             nodes: nodes.map(Listener::environments).unwrap_or_default(),
         };
         let broker = AgentBroker::with_pstack(parts, job_limits, remote, pstack)?;
+        let forge = config
+            .forge
+            .as_ref()
+            .map(|wanted| forge::open(wanted, canonical(state_dir)?.join(forge::FORGE_DIR), github))
+            .transpose()?;
+        if let Some(forge) = &forge {
+            broker.set_forge(forge.clone());
+        }
         let swarm = match &config.executor {
             ExecutorConfig::Pi {
                 provider: name,
@@ -509,19 +522,14 @@ where
                 model,
                 max_workers: *max_workers,
                 prepare: prepare.clone(),
-                forge: config
-                    .forge
-                    .as_ref()
-                    .map(|wanted| {
-                        forge::open(wanted, canonical(state_dir)?.join(forge::FORGE_DIR), github)
-                    })
-                    .transpose()?,
+                forge: forge.clone(),
                 swarm,
             })?)),
             _ => None,
         };
         Ok(Self {
             broker,
+            forge,
             router,
             executor,
             browsers,

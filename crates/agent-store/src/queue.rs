@@ -58,13 +58,15 @@ fn parse((id, body, attempts, due_ms, last_error, done): Raw) -> Result<QueuedEf
 /// Effects in one lane run in commit order. Sends share a lane per
 /// conversation, so a reply never overtakes an earlier one. Launch, Deliver
 /// and Stop share a lane per Ticket, so Inputs reach a worker in order and
-/// never before its Assignment starts.
+/// never before its Assignment starts. A Ticket's forge jobs have a lane of
+/// their own, so a delivery that waits on GitHub never holds back a Stop.
 fn lane(effect: &Effect) -> Result<Option<String>, StoreError> {
     match effect {
         Effect::Send(message) => Ok(Some(serde_json::to_string(&message.channel)?)),
         Effect::Launch { ticket, .. }
         | Effect::Deliver { ticket, .. }
         | Effect::Stop { ticket, .. } => Ok(Some(format!("ticket:{ticket}"))),
+        Effect::Forge(job) => Ok(Some(format!("forge:{}", job.ticket()))),
         Effect::Assess(_) => Ok(None),
     }
 }

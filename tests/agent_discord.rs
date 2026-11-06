@@ -2210,6 +2210,7 @@ impl Executor for Reports {
                 text: self.0.clone(),
                 question: None,
                 spent_microusd: 0,
+                harvest: None,
             };
             facts
                 .send(Fact::Report {

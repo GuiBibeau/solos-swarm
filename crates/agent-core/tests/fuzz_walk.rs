@@ -555,6 +555,7 @@ fn gen_accept(rng: &mut Lcg) -> Accept {
         repo: rng
             .chance(40)
             .then(|| RepoName::try_from("acme/widgets".to_owned()).unwrap()),
+        forge: None,
     }
 }
 
@@ -906,6 +907,7 @@ fn gen_cmd(rng: &mut Lcg, w: &mut World) -> Cmd {
                     text: format!("{status:?}"),
                     question,
                     spent_microusd,
+                    harvest: None,
                 },
             )
         }
@@ -1938,6 +1940,14 @@ fn check_effect(
                 ));
             }
         }
+        Effect::Forge(job) => {
+            if !r.tickets.contains_key(job.ticket()) {
+                found.push((
+                    "2-forge-missing-ticket",
+                    format!("Forge {job:?} names a ticket that does not exist"),
+                ));
+            }
+        }
         Effect::Send(m) => {
             if let Some(t) = &m.ticket
                 && !r.tickets.contains_key(t)
@@ -2019,6 +2029,7 @@ fn walk(seed: u64, steps: usize, check: bool) -> Walk {
             Effect::Deliver { .. } => "deliver",
             Effect::Stop { .. } => "stop",
             Effect::Send(_) => "send",
+            Effect::Forge(_) => "forge",
         };
         *effects.entry(kind).or_default() += 1;
     }

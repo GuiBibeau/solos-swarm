@@ -3,7 +3,8 @@
 //! through [`Repositories::commit`]. A command that returns an error commits
 //! nothing.
 
-use crate::change::Deliverable;
+use crate::change::{BranchName, Change, Checks, Deliverable, Delivered};
+use crate::delivery::{Admission, ForgeJob, NotReady, Observed, ready_gate};
 use crate::ids::key;
 use crate::model::{
     Accept, Acknowledge, Actor, Approval, Ask, Assignment, AssignmentId, AssignmentState,
@@ -139,7 +140,11 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
                         });
                         true
                     } else {
-                        owner && !ticket.has_live_assignment()
+                        // A Ticket whose pull request is being made waits for it:
+                        // its worker has ended, and a second one would race the
+                        // delivery. The input is kept, and `forge` wakes the Ticket
+                        // for it once the pull request exists.
+                        owner && !ticket.has_live_assignment() && !ticket.delivery_owed()
                     };
                     if wake {
                         tx.start(&mut ticket, policy);
@@ -399,7 +404,12 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
     }
 
     /// Record a worker's Report. `ready` sends the result and ends the
-    /// Ticket; `dropped` ends it silently; a question, `blocked` or `failed`
+    /// Ticket, unless the Ticket owes a change or a pull request: then the
+    /// host must have admitted the worker's commits (`report.harvest`), and
+    /// the Ticket ends only once they are delivered (see [`Engine::forge`]).
+    /// A `ready` the host refuses (`ready_gate`) commits nothing and comes
+    /// back as `Error::Refused` with the sentence the worker reads.
+    /// `dropped` ends the Ticket silently; a question, `blocked` or `failed`
     /// asks a person; `progress` and `waiting` stay quiet.
     pub fn report(
         &mut self,
@@ -409,6 +419,12 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
     ) -> Result<(), Error> {
         self.run(|tx, _| {
             let mut t = tx.open_ticket(ticket)?;
+            let admission = if report.status == ReportStatus::Ready {
+                ready_gate(&t, t.mandate.forge.as_ref(), report.harvest.as_ref())
+                    .map_err(|why: NotReady| Error::Refused(why.tell()))?
+            } else {
+                Admission::Answer
+            };
             t.seq += 1;
             let seq = t.seq;
             let latest = latest_mut(&mut t, assignment)?;
@@ -434,10 +450,70 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
                 tx.send(&mut t, MessageKind::Attention, question.clone(), None);
             }
             match report.status {
-                ReportStatus::Ready => {
-                    tx.send(&mut t, MessageKind::Result, report.text, None);
-                    tx.end_ticket(&mut t, EndedBy::Executor, TicketOutcome::Completed, "ready");
-                }
+                ReportStatus::Ready => match admission {
+                    Admission::Answer => {
+                        tx.send(&mut t, MessageKind::Result, report.text, None);
+                        tx.end_ticket(&mut t, EndedBy::Executor, TicketOutcome::Completed, "ready");
+                    }
+                    Admission::Committed(harvest) => {
+                        let text = format!(
+                            "{}\n\nCommitted {} ({} {}) in the ticket's clone; not published.",
+                            report.text,
+                            harvest.head.short(),
+                            harvest.files,
+                            if harvest.files == 1 { "file" } else { "files" }
+                        );
+                        tx.send(&mut t, MessageKind::Result, text, None);
+                        tx.end_ticket(&mut t, EndedBy::Executor, TicketOutcome::Completed, "ready");
+                    }
+                    Admission::Propose(harvest) => {
+                        let round = match t.change.as_mut() {
+                            Some(change) => {
+                                change.admit(&harvest, report.text);
+                                change.pushes
+                            }
+                            None => {
+                                let branch = BranchName::for_ticket(&t.id, &t.title);
+                                t.change = Some(Change::first(branch, &harvest, report.text));
+                                1
+                            }
+                        };
+                        tx.event(DomainEvent::ProposalAdmitted {
+                            ticket: t.id.clone(),
+                            head: harvest.head.clone(),
+                            commits: harvest.commits,
+                            files: harvest.files,
+                            bytes: harvest.bytes,
+                            round,
+                        });
+                        tx.effect(Effect::Forge(ForgeJob::Publish {
+                            ticket: t.id.clone(),
+                            head: harvest.head,
+                        }));
+                        // The worker is done, the Ticket is not: it ends once
+                        // the pull request exists.
+                        tx.end_assignment(&mut t, "proposed");
+                    }
+                    Admission::Reply => {
+                        let line = t
+                            .change
+                            .as_ref()
+                            .and_then(|change| change.delivered.as_ref())
+                            .map(|delivered| {
+                                format!(
+                                    "PR {} · head {} · unchanged",
+                                    delivered.url,
+                                    delivered.head.short()
+                                )
+                            });
+                        let text = match line {
+                            Some(line) => format!("{}\n\n{line}", report.text),
+                            None => report.text,
+                        };
+                        tx.send(&mut t, MessageKind::Result, text, None);
+                        tx.end_ticket(&mut t, EndedBy::Executor, TicketOutcome::Completed, "ready");
+                    }
+                },
                 ReportStatus::Dropped => {
                     tx.end_ticket(
                         &mut t,
@@ -680,6 +756,132 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
             Ok(())
         })
     }
+
+    /// Apply what the host observed of the forge. Every observation is
+    /// idempotent: one that repeats, or answers a head a newer proposal
+    /// replaced, commits nothing.
+    ///
+    /// `Published` records what the host read back (the pull request, the
+    /// head it holds), subscribes the Ticket to the pull request's
+    /// conversation, tells whoever asked (the worker's words, then one host
+    /// line, `PR <url> · head <sha> · opened`), moves the Ticket's reply
+    /// channel from an origin on the same Source to that conversation, and
+    /// ends the Ticket: it is done when the pull request exists. `Withheld`
+    /// holds the Change and asks a person once.
+    pub fn forge(&mut self, observed: Observed) -> Result<(), Error> {
+        self.run(|tx, policy| match observed {
+            Observed::Published {
+                ticket,
+                head,
+                pr,
+                url,
+                thread,
+                reply_to,
+                created,
+            } => {
+                let mut t = tx.require_ticket(&ticket)?;
+                let Some(change) = t.change.as_mut() else {
+                    return Err(Error::Refused(format!("{ticket} has no change to deliver")));
+                };
+                let answers_the_proposal = change.head == head && change.held.is_none();
+                let repeats = change.delivered.as_ref().is_some_and(|d| d.head == head);
+                if !answers_the_proposal || repeats {
+                    return Ok(());
+                }
+                let first = change.delivered.is_none();
+                change.delivered = Some(Delivered {
+                    pr: pr.clone(),
+                    head: head.clone(),
+                    url: url.clone(),
+                    at_ms: tx.now,
+                });
+                change.checks = Checks::Pending { reported: 0 };
+                let text = change.text.clone();
+                tx.event(DomainEvent::Delivered {
+                    ticket: t.id.clone(),
+                    head: head.clone(),
+                    pr,
+                    created,
+                });
+                let mut conversation = tx
+                    .thread(&thread)
+                    .unwrap_or_else(|| Thread::new(thread.clone()));
+                conversation.subscriptions.insert(t.id.clone());
+                tx.save_thread(conversation);
+                t.threads.insert(thread);
+                if t.ended.is_some() {
+                    // A person stopped the Ticket while the push was in
+                    // flight: the pull request exists, so it is recorded, and
+                    // nobody is told more.
+                    tx.save_ticket(t);
+                    return Ok(());
+                }
+                let verb = if first { "opened" } else { "updated" };
+                let line = format!("PR {url} · head {} · {verb}", head.short());
+                tx.send(
+                    &mut t,
+                    MessageKind::Result,
+                    format!("{text}\n\n{line}"),
+                    None,
+                );
+                // The first Result reaches the origin (the issue, the chat
+                // thread). From then on the pull request's conversation
+                // supersedes an origin on the same Source, so a review round
+                // answers once on GitHub while a chat origin keeps hearing
+                // everything.
+                t.channels
+                    .retain(|channel| channel.source != reply_to.source);
+                t.channels.push(reply_to);
+                tx.end_ticket(&mut t, EndedBy::Executor, TicketOutcome::Completed, "ready");
+                // A follow-up that came while the pull request was being made
+                // was kept, not acted on; the Ticket takes it up now.
+                let waiting = t
+                    .inputs
+                    .iter()
+                    .filter(|input| input.sent_to.is_none() && input.from_allowed_person)
+                    .find_map(|input| match &input.body {
+                        InputBody::Trigger { trigger } => Some(trigger.clone()),
+                        _ => None,
+                    });
+                if let Some(trigger) = waiting
+                    && policy.revalidate(&t.mandate)
+                {
+                    t.ended = None;
+                    tx.event(DomainEvent::TicketResumed {
+                        ticket: t.id.clone(),
+                        trigger,
+                    });
+                    tx.start(&mut t, policy);
+                }
+                tx.save_ticket(t);
+                Ok(())
+            }
+            Observed::Withheld { ticket, head, why } => {
+                let mut t = tx.require_ticket(&ticket)?;
+                let Some(change) = t.change.as_mut() else {
+                    return Err(Error::Refused(format!("{ticket} has no change to deliver")));
+                };
+                let repeats = change.held.is_some() || change.head != head;
+                let delivered = change.delivered.as_ref().is_some_and(|d| d.head == head);
+                if repeats || delivered {
+                    return Ok(());
+                }
+                change.held = Some(why.clone());
+                let told = why.tell(&t.title, &change.branch, &head);
+                tx.event(DomainEvent::Withheld {
+                    ticket: t.id.clone(),
+                    head,
+                    why,
+                });
+                if t.ended.is_none() {
+                    t.attention = Some(told.clone());
+                    tx.send(&mut t, MessageKind::Attention, told, None);
+                }
+                tx.save_ticket(t);
+                Ok(())
+            }
+        })
+    }
 }
 
 /// Only a person the Policy admits explicitly owns a follow-up: a resume
@@ -734,6 +936,20 @@ fn validate(accept: &Accept) -> Result<(), Error> {
             None,
         ) if method.deliverable > Deliverable::Answer => Err(Error::Invalid(
             "a change or a pull request needs a repository".into(),
+        )),
+        (
+            Plan::Session {
+                method: Some(method),
+                ..
+            },
+            Some(_),
+        ) if method.deliverable > Deliverable::Answer && accept.forge.is_none() => {
+            Err(Error::Invalid(
+                "a change or a pull request needs the forge terms of its repository".into(),
+            ))
+        }
+        (_, None) if accept.forge.is_some() => Err(Error::Invalid(
+            "forge terms are for an accept that names a repository".into(),
         )),
         _ => Ok(()),
     }
@@ -1299,6 +1515,7 @@ impl<R: Repositories> Tx<'_, R> {
                 source: primary.source,
                 budget_microusd: accept.budget_microusd,
                 repo: accept.repo,
+                forge: accept.forge,
             },
             plan: accept.plan,
             channels: primary.reply_to,
@@ -1312,6 +1529,7 @@ impl<R: Repositories> Tx<'_, R> {
             created_ms: self.now,
             seq: 0,
             handed_back: BTreeSet::new(),
+            change: None,
         };
         self.event(DomainEvent::TicketCreated {
             ticket: id.clone(),

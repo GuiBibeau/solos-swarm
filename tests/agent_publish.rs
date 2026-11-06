@@ -881,6 +881,7 @@ impl Executor for Browsing {
                         text: "done".into(),
                         question: None,
                         spent_microusd: 0,
+                        harvest: None,
                     },
                 })
                 .await
@@ -956,6 +957,7 @@ impl Executor for Says {
                         text: self.text.into(),
                         question: self.question.map(Into::into),
                         spent_microusd: 0,
+                        harvest: None,
                     },
                 })
                 .await

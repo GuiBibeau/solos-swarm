@@ -42,6 +42,7 @@ harness it uses), and `Gotchas`.
 | [Chat on Discord with approvals](./discord-chat.md) | 2026-11-04, zelix, b04f9f2, scripted Router | passed: approval buttons, Approve, result |
 | [Follow up on a running request](./follow-up.md) | not yet | seeded |
 | [Work on GitHub as the App's own bot](./github-app-auth.md) | not yet | seeded (needs the App created by hand) |
+| [Ask for a change and get a pull request from the bot](./github-pr.md) | not yet | seeded (needs the App created by hand and `owes: pull_request` on the sandbox) |
 
 Not yet mapped, each a real surface: Swarm Tickets (`executor.swarm`, the Router choosing `Plan::Swarm`), schedules,
 remote nodes, Claude Code workers, the Watchdog's alerts, Slack, `agent bench`, and swarm mode itself (`solos-swarm run`, verified by

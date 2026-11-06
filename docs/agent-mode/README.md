@@ -33,7 +33,7 @@ and its MIT-licensed prototype `deepseek-ai/dsh-superagent-prototype` (docs 000-
 | P11 Discord | Done (#35). `src/agent/discord/`: `DiscordSource` holds one Gateway v10 connection (an outbound WebSocket, nothing exposed) and `DiscordChannel` posts over REST, configured as `kind: discord` and read from a token file that is deleted once read. The Source dials the URL `GET /gateway/bot` names, heartbeats at Hello's interval with a random first beat and the last sequence number, identifies with the Guilds, Guild Messages, Direct Messages and Message Content intents, and treats a heartbeat with no ACK as a zombie. A dropped socket, op 7 and an invalid session with `d: true` resume the session on `resume_gateway_url`; a refused resume, `d: false` and close codes 4007 and 4009 identify again after 1 to 5 s. Five connections in a row that never became ready drop the session, and a spent limit on new sessions is waited out. Close codes 4004 and 4010 to 4014 end the run with the fix named, such as turning on Message Content Intent. A message from a listed guild or channel (or a thread of a listed channel) becomes a Trigger `discord:<channel>:<message>` by `discord:<user id>`, and a mention (of the bot or its managed role) or a pinging reply is addressed, a DM direct. The Thread is one snowflake, `discord:<id>`: a thread channel's id, or the message at the top of a reply chain, which the Source keeps for the agent's own posts too, so a reply to the agent's answer joins its request, and a Discord thread started from a message is the message's Thread. Posts are replies, at most 2,000 characters (a marker says what was cut), parse no mentions, and carry a `nonce` derived from their `MessageId` with `enforce_nonce`, so a retry cannot post twice. A 429 waits `retry_after`, a 5xx retries and another 4xx drops the message. An approval request carries Approve and Stop buttons; a click is an interaction the Source acknowledges at once and applies as the same `Fact::Command` Slack's buttons feed, for the policy to judge. No new dependency. Tests run against a fake Discord (HTTP and a Gateway that keeps each session's events for a resume). |
 | P12 Vault and verifiable browser | Done: the first build. Designed in #36 and built in eight PRs: capabilities in the tool registry (#38), the sealed envelope and the vault with its `solos-swarm vault` CLI (#43), approvals of vault items in the core, Slack and Discord (#47), keyed `fetch_url` and `vault_list` (#48), the trail in the core and schema V4 (#39), the `browse` module (#46), the browser tools (#49), and `solos-swarm agent trail` (#51). A worker uses an API key it never sees. `fetch_url {key}` writes `KeyUsed` to the chain, sends the key only to the key's hosts, on each redirect hop that stays there and through no proxy, scrubs every vault value from what comes back, and asks the item's owner in the thread before its first use on a Ticket. A worker also browses with a headless Lightpanda on this host and signs in with a vault login it never sees. Each browser step is on the chain as asked before the browser acts, then answered with the step this host's trail key signed, and the page and the exact View the model got are blobs in the state directory. `solos-swarm agent trail` checks a trail with public keys only: the chain, each step's signature and answer, each browser session's order and close, and every blob. Setup is in [Vault and API keys](#vault-and-api-keys), [Browser](#browser) and [Check a trail](#check-a-trail). [`vault-browser/`](vault-browser/rationale.md) holds the design: a write-only vault of logins and API keys used only on the machine that holds them, keyed `fetch_url` with first-use approval in chat, and a Lightpanda browser per Assignment whose every step is recorded in the chain and signed with Ed25519 by the machine that ran it. The PRs in [`prs.md`](vault-browser/prs.md) are the plan: browsers on nodes and keys in the browser (PRs 9 and 10) come later. |
 | P13 pstack as the coding method | Building. PRs 1 and 2 of [`prs.md`](pstack/prs.md) are done. PR 1 (#54) puts pstack in every worker with the vendored tree pinned by its MANIFEST, the entry into poteto-mode, the solos-swarm adapter and the `read` tool. PR 2 gives a Ticket a repository. The Router names one of `forge.repos`, the host clones it from its own mirror into the Ticket's `work/` before the worker starts, and the worker reads the clone and commits in it. Setup is in [Repositories](#repositories). Designed in #53. [`pstack/`](pstack/rationale.md) holds the design: pstack vendored verbatim and pinned, entered by the host, with a `read` tool, delegates that run as jobs on their own pool, repository workspaces cloned from a host mirror, pull requests published from a sandbox-made bundle so no token reaches a model or sandbox, a `ready` gate on host-recorded checks, cross-family review, and merges behind a click. Built in the PRs of [`prs.md`](pstack/prs.md). |
-| P14 The agent's own GitHub App | Designed in #62. [`github-app/`](github-app/rationale.md) holds the design: the agent works on GitHub as the bot of a GitHub App the owner installs on chosen repositories. One App key replaces both personal access tokens, and the host mints installation tokens per repository and per read or write, never with the `workflows` permission. A pull request is owed, not done: the worker commits and reports `ready`, the host admits its commits from a sandbox-made bundle (ancestry, the bot as every commit's author, protected paths, size) and delivers the branch and the pull request as a durable Effect, with no new worker tool. Intake stays the github Source's REST polling, plus a pass that reads every open pull request again every five minutes. CI failures resume the Ticket within a bound, reviewers' comments reach it, and a merge, pinned to the head, needs a Discord click or an approving review by an approver. Suspending the App on GitHub is a kill switch that waits instead of crashing. It supersedes PRs 3, 4 and 7 of [`pstack/prs.md`](pstack/prs.md) where they conflict. Built in the PRs of [`prs.md`](github-app/prs.md). |
+| P14 The agent's own GitHub App | Designed in #62. PRs 1 and 2 of [`prs.md`](github-app/prs.md) are built: the App replaces the tokens, and a worker's `ready` delivers a pull request (see [Repositories](#repositories)). [`github-app/`](github-app/rationale.md) holds the design: the agent works on GitHub as the bot of a GitHub App the owner installs on chosen repositories. One App key replaces both personal access tokens, and the host mints installation tokens per repository and per read or write, never with the `workflows` permission. A pull request is owed, not done: the worker commits and reports `ready`, the host admits its commits from a sandbox-made bundle (ancestry, the bot as every commit's author, protected paths, size) and delivers the branch and the pull request as a durable Effect, with no new worker tool. Intake stays the github Source's REST polling, plus a pass that reads every open pull request again every five minutes. CI failures resume the Ticket within a bound, reviewers' comments reach it, and a merge, pinned to the head, needs a Discord click or an approving review by an approver. Suspending the App on GitHub is a kill switch that waits instead of crashing. It supersedes PRs 3, 4 and 7 of [`pstack/prs.md`](pstack/prs.md) where they conflict. Built in the PRs of [`prs.md`](github-app/prs.md). |
 
 ## Later steps
 
@@ -176,7 +176,7 @@ and external work leaves as `Effect`s. The shell ports are async and live in the
 | `EventLog` | `append(kind, data) -> seq`; `verify()` | `events.jsonl` hash chain | `Store::record` (`src/broker.rs`), `broker_control::read_chain`/`load_image` |
 | `Source` | `run(sink, facts)`, with people's commands (Slack and Discord buttons) as `Fact::Command`; later `context(trigger, part)` for bounded recall | `JsonlSource` (P3b), `SlackSource` (P4), `GithubSource` and `ScheduleSource` (P8), `DiscordSource` (P11) | new |
 | `Channel` | `send(OutboundMessage, SendOptions { repeat, approval }) -> Sent \| Gone`; shapes text per medium (short chat, PRs structured) | `JsonlChannel` (P3b), `SlackChannel` (P4), `GithubChannel` (P8), `DiscordChannel` (P11) | `src/agent/jsonl.rs`, `src/agent/slack/`, `src/agent/github/`, `src/agent/discord/` |
-| `Forge` | `prepare(repo, dirs) -> Workspace`: a repository Ticket's `work/` cloned from the host's mirror, and its `repo.json` (`src/agent/ports.rs`, P13) | `GithubForge`, `LocalForge` (`src/agent/forge.rs`) | new |
+| `Forge` | `prepare(repo, dirs) -> Workspace`: a repository Ticket's `work/` cloned from the host's mirror, and its `repo.json`; `admit(proposal) -> Harvest \| Refusal`: judge the commits a worker proposes, on this host, in the mirror; `execute(Publish) -> Observed`: make the forge hold the head and a ready pull request, every step an ensure (`src/agent/ports.rs`, P13, P14) | `GithubForge`, `LocalForge` (`src/agent/forge/`; the local one clones and admits, and publishes nothing) | new |
 | `Store` | agent-core `Repositories` plus the effect queue | in-memory (P0), SQLite `crates/agent-store` (P3a) | new |
 | `ToolSurface` | How a session calls tools: `GET /tools`, `/model` (or `/v1/messages`, P7b) and `/tool/{name}` on the broker | Pi extension (`extensions/broker.ts`); `solos-swarm mcp` (P7a), so any MCP harness gets the same tools | the tool schemas live in `src/agent/broker/registry.rs`; the extension's copy is tested against it |
 
@@ -1012,7 +1012,7 @@ github:
 forge:
   kind: github                         # no token_file, no identity: the clone's commits are by the App's bot
   repos:                               # the one list of repositories: the Source, the Channel and the forge use it
-    acme/widgets: {about: The widget service, base: main}
+    acme/widgets: {about: The widget service, base: main, owes: pull_request}   # owes is the most the agent does here; see Repositories
 sources:
   - kind: github                       # no fields: it reads forge.repos
   - kind: schedule
@@ -1655,8 +1655,9 @@ Nothing anchors the chain's head outside `agent.db`, so a trail cut at a clean s
 A worker can answer from a repository's real code, and change it in a clone of its own. The Router names the
 repository when it accepts work on it, and a question about how or why a repository works counts as work. Before the
 Ticket's first worker starts, the host clones the repository into the Ticket's `work/`. The worker reads the clone
-with `read` and runs git and the code there with `run_code`, where its commits work. Nothing is pushed yet. Pull
-requests come with PR 3 of [`pstack/prs.md`](pstack/prs.md).
+with `read` and runs git and the code there with `run_code`, where its commits work. What the Ticket owes decides
+what its `ready` means: an answer, a change committed in the clone, or a pull request the host opens as the bot
+([Delivering a pull request](#delivering-a-pull-request)).
 
 1. List the repositories under `forge`. The executor must be `pi` with `run_code`, where workers run git:
 
@@ -1671,7 +1672,13 @@ requests come with PR 3 of [`pstack/prs.md`](pstack/prs.md).
          base: main                           # each clone starts at its tip
          budget_microusd: 3000000             # an accept that names no budget gets this
          notes: Rust is at /rust/bin and its crates at /cargo; build offline.   # the worker reads this
-         owes: pull_request                   # answer (the default), change or pull_request
+         owes: pull_request                   # answer (the default), change or pull_request: also the most the agent does here
+         # protected: [".github/**"]          # paths no commit of the agent may change (globs; ASCII case is ignored)
+         # max_pushes: 6                      # heads published for one Ticket, review rounds included
+         # max_change_bytes: 5000000          # the largest change a ready is admitted with
+         # merge: ask                         # off, ask or auto: recorded in the Ticket's terms; merging itself is later work
+         # ci: expected                       # expected or none: whether a merge waits for CI
+         # max_repairs: 2                     # CI failures that may resume a delivered Ticket (later work)
    ```
 
    `kind: local` takes `remote: <dir>` and `identity: {name, email}` (who its clone's commits are by) instead of the
@@ -1686,8 +1693,12 @@ requests come with PR 3 of [`pstack/prs.md`](pstack/prs.md).
 What happens:
 
 - `router_decide` takes `repo`, one of `forge.repos`, and `deliverable`, which says what the finished work owes:
-  `answer`, `change` or `pull_request`. Without `deliverable` the Ticket owes the repository's `owes`. The Ticket
-  records the repository in its Mandate and the deliverable in its Plan. Nothing enforces the deliverable yet.
+  `answer`, `change` or `pull_request`. Without `deliverable` the Ticket owes the repository's `owes`, and `owes` is
+  also a ceiling: the Router may lower it for one request, never raise it, and `router_decide` refuses a
+  `deliverable` above it and names the ceiling. `owes: answer` makes a repository read-only to the agent whatever a
+  model asks. The Ticket records the repository in its Mandate, the deliverable in its Plan, and, for a change or a
+  pull request, the repository's terms (merge mode, CI, limits), which a later config edit never changes for work in
+  flight.
   `router_decide` refuses an unknown repository, a repository on a swarm plan, a repository on a remote node, and a
   `deliverable` with no repository.
 - The host keeps a bare mirror of each repository at `<state>/forge/<owner>/<name>.git`. Before a Ticket's first
@@ -1713,7 +1724,55 @@ What happens:
   no script or hook from the clone. A repository is data until a sandbox runs it, and a `prepare` that runs it gives
   that repository's authors the host. Keep `prepare` to work that touches no file of the clone, such as writing a
   scratch directory or a file beside it.
-- Tickets that name a repository need schema V6 of `agent.db`, so an older build refuses the file.
+- Tickets that name a repository need schema V6 of `agent.db`, and Tickets that deliver a change or a pull request
+  need V7, so an older build refuses the file.
+
+### Delivering a pull request
+
+A pull request is owed, not done. The worker has no push, no pull-request tool and no token: its whole vote is
+`worker_report ready`, which the host admits or refuses, and everything after that is the host's. A worker that ends its
+turn in plain text, which the host files as `ready` for it, goes through the same admission.
+
+```text
+ready ─ harvest ─ admit ─ one commit: ProposalAdmitted + Effect::Forge(Publish) + the worker's Assignment ends
+        (a fresh      (in the mirror)           the Ticket stays open, stage `delivering`
+         sandbox)
+Publish ─ push the branch (lease) ─ find or open the pull request ─ read it back ─ Delivered, the Result, the Ticket ends
+```
+
+- **Harvest.** The host runs a fixed script in a sandbox it builds, with `/work` read-only, a fresh writable `/out`,
+  no network and an empty environment, and git told to ignore the clone's own config (no file system monitor, no hooks,
+  no replace refs). It writes `git bundle <base commit>..HEAD`. The script's own output is advisory.
+- **Admit.** The bundle is untrusted data. The host copies it to `<state>/forge-stage/<ticket>/<head>.bundle` (beside the
+  mirrors, so a mirror that is made again cannot lose it), opening it without following a link and within
+  `max_change_bytes`, fetches it into its mirror with `fsckObjects` and replace refs off, and judges the agent's own
+  range there, never in the worker's tree: the commits reachable from the head and from nothing on the base. The head
+  must descend from the commit the clone started from; every commit's author and committer must be the bot, exactly;
+  no commit in the range may change a `protected` path, an intermediate one included; and the change must be within
+  `max_change_bytes` and 2,000 files. A refusal is the `worker_report` call's 409, nothing is committed, the Ticket stays
+  open, and the sentence says what to do next (for a commit by someone else, `git rebase --exec 'git commit --amend
+  --no-edit --reset-author' <base>`). Commits of a newer base that the worker merged in are the base's, and are not judged.
+- **Publish.** The Effect is committed with the admission, so a crash anywhere leaves it queued, and the runtime runs it
+  again. Each step is an ensure. The branch is `solos/<ticket>/<slug of the title>`, named by the host. `ls-remote` first:
+  a branch that already holds the head is done; one that holds the last head the host confirmed is pushed with
+  `--force-with-lease` against it; anything else is someone else's, and is never overwritten (`Withheld`: the Change is
+  held and one question goes to a person). The token is a write token for the one repository, in the mirror git's
+  environment only. Then the pull request is found by its head or opened ready for review, never as a draft, with the
+  worker's words, `Closes #n` when the request was an issue of the same repository, who asked, and a hidden marker
+  that ties it to the Ticket. A pull request on that branch without the marker is refused, one a person closed is not
+  reopened, and what GitHub shows is read back before anything is recorded.
+- **The result.** The Ticket ends only then, and its Result is the worker's text and one line built by the host from
+  what it read back: `PR <url> · head <sha> · opened` (`updated` for a later head). The Ticket subscribes to the pull
+  request's conversation, so a listed person's comment on it resumes the Ticket, and the Result goes to the origin first
+  and then to the pull request instead of an origin on GitHub. A follow-up that arrives while the pull request is being
+  made is kept and takes the Ticket up again once it exists.
+- **Limits.** `max_pushes` heads per Ticket; a `ready` with the same head is an answer, not a second push.
+- **Held.** `policy.paused` holds the Effect with the rest of the agent. A suspended or missing installation makes it
+  wait five minutes and try again, and it converges when the owner lifts it. `github.writes: false` makes the answer
+  `Withheld`: nothing is pushed.
+- **`change`.** A Ticket that owes a change ends when the host admits the worker's commits (the same checks), and says
+  `Committed <sha> (n files) in the ticket's clone; not published.` A `ready` with no commits is refused.
+- **Existing work.** A Ticket accepted before this build, with no terms in its Mandate, ends on `ready` as it did.
 
 ## Security model
 

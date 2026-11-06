@@ -8,6 +8,7 @@ export type Stage =
   | "answer"
   | "blocked"
   | "failed"
+  | "delivering"
   | "queued"
   | "idle"
   | "working"

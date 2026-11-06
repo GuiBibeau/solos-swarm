@@ -207,6 +207,7 @@ fn stage(stage: Stage) -> &'static str {
         Stage::Answer => "waiting for an answer",
         Stage::Blocked => "blocked",
         Stage::Failed => "failed",
+        Stage::Delivering => "opening its pull request",
         Stage::Queued => "queued",
         Stage::Idle => "idle",
         Stage::Working => "working",
@@ -1063,6 +1064,7 @@ mod tests {
             budget_microusd: budget,
             notes: Some("Workers read this, the Router does not.".into()),
             owes,
+            ..RepoConfig::default()
         };
         let name = |name: &str| RepoName::try_from(name.to_owned()).unwrap();
         let decide = DecideTerms {

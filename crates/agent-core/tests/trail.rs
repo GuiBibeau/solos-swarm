@@ -151,6 +151,7 @@ fn running_ticket(
         acknowledge: Acknowledge::Standard,
         rules: Vec::new(),
         repo: None,
+        forge: None,
     });
     let decision = engine.decide(&eval, accept).unwrap();
     let ticket = engine.repos().decisions[&decision].ticket.clone().unwrap();
@@ -350,6 +351,7 @@ fn a_close_is_admitted_after_the_assignment_and_the_ticket_end() {
         text: "done".into(),
         question: None,
         spent_microusd: 0,
+        harvest: None,
     };
     w.engine.report(&w.ticket, &w.assignment, report).unwrap();
     assert!(w.engine.repos().tickets[&w.ticket].ended.is_some());

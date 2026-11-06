@@ -1,4 +1,7 @@
-use crate::change::{Deliverable, RepoName};
+use crate::change::{
+    Change, CommitSha, Deliverable, ForgeTerms, Harvest, PrRef, RepoName, Withheld,
+};
+use crate::delivery::ForgeJob;
 use crate::trail::{TrailAction, TrailCursor, TrailOutcome};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -283,6 +286,11 @@ pub struct Mandate {
     /// The one repository its worker reads and changes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<RepoName>,
+    /// What it may do on the forge, for a Ticket that owes a change or a pull
+    /// request. Fixed at accept, from the repository's config and never from
+    /// a model's words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forge: Option<ForgeTerms>,
 }
 
 /// Whether a person has to approve the Ticket's budget before it launches.
@@ -459,6 +467,10 @@ pub struct Ticket {
     /// Triggers its worker handed back to the Router, each at most once.
     #[serde(default)]
     pub handed_back: BTreeSet<TriggerId>,
+    /// The pull request this Ticket owes, once its worker's `ready` was
+    /// admitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change: Option<Change>,
 }
 impl Ticket {
     pub fn latest_assignment(&self) -> Option<&Assignment> {
@@ -477,6 +489,11 @@ impl Ticket {
     }
     pub fn stopped_by_person(&self) -> bool {
         self.ended.as_ref().is_some_and(|e| e.by == EndedBy::Person)
+    }
+    /// An admitted head is not on the forge yet: the host owes the pull
+    /// request.
+    pub fn delivery_owed(&self) -> bool {
+        self.change.as_ref().is_some_and(Change::delivery_owed)
     }
     /// Whether `ask` still stands: the Ticket is open and its question has
     /// not been answered.
@@ -517,6 +534,9 @@ impl Ticket {
                 _ => Stage::Blocked,
             };
         }
+        if self.delivery_owed() && !self.has_live_assignment() {
+            return Stage::Delivering;
+        }
         match self.latest_assignment() {
             None => Stage::Queued,
             Some(a) if a.state == AssignmentState::Pending => Stage::Queued,
@@ -539,6 +559,9 @@ pub enum Stage {
     Answer,
     Blocked,
     Failed,
+    /// The Ticket's worker is done and the host is publishing its change:
+    /// the pull request does not exist yet, so the Ticket is not done.
+    Delivering,
     Queued,
     /// Turn over; a Trigger on a subscribed Thread continues it.
     Idle,
@@ -605,6 +628,10 @@ pub struct Accept {
     /// The repository the work reads and changes, for a session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<RepoName>,
+    /// What the work may do on the forge, filled by the broker from the
+    /// repository's config for any deliverable above an answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forge: Option<ForgeTerms>,
 }
 
 /// What `Acknowledge::Standard` says. It is one short line a person would
@@ -634,6 +661,11 @@ pub struct ReportIn {
     pub question: Option<String>,
     #[serde(default)]
     pub spent_microusd: MicroUsd,
+    /// What the host harvested of the worker's tree and admitted, for a
+    /// `ready` on a Ticket that owes a change or a pull request. Set by the
+    /// broker only; a worker's tool arguments have no such field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harvest: Option<Harvest>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -720,6 +752,9 @@ pub enum Effect {
         reason: String,
     },
     Send(OutboundMessage),
+    /// Make the forge match the Store, committed with the decision that owes
+    /// it. Idempotent: the host runs it again after a crash.
+    Forge(ForgeJob),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -815,6 +850,29 @@ pub enum DomainEvent {
         secret: SecretId,
         method: String,
         url: String,
+    },
+    /// `ready` was accepted: this head will be delivered. `round` counts the
+    /// heads admitted for the Ticket.
+    ProposalAdmitted {
+        ticket: TicketId,
+        head: CommitSha,
+        commits: u32,
+        files: u32,
+        bytes: u64,
+        round: u32,
+    },
+    /// The forge holds `head` on the Ticket's branch with a pull request.
+    Delivered {
+        ticket: TicketId,
+        head: CommitSha,
+        pr: PrRef,
+        created: bool,
+    },
+    /// The forge said no, for good.
+    Withheld {
+        ticket: TicketId,
+        head: CommitSha,
+        why: Withheld,
     },
 }
 

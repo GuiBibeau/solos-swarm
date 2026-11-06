@@ -230,6 +230,9 @@ impl Source {
             | DomainEvent::SecretAsked { ticket, .. }
             | DomainEvent::SecretAnswered { ticket, .. }
             | DomainEvent::KeyUsed { ticket, .. }
+            | DomainEvent::ProposalAdmitted { ticket, .. }
+            | DomainEvent::Delivered { ticket, .. }
+            | DomainEvent::Withheld { ticket, .. }
             | DomainEvent::Reported { ticket, .. } => touch(self, ticket),
             DomainEvent::TicketResumed { ticket, .. } => {
                 touch(self, ticket);

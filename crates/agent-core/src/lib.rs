@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod change;
+pub mod delivery;
 pub mod engine;
 pub mod ids;
 pub mod memory;
