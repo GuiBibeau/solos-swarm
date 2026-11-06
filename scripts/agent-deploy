@@ -4,16 +4,22 @@
 #   deploy [REV]      build REV (default origin/main) on the box as an immutable release, back up agent.db, switch,
 #                     restart and wait until healthy; if it does not come up, switch back and restore agent.db
 #   rollback          switch to the previous release and restart
-#   status            the unit, the release it runs, and `agent status`
+#   status            the unit, the release it runs, `agent status`, and the dashboard publisher if there is one
 #   logs [ARGS]       journalctl for the unit (default: the last 100 lines; `logs -f` follows)
+#   publish-logs [ARGS]  the same for the dashboard publisher (solos-agent-publish)
 #   token NAME        store a one-use credential read from stdin as ~/agent/tokens/NAME (0600); prints nothing of it
 #   start|stop|restart
 #   releases          list releases, marking current and previous
 #
 # The box (AGENT_HOST, default remote-ai) keeps everything under ~/agent; see scripts/systemd/solos-agent.service.
+# When ~/agent/agent.yaml has a web.publish section (block style, as docs/agent-mode/production.md writes it), the
+# dashboard publisher, scripts/systemd/solos-agent-publish.service, is installed, enabled and restarted with the
+# agent by switch, rollback, start, stop and restart. It only reads agent.db, so it is stopped while agent.db is
+# backed up or restored and started again after.
 set -euo pipefail
 HOST=${AGENT_HOST:-remote-ai}
 UNIT=solos-agent
+PUB=solos-agent-publish
 
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 "$HOST")
 # This script runs on the box too: each command first installs it as ~/agent/.agent-deploy, so stdin stays free
@@ -29,6 +35,27 @@ if [[ ${1:-} == --on-host ]]; then
 	NODE=$HOME/.local/opt/node-v24.18.0-linux-x64/bin/node
 	export PATH=$HOME/.cargo/bin:$HOME/.local/opt/node-v24.18.0-linux-x64/bin:/usr/local/bin:/usr/bin:/bin
 	sc() { systemctl --user "$@"; }
+	publishing() { # 0 when agent.yaml has web.publish: a `web:` block with a `publish:` key, or one on the web: line
+		awk '/^web:/ { inweb = 1; if ($0 ~ /publish:/) found = 1; next }
+		     /^[^ \t#]/ { inweb = 0 }
+		     inweb && /^[ \t]+publish:/ { found = 1 }
+		     END { exit !found }' "$A/agent.yaml" 2> /dev/null
+	}
+	pub_stop() { sc stop $PUB 2> /dev/null || true; }
+	pub_start() { # (re)start the publisher when it is configured; otherwise make sure it is not left running
+		if publishing; then
+			sc reset-failed $PUB 2> /dev/null || true
+			# The agent is already up; a publisher that will not start is reported, not fatal.
+			if sc restart $PUB; then
+				echo "publisher: $(sc is-active $PUB)"
+			else
+				echo "the publisher did not start: scripts/agent-deploy publish-logs" >&2
+			fi
+		elif [[ -f $HOME/.config/systemd/user/$PUB.service ]]; then
+			sc disable -q --now $PUB 2> /dev/null || true
+			echo "publisher: off (agent.yaml has no web.publish)"
+		fi
+	}
 	healthy() { # 0 once the unit has stayed up with its broker socket for 20 s
 		local pid
 		for _ in $(seq 1 45); do
@@ -55,8 +82,16 @@ if [[ ${1:-} == --on-host ]]; then
 		ln -sfn "$1" "$A/current.new" && mv -T "$A/current.new" "$A/current"
 		[[ -n $old && $old != "$1" ]] && ln -sfn "$old" "$A/previous.new" && mv -T "$A/previous.new" "$A/previous"
 		install -m 0644 "$A/current/scripts/systemd/$UNIT.service" "$HOME/.config/systemd/user/$UNIT.service"
+		if publishing; then
+			if [[ -f $A/current/scripts/systemd/$PUB.service ]]; then
+				install -m 0644 "$A/current/scripts/systemd/$PUB.service" "$HOME/.config/systemd/user/$PUB.service"
+			else
+				echo "release $(basename "$1") has no $PUB.service: the publisher keeps the unit it has" >&2
+			fi
+		fi
 		sc daemon-reload
 		sc enable -q $UNIT
+		if publishing && [[ -f $HOME/.config/systemd/user/$PUB.service ]]; then sc enable -q $PUB; fi
 	}
 	case $cmd in
 	receive) # stdin: git archive of release $1
@@ -83,6 +118,7 @@ if [[ ${1:-} == --on-host ]]; then
 		rel=$A/releases/$1
 		[[ -f $rel/.complete ]] || { echo "no built release $1" >&2; exit 1; }
 		[[ -f $A/agent.yaml ]] || { echo "no $A/agent.yaml: write the config first" >&2; exit 1; }
+		pub_stop
 		sc stop $UNIT 2> /dev/null || true
 		b=$(backup)
 		[[ -n $b ]] && echo "backed up agent.db to $b"
@@ -91,6 +127,7 @@ if [[ ${1:-} == --on-host ]]; then
 		sc start $UNIT
 		if healthy; then
 			echo "release $1 is serving (pid $(sc show -p MainPID --value $UNIT))"
+			pub_start
 		else
 			echo "release $1 did not come up; its log:" >&2
 			journalctl --user -u $UNIT -n 30 --no-pager -o cat >&2
@@ -101,6 +138,7 @@ if [[ ${1:-} == --on-host ]]; then
 				[[ -n $b ]] && cp -a "$b"/agent.db* "$A/state/"
 				sc reset-failed $UNIT 2> /dev/null || true
 				sc start $UNIT && healthy && echo "switched back to $(basename "$prev") and restored agent.db" >&2
+				pub_start >&2 || true
 			fi
 			exit 1
 		fi
@@ -112,30 +150,48 @@ if [[ ${1:-} == --on-host ]]; then
 		;;
 	rollback)
 		prev=$(readlink "$A/previous" 2>/dev/null) || { echo "no previous release" >&2; exit 1; }
+		pub_stop
 		sc stop $UNIT || true
 		backup > /dev/null
 		switch "$prev"
 		sc reset-failed $UNIT 2> /dev/null || true
 		sc start $UNIT
-		healthy && echo "rolled back to $(basename "$prev")" || {
+		if healthy; then
+			echo "rolled back to $(basename "$prev")"
+			pub_start
+		else
 			echo "the previous release did not come up (a newer agent.db schema refuses an older binary; restore one from $A/backups/):" >&2
 			journalctl --user -u $UNIT -n 20 --no-pager -o cat >&2
 			exit 1
-		}
+		fi
 		;;
 	status)
 		echo "release: $(basename "$(readlink "$A/current" 2>/dev/null || echo none)") (previous: $(basename "$(readlink "$A/previous" 2>/dev/null || echo none)"))"
 		sc status $UNIT --no-pager -n 0 | sed -n 1,5p || true
 		[[ -f $A/state/agent.db ]] && "$A/current/bin/solos-swarm" agent status --state-dir "$A/state" --config "$A/agent.yaml" || true
+		if publishing || [[ -f $HOME/.config/systemd/user/$PUB.service ]]; then
+			echo "publisher: $(sc is-active $PUB 2> /dev/null || true) (configured: $(publishing && echo yes || echo no))"
+			sc status $PUB --no-pager -n 0 2> /dev/null | sed -n 1,5p || true
+			ms=$(grep -o '"index_ms":[0-9]*' "$A/state/publish-state.json" 2> /dev/null | cut -d: -f2 || true)
+			if [[ -n ${ms:-} && $ms -gt 0 ]]; then
+				echo "dashboard index last uploaded $(($(date +%s) - ms / 1000))s ago"
+			fi
+		fi
 		;;
 	logs) (($#)) || set -- -n 100; journalctl --user -u $UNIT --no-pager -o short-iso "$@" ;;
+	publish-logs) (($#)) || set -- -n 100; journalctl --user -u $PUB --no-pager -o short-iso "$@" ;;
 	token)
 		[[ $1 =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad token name" >&2; exit 1; }
 		mkdir -p -m 0700 "$A/tokens" && (umask 077 && cat > "$A/tokens/$1.new") && mv "$A/tokens/$1.new" "$A/tokens/$1"
 		[[ -s $A/tokens/$1 ]] || { rm -f "$A/tokens/$1"; echo "empty token refused" >&2; exit 1; }
 		echo "stored token $1; restart the agent to use it"
 		;;
-	start | stop | restart) sc "$cmd" $UNIT && echo "$cmd: $(sc is-active $UNIT)" ;;
+	start | stop | restart)
+		# The publisher goes first on a stop and last on a start: it reads what the agent writes.
+		[[ $cmd == stop ]] && pub_stop
+		sc "$cmd" $UNIT && echo "$cmd: $(sc is-active $UNIT)"
+		if [[ $cmd != stop ]] && publishing; then pub_start; fi
+		;;
 	releases)
 		cur=$(readlink "$A/current" 2>/dev/null || true)
 		prev=$(readlink "$A/previous" 2>/dev/null || true)
@@ -166,6 +222,7 @@ deploy)
 	;;
 rollback | status | releases | start | stop | restart) push_self && host "$cmd" ;;
 logs) push_self && host logs "$@" ;;
+publish-logs) push_self && host publish-logs "$@" ;;
 token)
 	[[ ${1:-} =~ ^[A-Za-z0-9._-]+$ ]] || { echo "usage: agent-deploy token NAME < file" >&2; exit 2; }
 	push_self && host token "$1"

@@ -1,0 +1,48 @@
+# The dashboard's publisher: `solos-swarm agent publish` as a systemd user unit, installed and restarted by
+# scripts/agent-deploy (which copies this file to ~/.config/systemd/user/ beside solos-agent.service whenever
+# ~/agent/agent.yaml has a web.publish section). See docs/agent-mode/production.md, "Dashboard".
+#
+# It opens ~/agent/state/agent.db read-only and uploads JSON snapshots of the tickets to a private Vercel Blob
+# store over HTTPS; nothing connects to this box. It never writes the Store: its one file in the state directory
+# is publish-state.json (the hash of each blob it last uploaded).
+#
+# The Blob read-write token is a one-use credential like the agent's: `agent-deploy token vercel-blob-token < file`
+# stores it as ~/agent/tokens/vercel-blob-token, ExecStartPre copies it (and nothing else) into this unit's private
+# tmpfs runtime directory before every start, crash restarts included, and `agent publish` reads it once and deletes
+# it. agent.yaml's web.publish.token_file is therefore /run/user/<uid>/solos-agent-publish/vercel-blob-token. The
+# runtime directory is removed when the unit stops. solos-agent.service does not copy this token.
+[Unit]
+Description=solos-swarm agent mode: publish tickets to the dashboard
+After=network-online.target solos-agent.service
+Wants=network-online.target
+StartLimitIntervalSec=900
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h/agent
+RuntimeDirectory=solos-agent-publish
+RuntimeDirectoryMode=0700
+UMask=0077
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStartPre=/bin/sh -c 'cp "$HOME/agent/tokens/vercel-blob-token" "$RUNTIME_DIRECTORY/vercel-blob-token"'
+ExecStart=%h/agent/current/bin/solos-swarm agent publish --config %h/agent/agent.yaml --state-dir %h/agent/state
+KillSignal=SIGTERM
+TimeoutStopSec=20
+# A refused token exits 1 and so does a missing one: after five tries in 15 minutes the unit stays failed, which
+# `agent-deploy status` shows. Rotate the token (production.md) and `agent-deploy restart`.
+Restart=on-failure
+RestartSec=30
+# The box runs other production services, and the agent itself: stay far below them.
+Nice=10
+CPUWeight=10
+IOWeight=10
+MemoryMax=512M
+TasksMax=128
+NoNewPrivileges=yes
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=solos-agent-publish
+
+[Install]
+WantedBy=default.target
