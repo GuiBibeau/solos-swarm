@@ -1,11 +1,13 @@
 //! `agent.yaml`. Unknown fields are errors, like a swarm Goal's, so a typo
 //! cannot silently fall back to a default.
 
+mod health;
 mod nodes;
 mod sources;
 mod watchdog;
 mod web;
 
+pub use health::HealthConfig;
 pub use nodes::{AllowedNode, NodesConfig};
 pub use sources::{Interval, ReplyTo, ScheduleConfig, TimeOfDay};
 pub use watchdog::{OperatorConfig, ThresholdsConfig, WatchdogConfig};
@@ -76,6 +78,10 @@ pub struct AgentConfig {
     /// link nowhere.
     #[serde(default)]
     pub web: Option<WebConfig>,
+    /// What `agent health` (the check systemd runs beside the agent) treats
+    /// as trouble. Without it, its defaults apply.
+    #[serde(default)]
+    pub health: Option<HealthConfig>,
 }
 
 fn pass_through() -> bool {
@@ -819,6 +825,7 @@ impl AgentConfig {
         );
         self.validate_schedules(&served)?;
         self.validate_watchdog(&served)?;
+        self.validate_health()?;
         self.validate_nodes()?;
         ensure!(
             self.browser.is_none() || matches!(self.executor, ExecutorConfig::Pi { .. }),

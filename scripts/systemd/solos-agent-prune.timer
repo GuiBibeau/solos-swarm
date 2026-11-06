@@ -1,0 +1,12 @@
+# Runs solos-agent-prune.service once a day, at 04:30 (the box's local time) plus up to 15 minutes. Persistent: a day
+# the box was off is made up at the next boot.
+[Unit]
+Description=solos-swarm agent mode: prune finished work once a day
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

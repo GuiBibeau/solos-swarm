@@ -11,6 +11,7 @@ pub mod environment;
 pub mod forge;
 pub mod github;
 pub mod goal_template;
+pub mod health;
 pub mod jobs;
 pub mod jsonl;
 pub mod links;
@@ -20,6 +21,7 @@ pub mod pi_executor;
 pub mod pi_router;
 mod plain_answer;
 pub mod ports;
+pub mod prune;
 pub mod pstack;
 pub mod publish;
 pub mod runtime;
@@ -28,6 +30,7 @@ pub mod scripted;
 pub mod simulated;
 pub mod slack;
 pub mod status;
+pub mod stop;
 pub mod swarm_executor;
 pub mod trail;
 pub mod utc;
@@ -825,6 +828,8 @@ impl Io {
                 SourceConfig::Mcp {} => {
                     let inbox = mcp::open_inbox(state_dir)?;
                     sources.push(Box::new(JsonlSource::new(inbox, follow)));
+                    let commands = mcp::open_commands(state_dir)?;
+                    sources.push(Box::new(mcp::CommandSource::new(commands, follow)));
                 }
             }
         }

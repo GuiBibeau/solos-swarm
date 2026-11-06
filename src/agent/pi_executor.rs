@@ -41,7 +41,7 @@ pub const WORK_DIR: &str = "work";
 /// `/host`.
 pub const HOST_DIR: &str = "host";
 /// Written once the prepare command succeeded, so it runs once per Ticket.
-const PREPARED: &str = "prepared";
+pub(crate) const PREPARED: &str = "prepared";
 const PREPARE_WAIT: Duration = Duration::from_secs(300);
 const INPUT_TEXT_CHARS: usize = 4_000;
 const FAILURE_CHARS: usize = 400;

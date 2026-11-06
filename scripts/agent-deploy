@@ -4,28 +4,44 @@
 #   deploy [REV]      build REV (default origin/main) on the box as an immutable release, back up agent.db, switch,
 #                     restart and wait until healthy; if it does not come up, switch back and restore agent.db
 #   rollback          switch to the previous release and restart
-#   status            the unit, the release it runs, `agent status`, and the dashboard publisher if there is one
+#   status            the unit, the release it runs, `agent status`, the health check and prune timers, and the
+#                     dashboard publisher if there is one
 #   logs [ARGS]       journalctl for the unit (default: the last 100 lines; `logs -f` follows)
 #   publish-logs [ARGS]  the same for the dashboard publisher (solos-agent-publish)
+#   health-logs [ARGS]   the same for the health check (solos-agent-health)
+#   prune-logs [ARGS]    the same for the daily prune (solos-agent-prune)
 #   token NAME        store a one-use credential read from stdin as ~/agent/tokens/NAME (0600); prints nothing of it
 #   start|stop|restart
 #   releases          list releases, marking current and previous
+#
+# deploy, rollback, stop and restart drain first: they pause the agent (state/control.json), wait up to 90 s for
+# each running Assignment to send a Report or end, and only then stop it, so a deploy interrupts work at a turn
+# boundary instead of mid-turn. `--drain SECONDS` changes the wait, `--no-drain` (or SECONDS 0) stops at once, as an
+# emergency rollback should; AGENT_DRAIN_SECS sets the default. The pause is lifted once the agent is healthy.
 #
 # The box (AGENT_HOST, default remote-ai) keeps everything under ~/agent; see scripts/systemd/solos-agent.service.
 # When ~/agent/agent.yaml has a web.publish section (block style, as docs/agent-mode/production.md writes it), the
 # dashboard publisher, scripts/systemd/solos-agent-publish.service, is installed, enabled and restarted with the
 # agent by switch, rollback, start, stop and restart. It only reads agent.db, so it is stopped while agent.db is
 # backed up or restored and started again after.
+# Every switch also installs and enables the health check (solos-agent-health.timer and .service, which alert from
+# outside the agent) and the daily prune (solos-agent-prune.timer and .service). While a command stops and starts the
+# agent it writes state/health-hold, so the health check does not alert about a stop it knows of; the hold expires
+# on its own after 30 minutes, so a stop that was forgotten, or a deploy that went wrong, is alerted.
 set -euo pipefail
 HOST=${AGENT_HOST:-remote-ai}
 UNIT=solos-agent
 PUB=solos-agent-publish
+HEALTH=solos-agent-health
+PRUNE=solos-agent-prune
+# How long a command waits for running Assignments to reach a Report before it stops the agent anyway.
+DRAIN_SECS=${AGENT_DRAIN_SECS:-90}
 
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 "$HOST")
 # This script runs on the box too: each command first installs it as ~/agent/.agent-deploy, so stdin stays free
 # for data (a release archive, a token).
 push_self() { "${SSH[@]}" "mkdir -p -m 0700 ~/agent && cat > ~/agent/.agent-deploy" < "$0"; }
-host() { "${SSH[@]}" "bash ~/agent/.agent-deploy --on-host $*"; }
+host() { "${SSH[@]}" "AGENT_DRAIN_SECS=$DRAIN_SECS bash ~/agent/.agent-deploy --on-host $*"; }
 
 if [[ ${1:-} == --on-host ]]; then
 	shift
@@ -56,17 +72,104 @@ if [[ ${1:-} == --on-host ]]; then
 			echo "publisher: off (agent.yaml has no web.publish)"
 		fi
 	}
-	healthy() { # 0 once the unit has stayed up with its broker socket for 20 s
+	# The health check and the daily prune are timers, installed beside the agent from the same release.
+	ops_installed() { [[ -f $A/current/scripts/systemd/$HEALTH.service ]]; }
+	ops_install() { # copy the release's health and prune units; a release that predates them turns the timers off
+		local f
+		if ops_installed; then
+			for f in $HEALTH.service $HEALTH.timer $PRUNE.service $PRUNE.timer; do
+				install -m 0644 "$A/current/scripts/systemd/$f" "$HOME/.config/systemd/user/$f"
+			done
+		fi
+	}
+	ops_enable() { # after daemon-reload
+		if ops_installed; then
+			sc enable -q $HEALTH.timer $PRUNE.timer
+		else
+			# An older binary has no `agent health`: its timer would fail every few minutes and tell nobody.
+			sc disable -q --now $HEALTH.timer $PRUNE.timer 2> /dev/null || true
+			echo "release $(basename "$(readlink "$A/current")") has no health check: its timers are off" >&2
+		fi
+	}
+	ops_start() { # once the agent is healthy
+		if ops_installed; then sc start $HEALTH.timer $PRUNE.timer || echo "the health timers did not start" >&2; fi
+	}
+	# state/health-hold: an expiry time. While it is in the future the health check records problems and tells
+	# nobody. It is on while a command stops and starts the agent, and `stop` leaves it for its 30 minutes.
+	hold_on() {
+		if [[ -d $A/state ]]; then echo $(($(date +%s) + 1800)) > "$A/state/health-hold"; fi
+	}
+	# shellcheck disable=SC2317 # run by `trap hold_off EXIT`
+	hold_off() { rm -f "$A/state/health-hold"; }
+	# state/control.json {"mode":"pause"} is the pause gate the agent and its broker already read. A drain writes
+	# one marked "by":"agent-deploy"; only a file with that mark is ever removed here.
+	paused_by_us() { grep -q '"by": *"agent-deploy"' "$A/state/control.json" 2> /dev/null; }
+	drain_pause() { # pause unless a control file that is somebody else's is already there
+		if [[ -f $A/state/control.json ]] && ! paused_by_us; then return 0; fi
+		printf '{"mode":"pause","by":"agent-deploy","reason":"deploy drain","at":%s}\n' "$(date +%s)" > "$A/state/control.json.tmp"
+		mv -f "$A/state/control.json.tmp" "$A/state/control.json"
+	}
+	drain_resume() { if paused_by_us; then rm -f "$A/state/control.json"; echo "unpaused"; fi; }
+	agent_status() { "$A/current/bin/solos-swarm" agent status --state-dir "$A/state" --json 2> /dev/null; }
+	running_assignments() { # stdin: `agent status --json`; stdout: "<ticket> <assignment> <reports>" per running Assignment
+		awk '/^  "tickets": \[/ { intickets = 1; next }
+		     /^  "[a-z_]+": / { intickets = 0 }
+		     !intickets { next }
+		     /^      "id": "/ { split($0, p, "\""); ticket = p[4]; next }
+		     /^      "assignment": \{/ { inside = 1; assignment = ""; state = ""; reports = 0; next }
+		     inside && /^        "id": "/ { split($0, p, "\""); assignment = p[4]; next }
+		     inside && /^        "state": "/ { split($0, p, "\""); state = p[4]; next }
+		     inside && /^        "reports": / { reports = $2 + 0; next }
+		     inside && /^      \}/ { inside = 0; if (state == "running") print ticket, assignment, reports }'
+	}
+	still_mid_turn() { # $1, $2: files of running_assignments from before and from now; those that have not moved
+		awk 'NR == FNR { seen[$1 " " $2] = $3; next } ($1 " " $2) in seen && seen[$1 " " $2] == $3' "$1" "$2"
+	}
+	drain() { # pause, then wait up to $1 s for every running Assignment to send a Report or end
+		local secs=$1 json before now deadline left n
+		((secs > 0)) || return 0
+		[[ -f $A/state/agent.db && -x $A/current/bin/solos-swarm ]] && sc is-active -q $UNIT || return 0
+		drain_pause
+		json=$(agent_status) || {
+			echo "drain: paused, but the running release's \`agent status\` failed, so not waiting" >&2
+			return 0
+		}
+		before=$(mktemp)
+		now=$(mktemp)
+		running_assignments <<< "$json" > "$before"
+		n=$(wc -l < "$before")
+		if ((n == 0)); then
+			echo "drain: paused; nothing is running"
+		else
+			echo "drain: paused; waiting up to ${secs}s for $n running assignment(s) to report or end"
+			deadline=$((SECONDS + secs))
+			left=$n
+			while ((SECONDS < deadline)); do
+				sleep "${DRAIN_POLL:-3}"
+				json=$(agent_status) || break
+				running_assignments <<< "$json" > "$now"
+				left=$(still_mid_turn "$before" "$now" | wc -l)
+				((left == 0)) && break
+			done
+			if ((left == 0)); then
+				echo "drain: every assignment reached a report or ended"
+			else
+				echo "drain: $left assignment(s) still mid-turn after ${secs}s; stopping anyway (each starts again as a recovery)" >&2
+			fi
+		fi
+		rm -f "$before" "$now"
+	}
+	healthy() { # 0 once the unit has stayed up with its broker socket for 20 s (HEALTHY_SECS: the tests' shorter wait)
 		local pid
 		for _ in $(seq 1 45); do
 			if sc is-active -q $UNIT && [[ -S $A/state/broker.sock ]]; then
 				pid=$(sc show -p MainPID --value $UNIT)
-				sleep 20
+				sleep "${HEALTHY_SECS:-20}"
 				sc is-active -q $UNIT && [[ $(sc show -p MainPID --value $UNIT) == "$pid" ]] && return 0
 				return 1
 			fi
 			sc is-failed -q $UNIT && return 1
-			sleep 2
+			sleep "${HEALTHY_POLL:-2}"
 		done
 		return 1
 	}
@@ -89,9 +192,11 @@ if [[ ${1:-} == --on-host ]]; then
 				echo "release $(basename "$1") has no $PUB.service: the publisher keeps the unit it has" >&2
 			fi
 		fi
+		ops_install
 		sc daemon-reload
 		sc enable -q $UNIT
 		if publishing && [[ -f $HOME/.config/systemd/user/$PUB.service ]]; then sc enable -q $PUB; fi
+		ops_enable
 	}
 	case $cmd in
 	receive) # stdin: git archive of release $1
@@ -118,6 +223,9 @@ if [[ ${1:-} == --on-host ]]; then
 		rel=$A/releases/$1
 		[[ -f $rel/.complete ]] || { echo "no built release $1" >&2; exit 1; }
 		[[ -f $A/agent.yaml ]] || { echo "no $A/agent.yaml: write the config first" >&2; exit 1; }
+		hold_on
+		trap hold_off EXIT
+		drain "$DRAIN_SECS"
 		pub_stop
 		sc stop $UNIT 2> /dev/null || true
 		b=$(backup)
@@ -127,7 +235,9 @@ if [[ ${1:-} == --on-host ]]; then
 		sc start $UNIT
 		if healthy; then
 			echo "release $1 is serving (pid $(sc show -p MainPID --value $UNIT))"
+			drain_resume
 			pub_start
+			ops_start
 		else
 			echo "release $1 did not come up; its log:" >&2
 			journalctl --user -u $UNIT -n 30 --no-pager -o cat >&2
@@ -137,8 +247,14 @@ if [[ ${1:-} == --on-host ]]; then
 				switch "$prev"
 				[[ -n $b ]] && cp -a "$b"/agent.db* "$A/state/"
 				sc reset-failed $UNIT 2> /dev/null || true
-				sc start $UNIT && healthy && echo "switched back to $(basename "$prev") and restored agent.db" >&2
+				if sc start $UNIT && healthy; then
+					echo "switched back to $(basename "$prev") and restored agent.db" >&2
+					drain_resume >&2
+				else
+					echo "the previous release did not come up either; the agent is left paused if it started (state/control.json)" >&2
+				fi
 				pub_start >&2 || true
+				ops_start >&2 || true
 			fi
 			exit 1
 		fi
@@ -150,6 +266,9 @@ if [[ ${1:-} == --on-host ]]; then
 		;;
 	rollback)
 		prev=$(readlink "$A/previous" 2>/dev/null) || { echo "no previous release" >&2; exit 1; }
+		hold_on
+		trap hold_off EXIT
+		drain "$DRAIN_SECS"
 		pub_stop
 		sc stop $UNIT || true
 		backup > /dev/null
@@ -158,7 +277,9 @@ if [[ ${1:-} == --on-host ]]; then
 		sc start $UNIT
 		if healthy; then
 			echo "rolled back to $(basename "$prev")"
+			drain_resume
 			pub_start
+			ops_start
 		else
 			echo "the previous release did not come up (a newer agent.db schema refuses an older binary; restore one from $A/backups/):" >&2
 			journalctl --user -u $UNIT -n 20 --no-pager -o cat >&2
@@ -177,9 +298,35 @@ if [[ ${1:-} == --on-host ]]; then
 				echo "dashboard index last uploaded $(($(date +%s) - ms / 1000))s ago"
 			fi
 		fi
+		if [[ -f $HOME/.config/systemd/user/$HEALTH.timer ]]; then
+			echo "health check: timer $(sc is-active $HEALTH.timer 2> /dev/null || true), last run $(sc show -p Result --value $HEALTH.service 2> /dev/null || true)"
+			echo "daily prune: timer $(sc is-active $PRUNE.timer 2> /dev/null || true), last run $(sc show -p Result --value $PRUNE.service 2> /dev/null || true)"
+			sc list-timers --all --no-pager "$HEALTH.timer" "$PRUNE.timer" 2> /dev/null | sed -n '1,3p' || true
+			journalctl --user -u $PRUNE --no-pager -n 1 -o cat 2> /dev/null | sed 's/^/last prune: /' || true
+			if [[ -f $A/state/health-state.json ]]; then
+				if grep -q '"incident": *null' "$A/state/health-state.json"; then
+					echo "health incident: none open"
+				else
+					since=$(grep -o '"since_ms": *[0-9]*' "$A/state/health-state.json" | grep -o '[0-9]*$' | head -1 || true)
+					echo "health incident: OPEN for $(($(date +%s) - ${since:-0} / 1000))s (state/health-state.json)"
+				fi
+			fi
+			# A look right now: unit, broker socket, free space. It posts nothing and changes nothing.
+			if "$A/current/bin/solos-swarm" agent health --help > /dev/null 2>&1; then
+				"$A/current/bin/solos-swarm" agent health --dry-run --state-dir "$A/state" --config "$A/agent.yaml" 2>&1 | sed 's/^/  /' || true
+			fi
+		else
+			echo "health check: not installed (the running release predates it; deploy to install it)"
+		fi
 		;;
 	logs) (($#)) || set -- -n 100; journalctl --user -u $UNIT --no-pager -o short-iso "$@" ;;
 	publish-logs) (($#)) || set -- -n 100; journalctl --user -u $PUB --no-pager -o short-iso "$@" ;;
+	health-logs) (($#)) || set -- -n 100; journalctl --user -u $HEALTH --no-pager -o short-iso "$@" ;;
+	prune-logs) (($#)) || set -- -n 100; journalctl --user -u $PRUNE --no-pager -o short-iso "$@" ;;
+	# Pieces of a deploy, run alone by the tests (and usable by hand on the box).
+	drain) drain "${1:-$DRAIN_SECS}" ;;
+	resume) drain_resume ;;
+	running-assignments) running_assignments ;; # stdin: `agent status --json`
 	token)
 		[[ $1 =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad token name" >&2; exit 1; }
 		mkdir -p -m 0700 "$A/tokens" && (umask 077 && cat > "$A/tokens/$1.new") && mv "$A/tokens/$1.new" "$A/tokens/$1"
@@ -187,10 +334,24 @@ if [[ ${1:-} == --on-host ]]; then
 		echo "stored token $1; restart the agent to use it"
 		;;
 	start | stop | restart)
+		# The health check is told of it: a stop it knows of is not an alert for 30 minutes (a start or a restart
+		# that comes up clears that at once).
+		hold_on
+		[[ $cmd == stop ]] || trap hold_off EXIT
+		[[ $cmd == start ]] || drain "$DRAIN_SECS"
 		# The publisher goes first on a stop and last on a start: it reads what the agent writes.
 		[[ $cmd == stop ]] && pub_stop
 		sc "$cmd" $UNIT && echo "$cmd: $(sc is-active $UNIT)"
-		if [[ $cmd != stop ]] && publishing; then pub_start; fi
+		if [[ $cmd == stop ]]; then
+			drain_resume # the agent that starts next starts unpaused
+		elif healthy; then
+			drain_resume
+			if publishing; then pub_start; fi
+			ops_start
+		else
+			echo "the agent did not stay up: scripts/agent-deploy logs; it is left paused if it started (state/control.json)" >&2
+			exit 1
+		fi
 		;;
 	releases)
 		cur=$(readlink "$A/current" 2>/dev/null || true)
@@ -208,6 +369,23 @@ fi
 
 cmd=${1:-}
 shift || true
+# `--drain SECONDS` and `--no-drain` can come anywhere after the command; what is left is its arguments.
+ARGS=()
+while (($#)); do
+	case $1 in
+	--no-drain) DRAIN_SECS=0 ;;
+	--drain)
+		[[ ${2:-} =~ ^[0-9]+$ ]] || { echo "usage: --drain SECONDS" >&2; exit 2; }
+		DRAIN_SECS=$2
+		shift
+		;;
+	*) ARGS+=("$1") ;;
+	esac
+	shift
+done
+[[ $DRAIN_SECS =~ ^[0-9]+$ ]] || { echo "AGENT_DRAIN_SECS must be a number of seconds, not $DRAIN_SECS" >&2; exit 2; }
+# The empty array is spelled out so that bash 3.2, the Mac's, does not call it unset.
+set -- ${ARGS[@]+"${ARGS[@]}"}
 case $cmd in
 deploy)
 	rev=${1:-origin/main}
@@ -223,9 +401,11 @@ deploy)
 rollback | status | releases | start | stop | restart) push_self && host "$cmd" ;;
 logs) push_self && host logs "$@" ;;
 publish-logs) push_self && host publish-logs "$@" ;;
+health-logs) push_self && host health-logs "$@" ;;
+prune-logs) push_self && host prune-logs "$@" ;;
 token)
 	[[ ${1:-} =~ ^[A-Za-z0-9._-]+$ ]] || { echo "usage: agent-deploy token NAME < file" >&2; exit 2; }
 	push_self && host token "$1"
 	;;
-*) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+*) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 2 ;;
 esac

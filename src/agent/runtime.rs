@@ -540,15 +540,17 @@ impl Runtime {
                 self.engine.approve(&ticket, &source, by.clone()),
                 format!("Approved by {who}. The work starts now."),
             )?,
-            Order::Stop => told(
-                self.engine.stop_ticket(
-                    &ticket,
-                    &source,
-                    by.clone(),
-                    &format!("stopped by {who} on {source}"),
-                ),
-                format!("Stopped by {who}."),
-            )?,
+            Order::Stop | Order::StopBecause(_) => {
+                let reason = match &order {
+                    Order::StopBecause(why) => format!("stopped by {who} on {source}: {why}"),
+                    _ => format!("stopped by {who} on {source}"),
+                };
+                told(
+                    self.engine
+                        .stop_ticket(&ticket, &source, by.clone(), &reason),
+                    format!("Stopped by {who}."),
+                )?
+            }
             Order::Secret { secret, allow } => told(
                 self.engine
                     .answer_secret(&ticket, secret, &source, by.clone(), *allow),

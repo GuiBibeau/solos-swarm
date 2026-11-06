@@ -1,0 +1,26 @@
+# Daily housekeeping: `solos-swarm agent prune`, run by solos-agent-prune.timer. Installed and enabled by
+# scripts/agent-deploy beside solos-agent.service. See docs/agent-mode/production.md, "Pruning state".
+#
+# For Tickets that ended more than 14 days ago it removes the worker's clone (tickets/<id>/work) and transcripts; it
+# also removes forge mirrors nobody has fetched into for 14 days and the Router's old transcripts. It never touches
+# an open Ticket, agent.db, or the trail's blobs (agent trail needs them; --include-trail is by hand). It opens the
+# Store read-only, so it is safe beside `agent serve`. The last line of its output says what it freed.
+[Unit]
+Description=solos-swarm agent mode: prune finished work from the state directory
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/agent
+UMask=0077
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/agent/current/bin/solos-swarm agent prune --state-dir %h/agent/state --keep-days 14
+TimeoutStartSec=2h
+# The disk is shared with other production services: delete behind them, not in front of them.
+Nice=19
+IOSchedulingClass=idle
+CPUWeight=5
+IOWeight=5
+NoNewPrivileges=yes
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=solos-agent-prune

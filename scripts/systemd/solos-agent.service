@@ -16,6 +16,10 @@ After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=900
 StartLimitBurst=5
+# Five failed starts in 15 minutes leave the unit failed. The Watchdog lives inside this process and cannot say so,
+# so systemd runs the health check (solos-agent-health.service: alerts to Discord from outside) at that moment, and
+# its timer runs it every few minutes besides.
+OnFailure=solos-agent-health.service
 
 [Service]
 Type=simple

@@ -1,0 +1,41 @@
+# The agent's health check, from outside it: `solos-swarm agent health`, run by solos-agent-health.timer every few
+# minutes and, through OnFailure= in solos-agent.service, the moment the agent's unit gives up. Installed and enabled
+# by scripts/agent-deploy beside solos-agent.service. See docs/agent-mode/production.md, "Alerts from outside the
+# agent".
+#
+# The Watchdog runs inside `agent serve`, so it cannot say that serve itself is down. This unit asks systemd whether
+# solos-agent is active and not restart-looping, asks the broker socket for GET /api/hello, checks the state
+# directory's free space (below health.min_free_gb it pauses new work by writing state/PAUSE and alerts), and checks
+# that the Discord bot token can reach the Watchdog's channel. It posts to that channel once per incident, with the
+# bot token, and needs nothing from the agent. Exit 1 means something failed, so `systemctl --user --failed` and
+# `scripts/agent-deploy status` show it.
+#
+# The token is the agent's own bot token: ExecStartPre copies ~/agent/tokens/discord-token into this unit's private
+# tmpfs runtime directory before each run, and the directory goes when the run ends. `agent health` reads the copy
+# and never needs the agent's runtime directory, which is gone when the agent is.
+[Unit]
+Description=solos-swarm agent mode: check the agent from outside it and alert
+# No After= or Wants= on solos-agent: this must run when the agent is down.
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/agent
+RuntimeDirectory=solos-agent-health
+RuntimeDirectoryMode=0700
+UMask=0077
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# A token that cannot be copied is not fatal here: the check runs and fails on "alerts cannot be delivered", which
+# is the honest report.
+ExecStartPre=-/bin/sh -c 'cp "$HOME/agent/tokens/discord-token" "$RUNTIME_DIRECTORY/discord-token"'
+ExecStart=%h/agent/current/bin/solos-swarm agent health --config %h/agent/agent.yaml --state-dir %h/agent/state --token-file %t/solos-agent-health/discord-token
+TimeoutStartSec=2min
+# The box runs other production services, and the agent itself: this is a few syscalls and one HTTPS call.
+Nice=10
+CPUWeight=10
+IOWeight=10
+MemoryMax=256M
+TasksMax=64
+NoNewPrivileges=yes
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=solos-agent-health
