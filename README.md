@@ -150,6 +150,8 @@ Dashboard checks: `node --test tests/dashboard-spatial.test.mjs tests/dashboard-
 | [`docs/self-update-operations.md`](docs/self-update-operations.md) | Channels, promote/rollback/prune, drain, doctor, smoke, outage pause. |
 | [`docs/self-update-and-graceful-restart.md`](docs/self-update-and-graceful-restart.md) | Design and failure modes behind the above. |
 | [`docs/dashboard.md`](docs/dashboard.md) | Dashboard server and the Mac tunnel script. |
+| [`docs/agent-mode/production.md`](docs/agent-mode/production.md#dashboard) | Agent mode in production, and its web dashboard: `agent publish`, the Vercel app, tokens and rotation. |
+| [`web/agent-dashboard/README.md`](web/agent-dashboard/README.md) | The agent's web dashboard (Next.js on Vercel, Sign in with Vercel): setup, environment, sign-in. |
 | [`docs/running-a-tournament.md`](docs/running-a-tournament.md) | Runbook from the first live tournament. |
 | [`replay/README.md`](replay/README.md) | Replay-scored policy loop. |
 | [`docs/rust-style.md`](docs/rust-style.md) | Rust style, lints and the gates CI runs. |

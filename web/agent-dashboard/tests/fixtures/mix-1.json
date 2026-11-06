@@ -1,0 +1,124 @@
+{
+  "approval": {
+    "state": "not_needed"
+  },
+  "assignments": [
+    {
+      "created_at": "2026-11-06T14:11:03Z",
+      "created_ms": 1793974263619,
+      "ended_ms": 1793974263624,
+      "ended_reason": "ready",
+      "id": "as_df335bfec368a4eb",
+      "report_count": 1,
+      "reports": [
+        {
+          "at": "2026-11-06T14:11:03Z",
+          "at_ms": 1793974263624,
+          "seq": 2,
+          "spent_microusd": 0,
+          "status": "ready",
+          "text": "done"
+        }
+      ],
+      "started_ms": 1793974263622,
+      "state": "ended"
+    }
+  ],
+  "browser": {
+    "closed": 0,
+    "lost": 0,
+    "needs_approval": [],
+    "pages": [
+      {
+        "action": "open",
+        "at": "1970-01-01T00:00:01Z",
+        "n": 1,
+        "status": 200,
+        "title": "Reset",
+        "url": "https://example.com/reset"
+      },
+      {
+        "action": "click",
+        "at": "1970-01-01T00:00:02Z",
+        "n": 2,
+        "status": 200,
+        "title": "Done",
+        "url": "https://example.com/done"
+      }
+    ],
+    "pages_omitted": 0,
+    "refused": 0,
+    "steps": 2
+  },
+  "budget_microusd": 500000,
+  "conversation": [
+    {
+      "at": "2026-11-06T14:11:03Z",
+      "at_ms": 1793974263619,
+      "channel": "slack",
+      "delivery": {
+        "attempts": 0,
+        "delivered": true
+      },
+      "from": "agent",
+      "kind": "acknowledgement",
+      "text": "Looking into it."
+    },
+    {
+      "at": "2026-11-06T14:11:03Z",
+      "at_ms": 1793974263624,
+      "channel": "slack",
+      "delivery": {
+        "attempts": 0,
+        "delivered": true
+      },
+      "from": "agent",
+      "kind": "result",
+      "text": "done"
+    }
+  ],
+  "created_at": "2026-11-06T14:11:03Z",
+  "created_ms": 1793974263619,
+  "decisions": [
+    {
+      "at": "2026-11-06T14:11:03Z",
+      "at_ms": 1793974263619,
+      "id": "dc_22d7139fa2e02429",
+      "kind": "accept",
+      "reason": "an explicit request"
+    }
+  ],
+  "deliverable": "answer",
+  "ended": {
+    "at": "2026-11-06T14:11:03Z",
+    "at_ms": 1793974263624,
+    "by": "executor",
+    "outcome": "completed",
+    "reason": "ready"
+  },
+  "id": "tk_22d7139fa2e02429",
+  "open": false,
+  "plan": {
+    "kind": "session"
+  },
+  "request": {
+    "at": "2026-11-06T14:10:05Z",
+    "at_ms": 1793974205615,
+    "from": "person",
+    "kind": "request",
+    "text": "Read my notifications",
+    "who": "alice"
+  },
+  "requester": {
+    "id": "alice",
+    "kind": "person"
+  },
+  "scope": "Read my notifications",
+  "source": "slack",
+  "spent_microusd": 0,
+  "stage": "ended",
+  "title": "Read my notifications",
+  "updated_at": "2026-11-06T14:11:03Z",
+  "updated_ms": 1793974263624,
+  "v": 1
+}

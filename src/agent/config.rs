@@ -4,10 +4,12 @@
 mod nodes;
 mod sources;
 mod watchdog;
+mod web;
 
 pub use nodes::{AllowedNode, NodesConfig};
 pub use sources::{Interval, ReplyTo, ScheduleConfig, TimeOfDay};
 pub use watchdog::{OperatorConfig, ThresholdsConfig, WatchdogConfig};
+pub use web::{DEFAULT_API_URL, PublishConfig, WebConfig};
 
 use super::goal_template::GoalTemplates;
 use super::jobs::{self, JobLimits};
@@ -25,7 +27,6 @@ use solos_agent_core::AllowlistPolicy;
 use solos_agent_core::change::{Deliverable, RepoName};
 use solos_agent_core::model::MicroUsd;
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -70,40 +71,15 @@ pub struct AgentConfig {
     /// github Channel or `forge: github` is.
     #[serde(default)]
     pub github: Option<GithubConfig>,
-    /// The web dashboard. Without it, none is served and replies link nowhere.
+    /// The web dashboard's address, and the sidecar that publishes the
+    /// Store's tickets to it. Without it, there is no dashboard and replies
+    /// link nowhere.
     #[serde(default)]
     pub web: Option<WebConfig>,
 }
 
 fn pass_through() -> bool {
     true
-}
-
-/// `web:` in agent.yaml: the dashboard `agent web` serves, and the address
-/// people reach it at.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WebConfig {
-    /// `https://host[/path]`, no trailing slash. A Ticket's page is
-    /// `{public_url}/tickets/{id}`, which replies link to.
-    pub public_url: String,
-    #[serde(default = "default_web_bind")]
-    pub bind: SocketAddr,
-    #[serde(default)]
-    pub access: Option<AccessConfig>,
-}
-
-fn default_web_bind() -> SocketAddr {
-    SocketAddr::from((Ipv4Addr::LOCALHOST, 4180))
-}
-
-/// Cloudflare Access in front of the dashboard.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AccessConfig {
-    pub team_domain: String,
-    pub aud: String,
-    pub allow: Vec<String>,
 }
 
 /// Where the setup is written down, for the sentences that tell an owner of
@@ -760,6 +736,9 @@ impl AgentConfig {
         if let Some(github) = &mut config.github {
             github.key_file = base.join(&github.key_file);
         }
+        if let Some(publish) = config.web.as_mut().and_then(|web| web.publish.as_mut()) {
+            publish.token_file = base.join(&publish.token_file);
+        }
         // GitHub logins are case-blind, and the Policy spells them in lower
         // case, as the Source does.
         let policy = &mut config.policy;
@@ -822,6 +801,7 @@ impl AgentConfig {
         self.validate_github()?;
         if let Some(web) = &self.web {
             TicketLinks::new(&web.public_url)?;
+            web.validate()?;
         }
         let mcp_sources = self
             .sources
@@ -1284,17 +1264,12 @@ budgets: {session_microusd: 500000}
         let config = with("web: {public_url: 'https://agent.example.com'}").unwrap();
         let web = config.web.unwrap();
         assert_eq!(web.public_url, "https://agent.example.com");
-        assert_eq!(web.bind, "127.0.0.1:4180".parse().unwrap());
-        assert_eq!(web.access, None);
-        let full = with(
-            "web:\n  public_url: https://example.com/agent\n  bind: 127.0.0.1:9000\n  access:\n    \
-             team_domain: acme.cloudflareaccess.com\n    aud: abc\n    allow: [me@example.com]",
-        )
-        .unwrap()
-        .web
-        .unwrap();
-        assert_eq!(full.bind.port(), 9_000);
-        assert_eq!(full.access.unwrap().allow, ["me@example.com"]);
+        assert_eq!(web.publish, None);
+        let full = with("web:\n  public_url: https://example.com/agent")
+            .unwrap()
+            .web
+            .unwrap();
+        assert_eq!(full.public_url, "https://example.com/agent");
 
         for (bad, why) in [
             ("web: {public_url: 'http://agent.example.com'}", "https"),
