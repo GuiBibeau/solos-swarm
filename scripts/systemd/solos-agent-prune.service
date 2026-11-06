@@ -13,6 +13,9 @@ Type=oneshot
 WorkingDirectory=%h/agent
 UMask=0077
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# The async runtime starts one worker thread per core (128 here); a check needs two, and fewer threads keep it
+# well inside TasksMax.
+Environment=TOKIO_WORKER_THREADS=2
 ExecStart=%h/agent/current/bin/solos-swarm agent prune --state-dir %h/agent/state --keep-days 14
 TimeoutStartSec=2h
 # The disk is shared with other production services: delete behind them, not in front of them.
