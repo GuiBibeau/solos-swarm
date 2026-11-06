@@ -22,6 +22,7 @@ use solos_swarm::agent::broker::{
     WorkerParts, WorkerSeat,
 };
 use solos_swarm::agent::jsonl::JsonlSource;
+use solos_swarm::agent::links::TicketLinks;
 use solos_swarm::agent::ports::{
     Answer, Applied, BoxFuture, Channel, Delivered, Delivery, Executor, Fact, FactSink, Launch,
     RetryAfter, SendOptions, SendOutcome, Source,
@@ -394,6 +395,12 @@ impl Fake {
 
     fn channel(&self) -> Arc<dyn Channel> {
         Arc::new(SlackChannel::new(self.api()))
+    }
+
+    /// A Channel whose results and questions link to `{public_url}/tickets/{id}`.
+    fn channel_linking_to(&self, public_url: &str) -> Arc<dyn Channel> {
+        let links = TicketLinks::new(public_url).unwrap();
+        Arc::new(SlackChannel::new(self.api()).with_links(links))
     }
 }
 
@@ -905,6 +912,88 @@ async fn a_reply_is_escaped_shaped_for_chat_and_an_approval_request_has_buttons(
     );
     assert_eq!(ask["blocks"][0]["text"]["text"], ask["text"]);
     assert_eq!(format!("{:?}", Token::new(BOT_TOKEN)), "Token(..)");
+}
+
+#[tokio::test]
+async fn markdown_is_posted_as_mrkdwn_and_a_result_links_the_tickets_page_once() {
+    let fake = Fake::start().await;
+    let channel = fake.channel_linking_to("https://agent.example.com");
+    let page = "https://agent.example.com/tickets/tk_1";
+    let answer = "## Merged\n\n| PR | What | When |\n|---|---|---|\n\
+        | [#65](https://github.com/acme/widgets/pull/65) | **fix** agent answers | 17:54 |\n\n\
+        See [the docs](https://example.com/a?b=1&c=2). <!channel>";
+    let long = "A paragraph that goes on for a while.\n\n".repeat(150);
+    let approval = SendOptions {
+        ask: Some(Ask::Budget),
+        ..SendOptions::default()
+    };
+    let result = || outbound("ms_result", MessageKind::Result, "C1", answer);
+    let sends = [
+        (
+            outbound(
+                "ms_ack",
+                MessageKind::Acknowledgement,
+                "C1",
+                "Looking into it.",
+            ),
+            SendOptions::default(),
+        ),
+        (
+            outbound(
+                "ms_ask",
+                MessageKind::Attention,
+                "C1",
+                "Approve the $5.00 budget?",
+            ),
+            approval,
+        ),
+        (result(), SendOptions::default()),
+        (
+            outbound("ms_long", MessageKind::Result, "C1", &long),
+            SendOptions::default(),
+        ),
+    ];
+    for (message, options) in sends {
+        channel.send(message, options).await.unwrap();
+    }
+    let repeat = SendOptions {
+        repeat: true,
+        ..SendOptions::default()
+    };
+    channel.send(result(), repeat).await.unwrap();
+
+    let posts = fake.until_posts(4).await;
+    assert_eq!(
+        posts.len(),
+        4,
+        "the repeat found its message and posted nothing"
+    );
+    let [ack, ask, result, long] = &posts[..] else {
+        unreachable!()
+    };
+    assert_eq!(ack["text"], "Looking into it.");
+    assert_eq!(
+        ask["text"],
+        format!("Approve the $5.00 budget?\n\n<{page}|Task details>")
+    );
+    assert_eq!(ask["blocks"][0]["text"]["text"], ask["text"]);
+    assert_eq!(
+        result["text"],
+        format!(
+            "*Merged*\n\n_PR · What · When_\n\
+             *<https://github.com/acme/widgets/pull/65|#65>* *fix* agent answers · 17:54\n\n\
+             See <https://example.com/a?b=1&amp;c=2|the docs>. &lt;!channel&gt;\n\n\
+             <{page}|Task details>"
+        )
+    );
+    let text = long["text"].as_str().unwrap();
+    assert!(
+        text.ends_with(&format!("\n\n…the rest is on the <{page}|task page>")),
+        "{}",
+        &text[text.len() - 120..]
+    );
+    assert!(text.chars().count() < 3_200);
+    assert!(!text.contains("Cut short") && !text.contains("Task details"));
 }
 
 #[tokio::test]

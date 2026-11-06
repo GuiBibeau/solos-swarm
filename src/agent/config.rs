@@ -11,6 +11,7 @@ pub use watchdog::{OperatorConfig, ThresholdsConfig, WatchdogConfig};
 
 use super::goal_template::GoalTemplates;
 use super::jobs::{self, JobLimits};
+use super::links::TicketLinks;
 use super::simulated::TimeFactor;
 use super::trail::TrailStoreConfig;
 use super::{discord, github, mcp, pstack, slack};
@@ -24,6 +25,7 @@ use solos_agent_core::AllowlistPolicy;
 use solos_agent_core::change::{Deliverable, RepoName};
 use solos_agent_core::model::MicroUsd;
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -68,10 +70,40 @@ pub struct AgentConfig {
     /// github Channel or `forge: github` is.
     #[serde(default)]
     pub github: Option<GithubConfig>,
+    /// The web dashboard. Without it, none is served and replies link nowhere.
+    #[serde(default)]
+    pub web: Option<WebConfig>,
 }
 
 fn pass_through() -> bool {
     true
+}
+
+/// `web:` in agent.yaml: the dashboard `agent web` serves, and the address
+/// people reach it at.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebConfig {
+    /// `https://host[/path]`, no trailing slash. A Ticket's page is
+    /// `{public_url}/tickets/{id}`, which replies link to.
+    pub public_url: String,
+    #[serde(default = "default_web_bind")]
+    pub bind: SocketAddr,
+    #[serde(default)]
+    pub access: Option<AccessConfig>,
+}
+
+fn default_web_bind() -> SocketAddr {
+    SocketAddr::from((Ipv4Addr::LOCALHOST, 4180))
+}
+
+/// Cloudflare Access in front of the dashboard.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessConfig {
+    pub team_domain: String,
+    pub aud: String,
+    pub allow: Vec<String>,
 }
 
 /// Where the setup is written down, for the sentences that tell an owner of
@@ -788,6 +820,9 @@ impl AgentConfig {
         );
         self.validate_discord()?;
         self.validate_github()?;
+        if let Some(web) = &self.web {
+            TicketLinks::new(&web.public_url)?;
+        }
         let mcp_sources = self
             .sources
             .iter()
@@ -1240,6 +1275,49 @@ budgets: {session_microusd: 500000}
                 path: dir.join("out/outbox.jsonl")
             }]
         );
+    }
+
+    #[test]
+    fn the_web_section_takes_an_https_public_url_and_defaults_the_rest() {
+        assert!(parse(VALID).unwrap().web.is_none());
+        let with = |section: &str| parse(&format!("{VALID}{section}\n"));
+        let config = with("web: {public_url: 'https://agent.example.com'}").unwrap();
+        let web = config.web.unwrap();
+        assert_eq!(web.public_url, "https://agent.example.com");
+        assert_eq!(web.bind, "127.0.0.1:4180".parse().unwrap());
+        assert_eq!(web.access, None);
+        let full = with(
+            "web:\n  public_url: https://example.com/agent\n  bind: 127.0.0.1:9000\n  access:\n    \
+             team_domain: acme.cloudflareaccess.com\n    aud: abc\n    allow: [me@example.com]",
+        )
+        .unwrap()
+        .web
+        .unwrap();
+        assert_eq!(full.bind.port(), 9_000);
+        assert_eq!(full.access.unwrap().allow, ["me@example.com"]);
+
+        for (bad, why) in [
+            ("web: {public_url: 'http://agent.example.com'}", "https"),
+            (
+                "web: {public_url: 'https://agent.example.com/'}",
+                "end with a slash",
+            ),
+            ("web: {public_url: 'agent.example.com'}", "not a URL"),
+            (
+                "web: {public_url: 'https://agent.example.com?x=1'}",
+                "query",
+            ),
+            ("web: {public_url: 'https://a.example/x)(y'}", "()"),
+            ("web: {public_url: ''}", "1 to"),
+            ("web: {}", "public_url"),
+            ("web: {public_url: 'https://a.example', port: 1}", "port"),
+        ] {
+            let err = with(bad).unwrap_err();
+            assert!(
+                format!("{err:#}").contains(why),
+                "{bad}: expected {why:?} in {err:#}"
+            );
+        }
     }
 
     #[test]

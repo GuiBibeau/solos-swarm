@@ -33,8 +33,21 @@
 //! and `enforce_nonce`, so Discord returns the earlier message for a retry
 //! instead of posting twice. Discord checks the nonce for a few minutes
 //! only, so a retry that comes later can post a message twice.
+//!
+//! Formatting. Discord renders no table, so a table in an answer becomes a
+//! monospace block or a line per row, and a heading a bold line (see
+//! [`format`]). A result longer than one message goes out as up to three, cut
+//! between paragraphs and never inside a code block, each with a nonce of its
+//! own derived from the `MessageId` and the part's number, so a retry after
+//! the second part fails posts only the parts Discord lacks. Every part
+//! replies to the request, so a reply to any of them joins its Thread. A
+//! result longer than three messages ends with where the rest is, the
+//! Ticket's page, when `web.public_url` is set, and with a note that it was
+//! cut when it is not. A result or a question links to the Ticket's page after
+//! its text.
 
 mod channel;
+mod format;
 mod gateway;
 mod source;
 

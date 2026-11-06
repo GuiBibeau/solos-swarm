@@ -3,6 +3,8 @@
 //! marker naming its `MessageId`, and a repeat looks for it first.
 
 use super::{GithubApi, Got, Page, marker, valid_repo};
+use crate::agent::links::TicketLinks;
+use crate::agent::markdown::{closes, fence_run};
 use crate::agent::ports::{BoxFuture, Channel, SendOptions, SendOutcome};
 use anyhow::{Result, bail};
 use reqwest::{Method, StatusCode, Url};
@@ -21,6 +23,7 @@ const MAX_PAGES: usize = 30;
 
 pub struct GithubChannel {
     api: Arc<GithubApi>,
+    links: TicketLinks,
 }
 
 enum Found {
@@ -31,7 +34,16 @@ enum Found {
 
 impl GithubChannel {
     pub fn new(api: Arc<GithubApi>) -> Self {
-        Self { api }
+        Self {
+            api,
+            links: TicketLinks::none(),
+        }
+    }
+
+    /// Link the messages that carry one to their Ticket's page.
+    pub fn with_links(mut self, links: TicketLinks) -> Self {
+        self.links = links;
+        self
     }
 
     async fn post(&self, message: OutboundMessage, options: SendOptions) -> Result<SendOutcome> {
@@ -57,7 +69,7 @@ impl GithubChannel {
                 Found::Missing => {}
             }
         }
-        let body = json!({ "body": body(&message) });
+        let body = json!({ "body": body(&message, &self.links) });
         match self
             .api
             .send(&repo, Method::POST, &url, Some(&body))
@@ -176,17 +188,26 @@ fn page_of(url: &str) -> Option<u64> {
     page.parse().ok()
 }
 
-fn body(message: &OutboundMessage) -> String {
+/// The comment: the text, the link to the Ticket's page for a message that
+/// carries one, and the marker, which stays last for a repeat to find.
+fn body(message: &OutboundMessage, links: &TicketLinks) -> String {
     let limit = match message.kind {
         MessageKind::Result => RESULT_CHARS,
         MessageKind::Acknowledgement | MessageKind::Attention => SHORT_CHARS,
     };
-    format!("{}\n\n{}", shape(&message.text, limit), marker(&message.id))
+    let page = links.page(message);
+    format!(
+        "{}\n\n{}",
+        shape(&message.text, limit, page.as_deref()),
+        marker(&message.id)
+    )
 }
 
 /// Cut to `limit` characters with a note that says so, and quiet every
-/// mention, so text from a worker cannot notify anyone.
-fn shape(text: &str, limit: usize) -> String {
+/// mention, so text from a worker cannot notify anyone. `page`, the Ticket's
+/// page, is linked after the text, and named as where the rest is when the
+/// text is cut.
+fn shape(text: &str, limit: usize, page: Option<&str>) -> String {
     let text = text.trim();
     let total = text.chars().count();
     let (kept, cut) = if total <= limit {
@@ -214,11 +235,18 @@ fn shape(text: &str, limit: usize) -> String {
         shaped.push('\n');
         shaped.push_str(&fence);
     }
-    if cut {
-        let shown = kept.chars().count();
-        shaped.push_str(&format!(
-            "\n\n_[Cut short: {shown} of {total} characters shown.]_"
-        ));
+    match (cut, page) {
+        (true, Some(page)) => {
+            shaped.push_str(&format!("\n\n…the rest is on the [task page]({page})"));
+        }
+        (true, None) => {
+            let shown = kept.chars().count();
+            shaped.push_str(&format!(
+                "\n\n_[Cut short: {shown} of {total} characters shown.]_"
+            ));
+        }
+        (false, Some(page)) => shaped.push_str(&format!("\n\n[Task details]({page})")),
+        (false, None) => {}
     }
     shaped
 }
@@ -235,10 +263,7 @@ fn quiet(text: &str) -> (String, Option<String>) {
                 fence = Some(run);
                 out.push_str(line);
             }
-            (Some(open), Some(run))
-                if run.starts_with(open.as_str())
-                    && line.trim_start_matches(' ')[run.len()..].trim().is_empty() =>
-            {
+            (Some(open), Some(_)) if closes(line, open) => {
                 fence = None;
                 out.push_str(line);
             }
@@ -247,20 +272,6 @@ fn quiet(text: &str) -> (String, Option<String>) {
         }
     }
     (out, fence)
-}
-
-/// The run of three or more backticks or tildes that opens a fence on this
-/// line. Anything GitHub would not take for a fence is text, so its mentions
-/// are quieted.
-fn fence_run(line: &str) -> Option<String> {
-    let trimmed = line.trim_start_matches(' ');
-    if line.len() - trimmed.len() > 3 {
-        return None;
-    }
-    let first = trimmed.chars().next().filter(|c| matches!(c, '`' | '~'))?;
-    let run: String = trimmed.chars().take_while(|c| *c == first).collect();
-    let info = &trimmed[run.len()..];
-    (run.len() >= 3 && !(first == '`' && info.contains('`'))).then_some(run)
 }
 
 fn quiet_line(line: &str, out: &mut String) {
@@ -353,13 +364,35 @@ mod tests {
     #[test]
     fn a_long_text_is_cut_on_a_word_and_an_open_code_block_is_closed() {
         let long = format!("Report\n```\n{}", "line of code\n".repeat(50));
-        let shaped = shape(&long, 100);
+        let shaped = shape(&long, 100, None);
         assert!(shaped.starts_with("Report\n```\nline of code"), "{shaped}");
         assert!(
             shaped.ends_with(" …\n```\n\n_[Cut short: 96 of 660 characters shown.]_"),
             "{shaped}"
         );
-        assert_eq!(shape("  short  ", 100), "short");
-        assert!(shape(&"x".repeat(20), 10).starts_with("xxxxxxxxxx …"));
+        assert_eq!(shape("  short  ", 100, None), "short");
+        assert!(shape(&"x".repeat(20), 10, None).starts_with("xxxxxxxxxx …"));
+    }
+
+    #[test]
+    fn a_page_is_linked_after_the_text_and_names_where_the_rest_is_when_the_text_is_cut() {
+        let page = "https://agent.example.com/tickets/tk_1";
+        assert_eq!(
+            shape(
+                "  ## Done\n\n| a | b |\n|---|---|\n| 1 | 2 |  ",
+                100,
+                Some(page)
+            ),
+            format!("## Done\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n[Task details]({page})")
+        );
+        let long = format!("Report\n```\n{}", "line of code\n".repeat(50));
+        let shaped = shape(&long, 100, Some(page));
+        assert!(
+            shaped.ends_with(&format!(
+                " …\n```\n\n…the rest is on the [task page]({page})"
+            )),
+            "{shaped}"
+        );
+        assert!(!shaped.contains("Cut short") && !shaped.contains("Task details"));
     }
 }

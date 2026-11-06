@@ -903,8 +903,10 @@ the message, because it has the message's id. After a restart the agent reads on
 Discord attaches to the reply.
 
 **Replies and limits.**
-- A reply is cut at 2,000 characters, with a marker that says how much was cut; acknowledgements and questions are
-  cut at 500.
+- A result longer than one message (2,000 characters) goes out as up to three, cut between paragraphs and never
+  inside a code block; longer than three ends with where the rest is (the task page, with `web.public_url`) or, with
+  none, a marker that says how much was cut. Acknowledgements and questions are cut at 500. Discord renders no table
+  or heading, so see "How the agent talks" for what they become.
 - Replies parse no mentions, so text from a worker cannot ping `@everyone` or a person.
 - Each post carries a `nonce` made from the agent's message id, with `enforce_nonce`, so a retry returns the message
   Discord already holds. Discord remembers a nonce for a few minutes only, so a retry that comes later, after a long
@@ -1209,8 +1211,31 @@ People read the agent in chat, so its words are meant to sound like a colleague'
   recap. A message after the Ticket ended is a new Ticket, and the Router's scope says it continues the Thread.
 - **What the host writes itself** (a worker that could not finish, Watchdog alerts) is first person and plain.
 
-The Channels keep their limits (500 characters for a first reply or a question, 2,000 on Discord and 3,000 on Slack
-for a result), neutralize mentions, and carry the markers that make a repeated send safe.
+The Channels keep their limits (500 characters for a first reply or a question; for a result 2,000 per message on
+Discord, up to three messages, 3,000 on Slack and 16,000 on GitHub), neutralize mentions, and carry the markers that
+make a repeated send safe.
+
+**What each Channel does with the Markdown a worker writes.**
+- *Discord* renders no table and no heading. A table of at most 50 characters across becomes a monospace block (its
+  columns aligned, emphasis marks dropped); a wider one, or one with a link in it, becomes one line per row, the first
+  cell bold and the rest after it, with the column names in italics above when there are three or more:
+  `**#65** fix(agent): … · 17:54`. A heading becomes a bold line. Lists, emphasis, links and code blocks are left as
+  written. A long result is cut into up to three messages between paragraphs; a code block is never cut unless it is
+  longer than a message alone, and then each message that holds a piece of it opens and closes its own fence. Each
+  message has a nonce of its own, so a retry after the second one failed posts only the ones Discord lacks.
+- *Slack* gets mrkdwn: `*bold*`, `_italic_`, `~strike~`, `<url|text>` links (only for http, https and mailto
+  addresses), `•` bullets, headings as bold lines, tables the same way as on Discord, code blocks without a language,
+  and `&`, `<` and `>` escaped, so a worker's `<!channel>` is text.
+- *GitHub* renders Markdown, so the text is unchanged; only `@mentions` outside code are quieted.
+- *MCP* gets the text as written.
+
+**Links to the task page.** With `web.public_url` set in agent.yaml (any https base URL, such as
+`https://agent.example.com` or a dashboard on Vercel, `https://acme.vercel.app`, with or without a path and no
+trailing slash), the host adds a link to the Ticket's page, `{public_url}/tickets/{id}`, after the text of a result and of a question or
+approval request: `[Task details](…)` on Discord and GitHub, `<…|Task details>` on Slack, `Details: …` over MCP. A
+result too long for the Channel ends with `…the rest is on the task page` and the link instead. The acknowledgement
+that opens a Ticket, and the answer to a button click, carry none: the result follows and links to the same page. A
+model never writes the link; the host does.
 
 ## Watchdog
 

@@ -8,13 +8,14 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use solos_agent_core::model::{
     Actor, ActorKind, Addressed, Approval, Ask, AssignmentId, ChannelRef, Effect, EndedBy,
-    InputBody, MessageId, MessageKind, OutboundMessage, SecretGrant, SecretId, ThreadKey, TicketId,
-    TicketOutcome, Trigger, TriggerId,
+    InputBody, MessageId, MessageKind, OutboundMessage, ReportIn, ReportStatus, SecretGrant,
+    SecretId, ThreadKey, TicketId, TicketOutcome, Trigger, TriggerId,
 };
 use solos_agent_core::{AllowlistPolicy, Repositories};
 use solos_agent_store::SqliteStore;
 use solos_swarm::agent::discord::{DiscordApi, DiscordChannel, DiscordSource, INTENTS, Token};
 use solos_swarm::agent::jsonl::JsonlSource;
+use solos_swarm::agent::links::TicketLinks;
 use solos_swarm::agent::ports::{
     Answer, Applied, BoxFuture, Channel, Delivered, Delivery, Executor, Fact, FactSink, Launch,
     RetryAfter, SendOptions, SendOutcome, Source,
@@ -160,6 +161,8 @@ enum Reply {
         message: &'static str,
     },
     KeepThenHang,
+    /// The post is created as usual; it only takes its place in the script.
+    Created,
 }
 
 struct Post {
@@ -366,7 +369,10 @@ async fn create_message(
         });
         let at = discord.posts.len() - 1;
         let reply = discord.script.pop_front();
-        let creates = matches!(reply, None | Some(Reply::KeepThenHang));
+        let creates = matches!(
+            reply,
+            None | Some(Reply::KeepThenHang) | Some(Reply::Created)
+        );
         let mut created = None;
         if creates {
             let nonce = body["nonce"].as_str().unwrap_or_default().to_owned();
@@ -394,7 +400,7 @@ async fn create_message(
         (reply, created)
     };
     match reply {
-        None => Json(created.unwrap()).into_response(),
+        None | Some(Reply::Created) => Json(created.unwrap()).into_response(),
         Some(Reply::KeepThenHang) => std::future::pending().await,
         Some(Reply::Status(status)) => {
             (StatusCode::from_u16(status).unwrap(), "busy").into_response()
@@ -798,6 +804,12 @@ impl Fake {
 
     fn channel(&self) -> Arc<dyn Channel> {
         Arc::new(DiscordChannel::new(self.api()))
+    }
+
+    /// A Channel whose results and questions link to `{public_url}/tickets/{id}`.
+    fn channel_linking_to(&self, public_url: &str) -> Arc<dyn Channel> {
+        let links = TicketLinks::new(public_url).unwrap();
+        Arc::new(DiscordChannel::new(self.api()).with_links(links))
     }
 }
 
@@ -1890,9 +1902,11 @@ async fn a_resume_address_nobody_answers_is_given_up_for_a_fresh_session() {
 }
 
 #[tokio::test]
-async fn a_reply_is_cut_to_discords_limit_and_an_approval_request_has_two_buttons() {
+async fn a_long_result_is_posted_in_messages_within_discords_limit_and_an_approval_request_has_two_buttons()
+ {
     let fake = Fake::start().await;
     let channel = fake.channel();
+    // 5,025 characters: three messages.
     let long = format!("@everyone fixed & tested. {}", "word ".repeat(1_000));
     let approval = SendOptions {
         ask: Some(Ask::Budget),
@@ -1924,16 +1938,34 @@ async fn a_reply_is_cut_to_discords_limit_and_an_approval_request_has_two_button
         );
     }
 
-    let posts = fake.until_posts(3).await;
-    let [result, ack, ask] = &posts[..] else {
+    let posts = fake.until_posts(5).await;
+    let [first, second, third, ack, ask] = &posts[..] else {
         unreachable!()
     };
-    let text = text_of(result);
-    assert!(text.starts_with("@everyone fixed & tested."), "{text}");
-    assert!(text.ends_with("of 5025 characters shown.]_"), "{text}");
-    assert!(text.chars().count() <= 2_000, "{}", text.chars().count());
+    let parts = [first, second, third];
+    assert!(
+        text_of(first).starts_with("@everyone fixed & tested."),
+        "{}",
+        text_of(first)
+    );
+    for part in parts {
+        assert!(
+            text_of(part).chars().count() <= 2_000,
+            "{}",
+            text_of(part).chars().count()
+        );
+    }
+    let words: usize = parts
+        .iter()
+        .map(|part| text_of(part).split_whitespace().count())
+        .sum();
+    assert_eq!(words, 4 + 1_000, "nothing is lost and no note says so");
+    assert!(!text_of(third).contains("Cut short"));
+    let nonces: BTreeSet<&str> = parts.iter().map(|part| nonce_of(part)).collect();
+    assert_eq!(nonces.len(), 3, "a nonce for each part");
     assert!(text_of(ack).chars().count() <= 500);
-    for post in [result, ack, ask] {
+    assert!(text_of(ack).ends_with("characters shown.]_"));
+    for post in [first, second, third, ack, ask] {
         assert_eq!(post["body"]["allowed_mentions"], json!({ "parse": [] }));
         assert_eq!(post["body"]["flags"], 4, "no link previews");
         assert_eq!(
@@ -1941,7 +1973,9 @@ async fn a_reply_is_cut_to_discords_limit_and_an_approval_request_has_two_button
             "1000000000000000001"
         );
     }
-    assert!(result["body"].get("components").is_none() && ack["body"].get("components").is_none());
+    for post in [first, second, third, ack] {
+        assert!(post["body"].get("components").is_none());
+    }
     assert_eq!(
         ask["body"]["components"],
         json!([{
@@ -2148,6 +2182,297 @@ async fn a_crash_after_discord_took_a_post_does_not_post_it_twice() {
         discord.messages[1]
     );
     assert_settled(&scratch.store());
+}
+
+const PUBLIC_URL: &str = "https://agent.example.com";
+
+/// `n` paragraphs of `each` characters: `n * each` and a little more.
+fn paragraphs(n: usize, each: usize) -> String {
+    (0..n)
+        .map(|i| format!("{i:03} {}", "w".repeat(each - 4)))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Starts every Assignment and reports `text` as its result at once.
+struct Reports(String);
+
+impl Executor for Reports {
+    fn launch(&self, launch: Launch, facts: FactSink) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            let started = Fact::Started {
+                ticket: launch.ticket.clone(),
+                assignment: launch.assignment.clone(),
+            };
+            facts.send(started).await?;
+            let report = ReportIn {
+                status: ReportStatus::Ready,
+                text: self.0.clone(),
+                question: None,
+                spent_microusd: 0,
+            };
+            facts
+                .send(Fact::Report {
+                    ticket: launch.ticket,
+                    assignment: launch.assignment,
+                    report,
+                })
+                .await
+        })
+    }
+    fn deliver(&self, _: Delivery, _: FactSink) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn stop(&self, _: TicketId, _: AssignmentId, _: String) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+fn contents(discord: &Discord) -> Vec<String> {
+    discord
+        .messages
+        .iter()
+        .map(|m| m["content"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_table_and_headings_in_a_result_are_posted_as_text_discord_renders() {
+    let fake = Fake::start().await;
+    let channel = fake.channel();
+    let answer = "## Merged today\n\n| PR | What | Merged |\n|---|---|---|\n\
+        | #65 | fix(agent): answers read well in Discord and a long answer is not cut | 17:54 |\n\
+        | #64 | feat(web): the task dashboard | 17:40 |\n\n\
+        ### Checks\n\n| Check | State |\n|:--|--:|\n| fmt | `ok` |\n| clippy | **failed** |\n\n\
+        ```\n| left | alone |\n```";
+    channel
+        .send(
+            outbound("ms_table", MessageKind::Result, CHAN, answer),
+            SendOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    let posts = fake.until_posts(1).await;
+    assert_eq!(
+        text_of(&posts[0]),
+        "**Merged today**\n\n\
+         _PR · What · Merged_\n\
+         **#65** fix(agent): answers read well in Discord and a long answer is not cut · 17:54\n\
+         **#64** feat(web): the task dashboard · 17:40\n\n\
+         **Checks**\n\n\
+         ```\nCheck    State\n------  ------\nfmt         ok\nclippy  failed\n```\n\n\
+         ```\n| left | alone |\n```"
+    );
+}
+
+#[tokio::test]
+async fn a_result_links_the_tickets_page_once_and_an_acknowledgement_does_not() {
+    let fake = Fake::start().await;
+    let channel = fake.channel_linking_to(PUBLIC_URL);
+    let page = format!("{PUBLIC_URL}/tickets/tk_1");
+    let approval = SendOptions {
+        ask: Some(Ask::Budget),
+        ..SendOptions::default()
+    };
+    let sends = [
+        (
+            outbound(
+                "ms_ack",
+                MessageKind::Acknowledgement,
+                CHAN,
+                "Looking into it.",
+            ),
+            SendOptions::default(),
+        ),
+        (
+            outbound(
+                "ms_ask",
+                MessageKind::Attention,
+                CHAN,
+                "Approve the $5.00 budget?",
+            ),
+            approval,
+        ),
+        (
+            outbound(
+                "ms_result",
+                MessageKind::Result,
+                CHAN,
+                "Fixed it. Test is green.",
+            ),
+            SendOptions::default(),
+        ),
+    ];
+    for (message, options) in sends {
+        channel.send(message, options).await.unwrap();
+    }
+
+    let posts = fake.until_posts(3).await;
+    let [ack, ask, result] = &posts[..] else {
+        unreachable!()
+    };
+    assert_eq!(text_of(ack), "Looking into it.");
+    assert_eq!(
+        text_of(ask),
+        format!("Approve the $5.00 budget?\n\n[Task details]({page})")
+    );
+    assert_eq!(
+        text_of(result),
+        format!("Fixed it. Test is green.\n\n[Task details]({page})")
+    );
+    assert_eq!(result["body"]["flags"], 4, "the link does not unfurl");
+    assert!(ask["body"]["components"].is_array(), "the buttons stay");
+}
+
+#[tokio::test]
+async fn a_result_over_three_messages_ends_on_its_page_or_with_a_note_that_it_was_cut() {
+    let fake = Fake::start().await;
+    let answer = paragraphs(20, 600);
+    let page = format!("{PUBLIC_URL}/tickets/tk_1");
+    for (channel, id) in [
+        (fake.channel_linking_to(PUBLIC_URL), "ms_linked"),
+        (fake.channel(), "ms_plain"),
+    ] {
+        channel
+            .send(
+                outbound(id, MessageKind::Result, CHAN, &answer),
+                SendOptions::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let posts = fake.until_posts(6).await;
+    let (linked, plain) = posts.split_at(3);
+    for post in &posts {
+        assert!(text_of(post).chars().count() <= 2_000);
+    }
+    assert!(
+        text_of(&linked[2]).ends_with(&format!("\n\n…the rest is on the [task page]({page})")),
+        "{}",
+        text_of(&linked[2])
+    );
+    assert!(
+        text_of(&plain[2]).ends_with("characters shown.]_"),
+        "{}",
+        text_of(&plain[2])
+    );
+    for part in &linked[..2] {
+        assert!(!text_of(part).contains("/tickets/"), "the link is once");
+    }
+    assert!(!plain.iter().any(|post| text_of(post).contains("/tickets/")));
+    // Whole paragraphs, in order.
+    let heads: Vec<&str> = linked
+        .iter()
+        .flat_map(|post| text_of(post).split("\n\n"))
+        .filter(|p| p.chars().take(3).all(|c| c.is_ascii_digit()))
+        .map(|p| &p[..3])
+        .collect();
+    assert_eq!(heads.len(), 9, "three paragraphs to a message of 2,000");
+    assert!(heads.windows(2).all(|w| w[0] < w[1]));
+}
+
+#[tokio::test]
+async fn a_retry_after_a_failed_part_posts_the_missing_parts_with_the_same_nonces() {
+    let fake = Fake::start().await;
+    let channel = fake.channel_linking_to(PUBLIC_URL);
+    let answer = paragraphs(7, 600);
+    let result = || outbound("ms_result", MessageKind::Result, CHAN, &answer);
+    fake.script([Reply::Created, Reply::Status(503)]);
+
+    let first = channel.send(result(), SendOptions::default()).await;
+    assert!(first.is_err(), "the second part failed");
+    let repeat = SendOptions {
+        repeat: true,
+        ..SendOptions::default()
+    };
+    assert_eq!(
+        channel.send(result(), repeat).await.unwrap(),
+        SendOutcome::Sent
+    );
+
+    let discord = fake.discord();
+    let nonces: Vec<&str> = discord.posts.iter().map(nonce_of_post).collect();
+    assert_eq!(nonces.len(), 5, "part 1, part 2 (503), part 1, 2 and 3");
+    assert_eq!(nonces[0], nonces[2], "part 1 is named the same");
+    assert_eq!(nonces[1], nonces[3], "and so is part 2");
+    assert_eq!(nonces.iter().collect::<BTreeSet<_>>().len(), 3);
+    let held = contents(&discord);
+    assert_eq!(held.len(), 3, "Discord holds each part once");
+    assert_eq!(
+        held.iter().filter(|c| c.contains("/tickets/")).count(),
+        1,
+        "and the link once"
+    );
+    assert!(held[2].ends_with("[Task details](https://agent.example.com/tickets/tk_1)"));
+}
+
+#[tokio::test]
+async fn the_runtime_retries_a_failed_part_and_a_ticket_has_its_link_once() {
+    let fake = Fake::start().await;
+    let scratch = Scratch::new("parts-retry");
+    let answer = paragraphs(5, 900);
+    // The acknowledgement, the first part, then a part that fails.
+    fake.script([Reply::Created, Reply::Created, Reply::Status(503)]);
+    let runtime = Agent {
+        scratch: &scratch,
+        source: scratch.triggers(&[request(&mid(1), &mid(1), "Summarise the incident")]),
+        channel: Some(fake.channel_linking_to(PUBLIC_URL)),
+        executor: Arc::new(Reports(answer)),
+        budget: BUDGET,
+        until_idle: true,
+    }
+    .runtime();
+
+    let summary = tokio::time::timeout(LIMIT, runtime.run(std::future::pending()))
+        .await
+        .expect("the run did not go idle")
+        .unwrap();
+
+    assert_eq!(summary.effect_failures, 1);
+    let ticket = scratch
+        .store()
+        .effects()
+        .unwrap()
+        .into_iter()
+        .find_map(|q| match q.effect {
+            Effect::Send(m) if m.kind == MessageKind::Result => m.ticket,
+            _ => None,
+        })
+        .unwrap();
+    let discord = fake.discord();
+    let held = contents(&discord);
+    assert_eq!(held.len(), 4, "the acknowledgement and three parts, once");
+    assert_eq!(held[0], "Looking into it.");
+    assert!(!held[1..3].iter().any(|c| c.contains("/tickets/")));
+    assert!(
+        held[3].ends_with(&format!(
+            "\n\n[Task details]({PUBLIC_URL}/tickets/{ticket})"
+        )),
+        "{}",
+        held[3]
+    );
+    assert_eq!(discord.posts.len(), 6, "the retry posted part 1 again");
+    for post in &discord.posts {
+        assert_eq!(post.body["message_reference"]["message_id"], mid(1));
+    }
+    assert_settled(&scratch.store());
+}
+
+#[tokio::test]
+async fn parts_posted_in_a_thread_channel_are_plain_posts_in_it() {
+    let fake = Fake::start().await;
+    let channel = fake.channel();
+    let mut answer = outbound("ms_thread", MessageKind::Result, CHAN, &paragraphs(5, 900));
+    answer.channel = person_address("1500000000000000001", None);
+    channel.send(answer, SendOptions::default()).await.unwrap();
+
+    let posts = fake.until_posts(3).await;
+    for post in &posts {
+        assert_eq!(post["channel"], "1500000000000000001");
+        assert!(post["body"].get("message_reference").is_none());
+    }
 }
 
 async fn ask_for_gated_work(fake: &Fake) -> (String, Value) {
@@ -2903,6 +3228,82 @@ budgets: {{session_microusd: {BUDGET}}}
         assert_eq!(post["body"]["message_reference"]["message_id"], mid(1));
     }
     assert_settled(&scratch.store());
+}
+
+#[tokio::test]
+async fn agent_serve_links_the_result_to_its_ticket_page_when_the_config_has_a_public_url() {
+    let fake = Fake::start().await;
+    let scratch = Scratch::new("serve-web");
+    std::fs::write(scratch.root.join("bot.token"), format!("{TOKEN}\n")).unwrap();
+    let config = scratch.root.join("agent.yaml");
+    std::fs::write(
+        &config,
+        format!(
+            "policy:
+  people: [discord:1300000000000000011]
+  approvers: [discord:1300000000000000011]
+sources:
+  - kind: discord
+    channels: [{CHAN}]
+    token_file: bot.token
+    api_base: {}
+channels:
+  - kind: discord
+router: {{kind: scripted}}
+executor: {{kind: scripted}}
+budgets: {{session_microusd: {BUDGET}}}
+web: {{public_url: \"{PUBLIC_URL}\"}}
+",
+            fake.api
+        ),
+    )
+    .unwrap();
+    let driver = async {
+        let conn = fake.connection().await;
+        fake.ready().await;
+        fake.dispatch(
+            "MESSAGE_CREATE",
+            mention(CHAN, &mid(1), &alice(), "summarise the incident"),
+        );
+        let posts = fake.until_posts(2).await;
+        conn.close(1000);
+        posts
+    };
+    let options = ServeOptions {
+        until_idle: true,
+        ..ServeOptions::default()
+    };
+    let state = scratch.root.join("state");
+    let (summary, posts) = tokio::time::timeout(LIMIT, async {
+        tokio::join!(serve(&config, &state, options), driver)
+    })
+    .await
+    .expect("agent serve did not go idle");
+
+    summary.unwrap();
+    let ticket = scratch
+        .store()
+        .effects()
+        .unwrap()
+        .into_iter()
+        .find_map(|q| match q.effect {
+            Effect::Send(m) if m.kind == MessageKind::Result => m.ticket,
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(text_of(&posts[0]), "Looking into it.");
+    let result = text_of(&posts[1]);
+    assert!(
+        result.starts_with("Done: summarise the incident."),
+        "{result}"
+    );
+    assert!(
+        result.ends_with(&format!(
+            "\n\n[Task details]({PUBLIC_URL}/tickets/{ticket})"
+        )),
+        "{result}"
+    );
+    assert!(ticket.as_str().starts_with("tk_"), "{ticket}");
 }
 
 #[test]
