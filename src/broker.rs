@@ -49,10 +49,27 @@ pub use solos_swarm::gateway::{
     Dialect, OpenAiCompatible, PriceTable, Provider, Upstream, effective_control, peak_retry_after,
     reasoning_model, upstream_profile, venice_model,
 };
+#[path = "broker_fetch.rs"]
+mod fetch_policy;
+#[allow(unused_imports)]
+pub use fetch_policy::{FetchGuard, FetchPolicy, FetchRefused, Pacer, interval_ms, is_public_ip};
 #[path = "broker_goal_text.rs"]
 mod goal_text;
 #[allow(unused_imports)]
 pub use goal_text::{FilingContract, Nudges, RecordFields};
+
+/// Scopes whose Goals probe a named target with the owner's authorization,
+/// each one a reviewed grant: a Goal naming a scope that is not listed is
+/// refused. These two were frozen before the `fetch` policy existed, so a
+/// Goal that grants `fetch_url` under them may still go without one.
+const AUDIT_SCOPES_BEFORE_FETCH_POLICY: [&str; 2] = [
+    "authorized-audit:solana-developer-platform",
+    "authorized-audit:solana-platform-redteam",
+];
+/// Audit scopes added since: a Goal that grants `fetch_url` under one must
+/// carry a `fetch` policy, so the hosts it may probe are enforced and not
+/// only written in its prompt. A new target is one line here.
+const AUDIT_SCOPES: [&str; 1] = ["authorized-audit:zelix"];
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Goal {
@@ -106,6 +123,10 @@ pub struct Goal {
     /// that never did. Absent, [`RecordFields::research`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record_fields: Option<RecordFields>,
+    /// What `fetch_url` may reach: hosts, methods, rate. Absent, it keeps
+    /// the historical reach, so a frozen Goal is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch: Option<FetchPolicy>,
 }
 
 impl Goal {
@@ -123,11 +144,9 @@ impl Goal {
         ensure!(
             matches!(
                 self.scope.as_str(),
-                "synthetic-fixtures-only"
-                    | "authorized-audit:solana-developer-platform"
-                    | "authorized-audit:solana-platform-redteam"
-                    | "public-web-research"
-            ),
+                "synthetic-fixtures-only" | "public-web-research"
+            ) || AUDIT_SCOPES_BEFORE_FETCH_POLICY.contains(&self.scope.as_str())
+                || AUDIT_SCOPES.contains(&self.scope.as_str()),
             "Goal scope outside the deployment allowlist"
         );
         match (&self.upstream, &self.provider) {
@@ -229,6 +248,21 @@ impl Goal {
         }
         if let Some(fields) = &self.record_fields {
             fields.validate().context("invalid Goal record_fields")?;
+        }
+        let fetches = self.grants.iter().any(|grant| grant == "fetch_url");
+        if let Some(policy) = &self.fetch {
+            ensure!(
+                fetches,
+                "Goal fetch policy needs the fetch_url grant it limits"
+            );
+            policy.validate().context("invalid Goal fetch policy")?;
+        } else {
+            ensure!(
+                !(fetches && AUDIT_SCOPES.contains(&self.scope.as_str())),
+                "scope {} grants fetch_url, so the Goal must carry a fetch policy naming the \
+                 hosts it may probe",
+                self.scope
+            );
         }
         Ok(())
     }
@@ -384,6 +418,10 @@ pub struct Store {
     previous_hash: String,
     #[serde(skip)]
     tokens: BTreeMap<String, String>,
+    /// When each agent may next call `fetch_url`, under the Goal's rate. Not
+    /// kept across a resume: the pace restarts with the process.
+    #[serde(skip)]
+    pacer: Pacer,
 }
 impl Store {
     pub fn new(dir: &Path, goal: &Goal) -> Result<Self> {
@@ -409,6 +447,7 @@ impl Store {
             seq: 0,
             previous_hash: "0".repeat(64),
             tokens: BTreeMap::new(),
+            pacer: Pacer::new(),
         })
     }
     pub fn record(&mut self, kind: &str, data: Value) -> Result<()> {
@@ -479,6 +518,18 @@ impl Store {
         let agent = self.agents.get_mut(id).context("unknown allocation")?;
         agent.fetch_bytes = agent.fetch_bytes.saturating_add(bytes);
         Ok(())
+    }
+    /// Admission of one more `fetch_url` call under the Goal's per-agent
+    /// rate: it counts, or it is refused with the wait. A Goal without a
+    /// rate admits every call.
+    pub fn fetch_pace(&mut self, goal: &Goal, id: &str, url: &str) -> Result<(), FetchRefused> {
+        let Some(rps) = goal.fetch.as_ref().and_then(|policy| policy.per_agent_rps) else {
+            return Ok(());
+        };
+        let now = self.pacer.now_ms();
+        self.pacer
+            .take(id, interval_ms(rps), now)
+            .map_err(|wait| FetchRefused::rate(rps, wait, url))
     }
     fn authenticate(&self, headers: &HeaderMap) -> Result<String> {
         let token = headers
@@ -977,6 +1028,9 @@ pub struct Broker {
     pub slots: Arc<Semaphore>,
     /// Egress client for `fetch_url`, deliberately separate from the provider
     /// client: a target's latency and redirects are the worker's business.
+    /// The swarm's `fetch_url` no longer sends through it: each of its hops
+    /// gets a client pinned to the addresses the fetch guard vetted (see
+    /// [`fetch_guarded`]). The field stays for the callers that build a Broker.
     pub client: reqwest::Client,
     /// The sandboxed local executor. `None` when the Goal did not grant
     /// `run_code`, so a frozen ten-agent Goal cannot acquire it accidentally.
@@ -1164,7 +1218,21 @@ async fn tool(
             }
         }
         let url = args["url"].clone();
-        match fetch(&broker.client, &args).await {
+        // The Goal's host and method rules come first and cost the agent
+        // nothing, then its rate, then the network, where every redirect hop
+        // meets the rules again and every address is checked.
+        let guard = FetchGuard::new(broker.goal.fetch.as_ref());
+        let fetched = async {
+            guard.precheck(&args)?;
+            broker.store.lock().await.fetch_pace(
+                &broker.goal,
+                &id,
+                url.as_str().unwrap_or_default(),
+            )?;
+            fetch_guarded(&args, &guard).await
+        }
+        .await;
+        match fetched {
             Ok(response) => {
                 let bytes = response["body_bytes"].as_u64().unwrap_or(0);
                 let mut store = broker.store.lock().await;
@@ -1174,6 +1242,14 @@ async fn tool(
             }
             Err(error) => {
                 let mut store = broker.store.lock().await;
+                // A refusal is the Goal's rule doing its work, so the agent is
+                // told in a result it can read, and the run records it.
+                if let Some(refused) = error.downcast_ref::<FetchRefused>() {
+                    store
+                        .record("fetch_refused", refused.event(&id, &args))
+                        .map_err(denied)?;
+                    return Ok(Json(refused.reply()));
+                }
                 store
                     .record(
                         "fetch_failed",
@@ -1311,6 +1387,33 @@ pub async fn fetch_with(
     args: &Value,
     hop: impl Fn(&mut reqwest::Request),
 ) -> Result<Value> {
+    fetch_via(Egress::Shared(client), args, hop).await
+}
+
+/// [`fetch`] for the swarm broker's `fetch_url`: every request, the first and
+/// each redirect, goes through `guard`, which holds it to the Goal's fetch
+/// policy and sends it only to an address it has vetted. A request the guard
+/// refuses comes back as a [`FetchRefused`] error, before anything is sent.
+pub async fn fetch_guarded(args: &Value, guard: &FetchGuard<'_>) -> Result<Value> {
+    fetch_via(Egress::Guarded(guard), args, |_| {}).await
+}
+
+/// How a fetch reaches the network.
+enum Egress<'a> {
+    /// One client for every hop, as agent mode and the keyed fetch use it.
+    Shared(&'a reqwest::Client),
+    /// A client pinned per hop, after the guard has judged that hop.
+    Guarded(&'a FetchGuard<'a>),
+}
+
+async fn fetch_via(
+    egress: Egress<'_>,
+    args: &Value,
+    hop: impl Fn(&mut reqwest::Request),
+) -> Result<Value> {
+    if let Egress::Guarded(guard) = &egress {
+        guard.admit_headers(args)?;
+    }
     let raw = args["url"].as_str().context("fetch url missing")?;
     let url = reqwest::Url::parse(raw)?;
     ensure!(
@@ -1332,7 +1435,24 @@ pub async fn fetch_with(
         .min(1_048_576);
     let mut current = url;
     let mut redirects = Vec::new();
-    for _ in 0..=FETCH_MAX_REDIRECTS {
+    let mut came_from: Option<(u16, reqwest::Url)> = None;
+    for hop_index in 0..=FETCH_MAX_REDIRECTS {
+        let pinned;
+        let client = match &egress {
+            Egress::Shared(client) => *client,
+            Egress::Guarded(guard) => {
+                let via = came_from
+                    .as_ref()
+                    .map(|(status, from)| fetch_policy::Redirect {
+                        hop: hop_index,
+                        status: *status,
+                        from,
+                    });
+                guard.admit(&current, &method, via.as_ref())?;
+                pinned = guard.pin(&current, hop_index).await?;
+                &pinned
+            }
+        };
         let mut builder = client
             .request(
                 reqwest::Method::from_bytes(method.as_bytes())?,
@@ -1360,6 +1480,7 @@ pub async fn fetch_with(
         {
             let next = current.join(location)?;
             redirects.push(json!({"status":status.as_u16(),"to":next.as_str()}));
+            came_from = Some((status.as_u16(), current));
             current = next;
             continue;
         }
@@ -1401,6 +1522,9 @@ pub use control::{
 #[cfg(test)]
 #[path = "broker_control_tests.rs"]
 mod control_tests;
+#[cfg(test)]
+#[path = "broker_fetch_tests.rs"]
+mod fetch_tests;
 #[cfg(test)]
 #[path = "broker_progress_tests.rs"]
 mod progress_tests;
@@ -2110,38 +2234,49 @@ mod tests {
     }
     #[test]
     fn authorized_audit_envelope_bounds_are_exact() {
-        let (mut goal, _, dir) = setup();
-        goal.scope = "authorized-audit:solana-developer-platform".into();
-        goal.deadline_seconds = 21_600;
-        goal.budget_microusd = 1_000_000_000_000;
-        goal.max_calls_per_agent = 200;
-        goal.max_input_bytes = 2_097_152;
-        goal.max_output_tokens = 393_216;
-        assert!(goal.validate().is_ok());
-        goal.budget_microusd = 1_000_000_000_001;
-        assert!(goal.validate().is_err());
-        goal.budget_microusd = 1_000_000_000_000;
-        goal.deadline_seconds = 21_601;
-        assert!(goal.validate().is_err());
-        goal.deadline_seconds = 21_600;
-        // The ceiling admits a deliberately generous range: 200 calls is inside
-        // it while the old 48-call value remains valid for a frozen preview Goal.
-        goal.max_calls_per_agent = 10_001;
-        assert!(goal.validate().is_err());
-        goal.max_calls_per_agent = 10_000;
-        assert!(goal.validate().is_ok());
-        goal.max_calls_per_agent = 48;
-        assert!(goal.validate().is_ok());
-        goal.max_input_bytes = 16_777_217;
-        assert!(goal.validate().is_err());
-        goal.max_input_bytes = 16_777_216;
-        assert!(goal.validate().is_ok());
-        goal.max_input_bytes = 6_291_456;
-        goal.max_output_tokens = 393_217;
-        assert!(goal.validate().is_err());
-        goal.max_output_tokens = 393_216;
-        goal.scope = "authorized-audit:other-target".into();
-        assert!(goal.validate().is_err());
-        fs::remove_dir_all(dir).unwrap();
+        // Every audit scope on the allowlist shares one envelope, so a target
+        // added to either list is held to these bounds without a new test.
+        let scopes: Vec<&str> = AUDIT_SCOPES_BEFORE_FETCH_POLICY
+            .iter()
+            .chain(&AUDIT_SCOPES)
+            .copied()
+            .collect();
+        assert!(scopes.contains(&"authorized-audit:zelix"));
+        for scope in scopes {
+            let (mut goal, _, scratch) = setup();
+            goal.scope = scope.into();
+            goal.deadline_seconds = 21_600;
+            goal.budget_microusd = 1_000_000_000_000;
+            goal.max_calls_per_agent = 200;
+            goal.max_input_bytes = 2_097_152;
+            goal.max_output_tokens = 393_216;
+            assert!(goal.validate().is_ok(), "{scope}");
+            goal.budget_microusd = 1_000_000_000_001;
+            assert!(goal.validate().is_err(), "{scope}");
+            goal.budget_microusd = 1_000_000_000_000;
+            goal.deadline_seconds = 21_601;
+            assert!(goal.validate().is_err(), "{scope}");
+            goal.deadline_seconds = 21_600;
+            // The ceiling admits a deliberately generous range: 200 calls is inside
+            // it while the old 48-call value remains valid for a frozen preview Goal.
+            goal.max_calls_per_agent = 10_001;
+            assert!(goal.validate().is_err(), "{scope}");
+            goal.max_calls_per_agent = 10_000;
+            assert!(goal.validate().is_ok(), "{scope}");
+            goal.max_calls_per_agent = 48;
+            assert!(goal.validate().is_ok(), "{scope}");
+            goal.max_input_bytes = 16_777_217;
+            assert!(goal.validate().is_err(), "{scope}");
+            goal.max_input_bytes = 16_777_216;
+            assert!(goal.validate().is_ok(), "{scope}");
+            goal.max_input_bytes = 6_291_456;
+            goal.max_output_tokens = 393_217;
+            assert!(goal.validate().is_err(), "{scope}");
+            goal.max_output_tokens = 393_216;
+            assert!(goal.validate().is_ok(), "{scope}");
+            goal.scope = "authorized-audit:other-target".into();
+            assert!(goal.validate().is_err(), "{scope}");
+            fs::remove_dir_all(scratch).unwrap();
+        }
     }
 }

@@ -5,7 +5,9 @@
 //! own. Draining waits for in-flight calls to settle, so a drained run holds no
 //! budget. Resuming rebuilds the Store from `state.json` after proving it
 //! matches the hash-chained `events.jsonl`.
-use super::{Agent, Finding, Goal, Intent, Store, Task, digest, file_digest, now_ms, write_json};
+use super::{
+    Agent, Finding, Goal, Intent, Pacer, Store, Task, digest, file_digest, now_ms, write_json,
+};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -508,6 +510,7 @@ impl Store {
             seq: chain.last_seq,
             previous_hash: chain.last_hash,
             tokens: Default::default(),
+            pacer: Pacer::new(),
         };
         let runtime = file_digest(&std::env::current_exe()?)?;
         store.record(

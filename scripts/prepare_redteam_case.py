@@ -5,6 +5,11 @@ Shards the repository's security-relevant source files into exactly ten Task
 inputs (one per admitted worker), each bounded so one shard fits a 262,144-token
 worker context. The private evaluator payload carries the per-task file lists
 and the structural security-review contract; it never enters the public Goal.
+
+The workers only read source, so this Goal grants no `fetch_url` and carries no
+`fetch` policy. A Goal that probes a live target grants `fetch_url` and must
+carry one (hosts, methods, per-agent rate); `prepare_platform_case.py` is the
+builder for that and emits it. See "Live-probe Goals" in docs/RUNBOOK.md.
 """
 
 import argparse
