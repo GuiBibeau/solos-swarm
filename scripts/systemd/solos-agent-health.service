@@ -24,6 +24,9 @@ RuntimeDirectory=solos-agent-health
 RuntimeDirectoryMode=0700
 UMask=0077
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# The async runtime starts one worker thread per core (128 here); a check needs two, and fewer threads keep it
+# well inside TasksMax.
+Environment=TOKIO_WORKER_THREADS=2
 # A token that cannot be copied is not fatal here: the check runs and fails on "alerts cannot be delivered", which
 # is the honest report.
 ExecStartPre=-/bin/sh -c 'cp "$HOME/agent/tokens/discord-token" "$RUNTIME_DIRECTORY/discord-token"'
@@ -34,7 +37,7 @@ Nice=10
 CPUWeight=10
 IOWeight=10
 MemoryMax=256M
-TasksMax=64
+TasksMax=256
 NoNewPrivileges=yes
 StandardOutput=journal
 StandardError=journal
