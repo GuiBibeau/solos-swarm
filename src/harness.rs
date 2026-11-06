@@ -26,6 +26,11 @@ pub mod scripted;
 pub enum SessionEvent {
     /// The session finished its turn and waits for the next prompt.
     TurnEnded,
+    /// The session's last message ended its run with no tool call, and this
+    /// is the text it wrote (never its reasoning or a tool call). It comes
+    /// before the `TurnEnded` it belongs to, and only for a reply that
+    /// stopped by itself: a failed, aborted or cut-off reply says nothing.
+    Said(String),
     /// The harness refused a command; the text is its reason.
     Rejected(String),
     /// A reply hit the model's output limit while it was asking for tool
@@ -305,6 +310,8 @@ fn event(frame: &Value) -> Option<SessionEvent> {
         Some(SessionEvent::Rejected(frame["error"].to_string()))
     } else if frame["type"] == "agent_settled" {
         Some(SessionEvent::TurnEnded)
+    } else if frame["type"] == "message_end" {
+        said(&frame["message"]).map(SessionEvent::Said)
     } else if frame["type"] == "turn_end"
         && frame["message"]["stopReason"] == "length"
         && frame["message"]["content"]
@@ -315,6 +322,27 @@ fn event(frame: &Value) -> Option<SessionEvent> {
     } else {
         None
     }
+}
+
+/// What an assistant message wrote when it ended Pi's run: it stopped by
+/// itself (not an error, an abort or the output limit), asked for no tool
+/// call and wrote some text. Only its text blocks count, so neither its
+/// reasoning nor a tool call is ever returned.
+fn said(message: &Value) -> Option<String> {
+    if message["role"] != "assistant" || message["stopReason"] != "stop" {
+        return None;
+    }
+    let parts = message["content"].as_array()?;
+    if parts.iter().any(|part| part["type"] == "toolCall") {
+        return None;
+    }
+    let text: Vec<&str> = parts
+        .iter()
+        .filter(|part| part["type"] == "text")
+        .filter_map(|part| part["text"].as_str())
+        .filter(|text| !text.trim().is_empty())
+        .collect();
+    (!text.is_empty()).then(|| text.join("\n\n"))
 }
 
 /// Copy Pi's stdout to `path` verbatim and forward its events. The end of the
@@ -563,5 +591,61 @@ mod tests {
         assert_eq!(event(&json!({"type":"response","success":true})), None);
         assert_eq!(event(&json!({"type":"response"})), None);
         assert_eq!(event(&json!({"type":"agent_end"})), None);
+    }
+
+    #[test]
+    fn only_a_message_that_stopped_by_itself_with_text_and_no_tool_call_is_said() {
+        let end = |role: &str, stop: &str, content: Value| {
+            let message = json!({"role":role,"content":content,"stopReason":stop});
+            json!({"type":"message_end","message":message})
+        };
+        let spoken = |frame: Value| match event(&frame) {
+            Some(SessionEvent::Said(text)) => Some(text),
+            other => {
+                assert_eq!(other, None, "{frame}");
+                None
+            }
+        };
+        let text = json!([{"type":"text","text":"The notes have 3 lines."}]);
+        assert_eq!(
+            spoken(end("assistant", "stop", text.clone())).as_deref(),
+            Some("The notes have 3 lines.")
+        );
+        // Reasoning is not what was said, and blocks are joined in order.
+        let thought = json!([
+            {"type":"thinking","thinking":"the user wants a count"},
+            {"type":"text","text":"Three lines."},
+            {"type":"text","text":"  "},
+            {"type":"text","text":"Want the file?"}
+        ]);
+        assert_eq!(
+            spoken(end("assistant", "stop", thought)).as_deref(),
+            Some("Three lines.\n\nWant the file?")
+        );
+        let call = json!({"type":"toolCall","id":"c1","name":"worker_report","arguments":{}});
+        let with_text = json!([{"type":"text","text":"Reporting."}, call.clone()]);
+        let only_thought = json!([{"type":"thinking","thinking":"hm"}]);
+        for (role, stop, content) in [
+            ("assistant", "toolUse", json!([call.clone()])),
+            ("assistant", "stop", with_text),
+            ("assistant", "error", text.clone()),
+            ("assistant", "aborted", text.clone()),
+            ("assistant", "length", text.clone()),
+            ("assistant", "pending", text.clone()),
+            ("assistant", "stop", only_thought),
+            ("assistant", "stop", json!([])),
+            ("assistant", "stop", json!([{"type":"text","text":" \n"}])),
+            ("assistant", "stop", json!("a string, not blocks")),
+            ("user", "stop", text.clone()),
+            ("toolResult", "stop", text.clone()),
+        ] {
+            let frame = end(role, stop, content);
+            assert_eq!(spoken(frame.clone()), None, "{frame}");
+        }
+        // Only the end of a message says anything, not its start or a delta.
+        let delta = json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"Hi"}});
+        let start = json!({"type":"message_start","message":{"role":"assistant","content":text,"stopReason":"stop"}});
+        assert_eq!(event(&delta), None);
+        assert_eq!(event(&start), None);
     }
 }

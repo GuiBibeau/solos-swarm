@@ -423,6 +423,8 @@ async fn drive<H>(
                             limit = (limit + 1).min(max_batch);
                         }
                     }
+                    // The Router decides with `router_decide`; what it says is not read.
+                    Some((_, Ok(SessionEvent::Said(_)))) => {}
                     Some((_, Ok(SessionEvent::OutputCut))) => {
                         limit = (prompted.len() / 2).max(1);
                         eprintln!(

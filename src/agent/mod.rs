@@ -18,6 +18,7 @@ mod markdown;
 pub mod mcp;
 pub mod pi_executor;
 pub mod pi_router;
+mod plain_answer;
 pub mod ports;
 pub mod pstack;
 pub mod publish;
