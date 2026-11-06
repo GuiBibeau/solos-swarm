@@ -256,7 +256,8 @@ fn repository_text(workspace: &Workspace, owes: Deliverable) -> String {
     let mut text = format!(
         "Repository: {repo}, base {base}. /work is a clone of it at {base}'s tip ({short}), with \
          its history and your commit identity: run git and its code there with run_code, and \
-         read its files with read. /host/repo.json says the same."
+         read its files with read. read also reaches /host/repo.json, which says the same; \
+         run_code has no /host."
     );
     if let Some(notes) = notes {
         let _ = write!(text, "\nNotes on {repo}: {}", notes.trim());

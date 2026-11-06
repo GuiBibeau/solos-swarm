@@ -35,7 +35,7 @@ use axum::{
 use browser::Browse;
 use registry::{PrincipalKind, RouterOp};
 pub use registry::{ROUTER_TOOLS, WORKER_TOOLS};
-use repeat::RepeatGuard;
+use repeat::{RepeatGuard, Stopped};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use solos_agent_core::change::{CommitSha, Deliverable, Harvest, RepoName};
@@ -50,7 +50,7 @@ use solos_agent_store::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
 use std::time::Duration;
 use tokio::net::UnixListener;
 use toolbox::{Env, Lookup, Toolbox, WorkerCall};
@@ -68,6 +68,14 @@ const READ_RECENT: usize = 20;
 pub(crate) const REPORT_TEXT_CHARS: usize = 8_000;
 const QUESTION_CHARS: usize = 1_000;
 const FAILURE_CHARS: usize = 400;
+/// What a worker whose turn the broker stopped for looping reads, in the
+/// refusal of every tool call it makes after.
+const TURN_STOPPED: &str = "Your turn is stopped because you kept sending calls that were \
+    refused, and the person is told you got stuck. Do not call any more tools.";
+/// Why the model call after that is refused. A harness that has no turn to
+/// end, such as Claude Code, shows this as the session's error.
+const STUCK_REASON: &str =
+    "the turn was stopped because the worker kept repeating calls that were refused";
 
 /// Who a session is.
 #[derive(Clone, Debug)]
@@ -191,9 +199,7 @@ impl WorkerSeat {
             *failure = None;
         }
         self.handed_back.store(false, Ordering::SeqCst);
-        if let Ok(mut repeats) = self.repeats.lock() {
-            repeats.begin_turn();
-        }
+        self.guard().begin_turn();
         self.jobs.begin_turn();
     }
 
@@ -274,14 +280,46 @@ impl WorkerSeat {
         }
     }
 
-    /// Refuse a tool call that repeats the seat's latest calls too often.
+    fn guard(&self) -> MutexGuard<'_, RepeatGuard> {
+        self.repeats.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Refuse a tool call that repeats the seat's latest calls too often,
+    /// and say what the call answered before. Once the refusals reach the
+    /// limit the turn is stopped: that call and each one after it is told
+    /// so, and runs nothing.
     fn repeat_refused(&self, tool: &str, args: &Value, repeatable: bool) -> Option<Refusal> {
-        let mut repeats = match self.repeats.lock() {
-            Ok(repeats) => repeats,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut repeats = self.guard();
+        if repeats.stopped().is_some() {
+            return Some(refuse(StatusCode::TOO_MANY_REQUESTS, TURN_STOPPED));
+        }
         let repeated = repeats.call(tool, args, repeatable)?;
-        Some(refuse(StatusCode::TOO_MANY_REQUESTS, repeated.why(tool)))
+        let mut why = repeated.why(tool, repeats.earlier(tool, args));
+        if let Some(stopped) = repeats.stopped() {
+            let (count, within) = match stopped {
+                Stopped::InARow(count) => (count, "in a row"),
+                Stopped::InTurn(count) => (count, "in this turn"),
+            };
+            eprintln!(
+                "agent: the worker of {} on {} sent {count} refused calls {within}, last {tool}; \
+                 its turn is stopped",
+                self.assignment, self.ticket
+            );
+            why = format!("{why} {TURN_STOPPED}");
+        }
+        Some(refuse(StatusCode::TOO_MANY_REQUESTS, why))
+    }
+
+    /// Keep what a call of `tool` with `args` answered, so a refusal of the
+    /// same call can say so.
+    fn answered(&self, tool: &str, args: &Value, answer: Result<&Value, &str>) {
+        self.guard().answered(tool, args, answer);
+    }
+
+    /// The guard stopped the turn: the seat's model calls are refused, which
+    /// ends a Pi turn, until the next turn begins.
+    fn turn_stopped(&self) -> bool {
+        self.guard().stopped().is_some()
     }
 }
 
@@ -298,6 +336,10 @@ pub enum ModelFailure {
     /// Anything else: the provider's error or its call limit, the model
     /// limit, or the stop after an overrun. The text is the broker's reason.
     Failed(String),
+    /// The broker stopped the turn: the worker kept sending the same call
+    /// after it was refused, so the call after the stop was refused too,
+    /// with no model call spent.
+    Stuck,
 }
 
 impl ModelFailure {
@@ -307,6 +349,12 @@ impl ModelFailure {
     /// words what stopped the work and how to go on.
     pub fn report(&self) -> (ReportStatus, String) {
         match self {
+            Self::Stuck => (
+                ReportStatus::Failed,
+                "I got stuck repeating the same step and stopped. Reply here to have me try \
+                 again with a different approach."
+                    .to_owned(),
+            ),
             Self::BudgetReached { committed, budget } => (
                 ReportStatus::Blocked,
                 format!(
@@ -1204,6 +1252,14 @@ impl Call {
         named: &mut Option<ModelFailure>,
     ) -> Reply {
         let terms = &grant.terms;
+        // First of all: a looping worker's turn ends here, with no hold, no
+        // upstream call and no cost.
+        if let Principal::Worker(seat) = &grant.principal
+            && seat.turn_stopped()
+        {
+            *named = Some(ModelFailure::Stuck);
+            return Err(forbidden(STUCK_REASON));
+        }
         if self.input_bytes > terms.max_input_bytes {
             return Err(forbidden("request exceeds the model limit"));
         }
@@ -1362,7 +1418,7 @@ async fn tool(
             if let Some(refusal) = seat.repeat_refused(&name, &args, repeatable) {
                 return Err(refusal);
             }
-            call.run(&broker, seat, args).await
+            call.run(&broker, seat, &name, args).await
         }
     }
 }
@@ -1386,12 +1442,16 @@ async fn router_call(broker: &AgentBroker, op: RouterOp, args: Value) -> Reply {
 }
 
 impl WorkerCall {
+    /// Run the tool `name`. What a tool that is not repeatable answers is
+    /// kept on the seat, so a refusal of the same call can say so.
     async fn run(
         &self,
         broker: &AgentBroker,
         seat: &Arc<WorkerSeat>,
+        name: &str,
         args: Value,
     ) -> std::result::Result<Response, Refusal> {
+        let asked = (!seat.held.repeatable(name)).then(|| args.clone());
         let reply = match self {
             Self::Browser(tool, browse) => {
                 return browser::call(broker, seat, *tool, browse.clone(), args).await;
@@ -1409,6 +1469,13 @@ impl WorkerCall {
             Self::VaultList(vault) => secrets::vault_list(broker, seat, vault).await,
             Self::ReadPath(reader) => read_path(reader, args).await,
         };
+        if let Some(asked) = asked {
+            let answer = match &reply {
+                Ok(Json(result)) => Ok(result),
+                Err((_, Json(body))) => Err(body["error"].as_str().unwrap_or("refused")),
+            };
+            seat.answered(name, &asked, answer);
+        }
         reply.map(IntoResponse::into_response)
     }
 }
@@ -2711,5 +2778,13 @@ mod tests {
         );
         let (_, long) = ModelFailure::Failed("x".repeat(5_000)).report();
         assert!(long.chars().count() < 600, "a long reason is cut: {long}");
+
+        let (status, text) = ModelFailure::Stuck.report();
+        assert_eq!(status, ReportStatus::Failed);
+        assert_eq!(
+            text,
+            "I got stuck repeating the same step and stopped. Reply here to have me try again \
+             with a different approach."
+        );
     }
 }

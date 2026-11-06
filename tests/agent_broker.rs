@@ -1618,6 +1618,224 @@ async fn a_worker_that_sends_the_same_call_over_and_over_is_refused_and_told_wha
     web.abort();
 }
 
+/// A page on a loopback port that counts its hits, and its address.
+async fn counting_page() -> (
+    String,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = hits.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let app = axum::Router::new().fallback(move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+        async { "page" }
+    });
+    let web = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (url, hits, web)
+}
+
+#[tokio::test]
+async fn a_worker_that_ignores_its_refusals_has_its_turn_stopped_and_pays_for_no_model_call_after()
+{
+    let scratch = Scratch::new("worker-stopped");
+    let provider = Scripted::new();
+    let (_runtime, served) = model_only(&scratch, provider.clone(), 1_000_000);
+    let seat = WorkerSeat::new(
+        TicketId::new("tk_loop"),
+        AssignmentId::new("as_1"),
+        scratch.state(),
+        500_000,
+    );
+    let seat = served
+        .broker
+        .admit_worker(WORKER.into(), seat, "You are a worker.".into())
+        .unwrap();
+    let (url, hits, web) = counting_page().await;
+    let fetch = |path: &str| {
+        let page = json!({"url": format!("{url}{path}")});
+        served.post("tool/fetch_url", Some(WORKER), page)
+    };
+    let ask = || {
+        let request = model_request_for("worker_report", "fix it");
+        served.post("model", Some(WORKER), request)
+    };
+    let spent = || served.broker.spent(&seat);
+    seat.begin_turn();
+    assert_eq!(ask().await.0, 200);
+
+    for call in 1..=2 {
+        assert_eq!(fetch("status").await.0, 200, "call {call}");
+        assert_eq!(ask().await.0, 200, "the model is asked after each result");
+    }
+    for refusal in 1..=2 {
+        let (status, refused) = fetch("status").await;
+        assert_eq!(status, 429, "refusal {refusal}: {refused}");
+        let why = refused["error"].as_str().unwrap();
+        for says in [
+            "What it answered before: {",
+            "page",
+            "You already have that answer.",
+            "your turn is stopped",
+        ] {
+            assert!(why.contains(says), "{says:?} is not in {why}");
+        }
+        assert!(!why.contains("Your turn is stopped"), "not yet: {why}");
+        assert_eq!(ask().await.0, 200, "still asked after refusal {refusal}");
+        assert_eq!(seat.take_model_failure(), None);
+    }
+
+    let (status, last) = fetch("status").await;
+    assert_eq!(status, 429);
+    let why = last["error"].as_str().unwrap();
+    assert!(why.contains("Your turn is stopped"), "{why}");
+    assert!(why.contains("Do not call any more tools"), "{why}");
+    let paid = spent().await.unwrap();
+    let asked = provider.calls();
+
+    let (status, refused) = ask().await;
+    assert_eq!(status, 403, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("turn was stopped"),
+        "{refused}"
+    );
+    assert_eq!(provider.calls(), asked, "the provider was not asked");
+    assert_eq!(
+        spent().await.unwrap(),
+        paid,
+        "and nothing was held or charged"
+    );
+    let failure = seat.take_model_failure();
+    assert_eq!(failure, Some(ModelFailure::Stuck));
+    assert_eq!(seat.take_model_failure(), None, "told once");
+    let (status, text) = failure.unwrap().report();
+    assert_eq!(status, ReportStatus::Failed);
+    assert_eq!(
+        text,
+        "I got stuck repeating the same step and stopped. Reply here to have me try again with \
+         a different approach."
+    );
+
+    for call in ["other", "status"] {
+        let (status, refused) = fetch(call).await;
+        assert_eq!(status, 429, "{call}: {refused}");
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap()
+                .contains("Your turn is stopped")
+        );
+    }
+    let report = json!({"status": "ready", "text": "done"});
+    let (status, refused) = served
+        .post("tool/worker_report", Some(WORKER), report)
+        .await;
+    assert_eq!(status, 429, "a stopped turn runs no tool: {refused}");
+    assert_eq!(hits.load(Ordering::SeqCst), 2, "nothing ran after the stop");
+    assert_eq!(ask().await.0, 403, "it stays stopped");
+
+    seat.begin_turn();
+    assert_eq!(ask().await.0, 200, "a new turn may ask the model");
+    assert_eq!(fetch("other").await.0, 200, "and run a tool");
+    assert_eq!(fetch("status").await.0, 200, "the count starts again");
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
+    web.abort();
+}
+
+#[tokio::test]
+async fn refusals_that_are_spread_over_a_turn_are_stopped_at_the_ceiling_too() {
+    let scratch = Scratch::new("worker-ceiling");
+    let provider = Scripted::new();
+    let (_runtime, served) = model_only(&scratch, provider.clone(), 1_000_000);
+    let seat = WorkerSeat::new(
+        TicketId::new("tk_spread"),
+        AssignmentId::new("as_1"),
+        scratch.state(),
+        500_000,
+    );
+    let seat = served
+        .broker
+        .admit_worker(WORKER.into(), seat, "You are a worker.".into())
+        .unwrap();
+    let (url, _hits, web) = counting_page().await;
+    let fetch = |path: String| {
+        let page = json!({"url": format!("{url}{path}")});
+        served.post("tool/fetch_url", Some(WORKER), page)
+    };
+    let ask = || {
+        let request = model_request_for("worker_report", "fix it");
+        served.post("model", Some(WORKER), request)
+    };
+    seat.begin_turn();
+
+    // Each round sends one call three times, and so is refused once, then
+    // sends another call that goes through: never three refusals in a row.
+    let mut refusals = 0;
+    for round in 0..10 {
+        assert_eq!(ask().await.0, 200, "round {round}: not stopped yet");
+        for _ in 0..3 {
+            refusals += usize::from(fetch("loop".to_owned()).await.0 == 429);
+        }
+        if round < 9 {
+            assert_eq!(fetch(format!("other{round}")).await.0, 200);
+        }
+    }
+    assert_eq!(refusals, 10);
+    let (status, refused) = ask().await;
+    assert_eq!(status, 403, "ten refusals in a turn stop it: {refused}");
+    assert_eq!(seat.take_model_failure(), Some(ModelFailure::Stuck));
+    web.abort();
+}
+
+#[tokio::test]
+async fn a_wait_between_refusals_is_a_call_that_went_through_and_the_turn_goes_on() {
+    let scratch = Scratch::new("wait-between");
+    let (_runtime, served, _fake) = serve_with_a_node_a_vault_and_a_browser(&scratch);
+    let run = |code: &str| {
+        let args = json!({"code": code});
+        served.post("tool/run_code", Some(THERE), args)
+    };
+    let wait = || served.post("tool/job_wait", Some(THERE), json!({"job": "job_1"}));
+    let ask = || {
+        let request = model_request_for("worker_report", "fix it");
+        served.post("model", Some(THERE), request)
+    };
+
+    for call in 1..=2 {
+        assert_eq!(run("rg -n for_config src").await.0, 422, "call {call}");
+    }
+    let (status, refused) = run("rg -n for_config src").await;
+    assert_eq!(status, 429);
+    let why = refused["error"].as_str().unwrap();
+    assert!(
+        why.contains("What it answered before: it was refused: not in this test"),
+        "a call that failed is an answer too: {why}"
+    );
+    assert_eq!(run("rg -n for_config src").await.0, 429);
+
+    for _ in 0..5 {
+        assert_ne!(wait().await.0, 429, "a repeat of a wait is normal");
+    }
+    assert_eq!(run("rg -n for_config src").await.0, 422);
+    assert_eq!(run("rg -n for_config src").await.0, 422);
+    assert_eq!(
+        run("rg -n for_config src").await.0,
+        429,
+        "refused again, but only once since the wait"
+    );
+    let (status, reply) = ask().await;
+    assert_eq!(
+        status, 200,
+        "two refusals with a wait between do not stop it: {reply}"
+    );
+}
+
 #[tokio::test]
 async fn a_repeat_is_normal_for_a_job_a_report_and_a_page_that_moves_but_not_for_the_rest() {
     let scratch = Scratch::new("repeatable");
