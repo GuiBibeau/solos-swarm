@@ -1238,6 +1238,23 @@ like a thread reply, so a crash between a post and its record there can post one
 `nonce`, which Discord checks for a few minutes, so a repeat soon after is not posted again.
 `solos-swarm agent status --state-dir DIR --config agent.yaml` shows what it would raise now.
 
+## Web dashboard
+
+```yaml
+web:
+  public_url: https://agent.guibibeau.com     # https, no trailing slash; a ticket's page is {public_url}/tickets/{id}
+  publish:                                    # optional: the sidecar `solos-swarm agent publish`
+    token_file: /run/user/1000/solos-agent-publish/vercel-blob-token   # a one-use Vercel Blob read-write token
+    every_secs: 5                             # optional
+    heartbeat_secs: 300                       # optional
+```
+
+A Next.js app on Vercel (`web/agent-dashboard`, behind Sign in with Vercel) shows the agent's tickets: the request, every
+reply the agent sent, the worker's reports and spend. The box accepts no inbound connection, so `agent publish` opens
+`agent.db` read-only and uploads JSON snapshots of the tickets whose content changed to a private Vercel Blob store, which
+the app reads. `agent serve` ignores the section. Setup, what is published, and rotation:
+[production.md](production.md#dashboard).
+
 ## MCP hosts
 
 `solos-swarm mcp` speaks the Model Context Protocol on stdin and stdout, so a host such as Claude Code or Codex

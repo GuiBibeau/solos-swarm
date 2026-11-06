@@ -9,7 +9,7 @@ switches releases from the Mac. Everything on the box is under `~/agent`:
 | `current`, `previous` | Links to the release that serves and the one before it. `--pi-root` is `current`. |
 | `agent.yaml` | The production config. It is not in git. |
 | `state/` | `agent.db`, `tickets/`, `router/`, `forge/`, `trail/`, `mcp/`, the broker socket. Kept across releases. |
-| `tokens/` | One file per one-use credential, mode 0600: `model.key` (the DeepSeek key), `discord-token`, `github-app.pem` (the GitHub App's private key). |
+| `tokens/` | One file per one-use credential, mode 0600: `model.key` (the DeepSeek key), `discord-token`, `github-app.pem` (the GitHub App's private key), and `vercel-blob-token` (the dashboard publisher's, see [Dashboard](#dashboard)). |
 | `backups/` | `agent.db` copied before every deploy and rollback, while the agent is stopped. The newest twenty are kept. |
 | `target/` | The cargo build cache. |
 
@@ -24,8 +24,9 @@ directory. The tokens rest unencrypted at mode 0600 in the agent user's home, li
 scripts/agent-deploy deploy            # build origin/main, back up agent.db, switch, restart, wait until healthy
 scripts/agent-deploy deploy <rev>      # any commit, branch or tag
 scripts/agent-deploy rollback          # back to the previous release
-scripts/agent-deploy status            # the unit, its release, and `agent status` (open Tickets, spend, alerts)
+scripts/agent-deploy status            # the unit, its release, `agent status` (open Tickets, spend, alerts), and the dashboard publisher
 scripts/agent-deploy logs              # the last 100 log lines; `logs -f` follows, `logs --since 1h`
+scripts/agent-deploy publish-logs      # the same for the dashboard publisher, when there is one
 scripts/agent-deploy restart           # also: start, stop, releases
 pbpaste | scripts/agent-deploy token discord-token   # store or rotate a token, then restart
 scripts/agent-deploy token github-app.pem < ~/Downloads/<name>.<date>.private-key.pem   # the GitHub App's key
@@ -132,6 +133,114 @@ restart keeps the agent reading and writing nothing.
 A config that still has `token_file` on the github Source or on `forge: github`, or `identity` on `forge: github`, fails to
 load with a sentence that points at [Moving from token files](README.md#moving-from-token-files). The `forge-token` file is no
 longer read; delete it from `~/agent/tokens`.
+
+## Dashboard
+
+A web page of the agent's tickets at `https://agent.guibibeau.com`, behind Sign in with Vercel, for one person. The box
+accepts no inbound connection, so it pushes instead of being asked:
+
+```
+solos-agent  --writes-->  agent.db  --read-only-->  solos-agent-publish  --HTTPS PUT-->  private Vercel Blob store
+                                                                                                  |
+                                       you  -->  agent.guibibeau.com (web/agent-dashboard)  <--reads, server side
+```
+
+`solos-swarm agent publish` is a second systemd user unit, `solos-agent-publish`
+([scripts/systemd/solos-agent-publish.service](../../scripts/systemd/solos-agent-publish.service)). It opens `agent.db`
+**read-only** (SQLite refuses any write on that handle; a test compares the file byte for byte after a run), looks
+every few seconds, and builds `tickets/index.json` (the open tickets first, then the latest 100 ended) and one
+`tickets/<ticket id>.json` per ticket in it. It uploads only a snapshot whose content hash changed, tickets first and the
+index last, so the index never names a blob that is not there. What it remembers is `state/publish-state.json`: the hash
+of each blob it last uploaded, for the Blob store its token names (a different store gets everything again). A look that
+finds nothing written costs one SQLite pragma; an idle agent costs one index upload every five minutes, which is how the
+dashboard tells a quiet agent from a dead publisher. The web app and its setup are in
+[web/agent-dashboard/README.md](../../web/agent-dashboard/README.md).
+
+### Turning it on
+
+The Vercel side comes first (the project, a **private** Blob store, the Sign in with Vercel app, the environment variables
+and the domain: [exact steps](../../web/agent-dashboard/README.md#setup-on-vercel)). Then, on the Mac:
+
+```sh
+# The Blob store's read-write token (vercel_blob_rw_...): from the store, or the project's BLOB_READ_WRITE_TOKEN.
+pbpaste | scripts/agent-deploy token vercel-blob-token
+```
+
+and add to `~/agent/agent.yaml`:
+
+```yaml
+web:
+  public_url: https://agent.guibibeau.com      # https, no trailing slash: a ticket's page is {public_url}/tickets/{id}
+  publish:
+    token_file: /run/user/1000/solos-agent-publish/vercel-blob-token   # the unit copies tokens/vercel-blob-token here before each start
+    every_secs: 5                              # optional, 1 to 3600
+    heartbeat_secs: 300                        # optional: re-upload the index this often even when nothing changed
+```
+
+Write `publish:` in block style, as above: `scripts/agent-deploy` looks for it to know whether to run the publisher. Then
+`scripts/agent-deploy deploy` (or `restart` on the current release). From then on `switch`, `rollback`, `start`, `stop` and
+`restart` install and restart the publisher with the agent, and stop it while `agent.db` is backed up or restored, so it
+never reads a file being replaced. `status` shows it and how long ago the index went up; `publish-logs` is its journal.
+
+```sh
+scripts/agent-deploy status           # "publisher: active", "dashboard index last uploaded 3s ago"
+scripts/agent-deploy publish-logs     # "publish: uploaded tickets/tk_...json, tickets/index.json (2 unchanged)"
+```
+
+`token_file` is a one-use token like the others: the unit's `ExecStartPre` copies `tokens/vercel-blob-token`, and only
+that, into its own tmpfs runtime directory, `/run/user/1000/solos-agent-publish/`, and `agent publish` reads it once and
+deletes it. `solos-agent.service` does not copy this token, so it is never in the agent's runtime directory. A `web:`
+section without `publish:` only sets `public_url` (the link the Discord replies carry) and installs nothing.
+
+`solos-swarm agent publish --config ~/agent/agent.yaml --state-dir ~/agent/state --once` makes one look, prints what was
+uploaded as JSON and exits 1 if the API refused a blob. It consumes the token file, so put a fresh copy there first.
+
+### What is published, and who can read it
+
+For each ticket: its title and the Router's scope; the request and every later message the ticket received from its
+Thread (the people's, bots' and the Router's notes), in full; **every reply the agent sent**, in full, with whether it was
+delivered; the Decisions about it; each Assignment's start, end and Reports; the spend and budget; and, for a browser, the
+pages it opened (title, status and address **without its query or fragment**, which carry tokens) and how many steps were
+refused or unanswered. Not published: what a browser typed (the Store holds only a digest), vault items and their grants'
+values, tokens, and anything outside `agent.db`. A message is cut at 100,000 characters, an Assignment keeps its latest 20
+Reports and a browser trail its latest 40 pages. The replies are the Store's own record of what was sent; the one-line answer
+to a Discord button or `stop` command is not in it and so is not on the page.
+
+Treat the Blob store as holding what the agent says to you: it is private (every read needs a token, and the dashboard reads
+it server-side after a sign-in whose email is `ALLOWED_EMAILS`), but anyone who holds its read-write token can read all of
+it. The token rests at mode 0600 beside the others, in the same place and with the same exposure as `model.key`.
+
+An old ticket's page keeps working after the index stops listing it: the publisher never deletes a blob, and a ticket the
+agent resumes goes back to the index. The discord link in a reply can be followed a few seconds before the first upload
+of that ticket; the page says so and checks again by itself. `source_url` (the link to the original conversation) is made
+for Discord messages and for issues and pull requests on github.com; a Slack link needs the workspace's name, which the
+agent does not hold.
+
+### Rotating the dashboard's secrets
+
+- **The Blob token.** On the Blob store (Vercel dashboard, **Storage**), create a new read-write token or rotate the
+  existing one, then `pbpaste | scripts/agent-deploy token vercel-blob-token` and `scripts/agent-deploy restart`. The
+  dashboard app needs `BLOB_READ_WRITE_TOKEN` in its project too only if it is not reading with OIDC; update it there and
+  redeploy. A refused token is not retried: the publisher exits (`agent publish` says "the Blob token was refused"), systemd
+  restarts it five times in fifteen minutes, then leaves the unit failed. `status` shows that, and so does the dashboard
+  itself, which warns when its index is fifteen minutes old.
+- **The app's client secret, the session secret, the allowlist.** [web/agent-dashboard/README.md](../../web/agent-dashboard/README.md#rotating-things).
+- **Turning it off.** Remove the `web.publish` section and `scripts/agent-deploy restart`: it stops and disables the
+  publisher. The blobs stay in the store until it is emptied (`vercel blob empty-store`).
+
+### Failures
+
+| What | What happens |
+|---|---|
+| Vercel Blob or the network is down | Each upload is tried five times with a doubling wait (honouring `retry-after`), then the look fails and the next one, after a growing wait up to five minutes, tries the same uploads again. Nothing is lost; the Store is not touched. |
+| The token is refused (401, 403) | The publisher exits with that message and stays down. See above. |
+| The API refuses one blob (another 4xx) | It is logged and skipped until that ticket's snapshot changes; the others and the index still go up. |
+| `agent.db` is missing, newer than this build understands, or being restored | The look fails with the reason and is tried again; a replaced file is noticed and read again from the start. |
+| The agent restarts | Nothing: the publisher holds no connection to it. |
+| The disk or the state directory is read-only | The look fails when it cannot write `publish-state.json`; what was uploaded stays uploaded and is uploaded again after the fix, which is harmless. |
+
+Blob operations are billed (a put is an "advanced operation"). A working ticket changes its snapshot with each report and
+each reply, so a busy hour is tens of puts; an idle day is about 290.
 
 ## Not handled yet
 
