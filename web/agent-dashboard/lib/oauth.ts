@@ -91,7 +91,14 @@ export async function exchangeCode(
     cache: "no-store",
   });
   if (!response.ok) {
-    throw new OAuthError("token", `the token endpoint answered ${response.status}`);
+    // RFC 6749 §5.2 error fields name the cause and carry no secret; anything else in the body is dropped.
+    const failure: unknown = await response.json().catch(() => null);
+    const field = (name: string): string | undefined => {
+      const value = typeof failure === "object" && failure !== null ? (failure as Record<string, unknown>)[name] : undefined;
+      return typeof value === "string" ? value.slice(0, 200) : undefined;
+    };
+    const why = [field("error"), field("error_description")].filter(Boolean).join(": ");
+    throw new OAuthError("token", `the token endpoint answered ${response.status}${why ? ` (${why})` : ""}`);
   }
   const body: unknown = await response.json().catch(() => null);
   const idToken = typeof body === "object" && body !== null ? (body as { id_token?: unknown }).id_token : undefined;
