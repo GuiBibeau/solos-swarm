@@ -91,6 +91,18 @@ class RemoteTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "1-30 agents"):
             remote.validate_goal_limits(goal)
 
+    def test_goal_limits_refuse_a_fetch_policy_that_lists_no_host_or_lacks_the_grant(self):
+        goal = {"agent_count": 1, "tasks": [{}], "deadline_seconds": 60, "budget_microusd": 1,
+                "grants": ["claim_task", "fetch_url"]}
+        remote.validate_goal_limits(goal)                      # no policy: as before
+        goal["fetch"] = {"hosts": ["app.example.com"], "methods": ["GET"], "per_agent_rps": 1}
+        remote.validate_goal_limits(goal)
+        for bad in ({}, {"hosts": []}, {"hosts": [""]}, {"hosts": "app.example.com"}, {"hosts": [7]}, []):
+            with self.assertRaisesRegex(ValueError, "fetch policy"):
+                remote.validate_goal_limits({**goal, "fetch": bad})
+        with self.assertRaisesRegex(ValueError, "fetch policy"):
+            remote.validate_goal_limits({**goal, "grants": ["claim_task"]})
+
     def test_provider_follows_the_goal_upstream_over_the_legacy_default(self):
         with tempfile.TemporaryDirectory() as directory:
             goal = Path(directory) / "goal.json"

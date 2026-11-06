@@ -19,6 +19,15 @@ Access is not read-only. The target's whole purpose is that a developer connects
 wallet and deploys, so an audit that never writes has not tested what matters. The
 rule is that nothing may be left damaged: `read` observes, `write` attempts the
 declared action, `verify` re-checks a peer.
+
+Scope is enforced, not only written in the prompt. The Goal carries a `fetch`
+policy that the broker holds every `fetch_url` call to, redirect hops included:
+the target's own host (plus any `--fetch-host`), read-only methods, one request
+a second per agent, no redirect off the list, no private address. The
+chain-trust assignment POSTs JSON-RPC to a third-party host, which the target's
+owner does not authorize, so by default the broker refuses it and that worker
+reports itself blocked; `--allow-rpc` lists the RPC host and POST for a run
+that is cleared to make those calls.
 """
 
 import argparse
@@ -29,6 +38,11 @@ from pathlib import Path
 
 TARGET = "https://platform.solana.com/"
 RPC = "https://api.mainnet-beta.solana.com"
+
+# The broker's fetch policy for this Goal (see Goal::fetch in src/broker.rs).
+FETCH_METHODS = ("GET", "HEAD", "OPTIONS")
+FETCH_RPS = 1
+BROKER_METHODS = {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
 
 INTENT = (
     "Authorized internal red team of the live Solana Developer Platform at "
@@ -243,13 +257,35 @@ def sha256(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def make_case(seed, target=TARGET, rpc=RPC):
+def fetch_policy(target, rpc=RPC, extra_hosts=(), methods=FETCH_METHODS, rps=FETCH_RPS,
+                 allow_rpc=False):
+    """The Goal's `fetch` policy: the hosts, methods and pace the broker holds
+    every fetch_url call to. The target's host leads; `allow_rpc` adds the
+    RPC host and POST for the chain-trust assignment's JSON-RPC calls."""
+    hosts = [urllib.parse.urlsplit(target).hostname, *extra_hosts]
+    methods = [method.upper() for method in methods]
+    if allow_rpc:
+        hosts.append(urllib.parse.urlsplit(rpc).hostname)
+        methods.append("POST")
+    hosts = list(dict.fromkeys(host.lower() for host in hosts if host))
+    methods = list(dict.fromkeys(methods))
+    if not methods or not set(methods) <= BROKER_METHODS:
+        raise ValueError(f"Fetch methods must be some of {sorted(BROKER_METHODS)}")
+    if isinstance(rps, bool) or not isinstance(rps, (int, float)) or not 0.01 <= rps <= 1000:
+        raise ValueError("Fetch rate must be between 0.01 and 1000 requests per second")
+    return {"hosts": hosts, "methods": methods, "per_agent_rps": rps,
+            "follow_redirects_off_list": False}
+
+
+def make_case(seed, target=TARGET, rpc=RPC, extra_hosts=(), methods=FETCH_METHODS,
+              rps=FETCH_RPS, allow_rpc=False):
     if type(seed) is not int or not 0 <= seed <= 2**64 - 1:
         raise ValueError("Seed must be an unsigned 64-bit integer")
     parsed = urllib.parse.urlsplit(target)
     if parsed.scheme != "https" or not parsed.hostname:
         raise ValueError("Target must be an absolute https URL")
     origin = f"{parsed.scheme}://{parsed.netloc}"
+    fetch = fetch_policy(target, rpc, extra_hosts, methods, rps, allow_rpc)
     tasks, expected_tasks = [], {}
     for index, (name, access, hypothesis) in enumerate(ASSIGNMENTS):
         task_id = f"task-{index:02d}"
@@ -266,7 +302,11 @@ def make_case(seed, target=TARGET, rpc=RPC):
                 "method": (
                     "Probe the live target with fetch_url. Quote raw bytes. Mark "
                     "confidence from your own evidence. A reviewer that cannot "
-                    "reach a surface must say so rather than guess."
+                    "reach a surface must say so rather than guess. The broker "
+                    "enforces which hosts, methods and request rate fetch_url may "
+                    "use: a refusal is a result, so do not retry the same call, "
+                    "wait out a retry_after_ms, and report what stopped you in "
+                    "coverage.blocked."
                 ),
             },
         })
@@ -298,6 +338,7 @@ def make_case(seed, target=TARGET, rpc=RPC):
         "output_price_microusd_per_million": 4_400_000,
         "grants": ["claim_task", "board_read", "board_post", "submit_finding",
                    "read_findings", "submit_artifact", "fetch_url"],
+        "fetch": fetch,
         "tasks": tasks,
     }
     expected = {
@@ -322,19 +363,20 @@ def make_case(seed, target=TARGET, rpc=RPC):
             "verdict_key": "verdict",
         },
         "coverage": {"target": target, "rpc": rpc, "workers": len(tasks),
+                     "fetch": fetch,
                      "surfaces": [name for name, _, _ in ASSIGNMENTS],
                      "writes_expected": sum(1 for _, a, _ in ASSIGNMENTS if a == "write")},
     }
     return goal, expected
 
 
-def write_case(seed, goal_path, expected_path, target=TARGET):
+def write_case(seed, goal_path, expected_path, target=TARGET, **policy):
     goal_path, expected_path = Path(goal_path).resolve(), Path(expected_path).resolve()
     if goal_path == expected_path:
         raise ValueError("Evaluator payload must be outside the public Goal")
     if goal_path.exists() or expected_path.exists():
         raise FileExistsError("Frozen Goal or evaluator payload already exists")
-    goal, expected = make_case(seed, target)
+    goal, expected = make_case(seed, target, **policy)
     goal_bytes = json.dumps(goal, indent=2, ensure_ascii=False).encode() + b"\n"
     expected["config_sha256"] = sha256(goal_bytes)
     for path, content, mode in (
@@ -354,9 +396,21 @@ def main():
     parser.add_argument("--goal", required=True, type=Path)
     parser.add_argument("--expected", required=True, type=Path)
     parser.add_argument("--target", default=TARGET)
+    parser.add_argument("--fetch-host", action="append", default=[], metavar="HOST",
+                        help="another host fetch_url may reach (repeatable); the target's host is always listed")
+    parser.add_argument("--fetch-methods", default=",".join(FETCH_METHODS),
+                        help="comma-separated methods fetch_url may use (default %(default)s)")
+    parser.add_argument("--fetch-rps", type=float, default=FETCH_RPS,
+                        help="fetch_url calls per second per agent (default %(default)s)")
+    parser.add_argument("--allow-rpc", action="store_true",
+                        help="also list the RPC host and POST, for the chain-trust assignment")
     args = parser.parse_args()
     try:
-        expected = write_case(args.seed, args.goal, args.expected, args.target)
+        expected = write_case(
+            args.seed, args.goal, args.expected, args.target,
+            extra_hosts=args.fetch_host,
+            methods=[m for m in args.fetch_methods.split(",") if m],
+            rps=args.fetch_rps, allow_rpc=args.allow_rpc)
     except (OSError, ValueError) as error:
         parser.exit(2, f"prepare_platform_case: {error}\n")
     print(json.dumps({

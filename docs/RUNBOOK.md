@@ -145,6 +145,64 @@ python3 scripts/remote.py collect \
   --output ./evidence/run-20260412-01
 ```
 
+### Live-probe Goals: the `fetch` policy
+
+A Goal that grants `fetch_url` lets its agents reach the network through the broker. Its `scope` is a label and its
+prompt a request, so the Goal can also carry a `fetch` policy, which the broker enforces on every call:
+
+```json
+"fetch": {
+  "hosts": ["zelix-front-dev.fly.dev", "zelix-deck.vercel.app"],
+  "methods": ["GET", "HEAD", "OPTIONS"],
+  "per_agent_rps": 1,
+  "follow_redirects_off_list": false
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `hosts` (required, 1 to 64) | The hosts a request may name: an exact name, `*.example.com` for any name under that suffix (never the bare suffix; `*.com` is refused), or an IP address. Case and a trailing dot do not matter; a port is not part of the match. |
+| `methods` | The methods allowed (`GET HEAD POST PUT PATCH DELETE OPTIONS`). Left out, every method `fetch_url` supports. |
+| `per_agent_rps` | Calls per second one agent may make, 0.01 to 1000. A call that follows redirects counts once. Left out, no limit. |
+| `follow_redirects_off_list` | Default `false`: a redirect to a host off the list is refused and not followed. `true` follows it, though the URL the agent asked for must still be on the list. |
+| `allow_private_networks` | Default `false`: see below. |
+
+The broker judges the URL the agent asked for, then every redirect hop before it is requested. A refused call sends
+nothing. The agent gets a tool result, not an HTTP error, so a swarm worker can read it:
+
+```json
+{"refused": true, "reason": "redirect_off_list", "error": "fetch_url refused: ... redirects to https://accounts.google.com/..., whose host ... is not on this Goal's fetch allowlist ...", "url": "https://accounts.google.com/..."}
+```
+
+`reason` is `host_not_allowed`, `method_not_allowed`, `redirect_off_list`, `rate_limited` (with `retry_after_ms`),
+`private_address` or `header_not_allowed` (a `Host` header of the agent's own, which would name another site on a
+listed address; under a policy the broker sets `Host` from the URL). Each refusal is a `fetch_refused` event in the run's `events.jsonl` (agent, requested URL, the URL
+refused, hop, reason), and `scripts/check_run.py` re-checks every completed `fetch_url` against the policy as a
+`fetch-scope` check. A policy needs the `fetch_url` grant, `Goal::validate` reads every field, and an unknown key or
+a missing `hosts` is refused, so a typo cannot leave a Goal looking restricted.
+
+**Private addresses.** Every swarm `fetch_url`, with a policy or without one, refuses an address that is loopback,
+private (RFC 1918), link-local (`169.254.0.0/16`, the cloud metadata address), carrier-grade NAT or Tailscale
+(`100.64.0.0/10`), multicast, reserved or documentation, and an IPv6 address that wraps one of those. A host name is
+resolved once per hop, all its addresses must be public, and the connection is then pinned to them, so a name that
+answers differently the second time cannot get past the check. Set `allow_private_networks: true` in a policy to
+reach one on purpose, such as a staging service on the same network. Without a policy there is no way to allow it:
+a Goal that must probe a private host names it in a policy.
+
+**Without a policy** the Goal behaves as before: any public host, any method, no rate limit. The one change is the
+private-address refusal above. Agent mode's own `fetch_url` (`src/agent/broker.rs`) does not go through this guard
+yet, so it has no private-address check.
+
+**Audit scopes.** `scope` must be on the deployment allowlist: `synthetic-fixtures-only`, `public-web-research` and the
+`authorized-audit:<target>` scopes, each a reviewed authorization named in `src/broker.rs`
+(`AUDIT_SCOPES_BEFORE_FETCH_POLICY`, `AUDIT_SCOPES`). All share one envelope (deadline, spend and call limits). A
+target added to `AUDIT_SCOPES`, such as `authorized-audit:zelix`, must carry a `fetch` policy when its Goal grants
+`fetch_url`; the two scopes frozen before the policy existed keep running without one.
+
+`scripts/prepare_platform_case.py` emits the policy for the live platform red team (`--fetch-host`,
+`--fetch-methods`, `--fetch-rps`, `--allow-rpc`). A swarm Ticket in agent mode sets the same `fetch:` key in its Goal
+template. `scripts/prepare_redteam_case.py` builds a source-review Goal that grants no `fetch_url`, so it has none.
+
 
 ## 7. Inspect, verify, and qualify
 

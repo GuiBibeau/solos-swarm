@@ -214,6 +214,14 @@ def validate_goal_limits(goal):
         or goal["budget_microusd"] > 1_000_000_000_000
     ):
         raise ValueError("Runs require 1-30 agents, one task per agent, deadline <=21600s, and budget <=$1000000")
+    # The broker validates the whole policy when it starts; this only stops a
+    # policy that restricts nothing from reaching the host with a credential.
+    fetch = goal.get("fetch")
+    if fetch is not None:
+        hosts = fetch.get("hosts") if isinstance(fetch, dict) else None
+        if (not isinstance(hosts, list) or not hosts or not all(isinstance(host, str) and host for host in hosts)
+                or "fetch_url" not in goal.get("grants", [])):
+            raise ValueError("A fetch policy needs a non-empty hosts list and the fetch_url grant")
 
 
 def start_host(request):

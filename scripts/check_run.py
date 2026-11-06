@@ -3,7 +3,9 @@
 
 import argparse
 import hashlib
+import ipaddress
 import json
+import urllib.parse
 from pathlib import Path
 
 
@@ -104,6 +106,53 @@ def receipt_cost(config, input_tokens, cached, output_tokens):
         raise ValueError("Invalid admitted prices")
     return (((input_tokens - cached) * miss_rate + cached * hit_rate + 999_999) // 1_000_000
             + (output_tokens * output_rate + 999_999) // 1_000_000)
+
+
+def host_listed(host, entries):
+    """Whether `host` is one of a fetch policy's `hosts`: an exact name, `*.suffix`
+    for a name under the suffix (never the suffix itself), or an IP address."""
+    host = (host or "").lower().rstrip(".").strip("[]")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    for entry in entries:
+        entry = str(entry).lower().rstrip(".").strip("[]")
+        if entry.startswith("*."):
+            suffix = entry[1:]
+            if address is None and host.endswith(suffix) and len(host) > len(suffix):
+                return True
+        elif address is not None:
+            try:
+                if ipaddress.ip_address(entry) == address:
+                    return True
+            except ValueError:
+                pass
+        elif host and host == entry:
+            return True
+    return False
+
+
+def fetch_policy_issues(policy, events):
+    """Re-judge from the retained events what the broker enforced: a completed
+    fetch_url reached only listed hosts, on its URL and on every redirect it
+    followed, unless the policy follows redirects off the list."""
+    entries = policy.get("hosts", [])
+    follow = policy.get("follow_redirects_off_list") is True
+    issues = []
+    for event in events:
+        data = event["data"]
+        if event["kind"] != "tool_completed" or data.get("tool") != "fetch_url":
+            continue
+        args = data.get("args", {})
+        hops = [args.get("url")]
+        if not follow:
+            hops += [hop.get("to") for hop in (args.get("response") or {}).get("redirects", [])]
+        for url in hops:
+            host = urllib.parse.urlsplit(url or "").hostname
+            if not host_listed(host, entries):
+                issues.append(f"{data.get('agent_id')} fetched unlisted host {host!r} (seq {event.get('seq')})")
+    return issues
 
 
 def event_evidence(events, state, config):
@@ -399,6 +448,12 @@ def check_run(run_dir, expected_path, runtime=None, extension=None, package_lock
                 check("event-completeness", "evidence", not issues, "; ".join(issues) or "All provider, lifecycle, Task, Finding and synthesis effects have evidence")
             except (KeyError, TypeError, ValueError, AttributeError) as error:
                 check("event-completeness", "evidence", False, f"Malformed effect evidence: {error}")
+        if events is not None and config is not None and config.get("fetch") is not None:
+            try:
+                issues = fetch_policy_issues(config["fetch"], events)
+                check("fetch-scope", "evidence", not issues, "; ".join(issues) or "Every completed fetch_url stayed on the Goal's fetch allowlist")
+            except (KeyError, TypeError, ValueError, AttributeError) as error:
+                check("fetch-scope", "evidence", False, f"Malformed fetch evidence: {error}")
 
     if artifact is not None and expected is not None:
         try:

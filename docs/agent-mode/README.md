@@ -1169,6 +1169,11 @@ and join text inside the braces with `~`.
     file: "You are {agent_id}. File now, exactly: {call}"
   record_fields: {file_from: [path], copy: [part], result_key: changes}
   ```
+- A template whose workers get `fetch_url` can limit what it reaches with `fetch`, which the swarm's broker enforces
+  on every call and every redirect hop: `fetch: {hosts: [app.example.com, "*.example.org"], methods: [GET, HEAD],
+  per_agent_rps: 1}`. A host name is a plain scalar, but `*.suffix` needs quotes in YAML. Its fields, the refusals and
+  the audit scopes are in [docs/RUNBOOK.md](../RUNBOOK.md#live-probe-goals-the-fetch-policy). A swarm `fetch_url`
+  refuses private, loopback and link-local addresses unless the policy sets `allow_private_networks: true`.
 
 `agent serve` renders each template for one and two agents as it loads the config, and refuses one that does not
 make a valid Goal. The example below is `tests/fixtures/goal-template.yaml`:
