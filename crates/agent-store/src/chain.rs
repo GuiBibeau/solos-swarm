@@ -51,6 +51,25 @@ impl SqliteStore {
         self.bodies("SELECT body FROM events ORDER BY seq")
     }
 
+    /// The events committed after sequence number `after` (0 for all), each
+    /// with its number, oldest first, at most `limit`. A reader that keeps
+    /// the last number it saw reads only what is new. The chain is not
+    /// verified: use [`Self::verified_events`] for that.
+    pub fn events_after(&self, after: u64, limit: usize) -> Result<Vec<(u64, Event)>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT seq, body FROM events WHERE seq > ?1 ORDER BY seq LIMIT ?2")?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = stmt.query_map(params![after, limit], |row| {
+            Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.map(|row| {
+            let (seq, body) = row?;
+            Ok((seq, serde_json::from_str(&body)?))
+        })
+        .collect()
+    }
+
     /// Recompute the chain from the first event. The first row that is out
     /// of sequence, does not link to its predecessor, or does not hash to its
     /// stored hash is the error.

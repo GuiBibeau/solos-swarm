@@ -87,6 +87,22 @@ impl SqliteStore {
         rows.map(|row| parse(row?)).collect()
     }
 
+    /// Effects committed after `after` (`EffectId(0)` for all), done or not,
+    /// in commit order, at most `limit`. A reader that keeps the last id it
+    /// saw reads only what is new.
+    pub fn effects_after(
+        &self,
+        after: EffectId,
+        limit: usize,
+    ) -> Result<Vec<QueuedEffect>, StoreError> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT {COLUMNS} FROM effects WHERE id > ?1 ORDER BY id LIMIT ?2"
+        ))?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = stmt.query_map(params![after.0, limit], raw)?;
+        rows.map(|row| parse(row?)).collect()
+    }
+
     /// Effects not done yet, in commit order.
     pub fn pending_effects(&self) -> Result<Vec<QueuedEffect>, StoreError> {
         let mut stmt = self.conn.prepare_cached(&format!(

@@ -3,7 +3,7 @@ mod common;
 use common::{SqlEngine, TempDb, accept, clock, policy, slack};
 use solos_agent_core::Engine;
 use solos_agent_core::model::{Actor, DecisionKind, Plan};
-use solos_agent_store::{HoldRequest, SqliteStore, StoreError};
+use solos_agent_store::{EffectId, HoldRequest, SqliteStore, StoreError};
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -117,4 +117,66 @@ fn recent_decisions_come_newest_first_and_stop_at_the_window() {
         pending.len(),
         store.effects().unwrap().iter().filter(|q| !q.done).count()
     );
+}
+
+#[test]
+fn a_reader_that_keeps_its_position_reads_only_what_is_new() {
+    let db = TempDb::new("positions");
+    populate(&db);
+    let store = SqliteStore::open_read_only(&db.path).unwrap();
+
+    let events = store.events().unwrap();
+    let all = store.events_after(0, 1_000).unwrap();
+    assert_eq!(all.len(), events.len());
+    assert_eq!(all.first().map(|(seq, _)| *seq), Some(1));
+    assert!(all.windows(2).all(|pair| pair[1].0 == pair[0].0 + 1));
+    let page = store.events_after(0, 2).unwrap();
+    assert_eq!(page.len(), 2);
+    let rest = store.events_after(page[1].0, 1_000).unwrap();
+    assert_eq!(rest.len(), events.len() - 2);
+    assert!(
+        store
+            .events_after(all.last().unwrap().0, 10)
+            .unwrap()
+            .is_empty()
+    );
+
+    let effects = store.effects().unwrap();
+    let first = store.effects_after(EffectId(0), 3).unwrap();
+    assert_eq!(first.len(), 3);
+    let rest = store.effects_after(first[2].id, 1_000).unwrap();
+    assert_eq!(first.len() + rest.len(), effects.len());
+    assert!(
+        store
+            .effects_after(effects.last().unwrap().id, 10)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn the_data_version_moves_when_another_connection_commits_and_not_otherwise() {
+    let db = TempDb::new("data-version");
+    populate(&db);
+    let reader = SqliteStore::open_read_only(&db.path).unwrap();
+    let before = reader.data_version().unwrap();
+    assert_eq!(
+        reader.data_version().unwrap(),
+        before,
+        "nothing was written"
+    );
+    let _ = reader.tickets().unwrap();
+    assert_eq!(
+        reader.data_version().unwrap(),
+        before,
+        "reading changes nothing"
+    );
+
+    let now = Rc::new(Cell::new(500_000));
+    let mut engine: SqlEngine =
+        Engine::new(SqliteStore::open(&db.path).unwrap(), policy(), clock(&now));
+    engine
+        .receive(slack("t9", Actor::person("alice"), "th9", "@agent more"))
+        .unwrap();
+    assert_ne!(reader.data_version().unwrap(), before, "a writer committed");
 }

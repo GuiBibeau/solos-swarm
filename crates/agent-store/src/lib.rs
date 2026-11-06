@@ -93,6 +93,17 @@ impl SqliteStore {
         schema::version(&self.conn)
     }
 
+    /// SQLite's `data_version`: a number that differs between two calls on
+    /// this connection exactly when another connection committed in between.
+    /// A reader that holds its connection open uses it to skip a read when
+    /// nothing was written. It says nothing about this connection's own
+    /// commits, which a read-only one has none of.
+    pub fn data_version(&self) -> Result<i64, StoreError> {
+        Ok(self
+            .conn
+            .pragma_query_value(None, "data_version", |row| row.get(0))?)
+    }
+
     /// Every Trigger, by id.
     pub fn triggers(&self) -> Result<Vec<Trigger>, StoreError> {
         self.bodies("SELECT body FROM triggers ORDER BY id")
