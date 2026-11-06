@@ -24,7 +24,7 @@ use crate::vault::VaultConfig;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Deserializer};
 use solos_agent_core::AllowlistPolicy;
-use solos_agent_core::change::{Deliverable, RepoName};
+use solos_agent_core::change::{Deliverable, ForgeTerms, MergeMode, RepoName};
 use solos_agent_core::model::MicroUsd;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -177,10 +177,112 @@ pub struct RepoConfig {
     /// toolchain is.
     #[serde(default)]
     pub notes: Option<String>,
-    /// What its work owes when the Router names nothing.
+    /// What its work owes when the Router names nothing, and the most it may
+    /// owe: the Router may lower it for one request, never raise it, so
+    /// `answer` makes a repository read-only to the agent whatever a model
+    /// asks.
     #[serde(default)]
     pub owes: Deliverable,
+    /// Whether the agent merges its own pull requests. Read at accept and
+    /// recorded in the Ticket's terms.
+    #[serde(default)]
+    pub merge: MergeConfig,
+    /// Whether the repository has CI that a merge waits for.
+    #[serde(default)]
+    pub ci: CiConfig,
+    /// Paths no commit of the agent may change, as globs. A pull request whose
+    /// commits touch one is refused when the worker reports ready. The App
+    /// holds no `workflows` permission either way.
+    #[serde(default = "protected")]
+    pub protected: Vec<String>,
+    /// Heads the agent publishes for one Ticket, repairs and review rounds
+    /// included.
+    #[serde(default = "max_pushes")]
+    pub max_pushes: u32,
+    /// CI failures that may resume a delivered Ticket.
+    #[serde(default = "max_repairs")]
+    pub max_repairs: u32,
+    /// The largest change, in bytes of commits, a ready is admitted with.
+    #[serde(default = "max_change_bytes")]
+    pub max_change_bytes: u64,
 }
+
+impl Default for RepoConfig {
+    fn default() -> Self {
+        Self {
+            about: String::new(),
+            base: "main".into(),
+            budget_microusd: None,
+            notes: None,
+            owes: Deliverable::default(),
+            merge: MergeConfig::default(),
+            ci: CiConfig::default(),
+            protected: protected(),
+            max_pushes: max_pushes(),
+            max_repairs: max_repairs(),
+            max_change_bytes: max_change_bytes(),
+        }
+    }
+}
+
+impl RepoConfig {
+    /// What an accept on this repository grants about the forge, fixed in the
+    /// Ticket's Mandate: config edits never change work in flight.
+    pub fn terms(&self) -> ForgeTerms {
+        ForgeTerms {
+            merge: match self.merge {
+                MergeConfig::Off => MergeMode::Off,
+                MergeConfig::Ask => MergeMode::Ask,
+                MergeConfig::Auto => MergeMode::Auto,
+            },
+            ci_expected: self.ci == CiConfig::Expected,
+            max_pushes: self.max_pushes,
+            max_repairs: self.max_repairs,
+        }
+    }
+}
+
+/// `forge.repos.<repo>.merge`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeConfig {
+    /// The agent never merges; people do, on GitHub.
+    Off,
+    /// A person says yes, by a click or a review.
+    #[default]
+    Ask,
+    /// Only for an approver's own request, once CI passed.
+    Auto,
+}
+
+/// `forge.repos.<repo>.ci`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CiConfig {
+    #[default]
+    Expected,
+    /// The repository has no CI to wait for.
+    None,
+}
+
+fn protected() -> Vec<String> {
+    vec![".github/**".into()]
+}
+
+fn max_pushes() -> u32 {
+    6
+}
+
+fn max_repairs() -> u32 {
+    2
+}
+
+fn max_change_bytes() -> u64 {
+    5_000_000
+}
+
+/// The most `max_change_bytes` may be.
+const MAX_CHANGE_BYTES_LIMIT: u64 = 50_000_000;
 
 /// pstack in every worker: its first prompt enters `entry`, its system
 /// prompt carries the adapter, and it may `read` the tree.
@@ -943,6 +1045,43 @@ impl AgentConfig {
                      policy.auto_approve_microusd, and nobody here can approve a budget"
                 );
             }
+            for glob in &terms.protected {
+                if let Err(why) = super::forge::valid_glob(glob) {
+                    bail!("forge.repos.{repo}.protected {glob:?} is not a path glob: {why}");
+                }
+            }
+            ensure!(
+                terms.max_pushes >= 1,
+                "forge.repos.{repo}.max_pushes must be at least 1"
+            );
+            ensure!(
+                (1..=MAX_CHANGE_BYTES_LIMIT).contains(&terms.max_change_bytes),
+                "forge.repos.{repo}.max_change_bytes must be 1..={MAX_CHANGE_BYTES_LIMIT}"
+            );
+            if terms.owes == Deliverable::PullRequest {
+                ensure!(
+                    matches!(forge, ForgeConfig::Github { .. }),
+                    "forge.repos.{repo}.owes is pull_request, and a local forge has no pull \
+                     requests: use forge: github, or owes: change to keep commits in the clone"
+                );
+                ensure!(
+                    self.github.as_ref().is_none_or(|github| github.writes),
+                    "forge.repos.{repo}.owes is pull_request, and github.writes is false, so \
+                     nothing could be pushed: use owes: answer, or turn writes on"
+                );
+            }
+            if terms.merge == MergeConfig::Auto {
+                ensure!(
+                    terms.ci == CiConfig::Expected,
+                    "forge.repos.{repo}.merge is auto, which needs ci: expected: a repository \
+                     with no CI never merges by itself"
+                );
+                ensure!(
+                    !self.policy.approvers.is_empty(),
+                    "forge.repos.{repo}.merge is auto, which acts only for an approver's own \
+                     requests, and policy.approvers names nobody"
+                );
+            }
         }
         Ok(())
     }
@@ -1614,8 +1753,10 @@ forge:
         format!("{workers}{}", edit(FORGE.to_owned()))
     }
 
-    /// The forge on bare repositories on this disk instead, which has no App.
+    /// The forge on bare repositories on this disk instead, which has no App and
+    /// no pull requests: its work owes a commit in the clone.
     fn local(yaml: String) -> String {
+        let yaml = yaml.replace("owes: pull_request", "owes: change");
         yaml.replace(
             "github: {app_id: 7, key_file: secrets/github-app.pem}\nforge:\n  kind: github",
             "forge:\n  kind: local\n  remote: remotes\n  identity: {name: solos-bot, email: bot@example.com}",
@@ -1669,6 +1810,7 @@ forge:
                         budget_microusd: None,
                         notes: None,
                         owes: Deliverable::Answer,
+                        ..RepoConfig::default()
                     }
                 ),
                 (
@@ -1679,11 +1821,108 @@ forge:
                         budget_microusd: Some(1_500_000),
                         notes: Some("Tests run with ./check.".into()),
                         owes: Deliverable::PullRequest,
+                        ..RepoConfig::default()
                     }
                 ),
             ])
         );
-        assert_eq!(on_disk.repos(), github.repos());
+        let mut kept = github.repos().clone();
+        kept.get_mut(&repo("acme/widgets")).unwrap().owes = Deliverable::Change;
+        assert_eq!(
+            *on_disk.repos(),
+            kept,
+            "the same terms, less the pull request"
+        );
+    }
+
+    #[test]
+    fn a_repository_owes_a_pull_request_only_where_one_can_be_made_and_its_limits_are_checked() {
+        let refused = |yaml: String, said: &str| {
+            let err = parse(&yaml).unwrap_err().to_string();
+            assert!(err.contains(said), "{said}: {err}");
+        };
+        let widgets = |extra: &str| {
+            forged(|yaml| {
+                yaml.replace(
+                    "      owes: pull_request\n",
+                    &format!("      owes: pull_request\n{extra}"),
+                )
+            })
+        };
+        assert!(parse(&widgets("")).is_ok());
+        assert!(parse(&widgets("      protected: [\".github/**\", \"vendor/**\"]\n      max_pushes: 3\n      merge: off\n      ci: none\n")).is_ok());
+        refused(
+            local(widgets("")).replace("owes: change", "owes: pull_request"),
+            "a local forge has no pull requests",
+        );
+        refused(
+            widgets("").replace("app_id: 7,", "app_id: 7, writes: false,"),
+            "github.writes is false",
+        );
+        refused(
+            widgets("      protected: [\"../x\"]\n"),
+            "is not a path glob",
+        );
+        refused(widgets("      protected: [\"\"]\n"), "is not a path glob");
+        refused(
+            widgets("      max_pushes: 0\n"),
+            "max_pushes must be at least 1",
+        );
+        refused(
+            widgets("      max_change_bytes: 0\n"),
+            "max_change_bytes must be 1..=",
+        );
+        refused(
+            widgets("      max_change_bytes: 60000000\n"),
+            "max_change_bytes must be 1..=",
+        );
+        refused(
+            widgets("      merge: auto\n      ci: none\n"),
+            "merge is auto, which needs ci: expected",
+        );
+        refused(
+            widgets("      merge: auto\n"),
+            "policy.approvers names nobody",
+        );
+        let auto = widgets("      merge: auto\n").replace(
+            "people: [slack:alice]",
+            "people: [slack:alice]\n  approvers: [slack:alice]",
+        );
+        assert!(parse(&auto).is_ok(), "{:?}", parse(&auto).err());
+    }
+
+    #[test]
+    fn what_a_repository_grants_is_read_into_the_terms_an_accept_fixes() {
+        use solos_agent_core::change::{ForgeTerms, MergeMode};
+        let repo = RepoConfig::default();
+        assert_eq!(
+            repo.terms(),
+            ForgeTerms {
+                merge: MergeMode::Ask,
+                ci_expected: true,
+                max_pushes: 6,
+                max_repairs: 2,
+            }
+        );
+        assert_eq!(repo.protected, [".github/**"]);
+        assert_eq!(repo.max_change_bytes, 5_000_000);
+        let loose = RepoConfig {
+            merge: super::MergeConfig::Auto,
+            ci: super::CiConfig::None,
+            max_pushes: 3,
+            max_repairs: 0,
+            ..RepoConfig::default()
+        };
+        let terms = loose.terms();
+        assert_eq!(
+            (
+                terms.merge,
+                terms.ci_expected,
+                terms.max_pushes,
+                terms.max_repairs
+            ),
+            (MergeMode::Auto, false, 3, 0)
+        );
     }
 
     #[test]

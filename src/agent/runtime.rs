@@ -2,17 +2,20 @@
 //! Adapters run concurrently and send facts and Effect outcomes back to it.
 
 use super::ports::{
-    Answer, Applied, BoxFuture, Channel, Command, Delivered, Delivery, Executor, Fact, FactSink,
-    Failure, Inbound, Launch, Order, Router, SendOptions, SendOutcome, Source,
+    Answer, Applied, BoxFuture, Channel, Command, Delivered, Delivery, Execute, Executor, Fact,
+    FactSink, Failure, Forge, Inbound, Launch, Order, Publish, Router, SendOptions, SendOutcome,
+    Source,
 };
 use super::watchdog;
 use crate::broker::now_ms;
 use crate::gateway;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
+use solos_agent_core::change::{BranchName, CommitSha, RepoName};
+use solos_agent_core::delivery::{ForgeJob, Observed};
 use solos_agent_core::ids::key;
 use solos_agent_core::model::{
-    AssignmentId, AssignmentState, Candidate, Effect, EvalId, Input, InputBody, MessageId,
+    Actor, AssignmentId, AssignmentState, Candidate, Effect, EvalId, Input, InputBody, MessageId,
     MessageKind, Ms, OutboundMessage, Stage, Ticket, TicketId, Trigger,
 };
 use solos_agent_core::{AllowlistPolicy, Engine, Error, Intake, Policy, Repositories};
@@ -80,6 +83,8 @@ struct Shared {
     router: Arc<dyn Router>,
     executor: Arc<dyn Executor>,
     channels: Arc<BTreeMap<String, Arc<dyn Channel>>>,
+    /// Makes the forge match the Store for `Effect::Forge`.
+    forge: Option<Arc<dyn Forge>>,
 }
 
 pub struct Runtime {
@@ -137,6 +142,7 @@ impl Runtime {
                 router: adapters.router,
                 executor: adapters.executor,
                 channels: Arc::new(adapters.channels),
+                forge: None,
             },
             options,
             summary: Summary::default(),
@@ -156,6 +162,14 @@ impl Runtime {
     /// still applied, such as each open browser's signed Close.
     pub fn with_closing(mut self, closing: impl Future<Output = ()> + Send + 'static) -> Self {
         self.closing = Some(Box::pin(closing));
+        self
+    }
+
+    /// The forge that performs `Effect::Forge`. Without one, such an Effect
+    /// fails and is retried, so a misconfigured agent says so instead of
+    /// dropping a pull request.
+    pub fn with_forge(mut self, forge: Option<Arc<dyn Forge>>) -> Self {
+        self.shared.forge = forge;
         self
     }
 
@@ -455,6 +469,10 @@ impl Runtime {
                     .use_key(&ticket, &assignment, &secret, &method, &url)
                     .map(done),
             ),
+            Fact::Observed(observed) => (
+                format!("observation of the forge on {}", observed_ticket(&observed)),
+                self.engine.forge(observed).map(done),
+            ),
             Fact::Retry {
                 ticket,
                 assignment,
@@ -714,6 +732,13 @@ impl Runtime {
                 assignment,
                 reason,
             },
+            Effect::Forge(ForgeJob::Publish { ticket, head }) => {
+                let found = store.ticket(&ticket).context("no such ticket")?;
+                match self.publish_job(found, &head)? {
+                    Ok(job) => Job::Forge(Box::new(job)),
+                    Err(why) => Job::Skip(why),
+                }
+            }
             Effect::Send(message) => {
                 let ask = message.ask.clone().filter(|ask| {
                     message
@@ -725,6 +750,60 @@ impl Runtime {
                 Job::Send(message, SendOptions { repeat, ask })
             }
         })
+    }
+
+    /// What publishing `head` needs, read from the Store now. `Err(why)` is an
+    /// Effect with nothing left to do: its Ticket was stopped, or a newer head
+    /// replaced it, or the forge already holds it, or the forge said no.
+    fn publish_job(
+        &self,
+        ticket: Ticket,
+        head: &CommitSha,
+    ) -> Result<std::result::Result<PublishJob, String>> {
+        let id = ticket.id.clone();
+        let Some(change) = ticket.change.clone() else {
+            return Ok(Err(format!("{id} has no change to publish")));
+        };
+        let skip = if ticket.stopped_by_person() {
+            Some("was stopped")
+        } else if change.head != *head {
+            Some("has a newer head, which has its own publish")
+        } else if change.delivered.as_ref().is_some_and(|d| d.head == *head) {
+            Some("is already on the forge")
+        } else if change.held.is_some() {
+            Some("is held: the forge said no")
+        } else {
+            None
+        };
+        if let Some(why) = skip {
+            return Ok(Err(format!(
+                "{id}: publishing {} is skipped: the ticket {why}",
+                head.short()
+            )));
+        }
+        let repo = ticket
+            .mandate
+            .repo
+            .clone()
+            .context("a change names no repository")?;
+        let origin = self
+            .engine
+            .repos()
+            .trigger(&ticket.origin)
+            .with_context(|| format!("no trigger {}", ticket.origin))?;
+        Ok(Ok(PublishJob {
+            ticket: id,
+            repo,
+            branch: change.branch,
+            base: change.base,
+            head: head.clone(),
+            lease: change.delivered.map(|delivered| delivered.head),
+            title: ticket.title,
+            text: change.text,
+            requester: ticket.mandate.requester,
+            source: ticket.mandate.source,
+            origin,
+        }))
     }
 
     /// An Input with the Trigger it names.
@@ -827,9 +906,12 @@ impl Runtime {
             return Ok(false);
         }
         for id in store.open_tickets()? {
-            let owed = store
-                .ticket(&id)
-                .is_some_and(|t| matches!(t.stage(), Stage::Queued | Stage::Working));
+            let owed = store.ticket(&id).is_some_and(|t| {
+                matches!(
+                    t.stage(),
+                    Stage::Queued | Stage::Working | Stage::Delivering
+                )
+            });
             if owed {
                 return Ok(false);
             }
@@ -880,10 +962,33 @@ fn backoff(options: &RunOptions, attempts: u32) -> Duration {
         .min(options.retry_max)
 }
 
+/// What `Execute::Publish` borrows, owned so an adapter task can hold it.
+struct PublishJob {
+    ticket: TicketId,
+    repo: RepoName,
+    branch: BranchName,
+    base: String,
+    head: CommitSha,
+    lease: Option<CommitSha>,
+    title: String,
+    text: String,
+    requester: Actor,
+    source: String,
+    origin: Trigger,
+}
+
+fn observed_ticket(observed: &Observed) -> &TicketId {
+    match observed {
+        Observed::Published { ticket, .. } | Observed::Withheld { ticket, .. } => ticket,
+    }
+}
+
 enum Job {
     Assess(Candidate),
     Launch(Box<Launch>),
     Deliver(Delivery),
+    /// Make the forge hold a head and a pull request for it.
+    Forge(Box<PublishJob>),
     Stop {
         ticket: TicketId,
         assignment: AssignmentId,
@@ -902,6 +1007,28 @@ impl Job {
                 Ok(())
             }
             Job::Assess(candidate) => shared.router.assess(candidate, facts).await,
+            Job::Forge(job) => {
+                let forge = shared
+                    .forge
+                    .as_ref()
+                    .context("this agent has no forge to publish through")?;
+                let observed = forge
+                    .execute(Execute::Publish(Publish {
+                        ticket: &job.ticket,
+                        repo: &job.repo,
+                        branch: &job.branch,
+                        base: &job.base,
+                        head: &job.head,
+                        lease: job.lease.as_ref(),
+                        title: &job.title,
+                        text: &job.text,
+                        requester: &job.requester,
+                        source: &job.source,
+                        origin: &job.origin,
+                    }))
+                    .await?;
+                facts.send(Fact::Observed(observed)).await
+            }
             Job::Launch(launch) => shared.executor.launch(*launch, facts).await,
             Job::Deliver(delivery) => shared.executor.deliver(delivery, facts).await,
             Job::Stop {
@@ -985,6 +1112,7 @@ mod tests {
             acknowledge: Acknowledge::Standard,
             rules: Vec::new(),
             repo: None,
+            forge: None,
         });
         let decision = runtime.engine.decide(&eval, accept).unwrap();
         let ticket = runtime.engine.repos().decision(&decision).unwrap().ticket;

@@ -522,6 +522,49 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("extensions/agent-tools.json")
     }
 
+    /// A pull request is owed, not done: the worker reaches the forge by the
+    /// one declaration it already makes, `worker_report ready`, which the host
+    /// admits or refuses. A tool that pushed, opened or merged would be a
+    /// handler a hostile text could steer, so a new one fails here and sends
+    /// its author back to `docs/agent-mode/github-app/rationale.md`.
+    #[test]
+    fn no_worker_tool_touches_the_forge() {
+        assert_eq!(
+            super::WORKER_TOOLS,
+            [
+                "worker_report",
+                "worker_handback",
+                "run_code",
+                "job_start",
+                "job_wait",
+                "job_stop",
+                "fetch_url",
+                "vault_list",
+                "browser_open",
+                "browser_act",
+                "browser_login",
+                "browser_read",
+                "read",
+            ]
+        );
+        let report = tools(PrincipalKind::Worker)
+            .into_iter()
+            .find(|tool| tool.name == "worker_report")
+            .expect("worker_report");
+        let schema = serde_json::to_value(&report).unwrap();
+        let properties: Vec<&str> = schema["input_schema"]["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            properties,
+            ["question", "status", "text"],
+            "no branch, title, base, pr, merge, token or harvest argument"
+        );
+    }
+
     /// `tests/broker.test.ts` holds the Pi extension to the same file.
     #[test]
     fn agent_tools_json_is_the_registry() {

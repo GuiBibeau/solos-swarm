@@ -84,7 +84,7 @@ fn a_v4_file_opens_at_the_latest_version_and_reads_its_ticket_send_and_events_ba
 
     let store = SqliteStore::open(&db.path).unwrap();
 
-    assert_eq!(store.schema_version().unwrap(), 6);
+    assert_eq!(store.schema_version().unwrap(), 7);
     let ticket = store.read_ticket(&TicketId::new("tk_1")).unwrap().unwrap();
     assert!(ticket.secrets.is_empty());
     assert_eq!(

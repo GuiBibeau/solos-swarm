@@ -38,6 +38,7 @@ export const STAGE_LABEL: Record<string, string> = {
   answer: "needs an answer",
   blocked: "blocked",
   failed: "failed",
+  delivering: "opening its pull request",
   queued: "queued",
   idle: "idle",
   working: "working",
@@ -48,7 +49,7 @@ export const STAGE_LABEL: Record<string, string> = {
 export function stageTone(stage: string, outcome?: string): "attention" | "bad" | "live" | "quiet" | "good" {
   if (stage === "approval" || stage === "answer") return "attention";
   if (stage === "blocked" || stage === "failed") return "bad";
-  if (stage === "working") return "live";
+  if (stage === "working" || stage === "delivering") return "live";
   if (stage === "ended") return outcome === "completed" ? "good" : "quiet";
   return "quiet";
 }

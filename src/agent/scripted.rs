@@ -77,6 +77,7 @@ impl ScriptedRouter {
             acknowledge: Acknowledge::Standard,
             rules: Vec::new(),
             repo: None,
+            forge: None,
         })
     }
 }
@@ -114,6 +115,7 @@ impl Executor for ScriptedExecutor {
                 text: format!("Done: {title}. (Scripted executor: no work ran.)"),
                 question: None,
                 spent_microusd: 0,
+                harvest: None,
             };
             facts
                 .send(Fact::Report {

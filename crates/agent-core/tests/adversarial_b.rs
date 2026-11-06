@@ -71,6 +71,7 @@ fn accept(plan: Plan, budget: u64) -> Verdict {
         acknowledge: Acknowledge::Standard,
         rules: Vec::new(),
         repo: None,
+        forge: None,
     })
 }
 
@@ -121,6 +122,7 @@ fn rep(status: ReportStatus) -> ReportIn {
         text: "t".into(),
         question: None,
         spent_microusd: 0,
+        harvest: None,
     }
 }
 fn ci(id: &str) -> Trigger {

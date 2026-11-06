@@ -317,6 +317,7 @@ fn gen_accept(rng: &mut Lcg) -> Accept {
         repo: rng
             .chance(40)
             .then(|| RepoName::try_from("acme/widgets".to_owned()).unwrap()),
+        forge: None,
     }
 }
 
@@ -671,6 +672,7 @@ fn gen_op(rng: &mut Lcg, w: &mut Walk) -> Op {
                 text: format!("{status:?}"),
                 question: rng.chance(25).then(|| "which branch?".to_owned()),
                 spent_microusd: rng.pick(&[0, 100_000, 900_000]),
+                harvest: None,
             };
             Op::Report(t, a, report)
         }
@@ -760,6 +762,7 @@ fn lane(effect: &Effect) -> Option<String> {
         Effect::Launch { ticket, .. }
         | Effect::Deliver { ticket, .. }
         | Effect::Stop { ticket, .. } => Some(format!("ticket:{ticket}")),
+        Effect::Forge(job) => Some(format!("forge:{}", job.ticket())),
         Effect::Assess(_) => None,
     }
 }

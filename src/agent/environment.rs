@@ -6,11 +6,12 @@
 //! error, and the executor holds a Launch until the node is back.
 
 use crate::code::{CodeExecutor, OutputBounds, Started};
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
+use solos_agent_core::change::CommitSha;
 use solos_agent_core::model::{Plan, TicketId};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -83,6 +84,61 @@ pub fn named(plan: &Plan) -> Option<&str> {
     }
 }
 
+/// The exit code the harvest script ends with when the tree holds no commit
+/// beyond the base.
+const NO_COMMITS: i64 = 3;
+
+/// What a fresh sandbox made of a worker's tree. The bundle is a file the
+/// sandbox wrote, so it is untrusted data until the forge has judged it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Bundle {
+    pub path: PathBuf,
+    /// The head the sandbox says the bundle holds. Advisory.
+    pub head: CommitSha,
+    /// `git status --porcelain | wc -l`, advisory, told to the worker so it
+    /// is not surprised that uncommitted work is not delivered.
+    pub uncommitted: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Harvested {
+    Bundle(Bundle),
+    /// The tree holds nothing beyond the commit the clone started from.
+    NoCommits,
+    /// The sandbox could not read the tree, in these words.
+    Failed(String),
+}
+
+/// What a sandbox wrote in a file of at most a few bytes, trimmed: nothing for a
+/// link (which could point at any file the host can read), a directory or a
+/// file that is large.
+fn small_file(path: &Path) -> Option<String> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > 64 {
+        return None;
+    }
+    Some(std::fs::read_to_string(path).ok()?.trim().to_owned())
+}
+
+/// The host's script for `Environments::harvest`, run in a sandbox with no
+/// network and an empty environment but the one below. It uses nothing the
+/// worker could have set: git is told not to run a file system monitor or a
+/// hook, to ignore replace refs and to read no global or system config. Its
+/// own output is advisory, since a hostile `.git` can make the sandbox's git
+/// lie but cannot make the host's believe it.
+const HARVEST_SCRIPT: &str = r#"set -eu
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_NO_REPLACE_OBJECTS=1 \
+       GIT_TERMINAL_PROMPT=0 LC_ALL=C
+g() { git -c core.fsmonitor=false -c core.hooksPath=/dev/null -C /work "$@"; }
+head=$(g rev-parse --verify 'HEAD^{commit}')
+count=$(g rev-list --count "$BASE..HEAD")
+[ "$count" -gt 0 ] || { echo "no commits since $BASE" >&2; exit 3; }
+g bundle create /out/proposal.bundle "$BASE..HEAD" 2>/dev/null
+printf '%s\n' "$head" > /out/head
+n=$(g --no-optional-locks status --porcelain 2>/dev/null | wc -l || true)
+printf '%s\n' "${n:-0}" > /out/uncommitted
+"#;
+
 /// The remote nodes a host knows, and which one a Plan that names none
 /// runs on.
 #[derive(Clone, Default)]
@@ -107,13 +163,18 @@ pub enum Launchable {
 pub struct Environments {
     /// `None`: this host offers no `run_code`.
     local: Option<Arc<dyn ExecutionEnvironment>>,
+    /// The same sandbox, for the host's own scripts on a worker's tree.
+    code: Option<Arc<CodeExecutor>>,
     remote: Nodes,
 }
 
 impl Environments {
     pub fn new(local: Option<Arc<CodeExecutor>>, remote: Nodes) -> Self {
         Self {
-            local: local.map(|code| Arc::new(Local(code)) as Arc<dyn ExecutionEnvironment>),
+            local: local
+                .clone()
+                .map(|code| Arc::new(Local(code)) as Arc<dyn ExecutionEnvironment>),
+            code: local,
             remote,
         }
     }
@@ -160,6 +221,59 @@ impl Environments {
     /// Whether such a worker has `run_code`.
     pub fn offers_run_code(&self, named: Option<&str>) -> bool {
         matches!(self.get(named), Ok(Some(_)))
+    }
+
+    /// Bundle the commits a worker made in `work` since `base`, in a fresh
+    /// sandbox this host builds (`work` read-only, `out` a fresh writable
+    /// directory), never in the worker's own. What the script printed is
+    /// advisory: the bundle is data that `Forge::admit` judges again in the
+    /// host's mirror.
+    pub async fn harvest(
+        &self,
+        named: Option<&str>,
+        work: &Path,
+        out: &Path,
+        base: &CommitSha,
+    ) -> Result<Harvested> {
+        if !self.is_local(named) {
+            bail!("a ticket on a repository runs on this host only");
+        }
+        let code = self
+            .code
+            .as_ref()
+            .context("this host offers no run_code to harvest a change in")?;
+        let receipt = code
+            .run_on_tree(work, out, &[("BASE", base.as_str())], HARVEST_SCRIPT)
+            .await?;
+        if receipt["timed_out"] == true {
+            return Ok(Harvested::Failed(
+                "reading your commits took longer than a minute".into(),
+            ));
+        }
+        match receipt["exit_code"].as_i64() {
+            Some(0) => {}
+            Some(NO_COMMITS) => return Ok(Harvested::NoCommits),
+            _ => {
+                let said = receipt["stderr"].as_str().unwrap_or_default().trim();
+                let last = said.lines().last().unwrap_or("git failed in your tree");
+                return Ok(Harvested::Failed(last.chars().take(300).collect()));
+            }
+        }
+        let read = |name: &str| small_file(&out.join(name));
+        let Some(head) = read("head") else {
+            return Ok(Harvested::Failed("the sandbox wrote no head".into()));
+        };
+        let Ok(head) = CommitSha::try_from(head) else {
+            return Ok(Harvested::Failed("the sandbox wrote no commit id".into()));
+        };
+        let uncommitted = read("uncommitted")
+            .and_then(|text| text.parse().ok())
+            .unwrap_or(0);
+        Ok(Harvested::Bundle(Bundle {
+            path: out.join("proposal.bundle"),
+            head,
+            uncommitted,
+        }))
     }
 
     pub fn launchable(&self, named: Option<&str>) -> Launchable {

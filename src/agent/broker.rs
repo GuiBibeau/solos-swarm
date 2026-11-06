@@ -13,9 +13,11 @@ mod toolbox;
 
 use super::AgentConfig;
 use super::config::{ExecutorConfig, RepoConfig};
-use super::environment::{Environments, ExecutionEnvironment, Nodes};
+use super::environment::{Environments, ExecutionEnvironment, Harvested, Nodes};
+use super::forge::REPO_JSON;
 use super::jobs::{Host, JobLimits, Jobs, Refused};
-use super::ports::{Applied, Fact, FactSink};
+use super::pi_executor::private_dir;
+use super::ports::{Applied, Fact, FactSink, Forge, Proposal, Refusal as Unadmitted, Workspace};
 use super::pstack::{self, Pstack, Reader};
 use super::watchdog::usd;
 use crate::broker::{FETCH_TOTAL_BYTES, fetch, now_ms};
@@ -36,7 +38,8 @@ pub use registry::{ROUTER_TOOLS, WORKER_TOOLS};
 use repeat::RepeatGuard;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use solos_agent_core::change::{Deliverable, RepoName};
+use solos_agent_core::change::{CommitSha, Deliverable, Harvest, RepoName};
+use solos_agent_core::delivery::{Admission, NotReady, ready_gate};
 use solos_agent_core::model::{
     Accept, Acknowledge, AssignmentId, EvalId, Method, MicroUsd, Ms, Plan, ReportIn, ReportStatus,
     ThreadKey, Ticket, TicketId, Trigger, TriggerId, Verdict,
@@ -47,7 +50,7 @@ use solos_agent_store::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 use tokio::net::UnixListener;
 use toolbox::{Env, Lookup, Toolbox, WorkerCall};
@@ -583,8 +586,95 @@ struct Inner {
     pstack: Option<Arc<Pstack>>,
     vault: Option<Arc<VaultParts>>,
     browser: Option<Arc<browser::BrowserParts>>,
+    /// Judges what a worker proposes on `ready`; set once, before workers run.
+    forge: OnceLock<Arc<dyn Forge>>,
     /// The Router's tools, which need no host resource.
     router: Toolbox<RouterOp>,
+}
+
+/// What `ready` came to before the Engine records it: what the Ticket owes
+/// decides whether the worker's commits were harvested and admitted.
+#[derive(Clone, Debug)]
+pub struct ReadyAdmission {
+    pub admission: Admission,
+    /// The commits the host admitted, for a Ticket that owes a change or a
+    /// pull request. Goes into the Report as `ReportIn.harvest`.
+    pub harvest: Option<Harvest>,
+    /// Files left uncommitted in the worker's tree, which are not delivered.
+    pub uncommitted: u32,
+    /// The head's number among the heads admitted for the Ticket.
+    pub round: u32,
+}
+
+impl ReadyAdmission {
+    /// Add to the worker's reply what the host did with its commits, and
+    /// what to do next.
+    fn describe(&self, reply: &mut Value) {
+        let Some(harvest) = &self.harvest else {
+            return;
+        };
+        let head = harvest.head.short();
+        let (kind, next) = match self.admission {
+            Admission::Propose(_) => (
+                "proposal",
+                format!(
+                    "Accepted. The host is publishing {head} on its own branch and opening the \
+                     pull request as the bot; the ticket ends when it exists. Stop here."
+                ),
+            ),
+            Admission::Committed(_) => (
+                "proposal",
+                format!(
+                    "Accepted. Your commits ({head}) stay in this ticket's clone, which is not \
+                     published; the ticket has ended. Stop here."
+                ),
+            ),
+            Admission::Reply | Admission::Answer => {
+                reply["next"] = json!(
+                    "Sent to whoever asked; the head is as it was, and the ticket has ended. \
+                     Stop here."
+                );
+                return;
+            }
+        };
+        reply[kind] = json!({
+            "head": head,
+            "commits": harvest.commits,
+            "files": harvest.files,
+            "bytes": harvest.bytes,
+            "round": self.round,
+            "uncommitted_files_not_included": self.uncommitted,
+        });
+        reply["next"] = json!(next);
+    }
+}
+
+/// Why `ready` is not admitted. Nothing was committed.
+#[derive(Debug)]
+pub struct NotAdmitted {
+    /// The worker's to mend (a refusal it acts on), not the host's trouble.
+    pub conflict: bool,
+    /// What the worker reads: what to do next, or what went wrong here.
+    pub why: String,
+}
+
+impl NotAdmitted {
+    fn refused(why: String) -> Self {
+        Self {
+            conflict: true,
+            why,
+        }
+    }
+
+    fn host(err: impl Into<anyhow::Error>) -> Self {
+        Self {
+            conflict: false,
+            why: format!(
+                "the host could not check your commits: {:#}. Report ready again in a moment.",
+                err.into()
+            ),
+        }
+    }
 }
 
 type Refusal = (StatusCode, Json<Value>);
@@ -703,6 +793,7 @@ impl AgentBroker {
                 pstack,
                 vault,
                 browser,
+                forge: OnceLock::new(),
                 router: toolbox::router(),
             }),
         })
@@ -750,6 +841,125 @@ impl AgentBroker {
 
     pub fn pstack(&self) -> Option<&Arc<Pstack>> {
         self.inner.pstack.as_ref()
+    }
+
+    /// The forge that judges the commits a worker proposes when it reports
+    /// `ready` (see [`admit_ready`](Self::admit_ready)). Set once, before any
+    /// worker runs; a second call changes nothing.
+    pub fn set_forge(&self, forge: Arc<dyn Forge>) {
+        let _ = self.inner.forge.set(forge);
+    }
+
+    /// What `ready` means for `seat`'s Ticket, before the Engine records it:
+    /// for one that owes only an answer, nothing to check; for one that owes
+    /// a change or a pull request, the host harvests the worker's commits in
+    /// a fresh sandbox of its own and has the forge admit them in its mirror.
+    /// Every path that files a `ready` for a worker goes through here, the
+    /// `worker_report` tool and the host's own report of a turn that ended in
+    /// plain text, so no `ready` ends such a Ticket without its commits being
+    /// judged. A refusal commits nothing and says what to do next.
+    pub async fn admit_ready(
+        &self,
+        seat: &WorkerSeat,
+    ) -> std::result::Result<ReadyAdmission, NotAdmitted> {
+        let id = seat.ticket.clone();
+        let found = self
+            .store(move |store| store.read_ticket(&id))
+            .await
+            .map_err(NotAdmitted::host)?;
+        // A Ticket the Store does not hold owes nothing here: the Engine refuses
+        // a Report for it, with its own words.
+        let Some(ticket) = found else {
+            return Ok(ReadyAdmission {
+                admission: Admission::Answer,
+                harvest: None,
+                uncommitted: 0,
+                round: 0,
+            });
+        };
+        let terms = ticket.mandate.forge.as_ref();
+        // Everything that does not need the commits is answered first.
+        match ready_gate(&ticket, terms, None) {
+            Ok(admission) => {
+                return Ok(ReadyAdmission {
+                    admission,
+                    harvest: None,
+                    uncommitted: 0,
+                    round: 0,
+                });
+            }
+            Err(NotReady::NothingToDeliver) => {}
+            Err(refused) => return Err(NotAdmitted::refused(refused.tell())),
+        }
+        let forge = self.inner.forge.get().ok_or_else(|| {
+            NotAdmitted::host(anyhow!("this agent has no forge to take a change"))
+        })?;
+        let repo = ticket
+            .mandate
+            .repo
+            .clone()
+            .ok_or_else(|| NotAdmitted::host(anyhow!("{} names no repository", ticket.id)))?;
+        let host = seat
+            .host_dir
+            .as_ref()
+            .ok_or_else(|| NotAdmitted::host(anyhow!("{} has no clone", ticket.id)))?;
+        let marker = host.join(REPO_JSON);
+        let workspace: Workspace = std::fs::read(&marker)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| serde_json::from_slice(&bytes).map_err(Into::into))
+            .with_context(|| format!("cannot read {}", marker.display()))
+            .map_err(NotAdmitted::host)?;
+        let base_commit = CommitSha::try_from(workspace.base_commit.clone())
+            .map_err(|why| NotAdmitted::host(anyhow!("{} says {why}", marker.display())))?;
+        let ticket_dir = host
+            .parent()
+            .ok_or_else(|| NotAdmitted::host(anyhow!("{} has no directory", ticket.id)))?;
+        let out = ticket_dir
+            .join("out")
+            .join(uuid::Uuid::new_v4().simple().to_string());
+        private_dir(&out).map_err(NotAdmitted::host)?;
+        let admitted = async {
+            let named = seat.environment.as_deref();
+            let bundle = match self
+                .inner
+                .environments
+                .harvest(named, &seat.work_dir, &out, &base_commit)
+                .await
+                .map_err(NotAdmitted::host)?
+            {
+                Harvested::Bundle(bundle) => bundle,
+                Harvested::NoCommits => {
+                    return Err(NotAdmitted::refused(NotReady::NothingToDeliver.tell()));
+                }
+                Harvested::Failed(why) => {
+                    return Err(NotAdmitted::refused(Unadmitted::BadBundle(why).tell()));
+                }
+            };
+            let proposal = Proposal {
+                ticket: &seat.ticket,
+                repo: &repo,
+                head: &bundle.head,
+                bundle: &bundle.path,
+                base: &workspace.base,
+                base_commit: &base_commit,
+            };
+            match forge.admit(proposal).await.map_err(NotAdmitted::host)? {
+                Ok(harvest) => Ok((harvest, bundle.uncommitted)),
+                Err(refusal) => Err(NotAdmitted::refused(refusal.tell())),
+            }
+        }
+        .await;
+        let _ = std::fs::remove_dir_all(&out);
+        let (harvest, uncommitted) = admitted?;
+        // What the Engine will make of it, for the words the worker reads.
+        let admission = ready_gate(&ticket, terms, Some(&harvest))
+            .map_err(|refused| NotAdmitted::refused(refused.tell()))?;
+        Ok(ReadyAdmission {
+            admission,
+            round: ticket.change.as_ref().map_or(1, |change| change.pushes + 1),
+            harvest: Some(harvest),
+            uncommitted,
+        })
     }
 
     /// What a worker whose Plan names `environment` holds on this host, on a
@@ -1292,9 +1502,20 @@ impl DecideArgs {
                             (None, Some(_)) => {
                                 return Err("deliverable is for an accept that names a repo".into());
                             }
-                            (Some((_, terms)), owed) => Some(Method {
-                                deliverable: owed.unwrap_or(terms.owes),
-                            }),
+                            (Some((name, terms)), owed) => {
+                                let deliverable = owed.unwrap_or(terms.owes);
+                                // What a repository owes is also the most the agent does
+                                // there: a model may lower it for one request, never raise it.
+                                if deliverable > terms.owes {
+                                    return Err(format!(
+                                        "deliverable {} is above what {name} owes: its config makes \
+                                         {} the most the agent does there",
+                                        deliverable.as_str(),
+                                        terms.owes.as_str()
+                                    ));
+                                }
+                                Some(Method { deliverable })
+                            }
                         };
                         Plan::Session {
                             harness: None,
@@ -1361,6 +1582,19 @@ impl DecideArgs {
                         ),
                     });
                 }
+                // What the work may do on the forge comes from the repository's
+                // config, for any deliverable above an answer: the Router names a
+                // repository and a deliverable, never a merge mode or a limit.
+                let forge = match (&repo, &plan) {
+                    (
+                        Some((_, terms)),
+                        Plan::Session {
+                            method: Some(method),
+                            ..
+                        },
+                    ) if method.deliverable > Deliverable::Answer => Some(terms.terms()),
+                    _ => None,
+                };
                 let acknowledge = match self.acknowledge {
                     None => Acknowledge::Standard,
                     Some(text) if text.trim().is_empty() => Acknowledge::Silent,
@@ -1375,6 +1609,7 @@ impl DecideArgs {
                     acknowledge,
                     rules: self.rules,
                     repo: repo.map(|(name, _)| name),
+                    forge,
                 })
             }
         };
@@ -1473,6 +1708,24 @@ async fn report(broker: &AgentBroker, seat: &Arc<WorkerSeat>, args: Value) -> Re
         .filter(|question| !question.is_empty())
         .map(|question| clip(question, QUESTION_CHARS));
     let question_cut = question.as_ref().is_some_and(|(_, cut)| *cut);
+    // A `ready` on a Ticket that owes a change or a pull request is admitted by
+    // the host before it is recorded, or refused with what to do next.
+    let admitted = if status == ReportStatus::Ready {
+        let admitted = broker.admit_ready(seat).await.map_err(|refused| {
+            let status = if refused.conflict {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            refuse(status, refused.why)
+        })?;
+        Some(admitted)
+    } else {
+        None
+    };
+    let harvest = admitted
+        .as_ref()
+        .and_then(|admitted| admitted.harvest.clone());
     let spent = broker.spent(seat).await.map_err(failed)?;
     let fact = Fact::Report {
         ticket: seat.ticket.clone(),
@@ -1482,6 +1735,7 @@ async fn report(broker: &AgentBroker, seat: &Arc<WorkerSeat>, args: Value) -> Re
             text,
             question: question.map(|(question, _)| question),
             spent_microusd: spent,
+            harvest,
         },
     };
     match broker.inner.facts.ask(fact).await.map_err(failed)? {
@@ -1494,6 +1748,9 @@ async fn report(broker: &AgentBroker, seat: &Arc<WorkerSeat>, args: Value) -> Re
                 "budget_microusd": seat.budget_microusd,
                 "next": after(status),
             });
+            if let Some(admitted) = &admitted {
+                admitted.describe(&mut reply);
+            }
             if text_cut || question_cut {
                 reply["shortened"] = json!(format!(
                     "The text is kept to {REPORT_TEXT_CHARS} characters and a question to \
@@ -2068,6 +2325,7 @@ mod tests {
                     budget_microusd: Some(1_500_000),
                     notes: None,
                     owes: Deliverable::PullRequest,
+                    ..RepoConfig::default()
                 },
             )]),
             ..terms()
@@ -2103,6 +2361,52 @@ mod tests {
         };
         assert_eq!(named.plan, owes(Deliverable::Answer));
         assert_eq!(named.budget_microusd, Some(700_000));
+        assert_eq!(named.forge, None, "an answer takes no forge terms");
+
+        // What a repository owes also takes its terms from config, never from
+        // the Router's words, and is the most the Router may name.
+        assert_eq!(
+            defaulted.forge,
+            Some(with_repos.repos[&widgets].terms()),
+            "a pull request carries the repository's terms"
+        );
+        let Ok(Verdict::Accept(lowered)) = accept(json!({"deliverable":"change"})) else {
+            panic!("refused")
+        };
+        assert_eq!(lowered.plan, owes(Deliverable::Change));
+        assert_eq!(lowered.forge, defaulted.forge);
+        let read_only = DecideTerms {
+            repos: BTreeMap::from([(
+                widgets.clone(),
+                RepoConfig {
+                    about: "Widgets.".into(),
+                    owes: Deliverable::Answer,
+                    ..RepoConfig::default()
+                },
+            )]),
+            ..terms()
+        };
+        let ask = |extra: serde_json::Value| {
+            let mut args = json!({"eval":"ev_1","decision":"accept","reason":"asked","title":"T",
+                                  "scope":"S","repo":"acme/widgets"});
+            for (key, value) in extra.as_object().unwrap() {
+                args[key] = value.clone();
+            }
+            verdict_under(&read_only, args)
+        };
+        let Ok(Verdict::Accept(read)) = ask(json!({})) else {
+            panic!("refused")
+        };
+        assert_eq!((read.plan, read.forge), (owes(Deliverable::Answer), None));
+        for raised in ["change", "pull_request"] {
+            let refused = ask(json!({"deliverable": raised})).unwrap_err();
+            assert!(
+                refused.contains(&format!(
+                    "deliverable {raised} is above what acme/widgets owes"
+                )) && refused.contains("answer the most the agent does there"),
+                "{refused}"
+            );
+        }
 
         for (extra, why) in [
             (
@@ -2196,6 +2500,7 @@ mod tests {
                     budget_microusd,
                     notes: None,
                     owes: Deliverable::Answer,
+                    ..RepoConfig::default()
                 },
             )])
         };

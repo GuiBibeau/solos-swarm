@@ -207,7 +207,7 @@ fn body(message: &OutboundMessage, links: &TicketLinks) -> String {
 /// mention, so text from a worker cannot notify anyone. `page`, the Ticket's
 /// page, is linked after the text, and named as where the rest is when the
 /// text is cut.
-fn shape(text: &str, limit: usize, page: Option<&str>) -> String {
+pub(crate) fn shape(text: &str, limit: usize, page: Option<&str>) -> String {
     let text = text.trim();
     let total = text.chars().count();
     let (kept, cut) = if total <= limit {
@@ -253,7 +253,7 @@ fn shape(text: &str, limit: usize, page: Option<&str>) -> String {
 
 /// Wraps `@name` and `@org/team` outside code in backticks. Returns the
 /// fence of a code block left open.
-fn quiet(text: &str) -> (String, Option<String>) {
+pub(crate) fn quiet(text: &str) -> (String, Option<String>) {
     let mut out = String::with_capacity(text.len());
     let mut fence: Option<String> = None;
     for line in text.split_inclusive('\n') {

@@ -72,6 +72,7 @@ impl World {
             acknowledge: Acknowledge::Standard,
             rules: Vec::new(),
             repo: None,
+            forge: None,
         });
         let decision = engine.decide(&eval, accept).unwrap();
         let ticket = engine.repos().decisions[&decision].ticket.clone().unwrap();
@@ -150,6 +151,7 @@ impl World {
             text: text.into(),
             question: question.map(str::to_owned),
             spent_microusd: 0,
+            harvest: None,
         };
         self.engine
             .report(&self.ticket, &assignment, report)

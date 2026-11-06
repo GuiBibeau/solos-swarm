@@ -535,6 +535,7 @@ async fn report(
                 text,
                 question: None,
                 spent_microusd,
+                harvest: None,
             },
         })
         .await

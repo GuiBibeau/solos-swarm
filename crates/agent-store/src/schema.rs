@@ -1,7 +1,7 @@
 use crate::StoreError;
 use rusqlite::{Connection, TransactionBehavior};
 
-pub(crate) const LATEST: u32 = 6;
+pub(crate) const LATEST: u32 = 7;
 
 /// Aggregates are JSON in `body`; the other columns index the port's queries.
 const V1: &str = "
@@ -122,8 +122,15 @@ const V5: &str = "";
 /// and `Plan::Session.method` when it rewrites a Ticket.
 const V6: &str = "";
 
+/// No new table. A file whose Tickets can hold a `Change`, whose Mandates can
+/// carry `ForgeTerms`, and whose Effects and events can be a forge job, a
+/// proposal, a delivery or a withheld change, is one an older build refuses
+/// to open, instead of dropping `Ticket.change` and `Mandate.forge` when it
+/// rewrites a Ticket, or failing on an Effect or an event it cannot read.
+const V7: &str = "";
+
 /// Migration `n` is `MIGRATIONS[n - 1]`.
-const MIGRATIONS: [&str; LATEST as usize] = [V1, V2, V3, V4, V5, V6];
+const MIGRATIONS: [&str; LATEST as usize] = [V1, V2, V3, V4, V5, V6, V7];
 
 /// Applies the migrations the file lacks. The write lock makes a second
 /// process that opens the file at the same time wait, then find nothing to do.
@@ -160,7 +167,7 @@ pub(crate) fn version(conn: &Connection) -> Result<u32, StoreError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LATEST, V1, V2, V3, V4, V5, V6, migrate, version};
+    use super::{LATEST, V1, V2, V3, V4, V5, V6, V7, migrate, version};
     use rusqlite::Connection;
 
     #[test]
@@ -180,6 +187,7 @@ mod tests {
         conn.execute_batch(V4).unwrap();
         conn.execute_batch(V5).unwrap();
         conn.execute_batch(V6).unwrap();
+        conn.execute_batch(V7).unwrap();
     }
 
     #[test]

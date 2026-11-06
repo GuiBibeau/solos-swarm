@@ -707,6 +707,7 @@ impl Executor for Browses {
                     text: "done".into(),
                     question: None,
                     spent_microusd: 0,
+                    harvest: None,
                 },
             };
 
@@ -834,6 +835,7 @@ impl Executor for Starts {
                     text: format!("{status:?}"),
                     question: None,
                     spent_microusd: 0,
+                    harvest: None,
                 };
                 facts
                     .send(Fact::Report {

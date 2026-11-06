@@ -151,6 +151,7 @@ fn accept() -> Verdict {
         acknowledge: Acknowledge::Silent,
         rules: Vec::new(),
         repo: None,
+        forge: None,
     })
 }
 fn ignore() -> Verdict {

@@ -1,4 +1,4 @@
-use solos_agent_core::change::{Deliverable, RepoName};
+use solos_agent_core::change::{Deliverable, ForgeTerms, MergeMode, RepoName};
 use solos_agent_core::model::{
     Accept, Acknowledge, Actor, Addressed, Approval, ChannelRef, DecisionKind, Effect, Mandate,
     MessageKind, Method, Plan, ReportIn, ReportStatus, Stage, ThreadKey, TicketId, TicketOutcome,
@@ -85,6 +85,7 @@ fn accept(plan: Plan, budget: u64) -> Verdict {
         acknowledge: Acknowledge::Standard,
         rules: Vec::new(),
         repo: None,
+        forge: None,
     })
 }
 
@@ -159,6 +160,7 @@ fn explicit_request_runs_to_a_result_in_the_same_thread() {
         text: text.into(),
         question: None,
         spent_microusd: 0,
+        harvest: None,
     };
     w.engine
         .report(
@@ -622,6 +624,16 @@ fn a_session_on_a_repository_keeps_it_in_its_mandate_and_what_it_owes_in_its_pla
             panic!("accept() makes an accept")
         };
         accepted.repo = repo.cloned();
+        let owed = matches!(
+            &accepted.plan,
+            Plan::Session { method: Some(m), .. } if m.deliverable > Deliverable::Answer
+        );
+        accepted.forge = (owed && repo.is_some()).then_some(ForgeTerms {
+            merge: MergeMode::Ask,
+            ci_expected: true,
+            max_pushes: 6,
+            max_repairs: 2,
+        });
         Verdict::Accept(accepted)
     };
     let mut w = World::new(policy());
@@ -648,6 +660,17 @@ fn a_session_on_a_repository_keeps_it_in_its_mandate_and_what_it_owes_in_its_pla
         (
             on(owes(Deliverable::PullRequest), None),
             "a change or a pull request needs a repository",
+        ),
+        (
+            {
+                let Verdict::Accept(mut bare) = on(owes(Deliverable::PullRequest), Some(&widgets))
+                else {
+                    unreachable!()
+                };
+                bare.forge = None;
+                Verdict::Accept(bare)
+            },
+            "a change or a pull request needs the forge terms of its repository",
         ),
     ] {
         let err = w.engine.decide(&eval, refused).unwrap_err();
@@ -837,6 +860,7 @@ fn a_person_resumes_ended_work_and_a_stopped_ticket_hears_nothing() {
         text: "done".into(),
         question: None,
         spent_microusd: 400_000,
+        harvest: None,
     };
     w.engine.report(ticket, assignment, ready).unwrap();
     w.effects();
@@ -903,6 +927,7 @@ fn a_blocked_ticket_holds_bot_inputs_until_a_person_writes() {
         text: "Which branch should I target?".into(),
         question: Some("Which branch should I target?".into()),
         spent_microusd: 0,
+        harvest: None,
     };
     w.engine.report(ticket, assignment, blocked).unwrap();
     let effects = w.effects();
@@ -1106,6 +1131,7 @@ fn retry_replaces_a_failed_assignment_and_late_reports_are_refused() {
         text: "provider outage".into(),
         question: None,
         spent_microusd: 0,
+        harvest: None,
     };
     w.engine.report(ticket, first, failed.clone()).unwrap();
     assert_eq!(w.engine.repos().tickets[ticket].stage(), Stage::Failed);
@@ -1160,6 +1186,7 @@ fn report(status: ReportStatus) -> ReportIn {
         text: "t".into(),
         question: None,
         spent_microusd: 0,
+        harvest: None,
     }
 }
 

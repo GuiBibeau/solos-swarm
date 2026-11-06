@@ -15,6 +15,7 @@ use crate::gateway;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
+use solos_agent_core::delivery::ForgeJob;
 use solos_agent_core::ids::key;
 use solos_agent_core::model::{
     AssignmentId, ChannelRef, Decision, DecisionKind, Effect, MessageId, MessageKind, MicroUsd, Ms,
@@ -614,6 +615,7 @@ pub fn stage_name(stage: Stage) -> &'static str {
         Stage::Answer => "answer",
         Stage::Blocked => "blocked",
         Stage::Failed => "failed",
+        Stage::Delivering => "delivering",
         Stage::Queued => "queued",
         Stage::Idle => "idle",
         Stage::Working => "working",
@@ -634,6 +636,7 @@ fn effect_ticket(effect: &Effect) -> Option<&TicketId> {
         | Effect::Deliver { ticket, .. }
         | Effect::Stop { ticket, .. } => Some(ticket),
         Effect::Send(message) => message.ticket.as_ref(),
+        Effect::Forge(job) => Some(job.ticket()),
         Effect::Assess(_) => None,
     }
 }
@@ -651,6 +654,9 @@ pub fn describe(effect: &Effect) -> String {
             assignment, inputs, ..
         } => format!("{} input(s) for {assignment}", inputs.len()),
         Effect::Stop { assignment, .. } => format!("the stop of {assignment}"),
+        Effect::Forge(ForgeJob::Publish { ticket, head }) => {
+            format!("the publication of {} for {ticket}", head.short())
+        }
         Effect::Send(message) => {
             let kind = match message.kind {
                 MessageKind::Acknowledgement => "an acknowledgement",
@@ -977,6 +983,7 @@ mod tests {
                 source: "slack".into(),
                 budget_microusd: Some(1_000_000),
                 repo: None,
+                forge: None,
             },
             plan: Plan::Session {
                 harness: None,
@@ -997,6 +1004,7 @@ mod tests {
             created_ms,
             seq: 0,
             handed_back: BTreeSet::new(),
+            change: None,
         }
     }
 

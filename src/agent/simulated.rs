@@ -209,6 +209,7 @@ async fn simulate(
         ),
         question: None,
         spent_microusd: 0,
+        harvest: None,
     };
     facts
         .send(Fact::Report {

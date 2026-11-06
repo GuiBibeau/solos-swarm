@@ -5,7 +5,8 @@
 
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
-use solos_agent_core::change::RepoName;
+use solos_agent_core::change::{BranchName, CommitSha, Harvest, RepoName};
+use solos_agent_core::delivery::Observed;
 use solos_agent_core::model::{
     Actor, Ask, AssignmentId, Candidate, ChannelRef, Decision, EvalId, Input, MicroUsd,
     OutboundMessage, Plan, ReportIn, SecretGrant, SecretId, TicketId, Trigger, TriggerId, Verdict,
@@ -151,6 +152,170 @@ pub trait Forge: Send + Sync {
         repo: &'a RepoName,
         dirs: TicketDirs<'a>,
     ) -> BoxFuture<'a, Result<Workspace>>;
+
+    /// Judge the commits a worker proposes, on this host and with no network
+    /// (so a refusal comes back in the same `worker_report` call). What
+    /// crosses from the worker's tree is a `git bundle` file, which is
+    /// untrusted data: the bundle is copied beside the mirror, fetched into
+    /// the host's mirror with `fsckObjects` and replace refs off, and every
+    /// check runs in the mirror, never in the worker's tree, over the agent's
+    /// own range (the commits reachable from the head and from nothing on the
+    /// base): the head descends from the clone's base commit, every commit's
+    /// author and committer is the bot, no commit changes a protected path,
+    /// and the change is within its size and file limits. The same head
+    /// twice is answered the same.
+    fn admit<'a>(
+        &'a self,
+        proposal: Proposal<'a>,
+    ) -> BoxFuture<'a, Result<std::result::Result<Harvest, Refusal>>>;
+
+    /// Make the forge match the Store, then say what it now holds. Every
+    /// step is an "ensure", so running it again after a crash at any point
+    /// converges and says the same thing. A decided no (the branch moved, the
+    /// pull request was closed, the forge refused) is `Ok(Observed::Withheld)`.
+    /// `Err` is only the transient: the network, a 5xx, a rate limit, or a
+    /// suspended or missing installation, which the runtime retries with
+    /// backoff (a `RetryAfter` in the chain says how long).
+    fn execute<'a>(&'a self, job: Execute<'a>) -> BoxFuture<'a, Result<Observed>>;
+}
+
+/// What `admit` is given. The bundle is a file a sandbox wrote, so it is data
+/// until `admit` has judged it.
+#[derive(Clone, Copy, Debug)]
+pub struct Proposal<'a> {
+    pub ticket: &'a TicketId,
+    pub repo: &'a RepoName,
+    /// The head the sandbox says the bundle holds. Advisory: `admit` derives
+    /// the head itself and refuses a bundle that holds another.
+    pub head: &'a CommitSha,
+    pub bundle: &'a Path,
+    /// What `repo.json` says: the base branch and the commit the clone
+    /// started from.
+    pub base: &'a str,
+    pub base_commit: &'a CommitSha,
+}
+
+/// Why `admit` would not take the commits, in words the worker acts on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// The head adds nothing to the base.
+    NoCommits,
+    /// The head does not descend from the commit the clone started from (an
+    /// orphan branch, a rewritten root).
+    NotDescendant {
+        base: CommitSha,
+    },
+    /// A commit in the range whose author or committer is not the bot.
+    Identity {
+        commit: CommitSha,
+        found: String,
+        expected: String,
+        base: CommitSha,
+    },
+    /// Commits in the range change a protected path.
+    Protected {
+        paths: Vec<String>,
+        globs: Vec<String>,
+        base: CommitSha,
+    },
+    TooLarge {
+        bytes: u64,
+        limit: u64,
+    },
+    TooManyFiles {
+        files: u32,
+        limit: u32,
+    },
+    /// The bundle did not verify, did not fsck, or could not be read.
+    BadBundle(String),
+}
+
+impl Refusal {
+    /// The sentence the worker reads; each says what to do next.
+    pub fn tell(&self) -> String {
+        match self {
+            Self::NoCommits => solos_agent_core::delivery::NotReady::NothingToDeliver.tell(),
+            Self::NotDescendant { base } => format!(
+                "Not accepted: your HEAD does not descend from {}, the commit this clone \
+                 started from. Do not rewrite the root. A new clone is not possible, so report \
+                 blocked and say what happened.",
+                base.short()
+            ),
+            Self::Identity {
+                commit,
+                found,
+                expected,
+                base,
+            } => format!(
+                "Not accepted: commit {} is by {found}, and every commit must be by {expected}. \
+                 Nothing was published. Run `git rebase --exec 'git commit --amend --no-edit \
+                 --reset-author' {base}`, then report ready again.",
+                commit.short()
+            ),
+            Self::Protected { paths, globs, base } => {
+                let shown: Vec<&str> = paths.iter().take(5).map(String::as_str).collect();
+                let more = paths.len().saturating_sub(shown.len());
+                let more = if more > 0 {
+                    format!(" and {more} more")
+                } else {
+                    String::new()
+                };
+                format!(
+                    "Not accepted: your commits change {}{more}, which is protected ({}). Nothing \
+                     was published. Rewrite history so no commit in {base}..HEAD touches it, for \
+                     example `git reset --soft {base}`, then `git restore --source={base} \
+                     --staged --worktree -- {}`, then `git commit`, and report ready again.",
+                    shown.join(", "),
+                    globs.join(", "),
+                    shown.first().copied().unwrap_or("<path>")
+                )
+            }
+            Self::TooLarge { bytes, limit } => format!(
+                "Not accepted: your change is {bytes} bytes, over this repository's limit of \
+                 {limit}. Report ready with a smaller change, or report blocked with a question \
+                 if it cannot be smaller."
+            ),
+            Self::TooManyFiles { files, limit } => format!(
+                "Not accepted: your change touches {files} files, over the limit of {limit}. \
+                 Report ready with a smaller change, or report blocked with a question if it \
+                 cannot be smaller."
+            ),
+            Self::BadBundle(why) => format!(
+                "Not accepted: the host could not take your commits ({why}). The repository may \
+                 be damaged: report failed and say what you saw."
+            ),
+        }
+    }
+}
+
+/// What `execute` is given. Everything the adapter needs is read from the
+/// Store when the Effect runs, so the Effect stays small and a superseded one
+/// is skipped before it gets here.
+#[derive(Clone, Copy, Debug)]
+pub enum Execute<'a> {
+    Publish(Publish<'a>),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Publish<'a> {
+    pub ticket: &'a TicketId,
+    pub repo: &'a RepoName,
+    pub branch: &'a BranchName,
+    pub base: &'a str,
+    pub head: &'a CommitSha,
+    /// The head this host last confirmed on the forge: the lease. `None` for
+    /// the first delivery.
+    pub lease: Option<&'a CommitSha>,
+    /// The Ticket's title.
+    pub title: &'a str,
+    /// The worker's words for `head`, as the Store kept them.
+    pub text: &'a str,
+    /// Who asked, for the pull request's footer.
+    pub requester: &'a Actor,
+    pub source: &'a str,
+    /// The Trigger the Ticket came from: `Closes #n` when it is an issue of
+    /// this repository.
+    pub origin: &'a Trigger,
 }
 
 /// A repository Ticket's directories on the host.
@@ -243,6 +408,10 @@ pub enum Fact {
         method: String,
         url: String,
     },
+    /// What the host observed of the forge: the pull request it read back, or
+    /// a decided no. Not asked: the outside action already happened (or is
+    /// retried), and this records it.
+    Observed(Observed),
     /// The Watchdog retries a stalled Assignment, unless it has moved on
     /// since it had `reports` Reports.
     Retry {
