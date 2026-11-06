@@ -4,10 +4,12 @@
 mod nodes;
 mod sources;
 mod watchdog;
+mod web;
 
 pub use nodes::{AllowedNode, NodesConfig};
 pub use sources::{Interval, ReplyTo, ScheduleConfig, TimeOfDay};
 pub use watchdog::{OperatorConfig, ThresholdsConfig, WatchdogConfig};
+pub use web::{DEFAULT_API_URL, PublishConfig, WebConfig};
 
 use super::goal_template::GoalTemplates;
 use super::jobs::{self, JobLimits};
@@ -68,6 +70,10 @@ pub struct AgentConfig {
     /// github Channel or `forge: github` is.
     #[serde(default)]
     pub github: Option<GithubConfig>,
+    /// The web dashboard's address, and the sidecar that publishes the
+    /// Store's tickets to it. Without it, there is no dashboard.
+    #[serde(default)]
+    pub web: Option<WebConfig>,
 }
 
 fn pass_through() -> bool {
@@ -728,6 +734,9 @@ impl AgentConfig {
         if let Some(github) = &mut config.github {
             github.key_file = base.join(&github.key_file);
         }
+        if let Some(publish) = config.web.as_mut().and_then(|web| web.publish.as_mut()) {
+            publish.token_file = base.join(&publish.token_file);
+        }
         // GitHub logins are case-blind, and the Policy spells them in lower
         // case, as the Source does.
         let policy = &mut config.policy;
@@ -788,6 +797,9 @@ impl AgentConfig {
         );
         self.validate_discord()?;
         self.validate_github()?;
+        if let Some(web) = &self.web {
+            web.validate()?;
+        }
         let mcp_sources = self
             .sources
             .iter()

@@ -18,6 +18,7 @@ pub mod pi_executor;
 pub mod pi_router;
 pub mod ports;
 pub mod pstack;
+pub mod publish;
 pub mod runtime;
 pub mod schedule;
 pub mod scripted;

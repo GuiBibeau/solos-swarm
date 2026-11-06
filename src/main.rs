@@ -234,6 +234,25 @@ enum AgentCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Publish the agent's tickets to its web dashboard: a sidecar that opens
+    /// the Store read-only, builds a JSON snapshot of each open and recently
+    /// ended Ticket, and uploads the ones whose content changed to the
+    /// private Vercel Blob store in `web.publish`. It writes nothing to the
+    /// Store, so it is safe beside `agent serve`. Serves until SIGINT or
+    /// SIGTERM.
+    Publish {
+        /// agent.yaml, whose `web.publish` section names the Blob token file
+        /// (read once and deleted) and how often to look.
+        #[arg(long)]
+        config: PathBuf,
+        /// The agent's state directory.
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// Look once, print what was uploaded as JSON and exit, instead of
+        /// serving. Exits 1 if the API refused a blob.
+        #[arg(long)]
+        once: bool,
+    },
     /// Check and replay what the agent's browsers did: the event chain, each
     /// step's signature under the key trusted for the machine that ran it,
     /// and every page and typed text the steps name. Reads the Store and the
@@ -827,6 +846,14 @@ async fn execute(command: Action) -> Result<()> {
             }
             Ok(())
         }
+        Action::Agent {
+            command:
+                AgentCommand::Publish {
+                    config,
+                    state_dir,
+                    once,
+                },
+        } => solos_swarm::agent::publish::run(&config, &state_dir, once).await,
         Action::Agent {
             command:
                 AgentCommand::Trail {
