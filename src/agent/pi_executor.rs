@@ -9,6 +9,7 @@
 use super::broker::{self, AgentBroker, ModelFailure, WorkerSeat, browser, clip};
 use super::config::HarnessKind;
 use super::environment::{self, Launchable};
+use super::plain_answer::Answer;
 use super::ports::{
     BoxFuture, Delivered, Delivery, Executor, Fact, FactSink, Forge, Launch, TicketDirs, Workspace,
 };
@@ -819,6 +820,8 @@ impl Turns<'_> {
             .context("the assignment did not reach the session")?;
         let mut in_turn = true;
         let mut queued: Vec<Delivered> = Vec::new();
+        // What the worker's last message of this turn said in plain text.
+        let mut said: Option<String> = None;
         loop {
             if !in_turn && !queued.is_empty() {
                 seat.begin_turn();
@@ -843,8 +846,12 @@ impl Turns<'_> {
                     None => return Ok(None),
                 },
                 event = events.recv() => match event {
+                    Some((_, Ok(SessionEvent::Said(text)))) => said = Some(text),
                     Some((_, Ok(SessionEvent::TurnEnded))) => {
                         in_turn = false;
+                        // A worker that handed an Input back is not answering
+                        // the person with what it says after.
+                        let said = said.take().filter(|_| !seat.handed_back());
                         // Before the Notes below: a Ticket that waits for a
                         // person holds automatic Inputs back.
                         let stopped = seat.take_model_failure();
@@ -857,7 +864,7 @@ impl Turns<'_> {
                             self.facts.send(note).await?;
                         }
                         if stopped.is_none() && queued.is_empty() && !woken && seat.quiet_turn() {
-                            self.quiet().await?;
+                            self.quiet(said).await?;
                         }
                     }
                     Some((_, Ok(SessionEvent::Rejected(why)))) => {
@@ -900,19 +907,35 @@ impl Turns<'_> {
     }
 
     /// A turn left the Ticket as if working and nothing waits to be
-    /// prompted, so it counts as `waiting`; or as `progress` while a job
-    /// runs, since the worker is still at work and the job's end wakes it.
-    async fn quiet(&self) -> Result<()> {
+    /// prompted. It counts as `progress` while a job runs, since the worker
+    /// is still at work and the job's end wakes it. Otherwise, if the
+    /// worker's last message was an answer in plain text, the host reports
+    /// it in the worker's place (a worker that did not report cannot be
+    /// asked to, and its answer would reach nobody); with no such text the
+    /// turn counts as `waiting`. The Report is recorded with the Ticket, so
+    /// the person is told once, and a restart does not tell them again:
+    /// `ready` ends the Ticket, and a question leaves it waiting for the
+    /// person.
+    async fn quiet(&self, said: Option<String>) -> Result<()> {
         let spent = self.broker.spent(self.seat).await?;
-        let (status, text) = if self.seat.jobs_running() {
-            (ReportStatus::Progress, JOB_TURN)
-        } else {
-            (ReportStatus::Waiting, QUIET_TURN)
+        let jobs = self.seat.jobs_running();
+        let answer = said.as_deref().and_then(Answer::of).filter(|_| !jobs);
+        let (status, text, question) = match answer {
+            Some(answer) => {
+                eprintln!(
+                    "agent: the worker of {} on {} ended its turn with an answer and no report; \
+                     reporting it as {:?}",
+                    self.launch.assignment, self.launch.ticket, answer.status
+                );
+                (answer.status, answer.text, answer.question)
+            }
+            None if jobs => (ReportStatus::Progress, JOB_TURN.into(), None),
+            None => (ReportStatus::Waiting, QUIET_TURN.into(), None),
         };
         let report = ReportIn {
             status,
-            text: text.into(),
-            question: None,
+            text,
+            question,
             spent_microusd: spent,
         };
         self.facts
@@ -1515,6 +1538,116 @@ mod tests {
             .unwrap();
         w.no_fact().await;
         assert_eq!(w.fake.prompts.lock().unwrap().len(), 2);
+    }
+
+    /// Input that starts the worker's next prompt (the `seq`-th), then what
+    /// the worker said before its turn ended, and the Report the host filed.
+    async fn turn_saying(
+        w: &mut World,
+        seq: u64,
+        said: &[&str],
+    ) -> (ReportStatus, String, Option<String>) {
+        let input = delivered(
+            seq,
+            trigger(&format!("t{seq}"), Actor::bot("ci"), "more"),
+            false,
+        );
+        let delivery = Delivery {
+            ticket: TicketId::new("tk_1"),
+            assignment: AssignmentId::new("as_1"),
+            inputs: vec![input],
+        };
+        w.executor.deliver(delivery, w.facts.clone()).await.unwrap();
+        w.fake.prompted(seq as usize).await;
+        for text in said {
+            let event = Ok(SessionEvent::Said((*text).into()));
+            w.fake.tell("as_1", event).await;
+        }
+        w.fake.tell("as_1", Ok(SessionEvent::TurnEnded)).await;
+        let Fact::Report { report, .. } = w.fact().await else {
+            panic!("no report")
+        };
+        (report.status, report.text, report.question)
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_ends_in_plain_text_reports_it_and_one_that_said_nothing_still_waits() {
+        let mut w = World::new(2, None);
+        w.launch(launch("tk_1", "as_1")).await;
+        assert!(started(&w.fact().await, "as_1"));
+        w.fake.prompted(1).await;
+        let waiting = (ReportStatus::Waiting, QUIET_TURN.to_owned(), None);
+
+        // The last text of the turn is the answer.
+        for text in ["Working on it.", "The test passes now."] {
+            w.fake
+                .tell("as_1", Ok(SessionEvent::Said(text.into())))
+                .await;
+        }
+        w.fake.tell("as_1", Ok(SessionEvent::TurnEnded)).await;
+        let Fact::Report { report, .. } = w.fact().await else {
+            panic!("no report")
+        };
+        assert_eq!(
+            (report.status, report.text.as_str(), report.question),
+            (ReportStatus::Ready, "The test passes now.", None)
+        );
+
+        // It is said once: the next turn, which says nothing, only waits.
+        assert_eq!(turn_saying(&mut w, 2, &[]).await, waiting);
+
+        // A text that asks the person something asks it, and holds the Ticket.
+        let ask = "Which branch should I fix it on?";
+        let blocked = (ReportStatus::Blocked, ask.to_owned(), Some(ask.to_owned()));
+        assert_eq!(turn_saying(&mut w, 3, &["On it.", ask]).await, blocked);
+
+        // No text, only reasoning, and a tool call written out say nothing.
+        let call = r#"{"name":"worker_report","arguments":{"status":"ready","text":"Done"}}"#;
+        for (seq, said) in [(4, "  \n"), (5, "<think>done</think>"), (6, call)] {
+            assert_eq!(turn_saying(&mut w, seq, &[said]).await, waiting, "{said}");
+        }
+        w.no_fact().await;
+    }
+
+    #[tokio::test]
+    async fn an_answer_waits_for_nobody_new_input_takes_the_turn_and_it_is_not_said_after() {
+        let mut w = World::new(2, None);
+        let mut first = launch("tk_1", "as_1");
+        first.inputs = vec![delivered(
+            1,
+            trigger("t1", Actor::person("alice"), "fix"),
+            true,
+        )];
+        w.launch(first).await;
+        assert!(started(&w.fact().await, "as_1"));
+        w.fake.prompted(1).await;
+
+        // Input arrives during the turn, which then ends in text: the next
+        // prompt brings the worker back to it, so nothing is reported yet.
+        let more = delivered(2, trigger("t2", Actor::person("alice"), "and this"), true);
+        let delivery = Delivery {
+            ticket: TicketId::new("tk_1"),
+            assignment: AssignmentId::new("as_1"),
+            inputs: vec![more],
+        };
+        w.executor.deliver(delivery, w.facts.clone()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        w.fake
+            .tell("as_1", Ok(SessionEvent::Said("Fixed.".into())))
+            .await;
+        w.fake.tell("as_1", Ok(SessionEvent::TurnEnded)).await;
+        w.fake.prompted(2).await;
+        w.no_fact().await;
+
+        // That text does not come back for the turn after it.
+        w.fake.tell("as_1", Ok(SessionEvent::TurnEnded)).await;
+        let Fact::Report { report, .. } = w.fact().await else {
+            panic!("no report")
+        };
+        assert_eq!(
+            (report.status, report.text.as_str()),
+            (ReportStatus::Waiting, QUIET_TURN)
+        );
     }
 
     #[tokio::test]

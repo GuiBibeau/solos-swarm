@@ -681,6 +681,270 @@ async fn a_turn_that_ends_on_a_failed_model_call_tells_the_person_once_and_a_rep
     assert_settled(&scratch.store());
 }
 
+/// Sessions that run the tool calls their model asks for, then end every
+/// turn with `text` as their last message and no tool call, as Pi does when
+/// its model answers in plain text.
+fn saying(text: &str) -> ScriptedHarness {
+    ScriptedHarness::new(BTreeMap::new())
+        .every_turn(vec![Call::Replied, Call::Say(text.to_owned())])
+}
+
+/// `(state, ended reason)` of each Assignment of the Ticket.
+fn assignment_states(ticket: &Ticket) -> Vec<(AssignmentState, Option<String>)> {
+    let states = ticket.assignments.iter();
+    states.map(|a| (a.state, a.ended_reason.clone())).collect()
+}
+
+#[tokio::test]
+async fn a_turn_that_ends_in_a_plain_text_answer_tells_the_person_once_and_a_restart_repeats_nothing()
+ {
+    let scratch = Scratch::new("text-answer");
+    scratch.ask("t-ask", "T1", "How many lines do the release notes have?");
+    let model = Model::new(Box::new(|_| Vec::new()));
+    let answer = "The release notes have 3 lines.";
+    let serve = || async {
+        let host = scratch.host(saying(answer), model.clone());
+        scratch.serve(scratch.config(false, ""), host).await;
+    };
+
+    serve().await;
+
+    assert_eq!(scratch.replies(), ack_and_result("T1"));
+    assert_eq!(scratch.sent()[1].text, answer);
+    let tickets = scratch.tickets();
+    let [ticket] = &tickets[..] else {
+        panic!("{tickets:?}")
+    };
+    let report = ticket.latest_report().unwrap();
+    assert_eq!(
+        (report.status, report.text.as_str()),
+        (ReportStatus::Ready, answer)
+    );
+    assert_eq!(
+        ticket.ended.as_ref().map(|e| e.outcome),
+        Some(TicketOutcome::Completed)
+    );
+    assert_eq!(
+        assignment_states(ticket),
+        [(AssignmentState::Ended, Some("ready".to_owned()))]
+    );
+    assert_eq!(model.worker_prompts().len(), 1);
+    assert_settled(&scratch.store());
+
+    serve().await;
+
+    assert_eq!(scratch.sent().len(), 2, "a restart tells nothing again");
+    let tickets = scratch.tickets();
+    assert_eq!(
+        assignment_states(&tickets[0]),
+        [(AssignmentState::Ended, Some("ready".to_owned()))],
+        "the ticket ended, so no worker starts again"
+    );
+    assert_eq!(model.worker_prompts().len(), 1);
+    assert_settled(&scratch.store());
+}
+
+#[tokio::test]
+async fn a_plain_text_question_asks_the_person_and_the_ticket_waits_for_their_reply() {
+    let scratch = Scratch::new("text-question");
+    scratch.ask("t-ask", "T1", "Fix the flaky retry test");
+    let model = Model::new(Box::new(|prompt| {
+        if prompt.contains("\n- trigger t-reply") {
+            vec![report("ready", "Fixed on staging.")]
+        } else {
+            Vec::new()
+        }
+    }));
+    let question = "Which environment should I fix it on?";
+    let serve = |said: &'static str| {
+        let model = model.clone();
+        let scratch = &scratch;
+        async move {
+            let host = scratch.host(saying(said), model);
+            scratch.serve(scratch.config(false, ""), host).await;
+        }
+    };
+
+    serve(question).await;
+
+    assert_eq!(
+        scratch.replies(),
+        [
+            ("T1".to_owned(), MessageKind::Acknowledgement),
+            ("T1".to_owned(), MessageKind::Attention)
+        ]
+    );
+    assert_eq!(scratch.sent()[1].text, question);
+    let tickets = scratch.tickets();
+    let ticket = &tickets[0];
+    let report = ticket.latest_report().unwrap();
+    assert_eq!(report.status, ReportStatus::Blocked);
+    assert_eq!(report.question.as_deref(), Some(question));
+    assert_eq!(ticket.stage(), Stage::Answer);
+    assert!(ticket.ended.is_none(), "a person may still answer");
+
+    serve(question).await;
+
+    assert_eq!(scratch.sent().len(), 2, "a restart asks nothing again");
+    let tickets = scratch.tickets();
+    assert_eq!(
+        assignment_states(&tickets[0]),
+        [(AssignmentState::Ended, Some(HOST_RESTARTED.to_owned()))],
+        "the ticket waits for a person, so no worker starts and spends"
+    );
+    assert_eq!(model.worker_prompts().len(), 1);
+
+    scratch.ask("t-reply", "T1", "On staging");
+    serve("Anything else?").await;
+
+    assert_eq!(
+        scratch.replies(),
+        [
+            ("T1".to_owned(), MessageKind::Acknowledgement),
+            ("T1".to_owned(), MessageKind::Attention),
+            ("T1".to_owned(), MessageKind::Result)
+        ],
+        "the reply goes on, and the closing text after the report says nothing"
+    );
+    assert_eq!(scratch.sent()[2].text, "Fixed on staging.");
+    assert_settled(&scratch.store());
+}
+
+#[tokio::test]
+async fn a_turn_that_ends_with_a_report_is_unchanged_whatever_it_says_after() {
+    for (status, text) in [
+        ("ready", "Fixed it."),
+        ("blocked", "I cannot reach the CI."),
+        ("waiting", "Fixed locally; waiting for CI."),
+    ] {
+        let scratch = Scratch::new("text-after-report");
+        scratch.ask("t-ask", "T1", "Fix the flaky retry test");
+        let model = Model::new(Box::new(move |_| vec![report(status, text)]));
+        let host = scratch.host(saying("All done, I reported it above."), model.clone());
+
+        scratch.serve(scratch.config(false, ""), host).await;
+
+        let told: Vec<(MessageKind, String)> = scratch
+            .sent()
+            .into_iter()
+            .skip(1)
+            .map(|m| (m.kind, m.text))
+            .collect();
+        let expected = match status {
+            "ready" => vec![(MessageKind::Result, text.to_owned())],
+            "blocked" => vec![(MessageKind::Attention, text.to_owned())],
+            _ => Vec::new(),
+        };
+        assert_eq!(told, expected, "{status}");
+        let tickets = scratch.tickets();
+        let ticket = &tickets[0];
+        let reports: Vec<_> = ticket.assignments[0]
+            .reports
+            .iter()
+            .map(|r| (r.status, r.text.as_str()))
+            .collect();
+        assert_eq!(
+            reports.len(),
+            1,
+            "{status}: the turn's one report is the worker's own: {reports:?}"
+        );
+        assert_eq!(reports[0].1, text);
+        assert_settled(&scratch.store());
+    }
+}
+
+#[tokio::test]
+async fn a_turn_that_ends_with_no_text_or_none_for_a_person_stays_waiting() {
+    let call = r#"{"name":"worker_report","arguments":{"status":"ready","text":"Done"}}"#;
+    for said in ["", "  \n\t", "<think>I am done</think>", call] {
+        let scratch = Scratch::new("text-nothing");
+        scratch.ask("t-ask", "T1", "Fix the flaky retry test");
+        let model = Model::new(Box::new(|_| Vec::new()));
+        let host = scratch.host(saying(said), model.clone());
+
+        scratch.serve(scratch.config(false, ""), host).await;
+
+        assert_eq!(
+            scratch.replies(),
+            [("T1".to_owned(), MessageKind::Acknowledgement)],
+            "{said:?} is not told"
+        );
+        let tickets = scratch.tickets();
+        let ticket = &tickets[0];
+        let report = ticket.latest_report().unwrap();
+        assert_eq!(
+            (report.status, report.text.as_str()),
+            (ReportStatus::Waiting, "The turn ended without a report.")
+        );
+        assert_eq!(ticket.stage(), Stage::Idle);
+        assert!(ticket.ended.is_none());
+        assert_settled(&scratch.store());
+    }
+}
+
+#[tokio::test]
+async fn a_plain_text_answer_is_cut_to_the_length_of_a_workers_own_report() {
+    let scratch = Scratch::new("text-long");
+    scratch.ask("t-ask", "T1", "Explain the incident");
+    let model = Model::new(Box::new(|_| Vec::new()));
+    let host = scratch.host(saying(&"x".repeat(20_000)), model);
+
+    scratch.serve(scratch.config(false, ""), host).await;
+
+    assert_eq!(scratch.replies(), ack_and_result("T1"));
+    let told = &scratch.sent()[1].text;
+    assert_eq!(told.chars().count(), 8_000 + "...".len());
+    assert!(told.ends_with("..."));
+}
+
+#[tokio::test]
+async fn text_after_a_handback_is_not_an_answer_to_the_person() {
+    let scratch = Scratch::new("text-handback");
+    scratch.ask("t-ask", "T1", "Fix the flaky retry test");
+    let model = Model::new(Box::new(|prompt| {
+        if prompt.contains("\n- trigger t-more") {
+            vec![(
+                "worker_handback",
+                json!({"trigger":"t-more","reason":"key rotation is separate work"}),
+            )]
+        } else if prompt.contains("Scope:\nAlso rotate") {
+            vec![report("ready", "Rotated the staging keys.")]
+        } else {
+            vec![report("waiting", "Fixed locally; waiting for CI.")]
+        }
+    }));
+    let serve = || async {
+        let host = scratch.host(saying("I handed that back."), model.clone());
+        scratch.serve(scratch.config(false, ""), host).await;
+    };
+    serve().await;
+    scratch.ask("t-more", "T1", "Also rotate the staging keys");
+
+    serve().await;
+
+    let tickets = scratch.tickets();
+    let [first, second] = &tickets[..] else {
+        panic!("{tickets:?}")
+    };
+    assert!(first.handed_back.contains(&TriggerId::new("t-more")));
+    assert!(first.ended.is_none(), "the handback text did not end it");
+    assert_eq!(
+        second.ended.as_ref().map(|e| e.outcome),
+        Some(TicketOutcome::Completed)
+    );
+    assert_eq!(
+        scratch.replies(),
+        [
+            ("T1".to_owned(), MessageKind::Acknowledgement),
+            ("T1".to_owned(), MessageKind::Acknowledgement),
+            ("T1".to_owned(), MessageKind::Result)
+        ],
+        "only the new ticket answers, and nobody hears 'I handed that back'"
+    );
+    assert_eq!(scratch.sent()[2].text, "Rotated the staging keys.");
+    assert_settled(&scratch.store());
+}
+
 #[tokio::test]
 async fn a_follow_up_the_worker_hands_back_reaches_a_fresh_eval() {
     let scratch = Scratch::new("handback");

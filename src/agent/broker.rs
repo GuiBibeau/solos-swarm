@@ -61,7 +61,8 @@ const READ_TEXT_CHARS: usize = 2_000;
 const READ_REPORT_CHARS: usize = 1_000;
 const READ_REASON_CHARS: usize = 300;
 const READ_RECENT: usize = 20;
-const REPORT_TEXT_CHARS: usize = 8_000;
+/// The most a Report's text keeps, which the host's own Reports keep too.
+pub(crate) const REPORT_TEXT_CHARS: usize = 8_000;
 const QUESTION_CHARS: usize = 1_000;
 const FAILURE_CHARS: usize = 400;
 
@@ -115,6 +116,8 @@ pub struct WorkerSeat {
     turn: Mutex<Option<ReportStatus>>,
     /// Why the turn's latest model call failed, if it did.
     model_failure: Mutex<Option<ModelFailure>>,
+    /// The worker handed an Input back in the current turn.
+    handed_back: AtomicBool,
     /// The turn's latest tool calls, so a loop is refused.
     repeats: Mutex<RepeatGuard>,
     fetched_bytes: AtomicU64,
@@ -142,6 +145,7 @@ impl WorkerSeat {
             since_ms: now_ms(),
             turn: Mutex::new(None),
             model_failure: Mutex::new(None),
+            handed_back: AtomicBool::new(false),
             repeats: Mutex::new(RepeatGuard::default()),
             fetched_bytes: AtomicU64::new(0),
             jobs: Arc::default(),
@@ -183,6 +187,7 @@ impl WorkerSeat {
         if let Ok(mut failure) = self.model_failure.lock() {
             *failure = None;
         }
+        self.handed_back.store(false, Ordering::SeqCst);
         if let Ok(mut repeats) = self.repeats.lock() {
             repeats.begin_turn();
         }
@@ -233,6 +238,12 @@ impl WorkerSeat {
     pub fn take_model_failure(&self) -> Option<ModelFailure> {
         let failure = self.model_failure.lock().ok()?.take();
         failure.filter(|_| self.quiet_turn())
+    }
+
+    /// The worker handed an Input back in the current turn, so what it says
+    /// after that is not an answer to the person.
+    pub fn handed_back(&self) -> bool {
+        self.handed_back.load(Ordering::SeqCst)
     }
 
     fn reported(&self, status: ReportStatus) {
@@ -1518,7 +1529,11 @@ async fn handback(broker: &AgentBroker, seat: &Arc<WorkerSeat>, args: Value) -> 
         trigger,
         reason,
     };
-    match broker.inner.facts.ask(fact).await.map_err(failed)? {
+    let handed = broker.inner.facts.ask(fact).await.map_err(failed)?;
+    if handed.is_ok() {
+        seat.handed_back.store(true, Ordering::SeqCst);
+    }
+    match handed {
         Ok(Applied::HandedBack { queued }) => Ok(Json(json!({
             "handed_back": true,
             "queued": queued,
@@ -2306,6 +2321,17 @@ mod tests {
 
     fn refused(why: &str) -> Reply {
         Err(refuse(StatusCode::FORBIDDEN, why))
+    }
+
+    #[test]
+    fn a_handback_belongs_to_the_turn_it_was_made_in() {
+        let seat = seat();
+        assert!(!seat.handed_back());
+        seat.handed_back
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(seat.handed_back());
+        seat.begin_turn();
+        assert!(!seat.handed_back(), "a new turn starts clean");
     }
 
     #[test]

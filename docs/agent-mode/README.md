@@ -298,8 +298,9 @@ provider through the real broker. It runs on macOS too. Swarm mode is the first 
     sandbox command) and `fetch_url` (`broker::fetch`, swarm mode's limits). `SWARM_TOOLSET=worker` selects them.
   - It is prompted with its Assignment (title, scope, matched rules, every Input so far, how to report, and with
     `recovery` a note to check `/work` before repeating outside actions), then with each later batch of Inputs
-    between turns. A turn that ends with no Report, or with `progress` only, counts as `waiting`. A session that
-    dies reports `failed` and ends its Assignment, so the next reply starts a new one.
+    between turns. A turn that ends with no Report, or with `progress` only, counts as `waiting`, unless its last
+    message was an answer in plain text (below). A session that dies reports `failed` and ends its Assignment, so
+    the next reply starts a new one.
   - A turn that ends because its last model call failed, with no Report and no `progress` beyond that, is not
     `waiting`: the broker keeps why the call failed on the worker's seat (`ModelFailure`), and the host reports in the
     worker's place. A budget with no room for another call reports `blocked`, any other failure (the provider, its
@@ -309,6 +310,22 @@ provider through the real broker. It runs on macOS too. Swarm mode is the first 
     recorded with the Ticket, which now waits for a person, so a restart ends the Assignment and starts nothing. A
     reply on the thread goes to the live session on a failure and starts a new Assignment after a restart; a budget
     is fixed at accept time, so the budget text asks for a new request that names a bigger one.
+  - A turn that ends with no Report (or `progress` only) and no failed model call, but whose last message was the
+    worker's answer written as plain text, is not `waiting` either: the person would hear nothing. The harness
+    reports the text of Pi's last message when it stopped by itself with no tool call (`SessionEvent::Said`, from the
+    `message_end` frame; its text blocks only, never its reasoning, and not a failed, aborted or cut-off reply), and
+    at the turn's end the host files the Report in the worker's place (`src/agent/plain_answer.rs`). A text that
+    asks the person something (up to 500 characters, ending in `?`) is `blocked` with that question, so the Ticket
+    waits for the person and their reply goes to the live session; any other text is `ready`, cut to the 8,000
+    characters a `worker_report` keeps, and the Channels cut it further as they do any result. The Report is
+    recorded with the Ticket like the failed-call one, so the person hears it once, a restart tells nothing again,
+    and a reply on the thread goes on as it does after any Report. Nothing is sent when the turn reported anything
+    but `progress` (the report is the answer), a job still runs (`progress`, as before), input waits for the next
+    prompt, the worker handed an Input back that turn, the text is empty, or it is only reasoning or a tool call
+    the model wrote out as text (`{"name": ..., "arguments": ...}`, `<tool_call>`): those stay `waiting`. The host
+    does not nudge the worker to report: that would spend another model call on a budget that may be gone, add a
+    second prompt path to the turn, and still need this fallback when the nudge ends in text too. Claude Code
+    sessions do not say their last text yet, so they keep the old behavior.
   - The broker stops a worker that loops (`src/agent/broker/repeat.rs`). A circle is one call, or up to three calls
     in turn, repeated three times with byte-identical arguments (`A A A`, `A B A B A B`); the call that closes the
     third round is refused with a reason (HTTP 429, read by the model as the tool's error) that asks it to change its

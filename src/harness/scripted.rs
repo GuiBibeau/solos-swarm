@@ -25,6 +25,10 @@ pub enum Call {
     /// reports `OutputCut`; the model is asked again with the same prompt,
     /// as Pi's agent loop does.
     Replied,
+    /// End the turn with this text as the session's last message, with no
+    /// tool call, as Pi does when its model answers in plain text. The host
+    /// reads it as `SessionEvent::Said`.
+    Say(String),
 }
 
 /// `script[k]` is what a session calls on its `k`-th prompt. A prompt past the
@@ -204,6 +208,10 @@ impl Agent {
                         let body: Value = serde_json::from_str(arguments)?;
                         self.post(&format!("tool/{name}"), body).await?;
                     }
+                }
+                Call::Say(text) => {
+                    let said = (self.id.clone(), Ok(SessionEvent::Said(text.clone())));
+                    events.send(said).await.ok();
                 }
                 Call::ClaimTask => {
                     let task = self.post("tool/claim_task", json!({})).await?;
