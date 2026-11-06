@@ -800,8 +800,8 @@ impl AgentConfig {
         self.validate_discord()?;
         self.validate_github()?;
         if let Some(web) = &self.web {
-            web.validate()?;
             TicketLinks::new(&web.public_url)?;
+            web.validate()?;
         }
         let mcp_sources = self
             .sources
