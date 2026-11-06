@@ -4,6 +4,7 @@
 //! carry Slack's channel id and message timestamps.
 
 mod channel;
+mod mrkdwn;
 mod source;
 
 pub use channel::SlackChannel;

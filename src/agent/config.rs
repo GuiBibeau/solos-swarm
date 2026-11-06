@@ -13,6 +13,7 @@ pub use web::{DEFAULT_API_URL, PublishConfig, WebConfig};
 
 use super::goal_template::GoalTemplates;
 use super::jobs::{self, JobLimits};
+use super::links::TicketLinks;
 use super::simulated::TimeFactor;
 use super::trail::TrailStoreConfig;
 use super::{discord, github, mcp, pstack, slack};
@@ -71,7 +72,8 @@ pub struct AgentConfig {
     #[serde(default)]
     pub github: Option<GithubConfig>,
     /// The web dashboard's address, and the sidecar that publishes the
-    /// Store's tickets to it. Without it, there is no dashboard.
+    /// Store's tickets to it. Without it, there is no dashboard and replies
+    /// link nowhere.
     #[serde(default)]
     pub web: Option<WebConfig>,
 }
@@ -799,6 +801,7 @@ impl AgentConfig {
         self.validate_github()?;
         if let Some(web) = &self.web {
             web.validate()?;
+            TicketLinks::new(&web.public_url)?;
         }
         let mcp_sources = self
             .sources
@@ -1252,6 +1255,44 @@ budgets: {session_microusd: 500000}
                 path: dir.join("out/outbox.jsonl")
             }]
         );
+    }
+
+    #[test]
+    fn the_web_section_takes_an_https_public_url_and_defaults_the_rest() {
+        assert!(parse(VALID).unwrap().web.is_none());
+        let with = |section: &str| parse(&format!("{VALID}{section}\n"));
+        let config = with("web: {public_url: 'https://agent.example.com'}").unwrap();
+        let web = config.web.unwrap();
+        assert_eq!(web.public_url, "https://agent.example.com");
+        assert_eq!(web.publish, None);
+        let full = with("web:\n  public_url: https://example.com/agent")
+            .unwrap()
+            .web
+            .unwrap();
+        assert_eq!(full.public_url, "https://example.com/agent");
+
+        for (bad, why) in [
+            ("web: {public_url: 'http://agent.example.com'}", "https"),
+            (
+                "web: {public_url: 'https://agent.example.com/'}",
+                "end with a slash",
+            ),
+            ("web: {public_url: 'agent.example.com'}", "not a URL"),
+            (
+                "web: {public_url: 'https://agent.example.com?x=1'}",
+                "query",
+            ),
+            ("web: {public_url: 'https://a.example/x)(y'}", "()"),
+            ("web: {public_url: ''}", "1 to"),
+            ("web: {}", "public_url"),
+            ("web: {public_url: 'https://a.example', port: 1}", "port"),
+        ] {
+            let err = with(bad).unwrap_err();
+            assert!(
+                format!("{err:#}").contains(why),
+                "{bad}: expected {why:?} in {err:#}"
+            );
+        }
     }
 
     #[test]

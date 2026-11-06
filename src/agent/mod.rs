@@ -13,6 +13,8 @@ pub mod github;
 pub mod goal_template;
 pub mod jobs;
 pub mod jsonl;
+pub mod links;
+mod markdown;
 pub mod mcp;
 pub mod pi_executor;
 pub mod pi_router;
@@ -55,6 +57,8 @@ use discord::{DiscordApi, DiscordChannel, DiscordSource};
 use github::{GithubApp, GithubChannel, GithubSource};
 use goal_template::GoalTemplates;
 use jsonl::{JsonlChannel, JsonlSource};
+use links::TicketLinks;
+use mcp::McpChannel;
 use pi_executor::{PiExecutor, PiExecutorParts};
 use pi_router::PiRouter;
 use ports::{Channel, Executor, Router, Source};
@@ -824,28 +828,43 @@ impl Io {
             }
         }
         let mut channels: BTreeMap<String, Arc<dyn Channel>> = BTreeMap::new();
+        // Replies link to the Ticket's page on the dashboard, when there is one.
+        let links = match &config.web {
+            Some(web) => TicketLinks::new(&web.public_url)?,
+            None => TicketLinks::none(),
+        };
         for channel in &config.channels {
             let adapter: Arc<dyn Channel> = match channel {
                 ChannelConfig::Jsonl { path, .. } => Arc::new(JsonlChannel::open(path)?),
-                ChannelConfig::Slack {} => Arc::new(SlackChannel::new(
-                    slack_api
-                        .clone()
-                        .context("the slack channel needs a slack source")?,
-                )),
-                ChannelConfig::Discord {} => Arc::new(DiscordChannel::new(
-                    discord_api
-                        .clone()
-                        .context("the discord channel needs a discord source")?,
-                )),
-                ChannelConfig::Github {} => Arc::new(GithubChannel::new(
-                    github
-                        .as_ref()
-                        .map(|app| app.api.clone())
-                        .context("the github channel needs the github: section")?,
-                )),
+                ChannelConfig::Slack {} => Arc::new(
+                    SlackChannel::new(
+                        slack_api
+                            .clone()
+                            .context("the slack channel needs a slack source")?,
+                    )
+                    .with_links(links.clone()),
+                ),
+                ChannelConfig::Discord {} => Arc::new(
+                    DiscordChannel::new(
+                        discord_api
+                            .clone()
+                            .context("the discord channel needs a discord source")?,
+                    )
+                    .with_links(links.clone()),
+                ),
+                ChannelConfig::Github {} => Arc::new(
+                    GithubChannel::new(
+                        github
+                            .as_ref()
+                            .map(|app| app.api.clone())
+                            .context("the github channel needs the github: section")?,
+                    )
+                    .with_links(links.clone()),
+                ),
                 ChannelConfig::Mcp {} => {
                     mcp::open_dir(state_dir)?;
-                    Arc::new(JsonlChannel::open(mcp::outbox(state_dir))?)
+                    let outbox = JsonlChannel::open(mcp::outbox(state_dir))?;
+                    Arc::new(McpChannel::new(outbox, links.clone()))
                 }
             };
             channels.insert(channel.source().to_owned(), adapter);
