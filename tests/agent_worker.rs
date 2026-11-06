@@ -59,6 +59,9 @@ struct Model {
     delay: Duration,
     /// Every worker call fails, as the provider's would while it is down.
     failing: AtomicBool,
+    /// `worker` answers after a tool result too, as a model does in Pi's
+    /// agent loop, instead of ending the turn.
+    looping: bool,
 }
 
 impl Model {
@@ -69,7 +72,41 @@ impl Model {
             hang: None,
             delay: Duration::ZERO,
             failing: AtomicBool::new(false),
+            looping: false,
         })
+    }
+    /// A model for `Call::Agent` sessions: `worker` is asked again after
+    /// every tool result, with the result's text.
+    fn looping(worker: Worker) -> Arc<Self> {
+        Arc::new(Self {
+            looping: true,
+            ..Arc::into_inner(Self::new(worker)).expect("a new model has one owner")
+        })
+    }
+    /// The calls the workers made to the model, not the Router's.
+    fn worker_calls(&self) -> usize {
+        let bodies = self.bodies.lock().unwrap();
+        let first = |body: &Value| text(&body["messages"][0]);
+        bodies
+            .iter()
+            .filter(|body| !first(body).contains(" new candidate"))
+            .count()
+    }
+    /// What the tools answered the worker in the latest of its model calls,
+    /// oldest first.
+    fn tool_results(&self) -> Vec<String> {
+        let bodies = self.bodies.lock().unwrap();
+        let latest = bodies.iter().rev().find(|body| {
+            body["messages"]
+                .as_array()
+                .is_some_and(|m| m.iter().any(|m| m["role"] == "tool"))
+        });
+        let messages = latest.and_then(|body| body["messages"].as_array());
+        let tools = messages
+            .into_iter()
+            .flatten()
+            .filter(|m| m["role"] == "tool");
+        tools.map(text).collect()
     }
     fn fail_workers(&self, failing: bool) {
         self.failing.store(failing, Ordering::SeqCst);
@@ -138,7 +175,8 @@ impl Provider for Model {
         let last = messages.last().cloned().unwrap_or(Value::Null);
         let prompt = text(&last);
         let router = prompt.contains(" new candidate");
-        let calls: Vec<Value> = if last["role"] != "user" {
+        let asks = last["role"] == "user" || (self.looping && !router);
+        let calls: Vec<Value> = if !asks {
             Vec::new()
         } else if router {
             cards(&prompt)
@@ -681,6 +719,259 @@ async fn a_turn_that_ends_on_a_failed_model_call_tells_the_person_once_and_a_rep
     assert_settled(&scratch.store());
 }
 
+/// Sessions that play Pi's whole agent loop: the model is asked again after
+/// every tool result, until it asks for no tool, and a refused model call
+/// ends the turn.
+fn agent_loop() -> ScriptedHarness {
+    ScriptedHarness::new(BTreeMap::new())
+        .every_turn(vec![Call::Agent])
+        .ending_the_turn_on_a_model_error()
+}
+
+/// A page on a loopback port that counts its hits, and its address.
+async fn counting_page() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counted = hits.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let app = axum::Router::new().fallback(move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+        async { "page" }
+    });
+    let web = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (url, hits, web)
+}
+
+const STUCK: &str = "I got stuck repeating the same step and stopped. Reply here to have me try \
+                     again with a different approach.";
+
+/// What a Ticket whose worker looped and was stopped shows: the person was
+/// told once, in plain words, and the Ticket waits for them.
+fn assert_told_once_that_it_got_stuck(scratch: &Scratch) {
+    assert_eq!(
+        scratch.replies(),
+        [
+            ("T1".to_owned(), MessageKind::Acknowledgement),
+            ("T1".to_owned(), MessageKind::Attention)
+        ],
+        "an acknowledgement, then exactly one reply that says why nothing came"
+    );
+    assert_eq!(scratch.sent()[1].text, STUCK);
+    let tickets = scratch.tickets();
+    let [ticket] = &tickets[..] else {
+        panic!("{tickets:?}")
+    };
+    let report = ticket.latest_report().unwrap();
+    assert_eq!(
+        (report.status, report.text.as_str()),
+        (ReportStatus::Failed, STUCK)
+    );
+    assert_eq!(ticket.stage(), Stage::Failed);
+    assert!(ticket.ended.is_none(), "a person may still answer");
+    assert_eq!(
+        ticket.assignments[0].reports.len(),
+        1,
+        "the host filed one report and the worker none"
+    );
+    let account = format!("ticket:{}", ticket.id);
+    assert_eq!(
+        report.spent_microusd,
+        scratch.store().committed(&account, 0).unwrap(),
+        "the report's spend is the ledger's"
+    );
+}
+
+#[tokio::test]
+async fn a_worker_that_repeats_one_call_forever_is_stopped_with_one_report_and_a_restart_repeats_nothing()
+ {
+    let scratch = Scratch::new("loop-one");
+    scratch.ask("t-ask", "T1", "Find where the bps range is checked");
+    let (url, hits, web) = counting_page().await;
+    let seen = AtomicUsize::new(0);
+    // The same call every time, until a person's reply gives it a new turn.
+    let model = Model::looping(Box::new(move |_| {
+        match seen.fetch_add(1, Ordering::SeqCst) {
+            0..=4 => vec![("fetch_url", json!({"url": format!("{url}status")}))],
+            5 => vec![report("ready", "Fixed it.")],
+            _ => Vec::new(),
+        }
+    }));
+    let serve = || async {
+        let host = scratch.host(agent_loop(), model.clone());
+        scratch.serve(scratch.config(false, ""), host).await;
+    };
+
+    serve().await;
+
+    assert_told_once_that_it_got_stuck(&scratch);
+    assert_eq!(
+        model.worker_calls(),
+        5,
+        "two calls that ran, three that were refused, and no model call after the third"
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "a refused call is never run"
+    );
+    let results = model.tool_results();
+    assert_eq!(results.len(), 4, "{results:?}");
+    assert!(
+        results[2].contains("this exact call 3 times in a row")
+            && results[2].contains("What it answered before: {"),
+        "{}",
+        results[2]
+    );
+    assert!(results[3].contains("4 times in a row"), "{}", results[3]);
+    let tickets = scratch.tickets();
+    let account = format!("ticket:{}", tickets[0].id);
+    let rows = scratch.store().spend(&account).unwrap();
+    assert_eq!(rows.len(), 5, "one row for each model call that was made");
+    assert!(rows.iter().all(|r| r.state == SpendState::Settled));
+    assert_settled(&scratch.store());
+
+    serve().await;
+
+    assert_eq!(scratch.sent().len(), 2, "a restart tells nothing again");
+    let tickets = scratch.tickets();
+    assert_eq!(
+        assignment_states(&tickets[0]),
+        [(AssignmentState::Ended, Some(HOST_RESTARTED.to_owned()))],
+        "the ticket waits for a person, so no new worker starts and spends"
+    );
+    assert_eq!(model.worker_calls(), 5);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+    scratch.ask("t-again", "T1", "Try again with another approach");
+    serve().await;
+
+    assert_eq!(
+        scratch.replies(),
+        [
+            ("T1".to_owned(), MessageKind::Acknowledgement),
+            ("T1".to_owned(), MessageKind::Attention),
+            ("T1".to_owned(), MessageKind::Result)
+        ],
+        "a reply goes on with a worker that has a new turn"
+    );
+    assert_eq!(scratch.sent()[2].text, "Fixed it.");
+    assert_settled(&scratch.store());
+    web.abort();
+}
+
+#[tokio::test]
+async fn two_calls_that_go_round_forever_are_stopped_after_a_bounded_number_of_model_calls() {
+    let scratch = Scratch::new("loop-two");
+    scratch.ask("t-ask", "T1", "Find where the bps range is checked");
+    let (url, hits, web) = counting_page().await;
+    let seen = AtomicUsize::new(0);
+    let model = Model::looping(Box::new(move |_| {
+        let page = if seen.fetch_add(1, Ordering::SeqCst).is_multiple_of(2) {
+            "a"
+        } else {
+            "b"
+        };
+        vec![("fetch_url", json!({"url": format!("{url}{page}")}))]
+    }));
+    let serve = || async {
+        let host = scratch.host(agent_loop(), model.clone());
+        scratch.serve(scratch.config(false, ""), host).await;
+    };
+
+    serve().await;
+
+    assert_told_once_that_it_got_stuck(&scratch);
+    assert_eq!(
+        model.worker_calls(),
+        8,
+        "five calls that ran, the sixth closes the circle and the next two are refused too"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 5);
+    let results = model.tool_results();
+    assert!(
+        results[5].contains("these 2 calls in turn, 3 times over"),
+        "{}",
+        results[5]
+    );
+    assert_settled(&scratch.store());
+
+    serve().await;
+
+    assert_eq!(scratch.sent().len(), 2, "a restart tells nothing again");
+    assert_eq!(model.worker_calls(), 8);
+    web.abort();
+}
+
+#[tokio::test]
+async fn a_worker_that_repeats_a_report_many_times_is_not_stopped() {
+    let scratch = Scratch::new("loop-report");
+    scratch.ask("t-ask", "T1", "Go through the logs");
+    let seen = AtomicUsize::new(0);
+    // More repeats than the turn's ceiling of refused calls: a report is a
+    // call that is always allowed, and none of them is a refusal.
+    let model = Model::looping(Box::new(move |_| {
+        match seen.fetch_add(1, Ordering::SeqCst) {
+            0..=14 => vec![report("progress", "Still going through the logs.")],
+            15 => vec![report("ready", "Nothing odd in the logs.")],
+            _ => Vec::new(),
+        }
+    }));
+
+    scratch
+        .serve(
+            scratch.config(false, ""),
+            scratch.host(agent_loop(), model.clone()),
+        )
+        .await;
+
+    assert_eq!(scratch.replies(), ack_and_result("T1"));
+    assert_eq!(scratch.sent()[1].text, "Nothing odd in the logs.");
+    let tickets = scratch.tickets();
+    assert_eq!(
+        tickets[0].ended.as_ref().map(|e| e.outcome),
+        Some(TicketOutcome::Completed)
+    );
+    assert!(model.worker_calls() >= 16, "{}", model.worker_calls());
+    assert_settled(&scratch.store());
+}
+
+#[tokio::test]
+async fn a_refusal_of_a_looped_run_code_quotes_its_exit_code_and_output() {
+    if !sandbox() {
+        return;
+    }
+    let scratch = Scratch::new("loop-run-code");
+    scratch.ask("t-ask", "T1", "Find where the bps range is checked");
+    let model = Model::looping(Box::new(|_| {
+        vec![(
+            "run_code",
+            json!({"code": "echo found it; echo and more; echo oops >&2"}),
+        )]
+    }));
+
+    scratch
+        .serve(
+            scratch.config(false, "  run_code: {}\n"),
+            scratch.host(agent_loop(), model.clone()),
+        )
+        .await;
+
+    assert_told_once_that_it_got_stuck(&scratch);
+    assert_eq!(model.worker_calls(), 5);
+    let results = model.tool_results();
+    assert!(
+        results[2].contains(
+            "What it answered before: exit code 0; stdout: found it | and more; stderr: oops. \
+             You already have that answer."
+        ),
+        "{}",
+        results[2]
+    );
+    assert_settled(&scratch.store());
+}
+
 /// Sessions that run the tool calls their model asks for, then end every
 /// turn with `text` as their last message and no tool call, as Pi does when
 /// its model answers in plain text.
@@ -1024,6 +1315,7 @@ async fn a_crash_during_a_running_assignment_restarts_it_as_a_recovery_without_r
         hang: Some(hung.clone()),
         delay: Duration::ZERO,
         failing: AtomicBool::new(false),
+        looping: false,
     });
     // Its own runtime, dropped whole as a crash would: every task, the
     // broker and the worker session go with it.
@@ -1313,6 +1605,7 @@ async fn no_more_workers_live_than_the_limit_and_every_ticket_is_still_answered(
         hang: None,
         delay: Duration::from_millis(150),
         failing: AtomicBool::new(false),
+        looping: false,
     });
     let (live, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     let harness = Counting {

@@ -334,7 +334,22 @@ provider through the real broker. It runs on macOS too. Swarm mode is the first 
     edits, is no circle, and a new turn starts the count again. A tool whose registry entry says `repeatable` is
     never refused and ends any circle it falls into: `job_wait`, `browser_act` and `browser_read` (what they answer
     moves between calls), `worker_report` and `worker_handback` (which must always get through) and the Router's
-    tools. `repeatable` is not part of the tool schema, so `extensions/agent-tools.json` does not carry it.
+    tools. `repeatable` is not part of the tool schema, so `extensions/agent-tools.json` does not carry it. The
+    refusal quotes what the call answered the first time on one line (a command's exit code and the first lines of
+    its stdout and stderr, else the start of the result), so the model sees it already has the answer.
+  - A refusal alone does not stop a model that ignores it (one Ticket sent the same refused `run_code` call 767
+    times, a model call each, about $2.25), so the guard counts the calls it refuses and stops the turn: after 3
+    refused calls in a row with no call that went through between them (`A A A A A` is stopped at the fifth call,
+    `A B A B A B A B` at the eighth), or 10 refused calls in one turn however far apart. From then on the broker
+    answers the seat's tool calls with the stop and refuses its next model call before any hold or upstream call, so
+    it costs nothing, which ends a Pi turn exactly as a failed provider call does. The seat keeps `ModelFailure::Stuck`
+    and the host reports `failed` in the worker's place: `I got stuck repeating the same step and stopped. Reply here
+    to have me try again with a different approach.` It is recorded with the Ticket like the failed-call Report, so
+    the person hears it once and a restart sends nothing. A reply on the thread starts a new turn, which starts the
+    count again. A Claude Code session has no turn to end on a refused model call: its session ends on the error and
+    the Assignment fails with that reason, as for any session that dies. No sampling parameter is sent to slow a loop:
+    DeepSeek's API documents `frequency_penalty` and `presence_penalty` as no longer supported, so they would have no
+    effect.
   - At start, an Assignment the last run left running, or pending with its Launch performed, ends with "host
     restarted", oldest Ticket first. One that was working starts again with `recovery` through
     `Engine::restart` (the end and the new launch in one transaction); one that waited for input, an answer or a

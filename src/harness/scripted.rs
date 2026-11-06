@@ -4,6 +4,7 @@
 //! prompt, then the tool calls the script names for that turn.
 use super::{AgentHarness, Observation, STOP_WAIT, Session, SessionEvent, SessionSpec};
 use anyhow::{Context, Result, ensure};
+use reqwest::StatusCode;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -29,7 +30,18 @@ pub enum Call {
     /// tool call, as Pi does when its model answers in plain text. The host
     /// reads it as `SessionEvent::Said`.
     Say(String),
+    /// Pi's whole agent loop: ask the model, run the tool calls it asks for,
+    /// and ask it again with their results, until a reply asks for none.
+    /// A refused tool call is a result the model reads, as it is for Pi. A
+    /// refused or failed model call ends the turn where the harness plays
+    /// model errors as Pi does. A loop that is still going after
+    /// `AGENT_CALLS` model calls is an error, so a test of a worker that must
+    /// be stopped fails instead of hanging.
+    Agent,
 }
+
+/// The most model calls one `Call::Agent` turn makes.
+pub const AGENT_CALLS: usize = 200;
 
 /// `script[k]` is what a session calls on its `k`-th prompt. A prompt past the
 /// end makes the model call and no tool call.
@@ -185,7 +197,12 @@ impl Agent {
         calls: &[Call],
         events: &mpsc::Sender<Observation>,
     ) -> Result<()> {
-        let mut reply = self.model(prompt).await?;
+        // `Agent` asks the model itself, as many times as its loop takes.
+        let mut reply = if calls.iter().any(|call| matches!(call, Call::Agent)) {
+            Value::Null
+        } else {
+            self.model(prompt).await?
+        };
         for call in calls {
             match call {
                 Call::Replied => {
@@ -213,6 +230,7 @@ impl Agent {
                     let said = (self.id.clone(), Ok(SessionEvent::Said(text.clone())));
                     events.send(said).await.ok();
                 }
+                Call::Agent => self.agent(prompt).await?,
                 Call::ClaimTask => {
                     let task = self.post("tool/claim_task", json!({})).await?;
                     let id = task["id"].as_str().context("claim_task returned no Task")?;
@@ -237,13 +255,57 @@ impl Agent {
         Ok(())
     }
 
+    /// Pi's agent loop on `prompt`; see [`Call::Agent`].
+    async fn agent(&self, prompt: &str) -> Result<()> {
+        let mut messages = vec![json!({"role":"user","content":prompt})];
+        for _ in 0..AGENT_CALLS {
+            let reply = self.ask(&messages).await?;
+            let message = reply["choices"][0]["message"].clone();
+            let asked = message["tool_calls"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            messages.push(message);
+            if asked.is_empty() {
+                return Ok(());
+            }
+            for tool in asked {
+                let name = tool["function"]["name"]
+                    .as_str()
+                    .context("a tool call names no tool")?;
+                let arguments = tool["function"]["arguments"]
+                    .as_str()
+                    .context("a tool call has no arguments")?;
+                let body: Value = serde_json::from_str(arguments)?;
+                let (_, text) = self.send(&format!("tool/{name}"), body).await?;
+                messages.push(json!({"role":"tool","tool_call_id":tool["id"],"content":text}));
+            }
+        }
+        anyhow::bail!("the agent loop was still going after {AGENT_CALLS} model calls")
+    }
+
     async fn model(&self, prompt: &str) -> Result<Value> {
-        let body = json!({"model":self.model,"messages":[{"role":"user","content":prompt}]});
+        self.ask(&[json!({"role":"user","content":prompt})]).await
+    }
+
+    async fn ask(&self, messages: &[Value]) -> Result<Value> {
+        let body = json!({"model":self.model,"messages":messages});
         let refused = |error: anyhow::Error| anyhow::Error::new(ModelFailed(format!("{error:#}")));
         self.post("model", body).await.map_err(refused)
     }
 
     async fn post(&self, path: &str, body: Value) -> Result<Value> {
+        let (status, text) = self.send(path, body).await?;
+        ensure!(
+            status.is_success(),
+            "broker refused {path}: {status} {text}"
+        );
+        Ok(serde_json::from_str(&text)?)
+    }
+
+    /// One request to the broker and what it answered, whether or not it
+    /// refused.
+    async fn send(&self, path: &str, body: Value) -> Result<(StatusCode, String)> {
         let response = self
             .client
             .post(format!("http://broker/{path}"))
@@ -251,13 +313,7 @@ impl Agent {
             .json(&body)
             .send()
             .await?;
-        let status = response.status();
-        let text = response.text().await?;
-        ensure!(
-            status.is_success(),
-            "broker refused {path}: {status} {text}"
-        );
-        Ok(serde_json::from_str(&text)?)
+        Ok((response.status(), response.text().await?))
     }
 }
 

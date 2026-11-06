@@ -368,7 +368,8 @@ async fn a_question_about_a_repository_gets_a_worker_on_a_clone_it_reads_and_com
     let told = format!(
         "Repository: acme/widgets, base main. /work is a clone of it at main's tip ({}), with \
          its history and your commit identity: run git and its code there with run_code, and \
-         read its files with read. /host/repo.json says the same.\n\
+         read its files with read. read also reaches /host/repo.json, which says the same; \
+         run_code has no /host.\n\
          Notes on acme/widgets: Tests run with ./check.",
         &tip[..7]
     );
