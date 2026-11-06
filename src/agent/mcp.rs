@@ -4,6 +4,9 @@
 //! actor is the operator, so the Policy names it `mcp:<operator>` and admits
 //! it, or not, as it would a Slack person.
 
+use super::jsonl::JsonlChannel;
+use super::links::TicketLinks;
+use super::ports::{BoxFuture, Channel, SendOptions, SendOutcome};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use solos_agent_core::model::{
@@ -81,6 +84,33 @@ pub fn reply_to(operator: &str, thread: &str) -> ChannelRef {
             ("operator".to_owned(), operator.to_owned()),
             ("thread".to_owned(), thread.to_owned()),
         ]),
+    }
+}
+
+/// The `mcp` Channel: the outbox, with the Ticket's page named after the text
+/// of a reply that carries a link. The text is otherwise as it was written;
+/// the operator's MCP host shows it as it is.
+pub struct McpChannel {
+    outbox: JsonlChannel,
+    links: TicketLinks,
+}
+
+impl McpChannel {
+    pub fn new(outbox: JsonlChannel, links: TicketLinks) -> Self {
+        Self { outbox, links }
+    }
+}
+
+impl Channel for McpChannel {
+    fn send(
+        &self,
+        mut message: OutboundMessage,
+        options: SendOptions,
+    ) -> BoxFuture<'_, Result<SendOutcome>> {
+        if let Some(page) = self.links.page(&message) {
+            message.text = format!("{}\n\nDetails: {page}", message.text.trim_end());
+        }
+        self.outbox.send(message, options)
     }
 }
 
@@ -204,7 +234,11 @@ pub fn replies(state_dir: &Path, operator: &str, thread: &str) -> Result<Replies
 
 #[cfg(test)]
 mod tests {
-    use super::{file, open_inbox, replies, valid_name};
+    use super::{McpChannel, file, open_inbox, replies, reply_to, valid_name};
+    use crate::agent::jsonl::JsonlChannel;
+    use crate::agent::links::TicketLinks;
+    use crate::agent::ports::{Channel, SendOptions};
+    use solos_agent_core::model::{MessageId, MessageKind, OutboundMessage, TicketId};
 
     #[test]
     fn names_are_short_and_plain() {
@@ -245,6 +279,47 @@ mod tests {
         );
         let none = replies(&dir, "alice", &filed.thread).unwrap();
         assert_eq!((none.replies.len(), none.earlier), (0, 0));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_result_names_the_tickets_page_after_its_text_and_an_acknowledgement_does_not() {
+        let dir = std::env::temp_dir().join(format!("agent-mcp-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        open_inbox(&dir).unwrap();
+        let channel = McpChannel::new(
+            JsonlChannel::open(super::outbox(&dir)).unwrap(),
+            TicketLinks::new("https://agent.example.com").unwrap(),
+        );
+        let send = |id: &str, kind, text: &str| {
+            channel.send(
+                OutboundMessage {
+                    id: MessageId::new(id),
+                    channel: reply_to("alice", "t-1"),
+                    kind,
+                    text: text.into(),
+                    ticket: Some(TicketId::new("tk_1")),
+                    ask: None,
+                },
+                SendOptions::default(),
+            )
+        };
+        send("ms_1", MessageKind::Acknowledgement, "On it.")
+            .await
+            .unwrap();
+        send("ms_2", MessageKind::Result, "Done.\n").await.unwrap();
+        send("ms_2", MessageKind::Result, "Done.\n").await.unwrap();
+
+        let found = replies(&dir, "alice", "t-1").unwrap();
+        let texts: Vec<&str> = found.replies.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "On it.",
+                "Done.\n\nDetails: https://agent.example.com/tickets/tk_1"
+            ],
+            "once, and the same text as the message otherwise"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -4,8 +4,10 @@
 
 use super::{
     ALLOW_SECRET_ACTION, APPROVE_ACTION, Answer, DENY_SECRET_ACTION, METADATA_EVENT, STOP_ACTION,
-    SecretClick, SlackApi, gone,
+    SecretClick, SlackApi, gone, mrkdwn,
 };
+use crate::agent::links::TicketLinks;
+use crate::agent::markdown::close_fences;
 use crate::agent::ports::{BoxFuture, Channel, SendOptions, SendOutcome};
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
@@ -21,6 +23,7 @@ const MAX_PAGES: usize = 50;
 
 pub struct SlackChannel {
     api: Arc<SlackApi>,
+    links: TicketLinks,
 }
 
 enum Found {
@@ -31,7 +34,16 @@ enum Found {
 
 impl SlackChannel {
     pub fn new(api: Arc<SlackApi>) -> Self {
-        Self { api }
+        Self {
+            api,
+            links: TicketLinks::none(),
+        }
+    }
+
+    /// Link the messages that carry one to their Ticket's page.
+    pub fn with_links(mut self, links: TicketLinks) -> Self {
+        self.links = links;
+        self
     }
 
     async fn post(&self, message: OutboundMessage, options: SendOptions) -> Result<SendOutcome> {
@@ -50,7 +62,7 @@ impl SlackChannel {
                 Found::Missing => {}
             }
         }
-        let body = body(&message, channel, thread, options.ask.as_ref());
+        let body = body(&message, channel, thread, options.ask.as_ref(), &self.links);
         match self.api.post("chat.postMessage", None, Some(&body)).await? {
             Answer::Ok(_) => Ok(SendOutcome::Sent),
             Answer::Refused(code) if gone(&code) => {
@@ -118,12 +130,13 @@ fn body(
     channel: &str,
     thread: Option<&str>,
     ask: Option<&Ask>,
+    links: &TicketLinks,
 ) -> Value {
     let limit = match message.kind {
         MessageKind::Result => RESULT_CHARS,
         MessageKind::Acknowledgement | MessageKind::Attention => SHORT_CHARS,
     };
-    let text = shape(&message.text, limit);
+    let text = shape(&message.text, limit, links.page(message).as_deref());
     let mut body = json!({
         "channel": channel,
         "text": text,
@@ -179,52 +192,112 @@ fn buttons(text: &str, ticket: &TicketId, ask: &Ask) -> Value {
     ])
 }
 
-/// Escape for mrkdwn, so text from a worker cannot mention anyone or ping
-/// `<!channel>`, and cut it to `limit` characters with a marker that says so.
-fn shape(text: &str, limit: usize) -> String {
+/// Slack's mrkdwn for `text`, which cannot mention anyone or ping
+/// `<!channel>` (see [`mrkdwn`]), cut to `limit` characters on a word with a
+/// marker that says so. `page`, the Ticket's page, is linked after the text,
+/// and where the rest is when the text is cut.
+fn shape(text: &str, limit: usize, page: Option<&str>) -> String {
     let text = text.trim();
-    let total = text.chars().count();
-    if total <= limit {
-        return escape(text);
+    let rendered = mrkdwn::render(text);
+    let page = page.map(mrkdwn::escape);
+    if rendered.chars().count() <= limit {
+        return match page {
+            Some(page) => format!("{rendered}\n\n<{page}|Task details>"),
+            None => rendered,
+        };
     }
-    let cut: String = text.chars().take(limit).collect();
+    let cut: String = rendered.chars().take(limit).collect();
     // End on a whole word when one ends near the limit.
     let kept = match cut.rfind(char::is_whitespace) {
         Some(at) if at >= cut.len() * 4 / 5 => &cut[..at],
         _ => cut.as_str(),
     }
     .trim_end();
+    let kept = whole_entities(kept);
     let shown = kept.chars().count();
-    format!(
-        "{} …\n_[Cut short: {shown} of {total} characters shown.]_",
-        escape(kept)
-    )
+    let kept = close_fences(kept);
+    match page {
+        Some(page) => format!("{kept}\n\n…the rest is on the <{page}|task page>"),
+        None => {
+            let total = text.chars().count();
+            format!("{kept} …\n_[Cut short: {shown} of {total} characters shown.]_")
+        }
+    }
 }
 
-fn escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+/// `text` without a link cut off in its middle, which Slack would show as
+/// the address and a stray `<`. The only `<` in mrkdwn text begins one: the
+/// rest is escaped.
+fn whole_entities(text: &str) -> &str {
+    match (text.rfind('<'), text.rfind('>')) {
+        (Some(open), close) if close.is_none_or(|close| close < open) => text[..open].trim_end(),
+        _ => text,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::shape;
+    use super::{shape, whole_entities};
 
     #[test]
     fn short_text_is_only_escaped_and_long_text_is_cut_on_a_word_with_a_marker() {
         assert_eq!(
-            shape("  <!channel> & <@U1>  ", 100),
+            shape("  <!channel> & <@U1>  ", 100, None),
             "&lt;!channel&gt; &amp; &lt;@U1&gt;"
         );
         let long = "word ".repeat(100);
-        let shaped = shape(&long, 52);
+        let shaped = shape(&long, 52, None);
         assert!(shaped.starts_with("word word"), "{shaped}");
         assert!(
             shaped.ends_with("…\n_[Cut short: 49 of 499 characters shown.]_"),
             "{shaped}"
         );
         let unbroken = "x".repeat(20);
-        assert!(shape(&unbroken, 10).starts_with("xxxxxxxxxx …"));
+        assert!(shape(&unbroken, 10, None).starts_with("xxxxxxxxxx …"));
+    }
+
+    #[test]
+    fn a_page_is_linked_after_the_text_or_named_as_where_the_rest_is() {
+        let page = "https://agent.example.com/tickets/tk_1";
+        assert_eq!(
+            shape("Done: **ok**.", 100, Some(page)),
+            format!("Done: *ok*.\n\n<{page}|Task details>")
+        );
+        let shaped = shape(&"word ".repeat(100), 52, Some(page));
+        assert!(shaped.starts_with("word word"), "{shaped}");
+        assert!(
+            shaped.ends_with(&format!("\n\n…the rest is on the <{page}|task page>")),
+            "{shaped}"
+        );
+        assert!(!shaped.contains("Cut short") && !shaped.contains("Task details"));
+    }
+
+    #[test]
+    fn a_cut_leaves_no_link_or_code_block_open() {
+        let text = format!(
+            "{} [the long label of a link](https://e.example/x) after",
+            "w ".repeat(10)
+        );
+        // The limit falls inside the link.
+        let shaped = shape(&text, 35, None);
+        assert!(!shaped.contains('<'), "{shaped}");
+        assert_eq!(whole_entities("a <https://e.example|lab"), "a");
+        assert_eq!(
+            whole_entities("a <https://e.example|label> b"),
+            "a <https://e.example|label> b"
+        );
+        let code = format!("```\n{}", "let x = 1;\n".repeat(50));
+        let shaped = shape(&code, 60, None);
+        assert!(shaped.contains("let x = 1;\n```"), "{shaped}");
+    }
+
+    #[test]
+    fn markdown_tables_and_headings_are_text_in_the_post() {
+        let shaped = shape(
+            "## Open\n\n| PR | State |\n|---|---|\n| #1 | open |",
+            3_000,
+            None,
+        );
+        assert_eq!(shaped, "*Open*\n\n```\nPR  State\n--  -----\n#1  open\n```");
     }
 }

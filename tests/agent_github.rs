@@ -34,6 +34,7 @@ use solos_swarm::agent::github::{
     SUSPENDED_WAIT, marker,
 };
 use solos_swarm::agent::jsonl::JsonlSource;
+use solos_swarm::agent::links::TicketLinks;
 use solos_swarm::agent::ports::{
     BoxFuture, Channel, Delivery, Executor, FactSink, Launch, RetryAfter, SendOptions, SendOutcome,
     Source, TicketDirs,
@@ -1798,6 +1799,68 @@ async fn a_reply_is_a_comment_on_its_issue_ending_in_a_hidden_marker() {
         ask.body.chars().count() < 2_200,
         "{}",
         ask.body.chars().count()
+    );
+}
+
+#[tokio::test]
+async fn a_result_links_the_tickets_page_before_its_marker_and_a_repeat_posts_nothing_more() {
+    let fake = Fake::start().await;
+    let page = "https://agent.example.com/tickets/tk_1";
+    let links = TicketLinks::new("https://agent.example.com").unwrap();
+    let channel: Arc<dyn Channel> = Arc::new(GithubChannel::new(fake.api()).with_links(links));
+    let table = "## Done\n\n| a | b |\n|---|---|\n| 1 | 2 |";
+    let long = format!("Report\n\n{}", "word ".repeat(5_000));
+    let sends = [
+        outbound("ms_ack", MessageKind::Acknowledgement, 7, "On it."),
+        outbound("ms_result", MessageKind::Result, 7, table),
+        outbound("ms_long", MessageKind::Result, 8, &long),
+        outbound("ms_ask", MessageKind::Attention, 7, "Which branch?"),
+    ];
+    for message in &sends {
+        let sent = channel
+            .send(message.clone(), SendOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(sent, SendOutcome::Sent);
+    }
+    for message in &sends {
+        let sent = channel.send(message.clone(), repeat()).await.unwrap();
+        assert_eq!(sent, SendOutcome::Sent);
+    }
+
+    let hub = fake.hub();
+    let [ack, result, long, ask] = &hub.posts[..] else {
+        panic!("{} posts: a repeat found each marker", hub.posts.len())
+    };
+    assert_eq!(
+        ack.body,
+        format!("On it.\n\n{}", marker(&MessageId::new("ms_ack"))),
+        "an acknowledgement has no link"
+    );
+    assert_eq!(
+        result.body,
+        format!(
+            "{table}\n\n[Task details]({page})\n\n{}",
+            marker(&MessageId::new("ms_result"))
+        ),
+        "the full Markdown, the link, then the marker last"
+    );
+    assert_eq!(message_id(&result.body), "ms_result");
+    assert!(
+        long.body.contains(&format!(
+            " …\n\n…the rest is on the [task page]({page})\n\n<!-- solos-swarm message "
+        )),
+        "{}",
+        &long.body[long.body.len() - 200..]
+    );
+    assert!(!long.body.contains("Cut short") && !long.body.contains("Task details"));
+    assert_eq!(message_id(&long.body), "ms_long");
+    assert_eq!(
+        ask.body,
+        format!(
+            "Which branch?\n\n[Task details]({page})\n\n{}",
+            marker(&MessageId::new("ms_ask"))
+        )
     );
 }
 

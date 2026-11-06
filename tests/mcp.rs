@@ -653,6 +653,61 @@ async fn an_operator_files_requests_as_mcp_people_and_reads_the_answers() {
 }
 
 #[tokio::test]
+async fn an_operators_result_names_the_tickets_page_when_the_config_has_a_public_url() {
+    let scratch = Scratch::new("operator-web");
+    let io = "sources:\n  - {kind: mcp}\nchannels:\n  - {kind: mcp}\n\
+              web: {public_url: 'https://agent.example.com'}\n";
+    let config = scripted_config(&scratch, io, "mcp:alice");
+    let state = scratch.state();
+    serve_until_idle(&config, &state).await;
+    let mut alice = Mcp::spawn(&[
+        &"--state-dir",
+        &state,
+        &"--operator",
+        &"alice",
+        &"--config",
+        &config,
+    ]);
+    alice.initialize().await;
+    let (text, is_error) = alice
+        .call("agent_request", json!({"text": "Summarise the incident"}))
+        .await;
+    assert!(!is_error, "{text}");
+    let thread = serde_json::from_str::<Value>(&text).unwrap()["thread"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    serve_until_idle(&config, &state).await;
+
+    let (text, is_error) = alice.call("agent_replies", json!({"thread": thread})).await;
+    assert!(!is_error, "{text}");
+    let replies: Value = serde_json::from_str(&text).unwrap();
+    let texts: Vec<&str> = replies["replies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|reply| reply["text"].as_str().unwrap())
+        .collect();
+    let ticket = replies["replies"][1]["ticket"].as_str().unwrap();
+    assert_eq!(texts.len(), 2, "{text}");
+    assert_eq!(
+        texts[0], "Looking into it.",
+        "an acknowledgement has no link"
+    );
+    assert!(
+        texts[1].starts_with("Done: Summarise the incident."),
+        "{text}"
+    );
+    assert!(
+        texts[1].ends_with(&format!(
+            "\n\nDetails: https://agent.example.com/tickets/{ticket}"
+        )),
+        "{text}"
+    );
+    alice.close().await;
+}
+
+#[tokio::test]
 async fn mcp_refuses_a_mixed_or_missing_mode_and_still_deletes_the_token() {
     let scratch = Scratch::new("usage");
     let token_file = scratch.write("t.token", ROUTER_TOKEN);
