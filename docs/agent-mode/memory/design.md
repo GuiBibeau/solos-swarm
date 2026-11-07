@@ -15,7 +15,7 @@
 > - `MemoState` is built as `Proposed`, `Active`, `Retired` and `Forgotten`. An active memo records the review that
 >   kept it, and a retired one records the memo that replaced it and the evidence the dream cited.
 >
-> How to run it: [Memory](../README.md#memory), [The dream](../README.md#the-dream) and
+> How to run it: [Memory](../runtime.md#memory), [The dream](../runtime.md#the-dream) and
 > [Memory and the dream](../production.md#memory-and-the-dream).
 
 > **Owner decisions, 2026-11-07 (these override the text below where they differ).**
@@ -26,7 +26,7 @@
 Applying Anthropic's "The components of agent memory" (Lance Martin, Anthropic Engineering, 2026-11-06,
 https://www.anthropic.com/research/components-of-agent-memory) to `solos-swarm agent serve`, grounded in `main` at
 `7b91f1b`. The analysis itself changed no code; the five PRs of section 6 build it, and the status of each is in the
-README's [P15 row](../README.md#status). The components, flows and gaps behind the tables are in [`graph.json`](graph.json).
+[P15 row](../status.md#p15-memory) of the status page. The components, flows and gaps behind the tables are in [`graph.json`](graph.json).
 
 ## 0. In one paragraph
 
@@ -90,7 +90,7 @@ pay. Keep the top layer small and indexed. Quote facts word for word.
 | Vault | `src/vault.rs` (sealed file, `Scrubber`); per-Ticket `SecretGrant` (`model.rs:309`) | Credentials, write-only. First-use consent is remembered per Ticket only. | Never a model. Nothing here is memory, and it must stay out of memory. |
 | Browser trail | `src/agent/trail.rs`, `trails` (V4), `TrailCursor` | Signed browser steps, page and View blobs by digest | `agent trail`. Page content is untrusted data. |
 | Dashboard snapshots | `src/agent/publish/` (snapshot FORMAT 1, Vercel Blob) | A read-only projection of Tickets for the owner | The owner, through `web/agent-dashboard`. The agent never reads it. |
-| Swarm mode | `docs/ARCHITECTURE.md` §1 and §6; `src/agent/swarm_executor.rs` | Board entries (append-only, never authority), Findings with `trust = min(trust of sources)`, union of markings, and taint on retraction; a run directory and artifact per swarm Ticket | The swarm's agents and the Ticket's Report. Its **lineage and taint model** is the one to reuse for memos. |
+| Swarm mode, and the frozen `mvp` cluster | `src/agent/swarm_executor.rs`; `docs/ARCHITECTURE.md`, [Domain primitives](../../ARCHITECTURE.md#domain-primitives) and [Lineage, taint and context assembly](../../ARCHITECTURE.md#lineage-taint-and-context-assembly) | Swarm mode keeps Board entries (append-only, never authority), Findings, and a run directory and artifact per swarm Ticket. Findings with `trust = min(trust of sources)`, the union of markings and taint on retraction exist only in the `mvp` cluster (`src/domain.rs`). | The swarm's agents and the Ticket's Report. The `mvp` cluster's **lineage and taint model** is the one to reuse for memos. |
 | Retention | `src/agent/prune.rs`, `solos-agent-prune.timer` (`--keep-days 14`, daily at 04:30) | Removes ended Tickets' clones and transcripts, unused mirrors and old Router transcripts | Purely physical forgetting by age. Nothing semantic. |
 | Naming | `crates/agent-core/src/memory.rs` `MemoryRepositories` (the in-memory Store), `InputBody::Note` / `Engine::note` / `Fact::Note` (a job's end or a Router fact) | | "Memory" and "Note" are taken. This design uses **Memo** in code and "memory" in what people read. |
 

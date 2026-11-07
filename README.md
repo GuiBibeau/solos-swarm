@@ -102,7 +102,7 @@ python3 scripts/remote.py status --run-id RUN
 python3 scripts/remote.py collect --run-id RUN --output evidence/RUN   # leaves the code/ scratch directory on the host
 ```
 
-Next: [docs/RUNBOOK.md](docs/RUNBOOK.md#6-standalone-and-remote-10-worker-runs) for runs,
+Next: [docs/RUNBOOK.md](docs/RUNBOOK.md) for runs,
 [docs/self-update-operations.md](docs/self-update-operations.md) for channels and drains, and
 [docs/pause-mode.md](docs/pause-mode.md) for peak-hour refusal.
 
@@ -134,10 +134,10 @@ Claude Code then lists `agent_request`, `agent_replies`, `agent_status` and the 
 `--node` and `--credential-file`.
 
 Next: [docs/agent-mode/production.md](docs/agent-mode/production.md) for the production config, the systemd units
-and `scripts/agent-deploy`. [docs/agent-mode/README.md](docs/agent-mode/README.md) has the setup of
-[Discord](docs/agent-mode/README.md#discord-app-setup), [the GitHub App](docs/agent-mode/README.md#github-app),
-[MCP hosts](docs/agent-mode/README.md#mcp-hosts), [repositories](docs/agent-mode/README.md#repositories) and
-[memory](docs/agent-mode/README.md#memory).
+and `scripts/agent-deploy`. [docs/agent-mode/README.md](docs/agent-mode/README.md) links every guide, among them
+the setup of [Discord](docs/agent-mode/how-to/discord.md), [the GitHub App](docs/agent-mode/how-to/github-app.md),
+[MCP hosts](docs/agent-mode/how-to/mcp.md), [repositories](docs/agent-mode/how-to/repositories.md) and
+[memory](docs/agent-mode/how-to/memory.md).
 
 ## Dashboards
 
@@ -164,11 +164,13 @@ a snapshot of each Ticket to a private Vercel Blob store that the app reads. Set
 |---|---|
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | The workspace, the ports, the module map of both modes, and the frozen `mvp` cluster's design. |
 | [`docs/adr/0001-hexagonal-ports-and-two-modes.md`](docs/adr/0001-hexagonal-ports-and-two-modes.md) | Why one hexagon serves two modes. |
-| [`docs/agent-mode/README.md`](docs/agent-mode/README.md) | Agent mode: concepts, the status of each phase (P0 to P15), budgets, memory, and the setup of each Source, worker, node, vault and browser. |
+| [`docs/agent-mode/README.md`](docs/agent-mode/README.md) | The agent-mode index: concepts, architecture, the configuration reference, the status of each phase (P0 to P15), and a how-to guide for each Source, worker, node, vault and browser. |
 | [`docs/agent-mode/production.md`](docs/agent-mode/production.md) | Agent mode in production: `scripts/agent-deploy`, the config, the dashboard, health checks, pruning. |
 | `docs/agent-mode/{vault-browser,pstack,github-app,memory}/` | Design records for the vault and browser, pstack in workers, the GitHub App and memory. |
 | [`web/agent-dashboard/README.md`](web/agent-dashboard/README.md) | The agent's web dashboard: Vercel setup, environment, sign-in. |
-| [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | Build, stage, run and qualify: host UIDs, tokenizers, offline bundles, the `mvp` daemons, 10-worker runs. |
+| [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | Run one swarm on the box with `scripts/remote.py`: check the host, build and promote a candidate, start, watch, collect, recover, roll back. |
+| [`docs/goal-fetch-policy.md`](docs/goal-fetch-policy.md) | The `fetch` policy a Goal needs to probe a live site. |
+| [`docs/mvp-cluster.md`](docs/mvp-cluster.md) | The frozen `mvp` cluster: host UIDs, tokenizers, offline bundles, the daemons, qualification. |
 | [`docs/pause-mode.md`](docs/pause-mode.md) | `control.json`, `PAUSE`, `SWARM_REFUSE_PEAK`, the 503 reply, unpaused deadlines. |
 | [`docs/self-update-operations.md`](docs/self-update-operations.md) | Swarm channels, promote, rollback, prune, drain, doctor, smoke, outage pause. |
 | [`docs/self-update-and-graceful-restart.md`](docs/self-update-and-graceful-restart.md) | The design and failure modes behind self-update. |

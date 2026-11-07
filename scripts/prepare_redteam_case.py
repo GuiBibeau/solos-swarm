@@ -9,7 +9,7 @@ and the structural security-review contract; it never enters the public Goal.
 The workers only read source, so this Goal grants no `fetch_url` and carries no
 `fetch` policy. A Goal that probes a live target grants `fetch_url` and must
 carry one (hosts, methods, per-agent rate); `prepare_platform_case.py` is the
-builder for that and emits it. See "Live-probe Goals" in docs/RUNBOOK.md.
+builder for that and emits it. See docs/goal-fetch-policy.md.
 """
 
 import argparse

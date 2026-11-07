@@ -117,18 +117,18 @@ Read these before you change it:
 - `mcp:<your name>` in `policy.people` lets you run `agent stop` and `agent memo` from the box.
 - There is no `budgets:` section, so a session Ticket and the Router have no cap. A swarm's budget comes from the Router
   or from `executor.swarm.default_budget_microusd`. To cap them, add
-  `budgets: {session_microusd: 500000, router_daily_microusd: 3000000}` ([Budgets](README.md#budgets)).
+  `budgets: {session_microusd: 500000, router_daily_microusd: 3000000}` ([Budgets](concepts.md#budgets)).
 - A Ticket from GitHub, MCP or a schedule has no Approve button, so its budget is capped at `auto_approve_microusd`.
 - `watchdog.operator` is where the Watchdog's alerts, the dream's daily digest and the health check's posts go. The
   health check posts only to a `source: discord` operator.
 - Write `web.publish` in block style, as above. `scripts/agent-deploy` looks for a `publish:` line under `web:` to know
   whether to run the publisher.
-- `memory:` and `health:` can be left out. Their defaults are in [Memory](README.md#memory) and
+- `memory:` and `health:` can be left out. Their defaults are in [memory](configuration.md#memory) and
   [The disk floor](#the-disk-floor).
 
 The sections below say how to set up GitHub, dependencies, memory and the dashboard. The keys are in
-[GitHub App](README.md#github-app), [Repositories](README.md#repositories), [Memory](README.md#memory),
-[Watchdog](README.md#watchdog) and [Web dashboard](README.md#web-dashboard).
+[github](configuration.md#github), [forge](configuration.md#forge), [memory](configuration.md#memory),
+[watchdog](configuration.md#watchdog) and [web](configuration.md#web).
 
 ## Deploy a release
 
@@ -293,7 +293,7 @@ ssh <box> 'for t in tk_aaa tk_bbb; do ~/agent/current/bin/solos-swarm agent stop
 
 The agent works on GitHub as the bot of a GitHub App, with no personal access token.
 
-1. Create and install the App by hand, once, as [GitHub App](README.md#github-app) says. Note its App ID and download
+1. Create and install the App by hand, once, as [Set up the GitHub App](how-to/github-app.md#create-and-install-the-app) says. Note its App ID and download
    its private key.
 2. Store the key, then delete the download:
 
@@ -334,7 +334,7 @@ To stop GitHub work:
 - Or set `github.writes: false` and restart. The agent then reads and writes nothing on GitHub.
 
 A config that still has `token_file` on the github Source or on `forge: github`, or `identity` on `forge: github`, fails
-to load with a sentence that points at [Moving from token files](README.md#moving-from-token-files). The agent no longer
+to load with a sentence that points at [Move from token files](how-to/github-app.md#move-from-token-files). The agent no longer
 reads `forge-token`. Delete it from `~/agent/tokens`.
 
 ## Install a repository's dependencies and require evidence
@@ -368,13 +368,13 @@ forge:
 
 The box needs `bun`, `bwrap` and `prlimit`. Keep `state/` off a tmpfs, because a cache holds many files. `agent prune`
 removes a cache no Ticket has used for its `--keep-days`. What the mechanism trusts and what it leaves to CI is in
-[Installed dependencies and evidence](README.md#installed-dependencies-and-evidence).
+[Install dependencies and require evidence](how-to/repositories.md#install-dependencies-and-require-evidence).
 
 ## Memory and the dream
 
 Memory is on by default wherever workers run on Pi. Workers propose memos, a review call at DeepSeek's highest thinking
 effort decides each one, and once a day the dream checks the memos against the transcripts of the Tickets that ended.
-How it works is in [Memory](README.md#memory) and [The dream](README.md#the-dream).
+How it works is in [Memory](runtime.md#memory) and [The dream](runtime.md#the-dream).
 
 Operate it from the box:
 

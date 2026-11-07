@@ -17,7 +17,7 @@ to disk. PR 1 of `docs/agent-mode/github-app/prs.md`, merged as #63.
 ## How to get to it (user POV)
 
 - Comment `@solos-bot <question about the repository>` on an issue, or open an issue that says it.
-- The operator created and installed the App by hand ([GitHub App](../../../../docs/agent-mode/README.md#github-app)),
+- The operator created and installed the App by hand ([GitHub App](../../../../docs/agent-mode/how-to/github-app.md)),
   listed the repository under `forge.repos` and `github:<login>` under `policy.people`, and stored the key.
 
 ## Driving it with gh

@@ -75,7 +75,7 @@ The shell ports are async and live in the root crate.
 | `AgentHarness` | `src/harness.rs` | `PiHarness`, `ClaudeCodeHarness` (`src/harness/claude_code.rs`), `ScriptedHarness` (`src/harness/scripted.rs`) |
 | `Provider` (model upstream) | `src/gateway/upstream.rs` | `OpenAiCompatible`, for DeepSeek and Venice |
 
-[agent-mode/README.md](agent-mode/README.md#ports) gives each port's shape.
+[agent-mode/architecture.md](agent-mode/architecture.md#ports) gives each port's shape.
 
 ### What the two modes share
 
@@ -116,7 +116,7 @@ Both brokers price model calls with `PriceTable` (`src/gateway/pricing.rs`), in 
   above its hold, does.
 - In agent mode, each Ticket, the Router and the memory review have their own account in `agent.db`
   (`crates/agent-store/src/ledger.rs`), and any of them may run with no cap
-  ([Budgets](agent-mode/README.md#budgets)).
+  ([Budgets](agent-mode/concepts.md#budgets)).
 
 Goals from `scripts/prepare_case.py` price input at 300,000, output at 1,200,000 and cache hits at 6,000 micro-USD
 per million tokens. These are conservative
@@ -187,7 +187,7 @@ over mutual TLS, an audit witness and an isolated evaluator. Its subcommands are
 `evaluator-serve`, `offline-startup-request`, `offline-startup-assemble`, `campaign`, `qa`, `inspect`, `verify`,
 `verify-signature` and `catalog` (`src/mvp.rs`). Neither mode runs it.
 [ADR 0001](adr/0001-hexagonal-ports-and-two-modes.md) keeps it frozen, not deleted: its local-model support, QUIC
-transport, SPIFFE identities and scoped tool credentials are to become adapters when a phase needs them. [RUNBOOK.md](RUNBOOK.md) has its host layout and operations.
+transport, SPIFFE identities and scoped tool credentials are to become adapters when a phase needs them. [mvp-cluster.md](mvp-cluster.md) has its host layout and operations.
 
 <p align="center">
   <img src="assets/architecture.svg" alt="The mvp cluster: intent, kernel, sandboxes and verification" width="100%" />
@@ -320,7 +320,7 @@ Prompt assembly (`src/planner.rs`, `src/context.rs`) measures the fixed contract
 |---|---|---|
 | Audit log (`src/audit.rs`) | RFC 6962 SHA-256 Merkle tree | Ed25519, signature domain `audit-tree-head`. Its signer also signs agent mode's browser trail. |
 | Witness (`src/witness.rs`) | Append-only consistency check | Ed25519, signature domain `audit-witness-receipt` |
-| Evaluator (`src/evaluator.rs`) | A separate Unix user (UID 995 in the RUNBOOK's layout) that owns its directory, with no access for group or others, and checks the broker's UID on its IPC socket | Splits the `Search` phase, capped by `max_search_evaluations`, from the `HeldOut` phase, frozen once per version |
+| Evaluator (`src/evaluator.rs`) | A separate Unix user (UID 995 in the host layout of [mvp-cluster.md](mvp-cluster.md#prepare-the-host)) that owns its directory, with no access for group or others, and checks the broker's UID on its IPC socket | Splits the `Search` phase, capped by `max_search_evaluations`, from the `HeldOut` phase, frozen once per version |
 
 ### `mvp` module map
 
