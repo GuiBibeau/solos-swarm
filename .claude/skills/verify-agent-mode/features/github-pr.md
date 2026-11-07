@@ -24,7 +24,7 @@ head <sha12> · opened`. The worker has no push, no token and no pull-request to
 
 - On Discord: "add a CONTRIBUTING line that says tests run offline" in the thread of the agent's channel; or on GitHub,
   `@solos-bot add a CONTRIBUTING line that says tests run offline` as a comment on an issue.
-- The operator created and installed the App ([GitHub App](../../../../docs/agent-mode/README.md#github-app)), listed
+- The operator created and installed the App ([GitHub App](../../../../docs/agent-mode/how-to/github-app.md)), listed
   the repository under `forge.repos` with `owes: pull_request`, listed the person under `policy.people`, and stored the
   key. `github.writes` is not `false`.
 

@@ -6,8 +6,8 @@
 > `solos-swarm agent trail` (#51). PRs 9 (browsers on nodes) and 10 (keys in the browser) are not built. Two answers came
 > later: `fetch_url` refuses private, loopback and metadata addresses unless `executor.fetch.allow_private_networks` is
 > set (#81, open question 6), and `agent prune --include-trail` removes the trail blobs of Tickets that ended long ago,
-> by hand only (#74, open question 3 and amendment 10). Setup as built: [Vault and API keys](../README.md#vault-and-api-keys),
-> [Browser](../README.md#browser) and [Check a trail](../README.md#check-a-trail).
+> by hand only (#74, open question 3 and amendment 10). Setup as built: [Vault and API keys](../how-to/vault.md),
+> [Browser](../how-to/browser.md) and [Check a trail](../how-to/browser.md#check-a-trail).
 
 This is the design contract for the vault and the browser. It came out of an architect bakeoff between two candidate designs, one by Opus and one by DeepSeek V4.1 Flash, judged against a fixed rubric by a DeepSeek cross-judge. The sketch files in `sketch/` are the base candidate as it was written. **Where they differ from the [Amendments](#amendments) section below, the amendments win.**
 

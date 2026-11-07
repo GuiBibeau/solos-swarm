@@ -5,7 +5,7 @@ description: Build, test, and qualify solos-swarm releases and 10-worker runs.
 
 # Verify solos-swarm
 
-Reference docs: `../../docs/ARCHITECTURE.md`, `../../docs/RUNBOOK.md`, `../../docs/CAMPAIGNS.md`, and `../../docs/BENCHMARKS.md`.
+Reference docs: `../../docs/ARCHITECTURE.md`, `../../docs/RUNBOOK.md`, `../../docs/mvp-cluster.md` (the `mvp` qualification steps), `../../docs/CAMPAIGNS.md`, and `../../docs/BENCHMARKS.md`.
 
 ```bash
 npm ci && npm run test:broker

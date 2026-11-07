@@ -6,7 +6,7 @@
 > does not exist. The config accepts
 > `github.reconcile_secs` and `forge.repos.<repo>.{merge, ci, max_repairs}`, and records the last three in each Ticket's
 > terms, but no code acts on them yet. The store schema versions this design planned for PRs 3 and 5 (V8 and V9) went to
-> memory (#84, #86), so those PRs take the next free version. Setup as built: [GitHub App](../README.md#github-app) and
+> memory (#84, #86), so those PRs take the next free version. Setup as built: [GitHub App](../how-to/github-app.md) and
 > [Set up GitHub](../production.md#set-up-github).
 
 This is the design contract for letting the agent work on GitHub by itself, as the bot of a GitHub App the owner installs. It came out of an architect arena. Two candidate designs were written against the same task and grounding. A DeepSeek V4.1 Flash cross-judge scored them against a six-criterion rubric. Candidate B became the base, with grafts from candidate A, one change to intake, and fixes to B's named defects. The [Synthesis decision](#synthesis-decision) records all of it. The sketch files in `sketch/` are B's, amended for the synthesis; they are documentation, not compiled code.
