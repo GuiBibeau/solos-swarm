@@ -40,6 +40,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use solos_agent_core::change::{CommitSha, Deliverable, Harvest, RepoName};
 use solos_agent_core::delivery::{Admission, NotReady, ready_gate};
+use solos_agent_core::memo::MemoAudience;
 use solos_agent_core::model::{
     Accept, Acknowledge, AssignmentId, EvalId, Method, MicroUsd, Ms, Plan, ReportIn, ReportStatus,
     ThreadKey, Ticket, TicketId, Trigger, TriggerId, Verdict,
@@ -1249,11 +1250,47 @@ impl AgentBroker {
     }
 }
 
+/// A session's system prompt, fetched once as it starts. A Router's ends
+/// with the global memos the core picks now, which it records as shown.
 async fn session(State(broker): State<AgentBroker>, headers: HeaderMap) -> Reply {
     let grant = broker.authenticate(&headers)?;
-    match &grant.system_prompt {
-        Some(prompt) => Ok(Json(json!({"system_prompt": prompt}))),
-        None => Err(refuse(StatusCode::NOT_FOUND, "no system prompt")),
+    let Some(prompt) = &grant.system_prompt else {
+        return Err(refuse(StatusCode::NOT_FOUND, "no system prompt"));
+    };
+    let memos = match &grant.principal {
+        Principal::Router => broker.router_memos().await,
+        Principal::Worker(_) => None,
+    };
+    let prompt = match memos {
+        Some(memos) => format!("{prompt}\n\n{memos}"),
+        None => prompt.clone(),
+    };
+    Ok(Json(json!({"system_prompt": prompt})))
+}
+
+impl AgentBroker {
+    /// The global memo index for a Router session starting now. A session
+    /// starts without one when the runtime cannot answer, rather than not
+    /// at all.
+    async fn router_memos(&self) -> Option<String> {
+        let fact = Fact::ShowMemos {
+            to: MemoAudience::Router,
+        };
+        match self.inner.facts.ask(fact).await {
+            Ok(Ok(Applied::Memos(index))) => (!index.text.is_empty()).then_some(index.text),
+            Ok(Ok(other)) => {
+                eprintln!("agent: the router's memos came back as {other:?}; none are shown");
+                None
+            }
+            Ok(Err(why)) => {
+                eprintln!("agent: the router's memos were refused: {why}; none are shown");
+                None
+            }
+            Err(err) => {
+                eprintln!("agent: the router's memos are not available: {err:#}; none are shown");
+                None
+            }
+        }
     }
 }
 

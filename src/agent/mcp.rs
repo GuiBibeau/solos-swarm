@@ -2,20 +2,23 @@
 //! operator's MCP host (`solos-swarm mcp --state-dir`) writes requests into
 //! and reads replies from. A request is a Trigger of source `mcp` whose
 //! actor is the operator, so the Policy names it `mcp:<operator>` and admits
-//! it, or not, as it would a Slack person.
+//! it, or not, as it would a Slack person. A third file holds the operator's
+//! orders (stop a Ticket; add, retire or forget a memo), which are commands
+//! the Engine decides, never text the Router reads.
 
 use super::jsonl::{Cursor, JsonlChannel};
 use super::links::TicketLinks;
 use super::ports::{
-    BoxFuture, Channel, Command, Fact, FactSink, Order, SendOptions, SendOutcome, Source,
-    TriggerSink,
+    BoxFuture, Channel, Command, Fact, FactSink, MemoCommand, MemoOrder, Order, SendOptions,
+    SendOutcome, Source, TriggerSink,
 };
 use crate::broker::now_ms;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
+use solos_agent_core::memo::{self, MemoScope};
 use solos_agent_core::model::{
-    Actor, Addressed, ChannelRef, MessageId, MessageKind, Ms, OutboundMessage, ThreadKey, TicketId,
-    Trigger, TriggerId,
+    Actor, Addressed, ChannelRef, MemoId, MessageId, MessageKind, Ms, OutboundMessage, ThreadKey,
+    TicketId, Trigger, TriggerId,
 };
 use std::collections::BTreeMap;
 use std::io::{ErrorKind, Write};
@@ -218,12 +221,40 @@ pub fn file(
     })
 }
 
-/// What an operator orders about a Ticket.
+/// What an operator orders: about a Ticket, or about the agent's memory.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "order", rename_all = "snake_case")]
 pub enum OperatorOrder {
-    /// Stop it, as a person's Stop does.
-    Stop { reason: String },
+    /// Stop a Ticket, as a person's Stop does.
+    Stop {
+        ticket: TicketId,
+        reason: String,
+    },
+    /// Remember `text` as the operator's own word.
+    MemoAdd {
+        scope: MemoScope,
+        text: String,
+    },
+    MemoRetire {
+        memo: MemoId,
+        reason: String,
+    },
+    /// Erase a memo's text, keeping its digest.
+    MemoForget {
+        memo: MemoId,
+    },
+}
+
+impl OperatorOrder {
+    /// What the thread its answer goes to is called after.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Stop { .. } => "stop",
+            Self::MemoAdd { .. } => "memo-add",
+            Self::MemoRetire { .. } => "memo-retire",
+            Self::MemoForget { .. } => "memo-forget",
+        }
+    }
 }
 
 /// A line of the commands file.
@@ -235,23 +266,43 @@ pub struct OperatorCommand {
     pub operator: String,
     /// Where the Engine's answer is posted: the `mcp` Channel's outbox.
     pub thread: String,
-    pub ticket: TicketId,
     #[serde(flatten)]
     pub order: OperatorOrder,
 }
 
 impl OperatorCommand {
-    /// The Command the Engine is asked, from `mcp:<operator>`.
-    pub fn command(&self) -> Command {
-        Command {
-            id: format!("{SOURCE}:{}", self.id),
-            order: match &self.order {
-                OperatorOrder::Stop { reason } => Order::StopBecause(reason.clone()),
-            },
-            ticket: self.ticket.clone(),
-            source: SOURCE.into(),
-            by: Actor::person(&self.operator),
-            reply_to: reply_to(&self.operator, &self.thread),
+    /// The fact the Engine is asked to apply, from `mcp:<operator>`.
+    pub fn fact(&self) -> Fact {
+        let id = format!("{SOURCE}:{}", self.id);
+        let by = Actor::person(&self.operator);
+        let reply_to = reply_to(&self.operator, &self.thread);
+        let memo = |order| {
+            Fact::Memo(MemoCommand {
+                id: id.clone(),
+                order,
+                source: SOURCE.into(),
+                by: by.clone(),
+                reply_to: reply_to.clone(),
+            })
+        };
+        match &self.order {
+            OperatorOrder::Stop { ticket, reason } => Fact::Command(Command {
+                id: id.clone(),
+                order: Order::StopBecause(reason.clone()),
+                ticket: ticket.clone(),
+                source: SOURCE.into(),
+                by: by.clone(),
+                reply_to: reply_to.clone(),
+            }),
+            OperatorOrder::MemoAdd { scope, text } => memo(MemoOrder::Add {
+                scope: scope.clone(),
+                text: text.clone(),
+            }),
+            OperatorOrder::MemoRetire { memo: m, reason } => memo(MemoOrder::Retire {
+                memo: m.clone(),
+                reason: reason.clone(),
+            }),
+            OperatorOrder::MemoForget { memo: m } => memo(MemoOrder::Forget { memo: m.clone() }),
         }
     }
 }
@@ -273,23 +324,57 @@ pub fn file_stop(
     reason: &str,
     now: Ms,
 ) -> Result<FiledCommand> {
-    ensure!(valid_name(operator), "operator {operator:?} is not a name");
     let reason = reason.trim();
     ensure!(!reason.is_empty(), "a stop needs a reason");
     ensure!(
         reason.chars().count() <= REASON_CHARS,
         "a reason is at most {REASON_CHARS} characters"
     );
+    let order = OperatorOrder::Stop {
+        ticket: ticket.clone(),
+        reason: reason.to_owned(),
+    };
+    file_order(state_dir, operator, order, now)
+}
+
+/// Append an order about a memo, from `operator`, to the commands file,
+/// refusing here what the Engine would refuse for its shape (an empty or
+/// overlong text or reason) so the operator hears it at once. The Policy
+/// decides whether `mcp:<operator>` may; the answer comes back on the
+/// returned thread.
+pub fn file_memo(
+    state_dir: &Path,
+    operator: &str,
+    order: OperatorOrder,
+    now: Ms,
+) -> Result<FiledCommand> {
+    match &order {
+        OperatorOrder::Stop { .. } => anyhow::bail!("a stop is filed with file_stop"),
+        OperatorOrder::MemoAdd { text, .. } => {
+            memo::check_text(text).map_err(anyhow::Error::msg)?;
+        }
+        OperatorOrder::MemoRetire { reason, .. } => {
+            memo::check_reason(reason).map_err(anyhow::Error::msg)?;
+        }
+        OperatorOrder::MemoForget { .. } => {}
+    }
+    file_order(state_dir, operator, order, now)
+}
+
+fn file_order(
+    state_dir: &Path,
+    operator: &str,
+    order: OperatorOrder,
+    now: Ms,
+) -> Result<FiledCommand> {
+    ensure!(valid_name(operator), "operator {operator:?} is not a name");
     let id = uuid::Uuid::new_v4().simple().to_string();
     let command = OperatorCommand {
         id: id.clone(),
         at_ms: now,
         operator: operator.to_owned(),
-        thread: format!("stop-{}", &id[..12]),
-        ticket: ticket.clone(),
-        order: OperatorOrder::Stop {
-            reason: reason.to_owned(),
-        },
+        thread: format!("{}-{}", order.kind(), &id[..12]),
+        order,
     };
     let path = commands(state_dir);
     let mut file = match std::fs::OpenOptions::new().append(true).open(&path) {
@@ -345,9 +430,9 @@ impl CommandSource {
         let age = (self.clock)().saturating_sub(found.at_ms);
         if age > COMMAND_TTL_MS {
             eprintln!(
-                "agent: operator command {} for {} is {} s old, not applied: file it again",
+                "agent: operator command {} ({}) is {} s old, not applied: file it again",
                 found.id,
-                found.ticket,
+                found.order.kind(),
                 age / 1_000
             );
             return false;
@@ -365,7 +450,7 @@ impl Source for CommandSource {
                     .read(&self.path, !self.follow, "operator command")
                     .await?;
                 for found in batch.iter().filter(|found| self.admit(found)) {
-                    if facts.send(Fact::Command(found.command())).await.is_err() {
+                    if facts.send(found.fact()).await.is_err() {
                         return Ok(());
                     }
                 }

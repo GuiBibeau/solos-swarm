@@ -1,7 +1,8 @@
 //! The same seeded command walks drive an Engine over `MemoryRepositories`
 //! and one over `SqliteStore`. After every step both stores hold the same
-//! Triggers, Threads, Tickets, Decisions, Effects and Events, answer the
-//! port's queries alike, and every command returned the same result.
+//! Triggers, Threads, Tickets, Decisions, trails, memos, Effects and Events,
+//! answer the port's queries alike, and every command returned the same
+//! result.
 //!
 //! Every fourth seed uses a database file and reopens it at random steps. A
 //! simulated effect runner works the SQLite queue in between (complete, fail,
@@ -19,9 +20,12 @@ use common::{
     signed_step, sqlite_contents,
 };
 use solos_agent_core::change::{Deliverable, RepoName};
+use solos_agent_core::memo::{
+    Memo, MemoActor, MemoAudience, MemoAuthor, MemoIn, MemoReview, MemoScope, MemoSource, MemoState,
+};
 use solos_agent_core::model::{
     Accept, Acknowledge, Actor, Addressed, Approval, AssignmentId, AssignmentState, ChannelRef,
-    Effect, EvalId, InputBody, Method, Plan, ReportIn, ReportStatus, SecretGrant, SecretId,
+    Effect, EvalId, InputBody, MemoId, Method, Plan, ReportIn, ReportStatus, SecretGrant, SecretId,
     ThreadKey, Ticket, TicketId, Trigger, TriggerId, Verdict,
 };
 use solos_agent_core::trail::{
@@ -38,9 +42,10 @@ use std::time::Instant;
 
 const THREADS: [&str; 3] = ["th1", "th2", "th3"];
 const SECRETS: [&str; 3] = ["local/github-gui", "local/openai", "laptop/gh"];
+const TRIGGER_TEXT: &str = "please look at this, \"quoted\" and ünïcode";
 
 /// Every public Engine command, by the name `Op::name` gives it.
-const COMMANDS: [&str; 19] = [
+const COMMANDS: [&str; 24] = [
     "receive",
     "evaluate_due",
     "decide(accept)",
@@ -60,6 +65,11 @@ const COMMANDS: [&str; 19] = [
     "ask_secret",
     "answer_secret",
     "use_key",
+    "propose_memo",
+    "activate_memo",
+    "retire_memo",
+    "forget_memo",
+    "show_memos",
 ];
 
 struct Lcg(u64);
@@ -108,6 +118,11 @@ enum Op {
     AskSecret(TicketId, SecretId, String, Vec<String>),
     AnswerSecret(TicketId, SecretId, String, Actor, bool),
     UseKey(TicketId, AssignmentId, SecretId, String, String),
+    ProposeMemo(MemoIn),
+    ActivateMemo(MemoId, MemoReview),
+    RetireMemo(MemoId, MemoActor, String),
+    ForgetMemo(MemoId, String, Actor),
+    ShowMemos(MemoAudience),
     SetPolicy(AllowlistPolicy),
     Advance(u64),
     /// SQLite only: the effect runner takes up to this many due Effects.
@@ -138,6 +153,11 @@ impl Op {
             Op::AskSecret(..) => "ask_secret",
             Op::AnswerSecret(..) => "answer_secret",
             Op::UseKey(..) => "use_key",
+            Op::ProposeMemo(_) => "propose_memo",
+            Op::ActivateMemo(..) => "activate_memo",
+            Op::RetireMemo(..) => "retire_memo",
+            Op::ForgetMemo(..) => "forget_memo",
+            Op::ShowMemos(_) => "show_memos",
             Op::SetPolicy(_) => "set_policy",
             Op::Advance(_) => "advance_clock",
             Op::RunEffects(_) => "run_effects",
@@ -176,6 +196,11 @@ fn apply<R: Repositories>(
             .answer_secret(t, secret, source, by.clone(), *allow)
             .map(unit),
         Op::UseKey(t, a, secret, method, url) => e.use_key(t, a, secret, method, url).map(unit),
+        Op::ProposeMemo(m) => e.propose_memo(m.clone()).map(|id| id.to_string()),
+        Op::ActivateMemo(m, review) => e.activate_memo(m, review.clone()).map(unit),
+        Op::RetireMemo(m, by, reason) => e.retire_memo(m, by.clone(), reason).map(unit),
+        Op::ForgetMemo(m, source, by) => e.forget_memo(m, source, by.clone()).map(unit),
+        Op::ShowMemos(to) => e.show_memos(to.clone()).map(|index| index.text),
         Op::SetPolicy(p) => {
             e.set_policy(p.clone());
             Ok(String::new())
@@ -276,7 +301,7 @@ fn gen_trigger(rng: &mut Lcg, r: &MemoryRepositories, fresh: &mut u64, now: u64)
             Addressed::Direct,
             Addressed::Unaddressed,
         ]),
-        text: "please look at this, \"quoted\" and ünïcode".into(),
+        text: TRIGGER_TEXT.into(),
         threads,
         reply_to,
         meta,
@@ -645,9 +670,150 @@ fn gen_use_key(rng: &mut Lcg, r: &MemoryRepositories) -> Op {
     Op::UseKey(ticket, assignment, secret, method.to_owned(), url)
 }
 
+fn gen_clicker(rng: &mut Lcg) -> (String, Actor) {
+    let source = if rng.chance(85) { "slack" } else { "github" };
+    let by = match rng.below(20) {
+        0..=9 => Actor::person("alice"),
+        10..=13 => Actor::person("bob"),
+        14 | 15 => Actor::person("mallory"),
+        16 | 17 => Actor::bot("ci-bot"),
+        _ => Actor::system("schedule"),
+    };
+    (source.to_owned(), by)
+}
+
+/// A memo, preferring (75%) one `want` accepts; 5% a missing one.
+fn pick_memo(rng: &mut Lcg, r: &MemoryRepositories, want: impl Fn(&Memo) -> bool) -> MemoId {
+    if r.memos.is_empty() || rng.chance(5) {
+        return MemoId::new("mm_missing");
+    }
+    let preferred: Vec<MemoId> = r
+        .memos
+        .values()
+        .filter(|m| want(m))
+        .map(|m| m.id.clone())
+        .collect();
+    if !preferred.is_empty() && rng.chance(75) {
+        rng.pick(&preferred)
+    } else {
+        let all: Vec<MemoId> = r.memos.keys().cloned().collect();
+        rng.pick(&all)
+    }
+}
+
+fn gen_propose_memo(rng: &mut Lcg, r: &MemoryRepositories) -> Op {
+    let scope = match rng.below(10) {
+        0..=5 => MemoScope::Global,
+        _ => MemoScope::Repo(RepoName::try_from("acme/widgets".to_owned()).unwrap()),
+    };
+    let text = match rng.below(20) {
+        0..=6 => TRIGGER_TEXT.to_owned(),
+        7..=10 => "Tests run with ./check, never cargo test.".to_owned(),
+        11..=17 => format!(
+            "Lesson {}: {}",
+            rng.below(1_000),
+            "ü".repeat(rng.pick(&[5, 200]))
+        ),
+        18 => String::new(),
+        _ => "y".repeat(401),
+    };
+    let operator = rng.chance(45);
+    let author = if operator {
+        let (source, by) = gen_clicker(rng);
+        MemoAuthor::Operator { source, by }
+    } else {
+        let ticket = pick_ticket(rng, r, |t| latest_is(t, AssignmentState::Running));
+        let assignment = pick_assignment(rng, r, &ticket);
+        MemoAuthor::Worker { ticket, assignment }
+    };
+    let n = match rng.below(20) {
+        0 => 0,
+        1..=16 => 1,
+        _ => 2,
+    };
+    let sources = (0..n)
+        .map(|_| match rng.below(10) {
+            0..=3 if operator => MemoSource::Operator,
+            0 => MemoSource::Operator,
+            1..=5 => {
+                let all: Vec<TriggerId> = r.triggers.keys().cloned().collect();
+                let trigger = if all.is_empty() || rng.chance(5) {
+                    TriggerId::new("t_missing")
+                } else {
+                    rng.pick(&all)
+                };
+                let quote = rng.pick(&[TRIGGER_TEXT, TRIGGER_TEXT, "\"quoted\"", "not in it"]);
+                MemoSource::Trigger {
+                    trigger,
+                    quote: quote.to_owned(),
+                }
+            }
+            6..=8 => MemoSource::Call {
+                assignment: AssignmentId::new("as_cited"),
+                call: "call-1".into(),
+                tool: rng
+                    .pick(&["run_code", "fetch_url", "browser_read"])
+                    .to_owned(),
+                transcript: Digest::of(b"transcript"),
+                quote: "./check: ok".into(),
+            },
+            _ => MemoSource::Ticket {
+                ticket: pick_ticket(rng, r, |_| true),
+            },
+        })
+        .collect();
+    Op::ProposeMemo(MemoIn {
+        scope,
+        text,
+        sources,
+        author,
+    })
+}
+
+fn gen_memo_op(rng: &mut Lcg, r: &MemoryRepositories) -> Op {
+    let reason = if rng.chance(5) {
+        String::new()
+    } else {
+        "checked against the transcript".to_owned()
+    };
+    let review_name = if rng.chance(5) { "" } else { "review:diff" };
+    match rng.below(14) {
+        0..=4 => gen_propose_memo(rng, r),
+        5..=6 => Op::ActivateMemo(
+            pick_memo(rng, r, |m| m.state == MemoState::Proposed),
+            MemoReview {
+                by: review_name.into(),
+                reason,
+            },
+        ),
+        7..=8 => {
+            let by = if rng.chance(60) {
+                let (source, by) = gen_clicker(rng);
+                MemoActor::Operator { source, by }
+            } else {
+                MemoActor::Review {
+                    by: review_name.into(),
+                }
+            };
+            Op::RetireMemo(pick_memo(rng, r, Memo::is_live), by, reason)
+        }
+        9 => {
+            let (source, by) = gen_clicker(rng);
+            let m = pick_memo(rng, r, |m| !matches!(m.state, MemoState::Forgotten { .. }));
+            Op::ForgetMemo(m, source, by)
+        }
+        10 => Op::ShowMemos(MemoAudience::Router),
+        _ => {
+            let ticket = pick_ticket(rng, r, |_| true);
+            let assignment = pick_assignment(rng, r, &ticket);
+            Op::ShowMemos(MemoAudience::Worker { ticket, assignment })
+        }
+    }
+}
+
 fn gen_op(rng: &mut Lcg, w: &mut Walk) -> Op {
     let r = w.mem.repos();
-    match rng.below(130) {
+    match rng.below(145) {
         0..=19 => Op::Receive(gen_trigger(rng, r, &mut w.fresh, w.now.get())),
         20..=29 => Op::EvaluateDue,
         30..=41 => gen_decide(rng, r),
@@ -728,6 +894,7 @@ fn gen_op(rng: &mut Lcg, w: &mut Walk) -> Op {
         112..=117 => gen_ask_secret(rng, r),
         118..=125 => gen_answer_secret(rng, r),
         126..=129 => gen_use_key(rng, r),
+        130..=144 => gen_memo_op(rng, r),
         _ if w.db.is_some() => Op::Reopen,
         _ => Op::EvaluateDue,
     }
@@ -846,6 +1013,13 @@ impl Walk {
             TicketId::new("tk_missing")
         };
         assert_eq!(m.ticket(&ticket), s.ticket(&ticket), "{at}: {ticket}");
+        let memo = if !a.memos.is_empty() && p.chance(80) {
+            p.pick(&a.memos).id
+        } else {
+            MemoId::new("mm_missing")
+        };
+        assert_eq!(m.memo(&memo), s.memo(&memo), "{at}: {memo}");
+        assert_eq!(s.read_memo(&memo).unwrap(), m.memo(&memo), "{at}: {memo}");
         let assignment = if !a.trails.is_empty() && p.chance(80) {
             p.pick(&a.trails).assignment
         } else {

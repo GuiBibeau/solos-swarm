@@ -192,6 +192,68 @@ impl HostArgs {
 }
 
 #[derive(Subcommand)]
+enum AgentMemoCommand {
+    /// The proposed and active memos, with who wrote each and how far it is
+    /// trusted; with `--all`, the retired and forgotten ones too.
+    List {
+        /// The agent's state directory.
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        all: bool,
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remember TEXT as your own word. It is active at once: the Router's
+    /// prompt holds a global memo, and the first prompt of every worker
+    /// holds the global ones and its repository's.
+    Add {
+        /// The agent's state directory (its `kind: mcp` Source must be
+        /// configured and `agent serve` running).
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// The `mcp:<operator>` the Policy is asked about.
+        #[arg(long)]
+        operator: String,
+        /// `global`, or `repo:<owner>/<name>` for the workers on one of the
+        /// repositories in `forge.repos`.
+        #[arg(long, default_value = "global")]
+        scope: String,
+        /// At most 400 characters.
+        text: String,
+        /// How long to wait for the agent's answer.
+        #[arg(long, default_value_t = 20)]
+        wait_secs: u64,
+    },
+    /// Take a memo out of every prompt for good, with why. `list --all`
+    /// still shows it.
+    Retire {
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        operator: String,
+        /// The memo, `mm_` and 16 hex digits.
+        memo: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long, default_value_t = 20)]
+        wait_secs: u64,
+    },
+    /// Erase a memo's text, quotes and reasons from the Store. Its digest
+    /// stays, so the event chain still verifies.
+    Forget {
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        operator: String,
+        memo: String,
+        #[arg(long, default_value_t = 20)]
+        wait_secs: u64,
+    },
+}
+
+#[derive(Subcommand)]
 enum AgentCommand {
     /// Take Triggers from the configured Sources, judge them, run the work and
     /// reply. Serves until SIGINT or SIGTERM.
@@ -314,6 +376,17 @@ enum AgentCommand {
         /// How long to wait for the agent's answer.
         #[arg(long, default_value_t = 20)]
         wait_secs: u64,
+    },
+    /// The agent's memory: memos it shows its Router and its workers, as
+    /// data, in their prompts. `list` reads the Store and writes nothing.
+    /// `add`, `retire` and `forget` go through the running agent as
+    /// `mcp:OPERATOR`, as `agent stop` does, so `policy.people` or
+    /// `policy.approvers` must name that principal. Each exits 0 once the
+    /// memory is as asked, 1 if the agent refused, 2 if it did not answer in
+    /// time.
+    Memo {
+        #[command(subcommand)]
+        command: AgentMemoCommand,
     },
     /// Publish the agent's tickets to its web dashboard: a sidecar that opens
     /// the Store read-only, builds a JSON snapshot of each open and recently
@@ -854,6 +927,71 @@ fn main() {
         std::process::exit(1);
     }
 }
+async fn memo_command(command: AgentMemoCommand) -> Result<()> {
+    use solos_swarm::agent::memo::{self, Change};
+    let (state_dir, operator, change, wait_secs) = match command {
+        AgentMemoCommand::List {
+            state_dir,
+            all,
+            json,
+        } => {
+            let listed = memo::list(&state_dir, all)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&listed)?);
+            } else {
+                print!("{}", memo::render(&listed));
+            }
+            return Ok(());
+        }
+        AgentMemoCommand::Add {
+            state_dir,
+            operator,
+            scope,
+            text,
+            wait_secs,
+        } => {
+            let scope = memo::scope(&scope)?;
+            (state_dir, operator, Change::Add { scope, text }, wait_secs)
+        }
+        AgentMemoCommand::Retire {
+            state_dir,
+            operator,
+            memo: id,
+            reason,
+            wait_secs,
+        } => {
+            let memo = memo::memo_id(&id)?;
+            (
+                state_dir,
+                operator,
+                Change::Retire { memo, reason },
+                wait_secs,
+            )
+        }
+        AgentMemoCommand::Forget {
+            state_dir,
+            operator,
+            memo: id,
+            wait_secs,
+        } => {
+            let memo = memo::memo_id(&id)?;
+            (state_dir, operator, Change::Forget { memo }, wait_secs)
+        }
+    };
+    let args = memo::Args {
+        state_dir,
+        operator,
+        change,
+        wait: Duration::from_secs(wait_secs),
+    };
+    let outcome = memo::run(&args).await?;
+    println!("{}", outcome.render());
+    match outcome.exit_code() {
+        0 => Ok(()),
+        code => std::process::exit(code),
+    }
+}
+
 async fn execute(command: Action) -> Result<()> {
     match command {
         Action::WasiWorker { .. } | Action::SandboxEnter { .. } | Action::Bridge { .. } => {
@@ -1012,6 +1150,9 @@ async fn execute(command: Action) -> Result<()> {
                 code => std::process::exit(code),
             }
         }
+        Action::Agent {
+            command: AgentCommand::Memo { command },
+        } => memo_command(command).await,
         Action::Agent {
             command:
                 AgentCommand::Publish {

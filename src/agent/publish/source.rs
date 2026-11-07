@@ -223,7 +223,12 @@ impl Source {
             }
             DomainEvent::EvalStarted { .. }
             | DomainEvent::EvalExpired { .. }
-            | DomainEvent::DecisionRecorded { .. } => {}
+            | DomainEvent::DecisionRecorded { .. }
+            | DomainEvent::MemoProposed { .. }
+            | DomainEvent::MemoActivated { .. }
+            | DomainEvent::MemoRetired { .. }
+            | DomainEvent::MemoForgotten { .. }
+            | DomainEvent::MemosShown { .. } => {}
             DomainEvent::TicketCreated { ticket, .. }
             | DomainEvent::TicketApproved { ticket, .. }
             | DomainEvent::HandedBack { ticket, .. }

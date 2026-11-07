@@ -1360,6 +1360,13 @@ production box ([production.md](production.md) has the units and the rollout):
 - `solos-swarm agent stop --state-dir DIR --operator NAME --ticket ID --reason TEXT` stops a Ticket as a person's Stop does:
   the command is filed (`state/mcp/commands.jsonl`) as `mcp:NAME` and the running agent's Engine applies it only if the Policy
   names that principal.
+- `solos-swarm agent memo add|list|retire|forget --state-dir DIR [--operator NAME]` reads and changes the agent's memory:
+  memos it shows, quoted as data, in the Router's system prompt (the global ones, within 1 KB) and in each worker's first
+  prompt (the global ones and its repository's, within 3 KB). `add TEXT [--scope global|repo:OWNER/NAME]` (a repository
+  of `forge.repos`), `retire MEMO --reason TEXT` and `forget MEMO` are filed like `agent stop` and applied by the Engine
+  only if the Policy names `mcp:NAME`. An operator's memo is their own word, so it is active at once. A memo's text is in
+  its row of `agent.db` (schema 8) and only its digest is on the event chain, so `forget` erases the text and the chain
+  still verifies; a `memos_shown` event names the memos each session was shown. `list [--all] [--json]` reads the Store.
 
 ## Web dashboard
 
@@ -1422,7 +1429,8 @@ command = "/usr/local/bin/solos-swarm"
 args = ["mcp", "--state-dir", "/srv/agent/state", "--operator", "alice", "--config", "/srv/agent/agent.yaml"]
 ```
 
-The host then has `agent_request`, `agent_replies` and `agent_status`. A request returns its thread; the
+The host then has `agent_request`, `agent_replies` and `agent_status`, and `agent_memos`, `agent_memo_add` and
+`agent_memo_retire`, which read and change the agent's memory as `agent memo` does. A request returns its thread; the
 acknowledgement, any question and the result arrive there, and a follow-up names the same thread. `--config` only
 adds the Router's cap, the Watchdog's thresholds and a pause set in agent.yaml to `agent_status`. Checked with
 Claude Code 2.1.231 (`claude mcp list` shows it connected) and Codex 0.145.0: both list the three tools and call

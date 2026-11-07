@@ -541,7 +541,14 @@ async fn an_operator_files_requests_as_mcp_people_and_reads_the_answers() {
     );
     assert_eq!(
         alice.names().await,
-        ["agent_status", "agent_request", "agent_replies"]
+        [
+            "agent_status",
+            "agent_request",
+            "agent_replies",
+            "agent_memos",
+            "agent_memo_add",
+            "agent_memo_retire"
+        ]
     );
     let (text, is_error) = alice.call("agent_request", json!({"text": "Hello"})).await;
     assert!(
@@ -650,6 +657,129 @@ async fn an_operator_files_requests_as_mcp_people_and_reads_the_answers() {
         json!([]),
         "the scripted ticket has ended"
     );
+    alice.close().await;
+    mallory.close().await;
+}
+
+/// Serve until idle once the commands file holds `lines` orders, so the
+/// order a tool call is waiting on is there to be read.
+async fn serve_once_filed(config: &Path, state: &Path, lines: usize) {
+    let start = Instant::now();
+    loop {
+        let filed = std::fs::read_to_string(solos_swarm::agent::mcp::commands(state))
+            .unwrap_or_default()
+            .lines()
+            .count();
+        if filed >= lines {
+            break;
+        }
+        assert!(start.elapsed() < LIMIT, "order {lines} was never filed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    serve_until_idle(config, state).await;
+}
+
+#[tokio::test]
+async fn an_operator_reads_adds_and_retires_memos_through_the_tools_and_the_policy_decides_who() {
+    let scratch = Scratch::new("operator-memos");
+    let io = "sources:\n  - {kind: mcp}\nchannels:\n  - {kind: mcp}\n";
+    let config = scripted_config(&scratch, io, "mcp:alice");
+    let state = scratch.state();
+    serve_until_idle(&config, &state).await;
+    let host = |operator: &str| {
+        Mcp::spawn(&[
+            &"--state-dir",
+            &state,
+            &"--operator",
+            &operator.to_owned(),
+            &"--config",
+            &config,
+        ])
+    };
+    let mut alice = host("alice");
+    alice.initialize().await;
+    let (text, is_error) = alice.call("agent_memos", json!({})).await;
+    assert_eq!((text.as_str(), is_error), ("[]", false));
+    for bad in [
+        json!({"text": "x", "scope": "repo:o"}),
+        json!({"text": ""}),
+        json!({"txt": "x"}),
+    ] {
+        let (text, is_error) = alice.call("agent_memo_add", bad.clone()).await;
+        assert!(is_error, "{bad}: {text}");
+    }
+    assert!(
+        !solos_swarm::agent::mcp::commands(&state)
+            .metadata()
+            .is_ok_and(|file| file.len() > 0),
+        "nothing was filed"
+    );
+
+    let add = alice.call("agent_memo_add", json!({"text": "Answer in French."}));
+    let ((text, is_error), ()) = tokio::join!(add, serve_once_filed(&config, &state, 1));
+    assert!(!is_error, "{text}");
+    let added: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(added["result"], "done", "{added}");
+    assert!(
+        added["reply"]
+            .as_str()
+            .unwrap()
+            .starts_with("Remembered as mm_"),
+        "{added}"
+    );
+    let memo = &added["memo"];
+    assert_eq!(
+        (
+            &memo["state"],
+            &memo["scope"],
+            &memo["trust"],
+            &memo["author"]
+        ),
+        (
+            &json!("active"),
+            &json!("global"),
+            &json!("person"),
+            &json!("mcp:alice")
+        )
+    );
+    let id = memo["id"].as_str().unwrap().to_owned();
+    let (text, _) = alice.call("agent_memos", json!({})).await;
+    let listed: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(listed[0]["id"], json!(id));
+    assert_eq!(listed[0]["text"], "Answer in French.");
+
+    // The same memo again is already there: nothing is filed.
+    let (text, is_error) = alice
+        .call("agent_memo_add", json!({"text": "Answer in French."}))
+        .await;
+    assert!(!is_error, "{text}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).unwrap()["result"],
+        "already"
+    );
+
+    let mut mallory = host("mallory");
+    mallory.initialize().await;
+    let retire = json!({"memo": id, "reason": "I say so"});
+    let refused = mallory.call("agent_memo_retire", retire);
+    let ((text, is_error), ()) = tokio::join!(refused, serve_once_filed(&config, &state, 2));
+    assert!(is_error, "{text}");
+    assert!(
+        text.contains("is not allowed to change the agent's memory"),
+        "{text}"
+    );
+
+    let retire = json!({"memo": id, "reason": "the owner reads English now"});
+    let retired = alice.call("agent_memo_retire", retire);
+    let ((text, is_error), ()) = tokio::join!(retired, serve_once_filed(&config, &state, 3));
+    assert!(!is_error, "{text}");
+    let retired: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(retired["memo"]["state"], "retired", "{retired}");
+    let (text, _) = alice.call("agent_memos", json!({})).await;
+    assert_eq!(text, "[]");
+    let (text, _) = alice.call("agent_memos", json!({"all": true})).await;
+    let all: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(all[0]["reason"], "the owner reads English now", "{all}");
     alice.close().await;
     mallory.close().await;
 }

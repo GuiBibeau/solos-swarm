@@ -21,9 +21,10 @@ pub use watchdog::AlertRow;
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::de::DeserializeOwned;
+use solos_agent_core::memo::Memo;
 use solos_agent_core::model::{
-    AssignmentId, ChangeSet, Decision, DecisionId, EvalId, Ms, Thread, ThreadKey, Ticket, TicketId,
-    Trigger, TriggerId,
+    AssignmentId, ChangeSet, Decision, DecisionId, EvalId, MemoId, Ms, Thread, ThreadKey, Ticket,
+    TicketId, Trigger, TriggerId,
 };
 use solos_agent_core::trail::TrailCursor;
 use solos_agent_core::{Error, Repositories};
@@ -127,6 +128,16 @@ impl SqliteStore {
     /// Every Assignment's trail position, by Assignment.
     pub fn trails(&self) -> Result<Vec<TrailCursor>, StoreError> {
         self.bodies("SELECT body FROM trails ORDER BY assignment")
+    }
+
+    /// Every memo, in any state, by id.
+    pub fn memos(&self) -> Result<Vec<Memo>, StoreError> {
+        self.bodies("SELECT body FROM memos ORDER BY id")
+    }
+
+    /// One memo. Unlike the port's read, a failed read is an error here.
+    pub fn read_memo(&self, id: &MemoId) -> Result<Option<Memo>, StoreError> {
+        self.body("SELECT body FROM memos WHERE id = ?1", id.as_str())
     }
 
     /// Decisions recorded at or after `since_ms`, newest first, at most
@@ -271,6 +282,19 @@ impl SqliteStore {
                     serde_json::to_string(cursor)?
                 ])?;
             }
+            let mut put = tx.prepare_cached(
+                "INSERT INTO memos (id, scope, state, body) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (id) DO UPDATE
+                 SET scope = excluded.scope, state = excluded.state, body = excluded.body",
+            )?;
+            for (id, memo) in &changes.memos {
+                put.execute(params![
+                    id.as_str(),
+                    memo.scope.to_string(),
+                    memo.state.name(),
+                    serde_json::to_string(memo)?
+                ])?;
+            }
             queue::append(&tx, &changes.effects)?;
             chain::append(&tx, &changes.events)?;
         }
@@ -299,6 +323,14 @@ impl Repositories for SqliteStore {
             "SELECT body FROM trails WHERE assignment = ?1",
             assignment.as_str(),
         ))
+    }
+    fn memo(&self, id: &MemoId) -> Option<Memo> {
+        self.port(self.body("SELECT body FROM memos WHERE id = ?1", id.as_str()))
+    }
+    fn live_memos(&self) -> Vec<Memo> {
+        self.port(
+            self.bodies("SELECT body FROM memos WHERE state IN ('proposed', 'active') ORDER BY id"),
+        )
     }
     fn active_threads(&self) -> Vec<ThreadKey> {
         self.port(self.thread_keys("SELECT key FROM threads WHERE active = 1 ORDER BY key", &[]))

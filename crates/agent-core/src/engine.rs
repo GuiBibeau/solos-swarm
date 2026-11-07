@@ -6,15 +6,20 @@
 use crate::change::{BranchName, Change, Checks, Deliverable, Delivered};
 use crate::delivery::{Admission, ForgeJob, NotReady, Observed, ready_gate};
 use crate::ids::key;
+use crate::memo::{
+    self, Memo, MemoActor, MemoAudience, MemoAuthor, MemoIn, MemoIndex, MemoReview, MemoScope,
+    MemoSource, MemoState, MemoTrust,
+};
 use crate::model::{
     Accept, Acknowledge, Actor, Approval, Ask, Assignment, AssignmentId, AssignmentState,
     Candidate, ChangeSet, Decision, DecisionId, DecisionKind, DomainEvent, Effect, Ended, EndedBy,
-    Eval, EvalId, Event, Input, InputBody, InputId, Mandate, MessageId, MessageKind, MicroUsd, Ms,
-    OutboundMessage, Plan, Report, ReportIn, ReportStatus, SecretGrant, SecretId, Strength, Thread,
-    ThreadKey, Ticket, TicketId, TicketOutcome, TicketSummary, Trigger, TriggerId, Verdict,
+    Eval, EvalId, Event, Input, InputBody, InputId, Mandate, MemoId, MessageId, MessageKind,
+    MicroUsd, Ms, OutboundMessage, Plan, Report, ReportIn, ReportStatus, SecretGrant, SecretId,
+    Strength, Thread, ThreadKey, Ticket, TicketId, TicketOutcome, TicketSummary, Trigger,
+    TriggerId, Verdict,
 };
 use crate::ports::{Clock, Error, Gate, Policy, Repositories};
-use crate::trail::{self, TrailAction, TrailCursor, TrailOutcome};
+use crate::trail::{self, Digest, TrailAction, TrailCursor, TrailOutcome};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The third consecutive expired Eval on a Thread records `unavailable`.
@@ -882,6 +887,233 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
             }
         })
     }
+
+    /// Propose a memo and return its id. Its trust is derived from its
+    /// sources, never from its author's word, and a person's own memo (the
+    /// operator's, or a person's message quoted word for word) is active at
+    /// once. Anything else waits for the review's decision
+    /// ([`Engine::activate_memo`]). A live memo with the same scope and text
+    /// is refused, naming it.
+    pub fn propose_memo(&mut self, proposal: MemoIn) -> Result<MemoId, Error> {
+        self.run(|tx, policy| {
+            let MemoIn {
+                scope,
+                text,
+                sources,
+                author,
+            } = proposal;
+            let author_key = match &author {
+                MemoAuthor::Operator { source, by } => {
+                    may_remember(policy, source, by)?;
+                    format!("{source}:{}", by.id)
+                }
+                MemoAuthor::Worker { ticket, assignment } => {
+                    let t = tx.open_ticket(ticket)?;
+                    if t.running_assignment().is_none_or(|a| a.id != *assignment) {
+                        return Err(Error::Refused(format!("{assignment} is not running")));
+                    }
+                    assignment.to_string()
+                }
+            };
+            memo::check_text(&text).map_err(Error::Invalid)?;
+            if !(1..=memo::MAX_MEMO_SOURCES).contains(&sources.len()) {
+                return Err(Error::Invalid(format!(
+                    "a memo cites 1 to {} sources",
+                    memo::MAX_MEMO_SOURCES
+                )));
+            }
+            let mut trust = MemoTrust::Person;
+            for source in &sources {
+                let trigger = match source {
+                    MemoSource::Trigger { trigger, .. } => tx.trigger(trigger),
+                    MemoSource::Ticket { ticket } => {
+                        tx.require_ticket(ticket)?;
+                        None
+                    }
+                    MemoSource::Operator | MemoSource::Call { .. } => None,
+                };
+                let allowed = trigger.as_ref().map(|t| allowed_person(policy, t));
+                let found = trigger.as_ref().zip(allowed);
+                let one =
+                    memo::source_trust(source, &text, &author, found).map_err(Error::Invalid)?;
+                trust = trust.min(one);
+            }
+            if let Some(held) = tx
+                .live_memos()
+                .into_iter()
+                .find(|m| m.scope == scope && m.text == text)
+            {
+                return Err(Error::Refused(format!("{} already holds it", held.id)));
+            }
+            let id = MemoId(key(
+                "mm",
+                &[&scope.to_string(), &text, &author_key, &tx.now.to_string()],
+            ));
+            if tx.memo(&id).is_some() {
+                return Err(Error::Refused(format!("{id} was just written")));
+            }
+            let active = trust == MemoTrust::Person;
+            let state = if active {
+                MemoState::Active {
+                    since_ms: tx.now,
+                    review: None,
+                }
+            } else {
+                MemoState::Proposed
+            };
+            let text_sha256 = Digest::of(text.as_bytes());
+            tx.event(DomainEvent::MemoProposed {
+                memo: id.clone(),
+                scope: scope.clone(),
+                trust,
+                author: author.clone(),
+                text_sha256: text_sha256.clone(),
+                active,
+            });
+            tx.save_memo(Memo {
+                id: id.clone(),
+                scope,
+                text,
+                text_sha256,
+                sources,
+                trust,
+                author,
+                state,
+                created_ms: tx.now,
+                verified_ms: tx.now,
+            });
+            Ok(id)
+        })
+    }
+
+    /// The review keeps a proposed memo: from now on it is in the index.
+    /// This is the one way a model's or an external memo becomes active.
+    pub fn activate_memo(&mut self, memo: &MemoId, review: MemoReview) -> Result<(), Error> {
+        self.run(|tx, _| {
+            memo::check_name("a review's name", &review.by).map_err(Error::Invalid)?;
+            memo::check_reason(&review.reason).map_err(Error::Invalid)?;
+            let mut m = tx.require_memo(memo)?;
+            if m.state != MemoState::Proposed {
+                return Err(Error::Refused(format!("{memo} is {}", m.state.name())));
+            }
+            tx.event(DomainEvent::MemoActivated {
+                memo: memo.clone(),
+                by: review.by.clone(),
+                reason_sha256: Digest::of(review.reason.as_bytes()),
+            });
+            m.state = MemoState::Active {
+                since_ms: tx.now,
+                review: Some(review),
+            };
+            m.verified_ms = tx.now;
+            tx.save_memo(m);
+            Ok(())
+        })
+    }
+
+    /// Take a proposed or active memo out of use for good, with why. A
+    /// person may retire any memo; the review only a model's or an external
+    /// one, so a person's word stands until a person takes it back.
+    pub fn retire_memo(&mut self, memo: &MemoId, by: MemoActor, reason: &str) -> Result<(), Error> {
+        self.run(|tx, policy| {
+            memo_actor(policy, &by)?;
+            memo::check_reason(reason).map_err(Error::Invalid)?;
+            let mut m = tx.require_memo(memo)?;
+            if !m.is_live() {
+                return Err(Error::Refused(format!("{memo} is {}", m.state.name())));
+            }
+            if matches!(by, MemoActor::Review { .. }) && m.trust == MemoTrust::Person {
+                return Err(Error::Refused(format!(
+                    "{memo} is a person's word, which only a person retires"
+                )));
+            }
+            tx.event(DomainEvent::MemoRetired {
+                memo: memo.clone(),
+                by: by.clone(),
+                reason_sha256: Digest::of(reason.as_bytes()),
+            });
+            m.state = MemoState::Retired {
+                by,
+                reason: reason.to_owned(),
+                at_ms: tx.now,
+            };
+            tx.save_memo(m);
+            Ok(())
+        })
+    }
+
+    /// A person erases a memo: its text, its quotes and the reasons given
+    /// for it. Its digest stays in its row and on the chain, so the chain
+    /// still verifies and an audit can tell it existed.
+    pub fn forget_memo(&mut self, memo: &MemoId, source: &str, by: Actor) -> Result<(), Error> {
+        self.run(|tx, policy| {
+            may_remember(policy, source, &by)?;
+            let mut m = tx.require_memo(memo)?;
+            if matches!(m.state, MemoState::Forgotten { .. }) {
+                return Err(Error::Refused(format!("{memo} is already forgotten")));
+            }
+            let by = MemoActor::Operator {
+                source: source.to_owned(),
+                by,
+            };
+            tx.event(DomainEvent::MemoForgotten {
+                memo: memo.clone(),
+                by: by.clone(),
+            });
+            m.erase();
+            m.state = MemoState::Forgotten { by, at_ms: tx.now };
+            tx.save_memo(m);
+            Ok(())
+        })
+    }
+
+    /// The index `to` is shown now: the active global memos, and for a worker
+    /// its repository's, within the audience's budget. A non-empty one is
+    /// recorded as `MemosShown`, so a wrong memo can name the sessions it
+    /// shaped.
+    pub fn show_memos(&mut self, to: MemoAudience) -> Result<MemoIndex, Error> {
+        self.run(|tx, _| {
+            let mut scopes = vec![MemoScope::Global];
+            if let MemoAudience::Worker { ticket, assignment } = &to {
+                let t = tx.require_ticket(ticket)?;
+                if !t.assignments.iter().any(|a| a.id == *assignment) {
+                    return Err(Error::Refused(format!(
+                        "{assignment} is not an assignment of {ticket}"
+                    )));
+                }
+                scopes.extend(t.mandate.repo.map(MemoScope::Repo));
+            }
+            let index = memo::memo_index(&tx.live_memos(), &scopes, to.budget());
+            if !index.text.is_empty() {
+                tx.event(DomainEvent::MemosShown {
+                    to,
+                    memos: index.shown.clone(),
+                    index_sha256: index.sha256.clone(),
+                });
+            }
+            Ok(index)
+        })
+    }
+}
+
+/// Only a person the Policy lets change the agent's memory acts as its
+/// operator.
+fn may_remember(policy: &impl Policy, source: &str, by: &Actor) -> Result<(), Error> {
+    if by.is_person() && policy.may_remember(source, by) {
+        Ok(())
+    } else {
+        Err(Error::Forbidden(format!(
+            "{} is not allowed to change the agent's memory.",
+            who(by)
+        )))
+    }
+}
+
+fn memo_actor(policy: &impl Policy, by: &MemoActor) -> Result<(), Error> {
+    match by {
+        MemoActor::Operator { source, by } => may_remember(policy, source, by),
+        MemoActor::Review { by } => memo::check_name("a review's name", by).map_err(Error::Invalid),
+    }
 }
 
 /// Only a person the Policy admits explicitly owns a follow-up: a resume
@@ -1048,6 +1280,33 @@ impl<R: Repositories> Tx<'_, R> {
         self.changes
             .trails
             .insert(cursor.assignment.clone(), cursor);
+    }
+    fn memo(&self, id: &MemoId) -> Option<Memo> {
+        self.changes
+            .memos
+            .get(id)
+            .cloned()
+            .or_else(|| self.repos.memo(id))
+    }
+    fn require_memo(&self, id: &MemoId) -> Result<Memo, Error> {
+        self.memo(id).ok_or_else(|| Error::Missing {
+            kind: "memo",
+            id: id.to_string(),
+        })
+    }
+    /// Proposed and active memos, this transaction's changes included.
+    fn live_memos(&self) -> Vec<Memo> {
+        let mut all: BTreeMap<MemoId, Memo> = self
+            .repos
+            .live_memos()
+            .into_iter()
+            .map(|memo| (memo.id.clone(), memo))
+            .collect();
+        all.extend(self.changes.memos.clone());
+        all.into_values().filter(Memo::is_live).collect()
+    }
+    fn save_memo(&mut self, memo: Memo) {
+        self.changes.memos.insert(memo.id.clone(), memo);
     }
     fn save_thread(&mut self, thread: Thread) {
         self.changes.threads.insert(thread.key.clone(), thread);

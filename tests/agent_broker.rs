@@ -5,11 +5,13 @@
 
 use anyhow::Result;
 use serde_json::{Value, json};
-use solos_agent_core::AllowlistPolicy;
+use solos_agent_core::memo::{MemoAudience, MemoAuthor, MemoIn, MemoScope, MemoSource};
 use solos_agent_core::model::{
-    Actor, Addressed, Approval, AssignmentId, Candidate, ChannelRef, DecisionKind, InputBody,
-    MessageKind, OutboundMessage, Plan, ReportStatus, ThreadKey, TicketId, Trigger, TriggerId,
+    Actor, Addressed, Approval, AssignmentId, Candidate, ChannelRef, DecisionKind, DomainEvent,
+    InputBody, MessageKind, OutboundMessage, Plan, ReportStatus, ThreadKey, TicketId, Trigger,
+    TriggerId,
 };
+use solos_agent_core::{AllowlistPolicy, Engine};
 use solos_agent_store::{SpendState, SqliteStore};
 use solos_swarm::agent::broker::browser::{BrowserParts, LocalBrowser};
 use solos_swarm::agent::broker::registry::{self, PrincipalKind};
@@ -722,6 +724,67 @@ async fn router_decide_becomes_the_engines_decision_and_a_refused_one_is_a_tool_
     assert_eq!(decision.kind, DecisionKind::Accept);
     assert_eq!(decision.reason, "alice asked");
     assert_eq!(store.tickets().unwrap()[0].title, "Summarise the incident");
+}
+
+#[tokio::test]
+async fn a_router_session_starts_with_the_global_memos_and_the_chain_records_it() {
+    let scratch = Scratch::new("router-memos");
+    let policy = AllowlistPolicy {
+        people: ["slack:alice".to_owned()].into(),
+        ..AllowlistPolicy::default()
+    };
+    let remember = |engine: &mut Engine<SqliteStore, AllowlistPolicy, fn() -> u64>,
+                    scope: &str,
+                    text: &str| {
+        engine
+            .propose_memo(MemoIn {
+                scope: MemoScope::try_from(scope.to_owned()).unwrap(),
+                text: text.into(),
+                sources: vec![MemoSource::Operator],
+                author: MemoAuthor::Operator {
+                    source: "slack".into(),
+                    by: Actor::person("alice"),
+                },
+            })
+            .unwrap()
+    };
+    let clock: fn() -> u64 = || 1_000;
+    let mut engine = Engine::new(scratch.store(), policy, clock);
+    let global = remember(&mut engine, "global", "Answer in French.");
+    remember(&mut engine, "repo:acme/widgets", "Tests run with ./check.");
+    drop(engine);
+
+    let runtime = scratch.runtime(Arc::new(Holding::default()), false);
+    let served = serve(&scratch, Scripted::new(), runtime.facts(), 1_000_000);
+    with_runtime(runtime, async {
+        let (status, session) = served.post("session", Some(TOKEN), json!({})).await;
+        assert_eq!(status, 200, "{session}");
+        let prompt = session["system_prompt"].as_str().unwrap();
+        assert!(
+            prompt.starts_with("You are the Router.\n\nMemos: "),
+            "{prompt}"
+        );
+        assert!(
+            prompt.ends_with(&format!("> [{global} · person] Answer in French.")),
+            "{prompt}"
+        );
+        assert!(
+            !prompt.contains("./check"),
+            "a repository's memo is a worker's"
+        );
+    })
+    .await;
+    let shown: Vec<_> = scratch
+        .store()
+        .events()
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| match e.event {
+            DomainEvent::MemosShown { to, memos, .. } => Some((to, memos)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(shown, [(MemoAudience::Router, vec![global])]);
 }
 
 async fn candidates(router: &Holding, count: usize) -> Vec<Candidate> {

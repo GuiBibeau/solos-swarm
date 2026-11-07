@@ -734,6 +734,9 @@ where
             );
         }
         let mut assignment = assignment_text(launch, run_code);
+        if let Some(memos) = &launch.memos {
+            assignment = format!("{assignment}\n\n{memos}");
+        }
         if let Some(pstack) = parts.broker.pstack() {
             let run_code_has_pstack = run_code && environments.is_local(named);
             let section = pstack.section(&parts.model, run_code_has_pstack);
@@ -1434,6 +1437,7 @@ mod tests {
             recovery: false,
             inputs: Vec::new(),
             earlier: Vec::new(),
+            memos: None,
         }
     }
 
@@ -1775,6 +1779,32 @@ mod tests {
             ),
             "{text}"
         );
+    }
+
+    #[tokio::test]
+    async fn the_memo_index_the_core_picked_ends_the_first_prompt_and_only_the_first() {
+        let mut w = World::new(2, None);
+        let mut first = launch("tk_1", "as_1");
+        let index = "Memos: what the agent has learned.\n> [mm_0123456789abcdef · person] \
+                     Answer in French.";
+        first.memos = Some(index.to_owned());
+        w.launch(first).await;
+        assert!(started(&w.fact().await, "as_1"));
+        let prompts = w.fake.prompted(1).await;
+        let assignment = assignment_text(&launch("tk_1", "as_1"), false);
+        assert!(
+            prompts[0].1.ends_with(&format!("\n\n{index}")),
+            "{}",
+            prompts[0].1
+        );
+        assert!(prompts[0].1.contains(assignment.trim_end()));
+
+        let mut plain = launch("tk_2", "as_2");
+        plain.memos = None;
+        w.launch(plain).await;
+        assert!(started(&w.fact().await, "as_2"));
+        let prompts = w.fake.prompted(2).await;
+        assert!(!prompts[1].1.contains("Memos:"), "{}", prompts[1].1);
     }
 
     #[tokio::test]

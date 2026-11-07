@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use solos_agent_core::memo::Memo;
 use solos_agent_core::model::{
     Accept, Acknowledge, Actor, Addressed, AssignmentId, ChannelRef, Decision, Effect, Event, Plan,
     Thread, ThreadKey, Ticket, TicketId, Trigger, TriggerId, Verdict,
@@ -69,6 +70,7 @@ pub struct Contents {
     pub tickets: Vec<Ticket>,
     pub decisions: Vec<Decision>,
     pub trails: Vec<TrailCursor>,
+    pub memos: Vec<Memo>,
     pub effects: Vec<Effect>,
     pub events: Vec<Event>,
 }
@@ -80,6 +82,7 @@ pub fn sqlite_contents(s: &SqliteStore) -> Contents {
         tickets: s.tickets().unwrap(),
         decisions: s.decisions().unwrap(),
         trails: s.trails().unwrap(),
+        memos: s.memos().unwrap(),
         effects: s.effects().unwrap().into_iter().map(|q| q.effect).collect(),
         events: s.events().unwrap(),
     }
@@ -92,6 +95,7 @@ pub fn memory_contents(m: &MemoryRepositories) -> Contents {
         tickets: m.tickets.values().cloned().collect(),
         decisions: m.decisions.values().cloned().collect(),
         trails: m.trails.values().cloned().collect(),
+        memos: m.memos.values().cloned().collect(),
         effects: m.effects.clone(),
         events: m.events.clone(),
     }
@@ -111,6 +115,7 @@ pub fn first_difference(a: &Contents, b: &Contents) -> Option<String> {
         .or_else(|| list("tickets", &a.tickets, &b.tickets))
         .or_else(|| list("decisions", &a.decisions, &b.decisions))
         .or_else(|| list("trails", &a.trails, &b.trails))
+        .or_else(|| list("memos", &a.memos, &b.memos))
         .or_else(|| list("effects", &a.effects, &b.effects))
         .or_else(|| list("events", &a.events, &b.events))
 }
@@ -122,7 +127,11 @@ pub fn port_view(r: &impl Repositories, threads: &[Thread]) -> String {
         .filter_map(|t| t.eval.as_ref())
         .map(|e| (e.id.clone(), r.thread_of_eval(&e.id)))
         .collect();
-    format!("active {:?}; evals {evals:?}", r.active_threads())
+    let live: Vec<_> = r.live_memos().into_iter().map(|m| m.id).collect();
+    format!(
+        "active {:?}; evals {evals:?}; live memos {live:?}",
+        r.active_threads()
+    )
 }
 
 pub fn page_seen() -> StepOutcome {

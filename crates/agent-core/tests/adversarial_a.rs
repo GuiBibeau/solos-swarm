@@ -1,9 +1,10 @@
 //! Regressions from the adversarial review of P0. Each test failed at 80e2fbe.
 
+use solos_agent_core::memo::Memo;
 use solos_agent_core::model::{
     Accept, Acknowledge, Actor, Addressed, AssignmentId, ChangeSet, ChannelRef, Decision,
-    DecisionId, Effect, EvalId, Plan, ReportIn, ReportStatus, Stage, Strength, Thread, ThreadKey,
-    Ticket, TicketId, Trigger, TriggerId, Verdict,
+    DecisionId, Effect, EvalId, MemoId, Plan, ReportIn, ReportStatus, Stage, Strength, Thread,
+    ThreadKey, Ticket, TicketId, Trigger, TriggerId, Verdict,
 };
 use solos_agent_core::trail::TrailCursor;
 use solos_agent_core::{AllowlistPolicy, Engine, Error, MemoryRepositories, Repositories};
@@ -34,6 +35,12 @@ impl Repositories for Flaky {
     }
     fn trail(&self, assignment: &AssignmentId) -> Option<TrailCursor> {
         self.inner.trail(assignment)
+    }
+    fn memo(&self, id: &MemoId) -> Option<Memo> {
+        self.inner.memo(id)
+    }
+    fn live_memos(&self) -> Vec<Memo> {
+        self.inner.live_memos()
     }
     fn active_threads(&self) -> Vec<ThreadKey> {
         self.inner.active_threads()

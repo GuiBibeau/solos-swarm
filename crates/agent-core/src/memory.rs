@@ -1,6 +1,7 @@
+use crate::memo::Memo;
 use crate::model::{
-    AssignmentId, ChangeSet, Decision, DecisionId, Effect, EvalId, Event, Thread, ThreadKey,
-    Ticket, TicketId, Trigger, TriggerId,
+    AssignmentId, ChangeSet, Decision, DecisionId, Effect, EvalId, Event, MemoId, Thread,
+    ThreadKey, Ticket, TicketId, Trigger, TriggerId,
 };
 use crate::ports::{Error, Repositories};
 use crate::trail::TrailCursor;
@@ -13,6 +14,7 @@ pub struct MemoryRepositories {
     pub tickets: BTreeMap<TicketId, Ticket>,
     pub decisions: BTreeMap<DecisionId, Decision>,
     pub trails: BTreeMap<AssignmentId, TrailCursor>,
+    pub memos: BTreeMap<MemoId, Memo>,
     pub effects: Vec<Effect>,
     pub events: Vec<Event>,
 }
@@ -39,6 +41,16 @@ impl Repositories for MemoryRepositories {
     fn trail(&self, assignment: &AssignmentId) -> Option<TrailCursor> {
         self.trails.get(assignment).cloned()
     }
+    fn memo(&self, id: &MemoId) -> Option<Memo> {
+        self.memos.get(id).cloned()
+    }
+    fn live_memos(&self) -> Vec<Memo> {
+        self.memos
+            .values()
+            .filter(|m| m.is_live())
+            .cloned()
+            .collect()
+    }
     fn active_threads(&self) -> Vec<ThreadKey> {
         self.threads
             .values()
@@ -62,6 +74,7 @@ impl Repositories for MemoryRepositories {
             self.decisions.insert(decision.id.clone(), decision);
         }
         self.trails.extend(changes.trails);
+        self.memos.extend(changes.memos);
         self.effects.extend(changes.effects);
         self.events.extend(changes.events);
         Ok(())

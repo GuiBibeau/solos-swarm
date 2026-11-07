@@ -1,6 +1,7 @@
+use crate::memo::Memo;
 use crate::model::{
-    Actor, AssignmentId, ChangeSet, Decision, DecisionId, EvalId, Mandate, MicroUsd, Ms, Thread,
-    ThreadKey, Ticket, TicketId, Trigger, TriggerId,
+    Actor, AssignmentId, ChangeSet, Decision, DecisionId, EvalId, Mandate, MemoId, MicroUsd, Ms,
+    Thread, ThreadKey, Ticket, TicketId, Trigger, TriggerId,
 };
 use crate::trail::TrailCursor;
 
@@ -37,6 +38,9 @@ pub trait Repositories {
     fn ticket(&self, id: &TicketId) -> Option<Ticket>;
     fn decision(&self, id: &DecisionId) -> Option<Decision>;
     fn trail(&self, assignment: &AssignmentId) -> Option<TrailCursor>;
+    fn memo(&self, id: &MemoId) -> Option<Memo>;
+    /// Memos proposed or active, by id.
+    fn live_memos(&self) -> Vec<Memo>;
     /// Threads with queued Triggers or an Eval in progress.
     fn active_threads(&self) -> Vec<ThreadKey>;
     /// The Thread whose running Eval has this id.
@@ -72,6 +76,9 @@ pub trait Policy {
     /// `source` is where the stop came from. A person who may approve, or
     /// who may ask for work, may stop a Ticket.
     fn may_stop(&self, source: &str, actor: &Actor) -> bool;
+    /// Whether `actor`, through `source`'s operator surface, may add, retire
+    /// and forget the agent's memos.
+    fn may_remember(&self, source: &str, actor: &Actor) -> bool;
 }
 
 pub trait Clock {

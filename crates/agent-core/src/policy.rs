@@ -142,4 +142,9 @@ impl Policy for AllowlistPolicy {
         actor.is_person()
             && (self.may_approve(source, actor) || self.people.contains(&ident(source, actor)))
     }
+    /// The people who may stop work: what they write as a memo is what a
+    /// person the agent works for said.
+    fn may_remember(&self, source: &str, actor: &Actor) -> bool {
+        self.may_stop(source, actor)
+    }
 }

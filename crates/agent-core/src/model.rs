@@ -2,7 +2,8 @@ use crate::change::{
     Change, CommitSha, Deliverable, ForgeTerms, Harvest, PrRef, RepoName, Withheld,
 };
 use crate::delivery::ForgeJob;
-use crate::trail::{TrailAction, TrailCursor, TrailOutcome};
+use crate::memo::{Memo, MemoActor, MemoAudience, MemoAuthor, MemoScope, MemoTrust};
+use crate::trail::{Digest, TrailAction, TrailCursor, TrailOutcome};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -45,6 +46,8 @@ ids!(
     InputId,
     /// Channels send each id at most once.
     MessageId,
+    /// `mm_` and 16 hex digits.
+    MemoId,
 );
 
 /// The longest [`SecretId`]. Discord's `custom_id` holds 100 characters and
@@ -874,6 +877,39 @@ pub enum DomainEvent {
         head: CommitSha,
         why: Withheld,
     },
+    /// A memo's text is in its row; the chain holds its digest. `active`: a
+    /// person's own word, so it is in the index at once.
+    MemoProposed {
+        memo: MemoId,
+        scope: MemoScope,
+        trust: MemoTrust,
+        author: MemoAuthor,
+        text_sha256: Digest,
+        active: bool,
+    },
+    /// The review kept a proposed memo.
+    MemoActivated {
+        memo: MemoId,
+        by: String,
+        reason_sha256: Digest,
+    },
+    MemoRetired {
+        memo: MemoId,
+        by: MemoActor,
+        reason_sha256: Digest,
+    },
+    /// Its text, quotes and reasons were erased from its row.
+    MemoForgotten {
+        memo: MemoId,
+        by: MemoActor,
+    },
+    /// Which memos shaped a session: a Router's system prompt or a worker's
+    /// first prompt held this index.
+    MemosShown {
+        to: MemoAudience,
+        memos: Vec<MemoId>,
+        index_sha256: Digest,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -892,6 +928,8 @@ pub struct ChangeSet {
     pub tickets: BTreeMap<TicketId, Ticket>,
     pub decisions: Vec<Decision>,
     pub trails: BTreeMap<AssignmentId, TrailCursor>,
+    #[serde(default)]
+    pub memos: BTreeMap<MemoId, Memo>,
     pub effects: Vec<Effect>,
     pub events: Vec<Event>,
 }
