@@ -1,0 +1,810 @@
+{
+ "title": "Agent memory for solos-swarm agent mode",
+ "source_post": "https://www.anthropic.com/research/components-of-agent-memory",
+ "repo_rev": "7b91f1b",
+ "layers": [
+  {
+   "id": "L0",
+   "name": "Injected",
+   "members": [
+    "operator_config",
+    "memo_index"
+   ]
+  },
+  {
+   "id": "L1",
+   "name": "On demand",
+   "members": [
+    "memo_files",
+    "router_recall"
+   ]
+  },
+  {
+   "id": "L2",
+   "name": "Episodic",
+   "members": [
+    "episodic_store",
+    "relaunch_context",
+    "ticket_workdir"
+   ]
+  },
+  {
+   "id": "L3",
+   "name": "Ground truth",
+   "members": [
+    "transcripts",
+    "event_chain",
+    "browser_trail",
+    "swarm_findings"
+   ]
+  }
+ ],
+ "actors": [
+  {
+   "id": "person",
+   "name": "Owner (allowed person, approver)"
+  },
+  {
+   "id": "sources",
+   "name": "GitHub / Discord / Slack / MCP / schedule Sources"
+  },
+  {
+   "id": "router",
+   "name": "Router (long-lived Pi session, triage)"
+  },
+  {
+   "id": "worker",
+   "name": "Worker (Pi or Claude Code session, one Ticket)"
+  },
+  {
+   "id": "dreamer",
+   "name": "Dream worker (worker on the daily dream Ticket)"
+  },
+  {
+   "id": "host",
+   "name": "Host (agent serve: Engine, broker, effect runner)"
+  },
+  {
+   "id": "provider",
+   "name": "Model provider (DeepSeek upstream)"
+  },
+  {
+   "id": "web",
+   "name": "Dashboard (Vercel, web/agent-dashboard)"
+  }
+ ],
+ "components": [
+  {
+   "id": "transcripts",
+   "name": "Session transcripts",
+   "from_post": "session log / transcript (hippocampus; ground truth for dreaming)",
+   "what": "Full RPC transcript of every worker Assignment and Router session. Today no model can read one. The dream Ticket gets staged copies, and memo citations are checked against the originals by sha256.",
+   "status": "extend",
+   "stored_in": "<state>/tickets/<t>/<as>.rpc.jsonl, <state>/router/router-*.rpc.jsonl",
+   "writer": "host (harness transcript reader)",
+   "reader": "host; the dream worker (staged copies in its /work/transcripts)",
+   "scope": "per Assignment / per Router session",
+   "retention": "prune deletes them 14 days after the Ticket ends; memos keep verbatim quotes and the digest",
+   "trust": "mixed: person, model and external text",
+   "files": [
+    "src/harness.rs",
+    "src/agent/prune.rs",
+    "docs/harness/solos-swarm.md",
+    "docs/agent-mode/pstack/rationale.md"
+   ]
+  },
+  {
+   "id": "event_chain",
+   "name": "Hash-chained event log",
+   "from_post": "provenance ('how it knew')",
+   "what": "An append-only sha256 chain of domain events. It gains MemoProposed, MemoKept, MemoRetired, MemoForgotten (text digests only) and MemosShown (which memos shaped which session).",
+   "status": "extend",
+   "stored_in": "agent.db events table",
+   "writer": "Engine (single writer)",
+   "reader": "audits, verify_chain(), agent trail; retiring a memo lists the Tickets it shaped",
+   "scope": "global",
+   "retention": "forever, append-only; forget erases memo text and the chain still verifies",
+   "trust": "host-made",
+   "files": [
+    "crates/agent-store/src/chain.rs",
+    "crates/agent-core/src/model.rs"
+   ]
+  },
+  {
+   "id": "episodic_store",
+   "name": "Store aggregates (Triggers, Threads, Tickets, Decisions, Reports)",
+   "from_post": "experience retained between sessions (episodic)",
+   "what": "Every Trigger verbatim, Thread subscriptions, Ticket Mandate, Inputs, Assignments and Reports, and Router Decisions with reasons. Subscriptions are never removed, so an owner's follow-up resumes the same Ticket.",
+   "status": "exists",
+   "stored_in": "agent.db (triggers, threads, tickets, decisions, spend)",
+   "writer": "Engine (single writer), from Source Triggers and adapter facts",
+   "reader": "Router cards and router_read; worker Launch.inputs; agent status; publisher",
+   "scope": "per Thread, per Ticket",
+   "retention": "rows kept indefinitely",
+   "trust": "Trigger text is data (person, bot or system); Reports and reasons are model text",
+   "files": [
+    "crates/agent-core/src/model.rs",
+    "crates/agent-core/src/engine.rs",
+    "crates/agent-store/src/schema.rs",
+    "crates/agent-store/src/lib.rs"
+   ]
+  },
+  {
+   "id": "relaunch_context",
+   "name": "Relaunch context (earlier replies and progress)",
+   "from_post": "knowledge retained across sessions of one task; global.md-style current plan",
+   "what": "A resumed or restarted Assignment gets the Ticket's earlier ready, blocked and failed Reports and the latest own progress (pstack todo list), quoted and labelled. Today it gets only Inputs and a recovery note.",
+   "status": "new",
+   "stored_in": "already in Ticket.assignments[].reports; rendered into Launch",
+   "writer": "worker (its Reports); runtime renders",
+   "reader": "the relaunched worker's first prompt",
+   "scope": "per Ticket",
+   "retention": "the Ticket's life",
+   "trust": "model-authored, labelled 'your earlier reply'",
+   "files": [
+    "src/agent/runtime.rs",
+    "src/agent/pi_executor.rs",
+    "src/agent/ports.rs"
+   ]
+  },
+  {
+   "id": "router_recall",
+   "name": "Router recall (cards and router_read)",
+   "from_post": "retrieval from memory read on demand",
+   "what": "Cards hold up to 12 Triggers and the Tickets on the Thread. router_read follows one Trigger, Thread or Ticket one hop. It gains kind: memo. Recall stays Thread-scoped, with no cross-Thread search.",
+   "status": "extend",
+   "stored_in": "derived from agent.db",
+   "writer": "host (broker)",
+   "reader": "Router, every turn and on demand",
+   "scope": "per Thread (plus memos)",
+   "retention": "n/a (a view)",
+   "trust": "data, never instructions (quoted)",
+   "files": [
+    "src/agent/pi_router.rs",
+    "src/agent/broker.rs",
+    "src/agent/broker/registry.rs"
+   ]
+  },
+  {
+   "id": "in_session_compaction",
+   "name": "In-session compaction",
+   "from_post": "compaction (explicitly not memory)",
+   "what": "Pi compaction (reserveTokens 65536) keeps the long-lived Router and long workers inside the window. It is lost when the session restarts.",
+   "status": "exists",
+   "stored_in": "inside the Pi session",
+   "writer": "Pi",
+   "reader": "the same session",
+   "scope": "per session",
+   "retention": "dies with the session",
+   "trust": "n/a",
+   "files": [
+    "src/agent/mod.rs",
+    "src/agent/pi_executor.rs"
+   ]
+  },
+  {
+   "id": "ticket_workdir",
+   "name": "Ticket work directory (/work)",
+   "from_post": "memory folder (task-scoped)",
+   "what": "The Ticket's own directory, the repository clone on a repo Ticket. It survives across the Ticket's Assignments, and the recovery prompt points at it.",
+   "status": "exists",
+   "stored_in": "<state>/tickets/<t>/work",
+   "writer": "worker via run_code; host prepare and Forge::prepare before the sandbox starts",
+   "reader": "the same Ticket's later Assignments (run_code, read)",
+   "scope": "per Ticket",
+   "retention": "prune, 14 days after the Ticket ends",
+   "trust": "worker-written and repository content",
+   "files": [
+    "src/agent/pi_executor.rs",
+    "src/agent/forge/mod.rs",
+    "src/agent/prune.rs"
+   ]
+  },
+  {
+   "id": "operator_config",
+   "name": "Operator knowledge in agent.yaml",
+   "from_post": "injected context (top layer), person-written",
+   "what": "router.instructions, proactive rule texts, forge.repos.<r>.about (Router) and .notes (worker prompt, /host/repo.json).",
+   "status": "exists",
+   "stored_in": "agent.yaml",
+   "writer": "person (operator)",
+   "reader": "Router system prompt; worker first prompt",
+   "scope": "global, per repo",
+   "retention": "until edited (restart)",
+   "trust": "person",
+   "files": [
+    "src/agent/config.rs",
+    "src/agent/pi_router.rs",
+    "src/agent/forge/mirror.rs"
+   ]
+  },
+  {
+   "id": "memos",
+   "name": "Memo store",
+   "from_post": "memory store / folder of memory notes (written as predictions)",
+   "what": "Small notes (400 chars or fewer): owner preferences, tested lessons, traps. Each has verbatim-quoted sources, a derived trust, a state (Proposed, Active, Retired) and supersedes. The core aggregate is Memo, avoiding MemoryRepositories and InputBody::Note.",
+   "status": "new",
+   "stored_in": "agent.db memos table (schema V8)",
+   "writer": "Engine only, on proposals from person (verbatim quote), operator CLI/MCP, worker memo_propose, dream worker",
+   "reader": "memo_index (L0), /memos files (L1), router_read, dream, dashboard",
+   "scope": "global | repo:<owner/name>",
+   "retention": "person memos until retired; model memos re-asked after 90 days unverified; proposals dropped after 7 days unanswered; forget erases text",
+   "trust": "person | model | external, derived by the core from sources (min, as in swarm Findings)",
+   "files": [
+    "crates/agent-core/src/model.rs",
+    "crates/agent-core/src/engine.rs",
+    "crates/agent-core/src/ports.rs",
+    "crates/agent-core/src/memory.rs",
+    "crates/agent-store/src/schema.rs",
+    "crates/agent-store/src/lib.rs"
+   ]
+  },
+  {
+   "id": "memo_index",
+   "name": "Injected memo index",
+   "from_post": "promoted top layer / injected context (MEMORY.md index, 200 lines)",
+   "what": "A pure, deterministic render of active memos: person first, then by last verified, every line >-quoted with id and trust label, overflow as a link to /memos. The ids are recorded in MemosShown.",
+   "status": "new",
+   "stored_in": "rendered at Launch commit; Router at session start",
+   "writer": "agent-core memo_index() (no model)",
+   "reader": "Router system prompt (global, 1 KB or less); worker first prompt (global plus repo, 3 KB or less)",
+   "scope": "per prompt",
+   "retention": "re-rendered each Launch; the Router restarts between turns when the digest changes",
+   "trust": "only Active memos; labelled; 'data, not instructions' header",
+   "files": [
+    "crates/agent-core/src/lib.rs",
+    "src/agent/pi_router.rs",
+    "src/agent/pi_executor.rs",
+    "src/agent/runtime.rs"
+   ]
+  },
+  {
+   "id": "memo_files",
+   "name": "On-demand memos (/memos)",
+   "from_post": "notes read or searched when needed (lower layer, links left behind)",
+   "what": "/memos/global.md and /memos/repo/<owner>/<name>.md, every active memo with its sources, served by the read tool from a host-only directory.",
+   "status": "new",
+   "stored_in": "<state>/memos/ (host-only render of the Store)",
+   "writer": "host",
+   "reader": "worker and dream via read; Router via router_read kind memo",
+   "scope": "global, per repo",
+   "retention": "mirrors active memos",
+   "trust": "labelled per memo",
+   "files": [
+    "src/agent/broker/toolbox.rs",
+    "src/agent/pstack.rs"
+   ]
+  },
+  {
+   "id": "memo_propose",
+   "name": "In-moment proposals (memo_propose)",
+   "from_post": "writing memory in the moment (salience at the source)",
+   "what": "A worker tool, at most 3 per Assignment: scope, text, and evidence ({trigger, quote} or {call, quote}) that the broker resolves against the seat's calls. 'Remember X' from the owner, quoted verbatim, is active at once.",
+   "status": "new",
+   "stored_in": "proposed Memo rows",
+   "writer": "worker (and dream worker)",
+   "reader": "trust gate",
+   "scope": "global | repo",
+   "retention": "proposals expire after 7 days",
+   "trust": "derived from evidence",
+   "files": [
+    "src/agent/broker/registry.rs",
+    "extensions/agent-tools.json",
+    "extensions/broker.ts",
+    "src/agent/broker.rs"
+   ]
+  },
+  {
+   "id": "salience_guidance",
+   "name": "Salience guidance",
+   "from_post": "steering: say what memory is for, not how; read first and test (weaker models)",
+   "what": "One paragraph in WORKER_INSTRUCTIONS: memos carry what a later ticket cannot re-read (preferences, tested rules, traps). Evidence is a required schema field, so testing is structural. There is no fixed 'record only failures' rule.",
+   "status": "new",
+   "stored_in": "code constant",
+   "writer": "maintainer",
+   "reader": "worker system prompt",
+   "scope": "global",
+   "retention": "code",
+   "trust": "n/a",
+   "files": [
+    "src/agent/pi_executor.rs",
+    "docs/harness/solos-swarm.md"
+   ]
+  },
+  {
+   "id": "trust_gate",
+   "name": "Memory reviewer (high thinking)",
+   "from_post": "confirmed vs unconfirmed marks; careful promotion",
+   "what": "Every proposed memo is decided autonomously by a separate review pass that runs the model with thinking on at its highest effort. It reads the proposal, its quoted evidence (checked by the host against the real calls and transcripts) and the related memos, then keeps, rewrites, merges or rejects it with a stated reason. No person is in the loop. Text from issues, PR comments, pages and repositories is reviewed as data: instruction-shaped memos are rejected. Every decision is chained; the owner can review on the dashboard and retire or forget any memo.",
+   "status": "new",
+   "stored_in": "MemoState in the memos table; MemoReviewed events with the reviewer's reason",
+   "writer": "Engine, applying the reviewer model's decision (thinking on, high effort)",
+   "reader": "memo_index (only Active memos are served)",
+   "scope": "per memo",
+   "retention": "n/a",
+   "trust": "model-reviewed at high effort; provenance (person, model, external) kept and shown",
+   "files": [
+    "crates/agent-core/src/engine.rs",
+    "crates/agent-core/src/model.rs",
+    "src/agent/discord/",
+    "src/agent/slack/"
+   ]
+  },
+  {
+   "id": "dreaming",
+   "name": "Dream Ticket (daily consolidation)",
+   "from_post": "dreaming: correct, merge, promote and demote, fill gaps, goal-focused",
+   "what": "A schedule slot before the 04:30 prune. The Router accepts it as a session with entry 'dream'. The host stages Ticket digests, transcript copies and memos into its /work. It revises and retires memos with citations checked against the original transcripts, merges duplicates, finds patterns across Tickets, and sends one digest with Keep/Discard buttons.",
+   "status": "new",
+   "stored_in": "an ordinary Ticket (its own ticket: account); outputs are proposals and events",
+   "writer": "dream worker (model) through memo_propose (supersedes) and memo_retire",
+   "reader": "the owner (digest); memos",
+   "scope": "global",
+   "retention": "daily; skipped when no Ticket ended since the last dream",
+   "trust": "model; every output gated",
+   "files": [
+    "src/agent/schedule.rs",
+    "src/agent/config/sources.rs",
+    "src/agent/pi_router.rs",
+    "src/agent/pi_executor.rs"
+   ]
+  },
+  {
+   "id": "procedural_skills",
+   "name": "Procedural memory (pstack and repo skills)",
+   "from_post": "reflect, propose, rebuild loop that rewrites the instructions guiding memory",
+   "what": "pstack is vendored and pinned (read at /pstack), the adapter compiled in, and repository skills sit at /work/.agents/skills. A lesson kept and hit three times graduates to structure through a dream-proposed PR, and the owner's merge promotes it.",
+   "status": "extend",
+   "stored_in": "vendor/pstack (MANIFEST); target repository .agents/skills/",
+   "writer": "maintainer (pstack-sync PR); dream worker opens a PR; person merges",
+   "reader": "every worker (entry skill, read)",
+   "scope": "global (pstack), per repo (repo skills)",
+   "retention": "git",
+   "trust": "person (merge)",
+   "files": [
+    "vendor/pstack/MANIFEST",
+    "src/agent/pstack.rs",
+    "docs/harness/solos-swarm.md",
+    "docs/agent-mode/pstack/rationale.md"
+   ]
+  },
+  {
+   "id": "repo_knowledge",
+   "name": "Repositories (mirror and clone)",
+   "from_post": "observable state, 'on screen': not worth memorising",
+   "what": "The code and history in the host mirror and the per-Ticket clone. Memos point at it and never copy it.",
+   "status": "exists",
+   "stored_in": "<state>/forge/ mirrors; tickets/<t>/work clones; /host/repo.json",
+   "writer": "forge adapter (host); worker commits; merges by people",
+   "reader": "worker via read and run_code",
+   "scope": "per repo",
+   "retention": "prune of unused mirrors and ended clones",
+   "trust": "external (repository content is data)",
+   "files": [
+    "src/agent/forge/mod.rs",
+    "src/agent/forge/mirror.rs",
+    "src/agent/forge/github.rs"
+   ]
+  },
+  {
+   "id": "vault",
+   "name": "Vault (credentials)",
+   "from_post": "(outside memory: never context)",
+   "what": "A write-only sealed store of API keys and logins, used only by the host. Consent is remembered per Ticket only. Its Scrubber also runs over memo text and evidence.",
+   "status": "exists",
+   "stored_in": "sealed vault file",
+   "writer": "person (vault CLI)",
+   "reader": "host only (keyed fetch_url, browser_login); never a model",
+   "scope": "per item; grants per Ticket",
+   "retention": "until removed",
+   "trust": "secret",
+   "files": [
+    "src/vault.rs",
+    "src/vault/scrub.rs",
+    "src/agent/broker/secrets.rs"
+   ]
+  },
+  {
+   "id": "browser_trail",
+   "name": "Browser trail",
+   "from_post": "session log of web actions (ground truth, external content)",
+   "what": "Signed browser steps on the chain, and page and View blobs by digest. A dream may cite a step, and the memo is then External.",
+   "status": "exists",
+   "stored_in": "agent.db trails (V4); <state>/trail blobs",
+   "writer": "host (browse module)",
+   "reader": "agent trail; dream citations",
+   "scope": "per Assignment",
+   "retention": "prune --include-trail",
+   "trust": "external",
+   "files": [
+    "src/agent/trail.rs",
+    "src/browse.rs",
+    "crates/agent-core/src/trail.rs"
+   ]
+  },
+  {
+   "id": "swarm_findings",
+   "name": "Swarm Findings, Board and artifacts",
+   "from_post": "shared log across sessions; one writer per page",
+   "what": "Append-only Board entries that never grant authority, Findings with trust = min over sources and taint on retraction, and a run directory and artifact per swarm Ticket. Its lineage model is reused for memo trust and MemosShown.",
+   "status": "exists",
+   "stored_in": "tickets/<t>/swarm/<run>/ (state.json, artifacts)",
+   "writer": "swarm agents through the swarm broker",
+   "reader": "the swarm Ticket's Report; dream citations",
+   "scope": "per Goal / per swarm Ticket",
+   "retention": "kept (prune leaves swarm books)",
+   "trust": "per Finding lineage",
+   "files": [
+    "src/agent/swarm_executor.rs",
+    "docs/ARCHITECTURE.md",
+    "src/broker.rs"
+   ]
+  },
+  {
+   "id": "dashboard_snapshots",
+   "name": "Dashboard snapshots",
+   "from_post": "(human view of memory for review)",
+   "what": "A read-only projection of Tickets to Vercel Blob. It gains memos/index.json (text, trust, sources linking to Tickets, kept by, last verified).",
+   "status": "extend",
+   "stored_in": "Vercel Blob tickets/*.json (+ memos/index.json); publish-state.json",
+   "writer": "publisher sidecar (read-only Store)",
+   "reader": "owner via web/agent-dashboard",
+   "scope": "global",
+   "retention": "mirrors the Store",
+   "trust": "read-only",
+   "files": [
+    "src/agent/publish/mod.rs",
+    "src/agent/publish/snapshot.rs",
+    "web/agent-dashboard"
+   ]
+  },
+  {
+   "id": "retention",
+   "name": "Retention and forgetting",
+   "from_post": "keeping memory current; cadence by volatility and access",
+   "what": "Today prune deletes files by age (14 days). Added: proposals expire after 7 days, model memos get a 90-day 'still true?' check, index budget order demotes to /memos, and operator forget erases text while the chain keeps digests.",
+   "status": "extend",
+   "stored_in": "prune timer; memo state",
+   "writer": "solos-agent-prune.timer; Engine (expiry); operator",
+   "reader": "n/a",
+   "scope": "global",
+   "retention": "n/a",
+   "trust": "n/a",
+   "files": [
+    "src/agent/prune.rs",
+    "scripts/systemd/solos-agent-prune.service",
+    "docs/agent-mode/production.md"
+   ]
+  }
+ ],
+ "flows": [
+  {
+   "from": "person",
+   "to": "sources",
+   "label": "messages, comments, clicks"
+  },
+  {
+   "from": "sources",
+   "to": "episodic_store",
+   "label": "Triggers (verbatim, idempotent)"
+  },
+  {
+   "from": "episodic_store",
+   "to": "router_recall",
+   "label": "cards and router_read (one hop, per Thread)"
+  },
+  {
+   "from": "router_recall",
+   "to": "router",
+   "label": "candidate context"
+  },
+  {
+   "from": "operator_config",
+   "to": "router",
+   "label": "instructions, rules, repos.about"
+  },
+  {
+   "from": "operator_config",
+   "to": "worker",
+   "label": "repos.notes in the first prompt"
+  },
+  {
+   "from": "memo_index",
+   "to": "router",
+   "label": "global memos in the system prompt"
+  },
+  {
+   "from": "memo_index",
+   "to": "worker",
+   "label": "global plus repo memos in the first prompt"
+  },
+  {
+   "from": "router",
+   "to": "episodic_store",
+   "label": "router_decide: Decision, Ticket, scope"
+  },
+  {
+   "from": "episodic_store",
+   "to": "relaunch_context",
+   "label": "earlier Reports and latest progress"
+  },
+  {
+   "from": "relaunch_context",
+   "to": "worker",
+   "label": "first prompt of a resumed Assignment"
+  },
+  {
+   "from": "episodic_store",
+   "to": "worker",
+   "label": "Launch.inputs (person follow-ups by pass-through)"
+  },
+  {
+   "from": "worker",
+   "to": "transcripts",
+   "label": "every turn (host writes rpc.jsonl)"
+  },
+  {
+   "from": "worker",
+   "to": "ticket_workdir",
+   "label": "run_code writes, commits"
+  },
+  {
+   "from": "ticket_workdir",
+   "to": "worker",
+   "label": "the next Assignment of the same Ticket"
+  },
+  {
+   "from": "worker",
+   "to": "episodic_store",
+   "label": "worker_report (progress, ready)"
+  },
+  {
+   "from": "worker",
+   "to": "memo_propose",
+   "label": "proposal with quoted evidence"
+  },
+  {
+   "from": "salience_guidance",
+   "to": "worker",
+   "label": "what memos are for"
+  },
+  {
+   "from": "memo_propose",
+   "to": "trust_gate",
+   "label": "trust derived from sources"
+  },
+  {
+   "from": "trust_gate",
+   "to": "memos",
+   "label": "kept, rewritten or merged memos become Active"
+  },
+  {
+   "from": "trust_gate",
+   "to": "person",
+   "label": "daily digest of what was kept, rewritten or rejected"
+  },
+  {
+   "from": "person",
+   "to": "trust_gate",
+   "label": "retire or forget any memo (CLI, MCP, Discord)"
+  },
+  {
+   "from": "person",
+   "to": "memos",
+   "label": "operator memo add/retire/forget (CLI, MCP)"
+  },
+  {
+   "from": "memos",
+   "to": "memo_index",
+   "label": "Active memos, budgeted render"
+  },
+  {
+   "from": "memos",
+   "to": "memo_files",
+   "label": "host render to /memos"
+  },
+  {
+   "from": "memo_files",
+   "to": "worker",
+   "label": "read on demand"
+  },
+  {
+   "from": "memos",
+   "to": "event_chain",
+   "label": "MemoProposed, Kept, Retired, Forgotten (digests)"
+  },
+  {
+   "from": "memo_index",
+   "to": "event_chain",
+   "label": "MemosShown per Assignment"
+  },
+  {
+   "from": "sources",
+   "to": "dreaming",
+   "label": "daily schedule Trigger"
+  },
+  {
+   "from": "transcripts",
+   "to": "dreaming",
+   "label": "staged copies (host prepare)"
+  },
+  {
+   "from": "episodic_store",
+   "to": "dreaming",
+   "label": "digests of ended Tickets"
+  },
+  {
+   "from": "memos",
+   "to": "dreaming",
+   "label": "all memos, proposals included"
+  },
+  {
+   "from": "browser_trail",
+   "to": "dreaming",
+   "label": "citable steps (external)"
+  },
+  {
+   "from": "swarm_findings",
+   "to": "dreaming",
+   "label": "citable findings (lineage)"
+  },
+  {
+   "from": "dreamer",
+   "to": "dreaming",
+   "label": "runs the dream Ticket"
+  },
+  {
+   "from": "dreaming",
+   "to": "trust_gate",
+   "label": "revisions, merges, retirements with citations"
+  },
+  {
+   "from": "transcripts",
+   "to": "trust_gate",
+   "label": "host checks quotes against originals (sha256)"
+  },
+  {
+   "from": "dreaming",
+   "to": "procedural_skills",
+   "label": "graduation PR (.agents/skills, docs)"
+  },
+  {
+   "from": "person",
+   "to": "procedural_skills",
+   "label": "merge = promotion"
+  },
+  {
+   "from": "procedural_skills",
+   "to": "worker",
+   "label": "entry skill, read /pstack, repo skills"
+  },
+  {
+   "from": "repo_knowledge",
+   "to": "worker",
+   "label": "clone at /work, /host/repo.json"
+  },
+  {
+   "from": "vault",
+   "to": "host",
+   "label": "keys used by the host only, never in memory"
+  },
+  {
+   "from": "vault",
+   "to": "trust_gate",
+   "label": "Scrubber over memo text and evidence"
+  },
+  {
+   "from": "memos",
+   "to": "dashboard_snapshots",
+   "label": "memos/index.json"
+  },
+  {
+   "from": "episodic_store",
+   "to": "dashboard_snapshots",
+   "label": "ticket snapshots"
+  },
+  {
+   "from": "dashboard_snapshots",
+   "to": "web",
+   "label": "private Blob, owner sign-in"
+  },
+  {
+   "from": "retention",
+   "to": "transcripts",
+   "label": "prune after 14 days"
+  },
+  {
+   "from": "retention",
+   "to": "memos",
+   "label": "expire proposals, 90-day re-ask, forget"
+  },
+  {
+   "from": "router",
+   "to": "provider",
+   "label": "prompts (memos included)"
+  },
+  {
+   "from": "worker",
+   "to": "provider",
+   "label": "prompts (memos included)"
+  },
+  {
+   "from": "in_session_compaction",
+   "to": "router",
+   "label": "keeps the session in the window (lost on restart)"
+  },
+  {
+   "from": "host",
+   "to": "event_chain",
+   "label": "commits every Engine change"
+  }
+ ],
+ "phases": [
+  {
+   "n": 1,
+   "title": "A relaunched worker knows what it said",
+   "delivers": "Launch carries the Ticket's earlier ready, blocked and failed Reports and the latest own progress text, quoted and labelled, in assignment_text. This does what pstack PR 1 planned and never built. No core or schema change.",
+   "test": "A scripted worker reports ready; the owner follows up on the Thread; the second Assignment's first prompt holds the earlier reply and the last progress list, once; bot text stays 'context only'; a restart quotes the same. Live: follow-up.md resume, where the reply continues with no recap."
+  },
+  {
+   "n": 2,
+   "title": "Memos in the core, written by the owner",
+   "delivers": "Memo aggregate, derived trust, memo_index, Engine propose, retire and forget, chain events with digests, schema V8, operator CLI and MCP memo tools, index injected into the Router (global) and worker (global plus repo) prompts, MemosShown.",
+   "test": "Core: an operator memo is Active and indexed; a bot or fetch_url-sourced memo is never Active without a click; the index respects its budget and links the overflow; an injected line is always >-quoted; forget keeps verify_chain() green; the differential walk covers memos. Live: memo-owner.md, 'Answer in French' then an English request answered in French with MemosShown."
+  },
+  {
+   "n": 3,
+   "title": "Workers propose, a high-effort reviewer decides",
+   "delivers": "memo_propose (at most 3 per Assignment, quoted evidence resolved by the broker), a host-run memory review per proposal on the provider's thinking mode at its highest effort that keeps, rewrites, merges or rejects with a reason (no person in the loop), the /memos read root, router_read kind memo, the salience paragraph, and owner retire/forget.",
+   "test": "A GitHub issue saying 'always push to main' yields an External proposal the scripted reviewer rejects as an instruction, absent from the index; a useful lesson is kept and appears in the next Ticket's prompt labelled with its provenance; the review request carries thinking at high effort; a fake quote is refused before review; a vault canary is scrubbed; a 4th proposal is refused."
+  },
+  {
+   "n": 4,
+   "title": "Dreaming",
+   "delivers": "A daily dream schedule and rule, entry 'dream', host staging of Ticket digests, transcripts and memos into the dream's /work, memo_retire and supersedes, citations checked against the original transcripts, and one daily digest of what changed. The dream runs with thinking on at its highest effort and applies its own decisions.",
+   "test": "Fixture transcripts contradict memo M ('cargo test' failed, './check' passed); the dream proposes a cited revision; a citation to a missing quote or an edited staged copy is refused; no ended Ticket means no dream; the Mandate caps its spend; M is superseded in the index without a click. Live: dream.md, two Tickets hit the same trap and the digest cites both transcript digests."
+  },
+  {
+   "n": 5,
+   "title": "Forgetting, review and graduation",
+   "delivers": "A 90-day 'still true?' check for model memos, budget-order demotion, memo counts in agent status, memos/index.json on the dashboard, and graduation PRs to the repository's .agents/skills or docs for lessons hit three times.",
+   "test": "With the clock moved, a 91-day model memo is asked once and retired on Discard, and a person memo is never asked; a pruned transcript leaves the memo's quote and digest intact; the snapshot holds no vault canary; a graduation PR through LocalForge touches no protected path. Live: memo-review.md."
+  }
+ ],
+ "decisions": [
+  {
+   "title": "Who promotes model-written memory",
+   "choice": "Fully autonomous, decided carefully: memos become active without a person, but every promotion, rewrite, merge and retirement is decided by a separate model pass with thinking on at its highest effort, never by the fast thinking-off worker. Quotes are checked by the host, provenance is kept, external text is reviewed as data, every decision is chained, and the owner can review and forget.",
+   "rejected": "An owner Keep click per memo (safest, but the owner chose autonomy); autonomy decided by the worker itself on DeepSeek Flash with thinking off (too easy to steer with hostile issue or page text); owner-only memory (no learning loop)."
+  },
+  {
+   "title": "Where memos live",
+   "choice": "A Memo aggregate in pure agent-core, persisted in agent.db (schema V8), chained by digest, written only by the Engine, and rendered read-only to models as an injected index and /memos files.",
+   "rejected": "A writable memory folder in the sandbox: it breaks 'the host never writes where a sandbox writes' and has no provenance or gate. A vector store: another service, opaque provenance, overkill for about 200 memos. Pi or Claude Code native memory: disabled on purpose (--no-session, --no-context-files, --bare) and model-specific. Git-backed markdown on the host: off the chain, with host git near model-written text."
+  },
+  {
+   "title": "How consolidation runs",
+   "choice": "Dreaming is an ordinary daily scheduled Ticket (entry 'dream') on the existing budget, Watchdog, chain, pause and dashboard, with host-staged transcripts and host-verified citations.",
+   "rejected": "A host daemon with its own model loop: it bypasses the ledger, Watchdog and chain, and is a second runtime. In-moment writing only: no correction of wrong or drifting notes (Mt. Moon). Dreaming in the Router: it is triage on a daily cap with no tools. A repository wiki for now: clones plus grep already search, the post shows no gain on single-document lookups, and maps can grow as large as the territory."
+  }
+ ],
+ "gaps": [
+  "No cross-Ticket memory: Ticket B learns from Ticket A only through merged commits or an agent.yaml edit.",
+  "A resumed or restarted Assignment gets the person's Inputs but not the agent's own earlier Reports or latest progress (runtime.rs Runtime::job, pi_executor.rs assignment_text); pstack PR 1's 'recovery quotes the last progress report' and the /method decision trail are not in the code.",
+  "No owner preferences beyond static agent.yaml; the core never maps identities across Sources, so there is no per-person key (moot with one owner).",
+  "No learned lessons: toolchain quirks and traps are rediscovered per Ticket; loop-guard failure shapes are not fed forward.",
+  "Project knowledge beyond the clone is only the static forge.repos about and notes.",
+  "No summarization across sessions: the Router's context lives in a compacting Pi session and is lost on restart; router_read is one hop within one Thread, with no cross-Thread search; router_note and Source::context are 'later'.",
+  "Transcripts are unreadable by any model, so nothing can be corrected against ground truth; pstack reflect, recall and session-pickup are skipped (/host/transcripts planned, not built).",
+  "Retention is file deletion by age (prune, 14 days); there is no staleness, re-verification or expiry of knowledge.",
+  "No provenance for remembered content: the chain records actions, not why the agent believes something.",
+  "No trust model for remembered content: anything a model wrote from issue, page or repository text would become a persistent prompt injection beyond the session's 'text is data' guard.",
+  "Naming collision: MemoryRepositories (in-memory store) and InputBody::Note / Engine::note already take the obvious names; use Memo."
+ ],
+ "owner_decisions": {
+  "date": "2026-11-07",
+  "promotion": "fully autonomous, high thinking effort",
+  "storage": "core table in agent.db",
+  "consolidation": "daily dream Ticket"
+ }
+}
