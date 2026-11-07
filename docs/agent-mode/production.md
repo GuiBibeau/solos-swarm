@@ -1,102 +1,70 @@
 # Running agent mode in production
 
-One box runs `solos-swarm agent serve` as the systemd user unit `solos-agent`. `scripts/agent-deploy` builds and
-switches releases from the Mac. Everything on the box is under `~/agent`:
+This runbook is for the person who operates the always-on agent. One box runs `solos-swarm agent serve` as the systemd
+user unit `solos-agent`, with three helper units beside it: the dashboard publisher, the health check and the daily
+prune. You run `scripts/agent-deploy` on the Mac, in this repository, and it does the work on the box over SSH. The box
+is `remote-ai` unless `AGENT_HOST` names another. Everything on the box is under `~/agent`
+([layout](#layout-on-the-box)).
 
-| Path | What it is |
-|---|---|
-| `releases/<sha>/` | One immutable build of a commit: `bin/solos-swarm`, `node_modules`, `extensions`, `vendor/pstack`. Read-only. The newest five are kept, plus current and previous. |
-| `current`, `previous` | Links to the release that serves and the one before it. `--pi-root` is `current`. |
-| `agent.yaml` | The production config. It is not in git. |
-| `state/` | `agent.db`, `tickets/`, `router/`, `forge/`, `deps/`, `trail/`, `mcp/`, the broker socket, and the operator's files: `health-state.json`, `health-hold`, `PAUSE`, `control.json`. Kept across releases; finished work is pruned daily ([Pruning state](#pruning-state-and-the-disk-floor)). |
-| `tokens/` | One file per one-use credential, mode 0600: `model.key` (the DeepSeek key), `discord-token`, `github-app.pem` (the GitHub App's private key), and `vercel-blob-token` (the dashboard publisher's, see [Dashboard](#dashboard)). |
-| `backups/` | `agent.db` copied before every deploy and rollback, while the agent is stopped. The newest twenty are kept. |
-| `target/` | The cargo build cache. |
+What each config key means is in [the agent-mode plan](README.md). This page says how to run the agent. The
+[Reference](#reference) at the end lists the units, the commands, the files and the limits.
 
-`agent serve` reads each token file once and deletes it. The unit's `ExecStartPre` copies `tokens/` into its private
-tmpfs runtime directory, `/run/user/1000/solos-agent/`, before every start, so a crash restart or a reboot starts
-again without a person. That directory goes away when the unit stops. No sandbox sees `~/agent/tokens` or the runtime
-directory. The tokens rest unencrypted at mode 0600 in the agent user's home, like the vault key.
+## Before you start
 
-## Commands (from the Mac, in the repository)
+Once per box:
+
+1. Give the Mac SSH access to the box with a key. `scripts/agent-deploy` connects with `ssh -o BatchMode=yes`, so it
+   cannot answer a password prompt.
+2. Install the build tools for the user that runs the agent: rustup with toolchain 1.96.0 under `~/.cargo/bin`, `npm`,
+   and Node 24.18.0 at `~/.local/opt/node-v24.18.0-linux-x64/`.
+3. Install `bwrap` and `prlimit`, which the sandboxes need. For a repository with `deps`
+   ([below](#install-a-repositorys-dependencies-and-require-evidence)), also install `bun` at `~/.bun/bin/bun`.
+4. Turn on lingering for that user (`loginctl enable-linger <user>`), so its units start at boot with nobody logged in.
+5. Make the directory the units go in: `mkdir -p ~/.config/systemd/user`.
+6. Write `~/agent/agent.yaml` ([the production config](#the-production-config)) and store the tokens it names
+   ([Store a token](#store-a-token)). A deploy refuses to switch without the config.
+
+The units' runtime directories are `/run/user/1000/...`, so the examples assume the agent runs as uid 1000.
+
+## Store a token
+
+Each credential is one file in `~/agent/tokens/` on the box, mode 0600. From the Mac, pipe the value in:
 
 ```sh
-scripts/agent-deploy deploy            # build origin/main, drain, back up agent.db, switch, restart, wait until healthy
-scripts/agent-deploy deploy <rev>      # any commit, branch or tag
-scripts/agent-deploy rollback          # back to the previous release
-scripts/agent-deploy status            # the unit, its release, `agent status` (open Tickets, spend, alerts), the health check and prune timers, and the dashboard publisher
-scripts/agent-deploy logs              # the last 100 log lines; `logs -f` follows, `logs --since 1h`
-scripts/agent-deploy publish-logs      # the same for the dashboard publisher, when there is one
-scripts/agent-deploy health-logs       # the same for the health check
-scripts/agent-deploy prune-logs        # the same for the daily prune: its last line says what it freed
-scripts/agent-deploy restart           # also: start, stop, releases
-scripts/agent-deploy deploy --drain 300   # wait up to 5 minutes for running work to reach a Report (default 90 s)
-scripts/agent-deploy rollback --no-drain  # stop at once; for an emergency
-pbpaste | scripts/agent-deploy token discord-token   # store or rotate a token, then restart
-scripts/agent-deploy token github-app.pem < ~/Downloads/<name>.<date>.private-key.pem   # the GitHub App's key
+pbpaste | scripts/agent-deploy token discord-token
+scripts/agent-deploy token github-app.pem < ~/Downloads/solos-bot.2026-11-05.private-key.pem
 ```
 
-A deploy builds on the box with the pinned toolchain (`cargo build --locked`, `npm ci`), runs `doctor` on the new
-release, refuses to build with less than 30 GB free, drains the agent (below), stops it, copies `agent.db`, switches
-`current`, installs the unit files from the release and starts it. Healthy means the unit is active with its broker
-socket and keeps the same process for 20 s. If the new release does not get there, the deploy switches back to the
-previous release, restores the `agent.db` it copied (a new release may have migrated it), starts that and exits 1.
+The command reads stdin, refuses an empty value, and prints nothing of it. Then restart the unit that reads the token
+(`scripts/agent-deploy restart`). The names the units know are in [Tokens](#tokens).
 
-### Draining on deploy
-
-`deploy`, `rollback`, `restart` and `stop` drain before they stop the unit:
-
-1. They write `state/control.json` as `{"mode":"pause","by":"agent-deploy",...}`, the pause gate `PAUSE` also is. The agent
-   starts no new Eval and performs no Effect, and the broker answers every worker's next model call with the pause
-   reply, so each worker finishes the call it is in and then waits.
-2. They ask `agent status --json` of the running release every 3 seconds, for up to 90 seconds, until each Assignment
-   that was running when the pause began has sent a Report (any status: a Report is a turn boundary the Store holds) or
-   has ended.
-3. They stop the unit and carry on as before. When the new release is healthy they remove `control.json`, but only a file
-   marked `"by":"agent-deploy"`: a pause a person wrote is never replaced or lifted. The agent that starts next after a
-   `stop` starts unpaused.
-
-Trade-offs, so nobody is surprised:
-
-- **It narrows the loss, it does not remove it.** A worker that is partway through a long tool call (a build, a test run)
-  does not reach a boundary in 90 seconds and is killed by the stop, as before; it recovers on the next start as `host
-  restarted` and is told to check `/work` before repeating anything. A drain that times out says how many Assignments were
-  still mid-turn and stops anyway: a deploy never waits forever.
-- **A deploy costs up to the drain time more.** The build happens before the drain, so the agent is paused from the
-  drain until the new release is healthy: the drain time, the restart, and 20 seconds. `--drain SECONDS` (or
-  `AGENT_DRAIN_SECS`) changes the wait; `--no-drain` skips it. Use `--no-drain` for an emergency rollback.
-- **Messages still arrive.** While paused the Sources keep reading and storing; they are judged after the pause lifts. A
-  Discord message sent during the few seconds the agent is down is lost (a new Gateway session does not replay).
-- **The pause is the same switch an operator has**, so `agent status` shows `pause: held by control.json (mode pause)`
-  during a drain, and the Watchdog's own pause alert (after an hour) would fire for a drain that was left behind. If a
-  deploy fails and the agent that is running was left paused, the script says so: look at `~/agent/state/control.json`
-  and, once the agent is right, `rm` it (it names `"by":"agent-deploy"` when it is the drain's).
-- **It uses only what every release has**: `agent status --json` of the release that is running, so the first deploy that
-  contains this already drains.
-
-**Rollback and the schema.** A release that migrated `agent.db` to a newer schema cannot be rolled back to a binary
-that knows only the older one: the older binary refuses the file and `rollback` says so. Then stop the agent, copy
-the matching `agent.db*` back from `backups/` into `state/`, and roll back. A Ticket accepted without a budget (no
-`budgets:` section) stores none, and a binary from before budgets were optional fails to read it. The schema version
-is the same, so `rollback` does not notice: roll back only when no such Ticket is open, or restore `agent.db*` from
-`backups/` as above.
+`agent serve` and `agent publish` read each token file once and delete it. So before every start, crash restarts
+included, each unit's `ExecStartPre` copies the tokens it needs into its own tmpfs runtime directory, and the config
+names that copy, never `~/agent/tokens`. The runtime directory goes away when the unit stops. No sandbox sees
+`~/agent/tokens` or a runtime directory. The tokens rest unencrypted at mode 0600 in the agent user's home, like the
+vault key.
 
 ## The production config
+
+`~/agent/agent.yaml` on the box is the production config. It is not in git. This is its shape, with your values in
+`<...>`:
 
 ```yaml
 # ~/agent/agent.yaml on the box
 policy:
-  people: [discord:<your user id>, mcp:<your name>]
-  approvers: [discord:<your user id>]
-  auto_approve_microusd: 500000           # above this a swarm's budget waits for Approve
+  people: [discord:<your Discord user id>, mcp:<your name>, github:<your GitHub login>]
+  approvers: [discord:<your Discord user id>, github:<your GitHub login>]
+  auto_approve_microusd: 500000            # a budget above this waits for Approve
 sources:
   - kind: discord
     guilds: [<server id>]
     token_file: /run/user/1000/solos-agent/discord-token
-  - kind: mcp                              # `solos-swarm mcp --state-dir ~/agent/state --operator <your name>`
+  - kind: mcp                              # `solos-swarm mcp`, `agent stop` and `agent memo` on the box
+  - kind: github                           # no fields: it reads forge.repos as the App
 channels:
   - kind: discord
   - kind: mcp
+  - kind: github                           # comments as the App's bot
 router:
   kind: pi
   provider: deepseek
@@ -104,89 +72,277 @@ router:
   prices: {input_microusd_per_million: 300000, output_microusd_per_million: 1320000, cache_hit_microusd_per_million: 30000}
 executor:
   kind: pi
-  provider: deepseek
+  provider: deepseek                       # the Router's provider: one key serves both
   model: deepseek-flash
   prices: {input_microusd_per_million: 300000, output_microusd_per_million: 1320000, cache_hit_microusd_per_million: 30000}
   max_workers: 4
-  run_code: {}
-  # fetch_url reaches the public internet only: loopback, private, link-local and 100.64/10 (Tailscale) addresses are
-  # refused on every hop, so a worker steered by hostile text cannot probe this box's own services. To allow them:
-  #   fetch: {allow_private_networks: true}
-pstack: {}
-# No `budgets:` section: a session Ticket and the Router have no cap, and a swarm's budget is named by the Router
-# (or `executor.swarm.default_budget_microusd`). To cap them, add
-#   budgets: {session_microusd: 500000, router_daily_microusd: 3000000}
-# and see "Budgets" in README.md.
-watchdog:
-  operator: {source: discord, address: {channel: <a channel id you read>}}   # also where the health check posts
-  every: 1m
-health:
-  min_free_gb: 50        # below this much free space on the state directory's disk: pause new work and alert
-```
-
-`mcp:<your name>` in `policy.people` is what lets you stop a Ticket from the box ([below](#stopping-a-ticket-by-hand)).
-`health:` is optional; its defaults are in [Pruning state and the disk floor](#pruning-state-and-the-disk-floor).
-
-### GitHub
-
-The agent works on GitHub as a GitHub App's bot, with no personal access token. Create and install the App as
-[GitHub App](README.md#github-app) says (by hand, once), then store its key and add a `github:` section, a `forge:` of the
-repositories it may act on, and the `github` Source and Channel:
-
-```sh
-scripts/agent-deploy token github-app.pem < ~/Downloads/solos-bot.2026-11-05.private-key.pem
-rm -P ~/Downloads/solos-bot.2026-11-05.private-key.pem
-```
-
-```yaml
-# ~/agent/agent.yaml, beside the sections above
-policy:
-  people: [discord:<your user id>, github:<your login>]    # lowercase; each is pinned to its account id in state/github-identities.json
-  approvers: [discord:<your user id>, github:<your login>]
+  run_code: {}                             # the forge needs it: workers run git in their clones
+  # fetch: {allow_private_networks: true}  # without it, fetch_url refuses loopback, private and Tailscale addresses
+pstack: {}                                 # every worker enters poteto-mode
 github:
   app_id: <the App's numeric id>
-  key_file: /run/user/1000/solos-agent/github-app.pem      # the unit copies tokens/github-app.pem here before each start; serve reads it once and deletes it
+  key_file: /run/user/1000/solos-agent/github-app.pem
 forge:
-  kind: github                                             # no token_file and no identity: the commits are by the App's bot
+  kind: github
   repos:
-    <owner>/<repo>: {about: What the Router reads to tell which repository a request is about, base: main, owes: pull_request}
-sources:
-  - kind: github                                           # no fields: it reads forge.repos
-channels:
-  - kind: github
+    GuiBibeau/solos:
+      about: solos, one binary agents call to trade across venues (JavaScript).
+      base: main
+      owes: pull_request                   # the most the agent does here
+      deps: {kind: bun}                    # the host installs bun.lock's dependencies
+      evidence: {command: "bun run solos dev verify --scope unit --json"}
+    GuiBibeau/solos-swarm:
+      about: solos-swarm, the agent's own code (Rust and TypeScript).
+      base: main                           # no owes: it defaults to answer, so the agent only reads here
+memory:                                    # optional; these are the defaults
+  proposals: true                          # workers propose memos, and a review decides each
+  review: {thinking: max}
+  dream: {enabled: true, at: "03:30", thinking: max}   # UTC, before the 04:30 prune
+  # daily_microusd: 500000                 # the review's and the dream's cap per UTC day; absent: no cap
+watchdog:
+  operator: {source: discord, address: {channel: <a channel id you read>}}
+  every: 1m
+health:
+  min_free_gb: 50                          # pause new work below 50 GB free on the state directory's disk
+web:
+  public_url: https://agent.guibibeau.com
+  publish:
+    token_file: /run/user/1000/solos-agent-publish/vercel-blob-token
 ```
 
-Deploy, then check from the box (the unit's copy of the key is gone, so name the durable one):
+Read these before you change it:
+
+- Every `token_file` and `github.key_file` names the unit's runtime copy, as [Store a token](#store-a-token) says.
+  `serve` refuses a `key_file` under any path a sandbox can read.
+- `mcp:<your name>` in `policy.people` lets you run `agent stop` and `agent memo` from the box.
+- There is no `budgets:` section, so a session Ticket and the Router have no cap. A swarm's budget comes from the Router
+  or from `executor.swarm.default_budget_microusd`. To cap them, add
+  `budgets: {session_microusd: 500000, router_daily_microusd: 3000000}` ([Budgets](README.md#budgets)).
+- A Ticket from GitHub, MCP or a schedule has no Approve button, so its budget is capped at `auto_approve_microusd`.
+- `watchdog.operator` is where the Watchdog's alerts, the dream's daily digest and the health check's posts go. The
+  health check posts only to a `source: discord` operator.
+- Write `web.publish` in block style, as above. `scripts/agent-deploy` looks for a `publish:` line under `web:` to know
+  whether to run the publisher.
+- `memory:` and `health:` can be left out. Their defaults are in [Memory](README.md#memory) and
+  [The disk floor](#the-disk-floor).
+
+The sections below say how to set up GitHub, dependencies, memory and the dashboard. The keys are in
+[GitHub App](README.md#github-app), [Repositories](README.md#repositories), [Memory](README.md#memory),
+[Watchdog](README.md#watchdog) and [Web dashboard](README.md#web-dashboard).
+
+## Deploy a release
 
 ```sh
-scripts/agent-deploy deploy
-ssh <box> '~/agent/current/bin/solos-swarm agent github check --config ~/agent/agent.yaml --key-file ~/agent/tokens/github-app.pem --state-dir ~/agent/state'
+scripts/agent-deploy deploy            # origin/main
+scripts/agent-deploy deploy <rev>      # any commit, branch or tag
 ```
 
-The key rests unencrypted at mode 0600 beside the other tokens. `serve` refuses a `key_file` under any path a sandbox can
-read, and mints every token for one repository of `forge.repos`, read for a `GET` and write for the rest. Rotate the key by
-generating a second one in the App's settings, storing it with `agent-deploy token github-app.pem`, restarting, and then
-deleting the first. To stop GitHub work, suspend the App under Settings, Applications, Installed GitHub Apps: every GitHub
-call then waits and retries every five minutes, and unsuspending resumes it with no restart. `github.writes: false` and a
-restart keeps the agent reading and writing nothing.
+A deploy does these steps, in order:
 
-`owes: pull_request` on a repository is what makes a worker's `ready` open a pull request there, and it is also the most the
-agent does there (`owes: answer` makes the repository read-only whatever the Router asks). The pull request is opened as the
-bot, ready for review, on a branch `solos/<ticket>/<slug>` that only the agent writes, and never touches `.github/**`
-(`protected` is the list, per repository). Nothing merges: merging is later work. A config with `owes: pull_request` and
-`github.writes: false` does not load. Tickets that deliver a change or a pull request need schema V7 of `agent.db`; an older
-build refuses a store that has them, so roll the binary forward with the store, not back.
+1. It fetches `origin`, resolves the revision to a 12-digit sha, and sends `git archive` of it to the box. The box skips
+   the build when that release is already built.
+2. It refuses to build with less than 30 GB free.
+3. It builds on the box: `npm ci`, then `cargo build --locked --release` with toolchain 1.96.0 and the build cache
+   `~/agent/target`. It runs `doctor` on the new release and makes the release read-only.
+4. It [drains](#drain-running-work) the agent, stops the publisher and the agent, and copies `agent.db*` into
+   `backups/`.
+5. It points `current` at the new release (the old one becomes `previous`), installs and enables the units from the
+   release, and starts the agent.
+6. It waits until the agent is healthy: the unit is active, its broker socket exists, and the process is the same 20
+   seconds later.
+7. It lifts the drain's pause, starts the publisher if the config has `web.publish`, and starts the health and prune
+   timers.
+8. It deletes old releases. It keeps the newest five, plus `current` and `previous`.
 
-A config that still has `token_file` on the github Source or on `forge: github`, or `identity` on `forge: github`, fails to
-load with a sentence that points at [Moving from token files](README.md#moving-from-token-files). The `forge-token` file is no
-longer read; delete it from `~/agent/tokens`.
+If the new release does not become healthy, the deploy switches back to the previous release, restores the
+`agent.db` it copied (the new release may have migrated it), starts that, and exits 1.
 
-### A repository whose pull requests need its own checks (`GuiBibeau/solos`)
+A deploy that went well ends like this:
 
-A JavaScript repository's checks cannot run in a worker's sandbox, which has no network and a clone with no
-`node_modules`, and a pull request that lacks the checks' proof fails CI. `GuiBibeau/solos` wants the JSON of
+```text
+backed up agent.db to /home/debian/agent/backups/20261107T142301Z-ebb9f39ae70a
+release 53f30cbf570b is serving (pid 812345)
+unpaused
+publisher: active
+```
+
+## Roll back
+
+```sh
+scripts/agent-deploy rollback
+```
+
+`rollback` switches to the `previous` release with the same drain, backup and health wait as a deploy.
+
+A binary refuses an `agent.db` whose schema is newer than it knows, so a rollback across a schema change fails and
+says so. These releases changed the schema:
+
+| Schema | Added by |
+|---|---|
+| 7 | #75, a Ticket's change and pull request |
+| 8 | #84, memos |
+| 9 | #86, memos the dream supersedes and retires |
+
+To roll back across one of them:
+
+1. Run `scripts/agent-deploy stop`.
+2. On the box, list the backups with `ls -1t ~/agent/backups/`. Each name is the backup's time and the release that
+   was serving then.
+3. Move `~/agent/state/agent.db*` aside, and copy the matching backup's `agent.db*` into `~/agent/state/`. You lose
+   everything the agent stored after that backup.
+4. Run `scripts/agent-deploy rollback`.
+
+One change does not move the schema. A Ticket accepted with no budget (no `budgets:` section) stores none, and a binary
+from before #68 fails to read it. `rollback` does not notice. Roll back past #68 only when no such Ticket is open, or
+restore a backup as above.
+
+## Drain running work
+
+`deploy`, `rollback`, `restart` and `stop` drain before they stop the agent. `start` does not. A drain pauses the
+agent, then waits up to 90 seconds for each Assignment that was running to send a Report or end.
+
+```sh
+scripts/agent-deploy deploy --drain 300      # wait up to 5 minutes
+scripts/agent-deploy rollback --no-drain     # stop at once, for an emergency
+AGENT_DRAIN_SECS=180 scripts/agent-deploy restart
+```
+
+`--drain SECONDS` and `--no-drain` go anywhere after the command. `--drain 0` is the same as `--no-drain`.
+
+To pause and wait by hand on the box, without a stop, use the copy of the script that every command installs there:
+
+```sh
+ssh <box> 'bash ~/agent/.agent-deploy --on-host drain 300'   # pause, then wait up to 300 s
+ssh <box> 'bash ~/agent/.agent-deploy --on-host resume'      # lift that pause
+```
+
+What a drain does:
+
+- It writes `state/control.json` as `{"mode":"pause","by":"agent-deploy",...}`. If a `control.json` that someone else
+  wrote is already there, it keeps that one and waits under it.
+- While the agent is paused, it starts no new Eval and performs no Effect. The broker answers each worker's next model
+  call with the pause reply, so the worker finishes the call it is in and then waits.
+- It asks the running release's `agent status --json` every 3 seconds. An Assignment is done waiting once its Report
+  count changed or it is no longer running.
+- After the timeout it stops the agent anyway and says how many Assignments were still mid-turn. The stop kills a
+  worker in a long tool call, such as a build. That work starts again as `host restarted`, and the new worker is told
+  to check `/work` before it repeats anything.
+- Once the new release is healthy, the script removes `control.json`, but only a file marked `"by":"agent-deploy"`. It
+  never replaces or lifts a pause a person wrote. After `stop`, it removes the drain's file at once, so the next start
+  is unpaused.
+
+While paused, the Sources keep reading and storing messages, and the agent judges them after the pause lifts. A Discord
+message sent in the seconds the agent is down is lost, because a new Gateway session does not replay. `agent status`
+shows `pause: held by control.json (mode pause)` during a drain, and the Watchdog alerts after an hour of pause. If a
+deploy fails and leaves the agent paused, the script says so. Look at `~/agent/state/control.json` and, once the agent
+is right, remove it.
+
+## Start, stop and restart
+
+```sh
+scripts/agent-deploy restart
+scripts/agent-deploy stop
+scripts/agent-deploy start
+```
+
+- `restart` drains, restarts the agent, waits until it is healthy, then restarts the publisher and starts the timers.
+- `stop` drains, stops the publisher and then the agent. The health check stays quiet about it for 30 minutes, so an
+  agent you stopped on purpose alerts only if it is still down after that.
+- `start` starts the agent, waits until it is healthy, then starts the publisher and the timers.
+
+## Check on the agent
+
+```sh
+scripts/agent-deploy status            # the release, the unit, `agent status`, the publisher, the timers, a health check
+scripts/agent-deploy logs              # the agent's last 100 log lines
+scripts/agent-deploy logs -f           # follow them
+scripts/agent-deploy logs --since 1h
+scripts/agent-deploy publish-logs      # the publisher's journal; same arguments
+scripts/agent-deploy health-logs       # the health check's journal
+scripts/agent-deploy prune-logs        # the daily prune's journal: its last line says what it freed
+scripts/agent-deploy releases          # the releases on the box, with current and previous marked
+```
+
+`status` prints `agent status` (open Tickets with their age, spend, alerts and the pause), then
+`publisher: active (configured: yes)` and how long ago the dashboard index went up, the two timers and their last
+results, any open health incident, and the output of `agent health --dry-run`, which checks and changes nothing.
+
+## Stop a Ticket by hand
+
+To stop a stale Ticket, such as an Assignment that will never report or a request nobody wants any more, run
+`agent stop` on the box. It goes through the running agent, as a person's Stop button does:
+
+```sh
+ssh <box> '~/agent/current/bin/solos-swarm agent stop --state-dir ~/agent/state --operator <your name> --ticket tk_0123456789abcdef --reason "stale after the deploy"'
+# tk_...: Stopped by <your name>.
+```
+
+`agent stop` files the command in `state/mcp/commands.jsonl` as the operator `mcp:<your name>`, and `agent serve` reads
+it. This needs the `kind: mcp` Source and Channel in `agent.yaml`, and `mcp:<your name>` in `policy.people` or
+`policy.approvers`. The agent refuses anyone else with "is not allowed to stop this work". The Ticket ends for good as
+`stopped`, with the reason `stopped by <your name> on mcp: <reason>`, and a later message in its thread does not resume
+it. Only the agent writes the Store. The exit statuses are in [`agent stop`](#agent-stop).
+
+To clear several stale Tickets, list the open ones with `scripts/agent-deploy status`, then stop each:
+
+```sh
+ssh <box> 'for t in tk_aaa tk_bbb; do ~/agent/current/bin/solos-swarm agent stop --state-dir ~/agent/state --operator <your name> --ticket $t --reason "stale after the deploy"; done'
+```
+
+## Set up GitHub
+
+The agent works on GitHub as the bot of a GitHub App, with no personal access token.
+
+1. Create and install the App by hand, once, as [GitHub App](README.md#github-app) says. Note its App ID and download
+   its private key.
+2. Store the key, then delete the download:
+
+   ```sh
+   scripts/agent-deploy token github-app.pem < ~/Downloads/solos-bot.2026-11-05.private-key.pem
+   rm -P ~/Downloads/solos-bot.2026-11-05.private-key.pem
+   ```
+
+3. Add `github:`, `forge:` and the `github` Source and Channel to `agent.yaml`, as in
+   [the production config](#the-production-config). Add `github:<your login>` to `policy.people` and
+   `policy.approvers`. Logins are lowercase, and each one is pinned to its account id in
+   `state/github-identities.json` the first time the agent looks it up.
+4. Deploy with `scripts/agent-deploy deploy`.
+5. Check the App from the box. The unit's copy of the key is gone, so name the durable one:
+
+   ```sh
+   ssh <box> '~/agent/current/bin/solos-swarm agent github check --config ~/agent/agent.yaml --key-file ~/agent/tokens/github-app.pem --state-dir ~/agent/state'
+   ```
+
+   It ends with `ok`, or exits 1 and says what to fix.
+
+What `owes` allows on each repository of `forge.repos`:
+
+- `answer` (the default): the agent reads the repository and answers. No Router choice raises it.
+- `change`: the worker's commits stay in the Ticket's clone.
+- `pull_request`: a worker's `ready` opens a pull request as the bot, ready for review, on a branch
+  `solos/<ticket>/<slug>` that only the agent writes. No commit may touch a path in `protected` (default
+  `.github/**`). Nothing merges. The config accepts `merge`, `ci`, `max_repairs` and `github.reconcile_secs`, and no
+  release acts on them yet. A config with `owes: pull_request` and `github.writes: false` does not load.
+
+To rotate the key, generate a second key in the App's settings, store it with `scripts/agent-deploy token
+github-app.pem`, run `scripts/agent-deploy restart`, then delete the first key on GitHub.
+
+To stop GitHub work:
+
+- Suspend the App under Settings, Applications, Installed GitHub Apps. Every GitHub call then waits and tries again
+  every five minutes. Unsuspending resumes the work with no restart.
+- Or set `github.writes: false` and restart. The agent then reads and writes nothing on GitHub.
+
+A config that still has `token_file` on the github Source or on `forge: github`, or `identity` on `forge: github`, fails
+to load with a sentence that points at [Moving from token files](README.md#moving-from-token-files). The agent no longer
+reads `forge-token`. Delete it from `~/agent/tokens`.
+
+## Install a repository's dependencies and require evidence
+
+A worker's sandbox has no network, and its clone has no `node_modules`. So a JavaScript repository's checks cannot run
+there, and a pull request without their proof fails that repository's CI. `GuiBibeau/solos` wants the JSON of
 `bun run solos dev verify --scope unit --json` under `## Evidence` in every pull request (its `AGENTS.md`, "Evidence").
-Two keys on its repository fix both:
+Two keys on its repository handle both:
 
 ```yaml
 # ~/agent/agent.yaml
@@ -196,264 +352,371 @@ forge:
       about: ...
       base: main
       owes: pull_request
-      deps: {kind: bun, binary: /home/debian/.bun/bin/bun}       # the box's bun; the default is $HOME/.bun/bin/bun
+      deps: {kind: bun}                    # binary: the box's bun; default $HOME/.bun/bin/bun
       evidence: {command: "bun run solos dev verify --scope unit --json"}
 ```
 
-`deps.memory_bytes` is 16 GiB of address space (a cap, not memory used) for the `run_code` of Tickets on this repository
-alone: bun aborts under 4 or 6 GiB, and its lint step under 8. `executor.run_code.memory_bytes` stays as it is for every
-other Ticket.
+- `deps`: the first time a Ticket on the repository starts, the host installs the dependencies from `bun.lock` at the
+  base commit into `state/deps/GuiBibeau/solos/<key>/`. On the box that cache is 2.2 GiB. A later Ticket mounts the same
+  cache read-only, and a new lockfile on `main` makes a new cache. The install runs in its own sandbox, the one place
+  besides the browser that reaches the network.
+- `deps.memory_bytes` is the address space (a cap, not memory used) for this repository's `run_code`, 16 GiB by
+  default. bun aborts under 4 or 6 GiB, and its lint step under 8. `executor.run_code.memory_bytes` stays as it is for
+  every other Ticket.
+- `evidence`: the worker runs the command itself, offline, and the host refuses its `ready` unless the report carries
+  the JSON under the heading.
 
-The host installs the dependencies from `bun.lock` at the base commit the first time a Ticket on the repository starts
-(about four seconds, 2.2 GiB and 234,000 files, links and directories on the box), under `state/deps/GuiBibeau/solos/<key>/`, and a later Ticket
-mounts the same cache; a new lockfile on `main` is a new cache. The worker runs `verify` itself, offline, and the host refuses
-its `ready` without the JSON in its report. The whole mechanism, what it trusts and what it leaves to CI is in
-[Installed dependencies and evidence](README.md#installed-dependencies-and-evidence). Needs: `bun`, `bwrap` and `prlimit` on the
-box, and the network from the host (the build sandbox is the one place besides the browser that has it). `agent prune`
-removes a cache no Ticket has used for its `--keep-days`. Keep `state/` off a tmpfs: a cache has many files.
+The box needs `bun`, `bwrap` and `prlimit`. Keep `state/` off a tmpfs, because a cache holds many files. `agent prune`
+removes a cache no Ticket has used for its `--keep-days`. What the mechanism trusts and what it leaves to CI is in
+[Installed dependencies and evidence](README.md#installed-dependencies-and-evidence).
+
+## Memory and the dream
+
+Memory is on by default wherever workers run on Pi. Workers propose memos, a review call at DeepSeek's highest thinking
+effort decides each one, and once a day the dream checks the memos against the transcripts of the Tickets that ended.
+How it works is in [Memory](README.md#memory) and [The dream](README.md#the-dream).
+
+Operate it from the box:
+
+```sh
+ssh <box> '~/agent/current/bin/solos-swarm agent memo list --state-dir ~/agent/state'          # --all adds retired and forgotten memos
+ssh <box> '~/agent/current/bin/solos-swarm agent memo add --state-dir ~/agent/state --operator <your name> --scope repo:GuiBibeau/solos "Tests run with bun test"'
+ssh <box> '~/agent/current/bin/solos-swarm agent memo retire --state-dir ~/agent/state --operator <your name> mm_0123456789abcdef --reason "no longer true"'
+ssh <box> '~/agent/current/bin/solos-swarm agent memo forget --state-dir ~/agent/state --operator <your name> mm_0123456789abcdef'
+```
+
+`list` reads the Store. `add`, `retire` and `forget` go through the running agent as `mcp:<your name>`, like
+`agent stop`, with the same exit statuses. A memo you add is active at once. `forget` erases a memo's text, quotes and
+reasons and keeps its digest, so the event chain still verifies.
+
+- The dream starts at `memory.dream.at` (03:30 UTC by default), only if a Ticket ended since the last dream. Keep `at`
+  before the 04:30 prune, which removes transcripts 14 days after their Ticket ended.
+- The dream's digest goes to `watchdog.operator` once a day. Without a `watchdog:` section there is no digest.
+- The review and the dream are billed to the ledger's `memory` account. `memory.daily_microusd` caps that account per
+  UTC day.
+- To stop workers proposing memos, and the dream with them, set `memory.proposals: false`. To stop only the dream, set
+  `memory.dream.enabled: false`. Restart after either.
 
 ## Dashboard
 
-A web page of the agent's tickets at `https://agent.guibibeau.com`, behind Sign in with Vercel, for one person. The box
-accepts no inbound connection, so it pushes instead of being asked:
+The dashboard is a web page of the agent's tickets at `https://agent.guibibeau.com`, behind Sign in with Vercel, for one
+person. The box accepts no inbound connection, so it pushes:
 
-```
+```text
 solos-agent  --writes-->  agent.db  --read-only-->  solos-agent-publish  --HTTPS PUT-->  private Vercel Blob store
                                                                                                   |
                                        you  -->  agent.guibibeau.com (web/agent-dashboard)  <--reads, server side
 ```
 
-`solos-swarm agent publish` is a second systemd user unit, `solos-agent-publish`
-([scripts/systemd/solos-agent-publish.service](../../scripts/systemd/solos-agent-publish.service)). It opens `agent.db`
-**read-only** (SQLite refuses any write on that handle; a test compares the file byte for byte after a run), looks
-every few seconds, and builds `tickets/index.json` (the open tickets first, then the latest 100 ended) and one
-`tickets/<ticket id>.json` per ticket in it. It uploads only a snapshot whose content hash changed, tickets first and the
-index last, so the index never names a blob that is not there. What it remembers is `state/publish-state.json`: the hash
-of each blob it last uploaded, for the Blob store its token names (a different store gets everything again). A look that
-finds nothing written costs one SQLite pragma; an idle agent costs one index upload every five minutes, which is how the
-dashboard tells a quiet agent from a dead publisher. The web app and its setup are in
-[web/agent-dashboard/README.md](../../web/agent-dashboard/README.md).
+`solos-swarm agent publish` runs as the unit `solos-agent-publish`. It opens `agent.db` read-only and looks at it every
+`web.publish.every_secs` (5). A look that finds nothing written costs one SQLite pragma. When the Store changed, it
+builds `tickets/index.json` (the open tickets first, then the latest 100 ended) and one `tickets/<ticket id>.json` per
+ticket in the index. It uploads only a snapshot whose content changed, tickets first and the index last, so the index
+never names a blob that is not there. When nothing changed, it uploads the index again every `heartbeat_secs` (300),
+which is how the dashboard tells a quiet agent from a dead publisher. Its only file is
+`state/publish-state.json`, the hash of each blob it last uploaded to the store its token names. A different store gets
+everything again. The web app is [web/agent-dashboard](../../web/agent-dashboard/README.md).
 
-### Turning it on
+### Turn on the dashboard
 
-The Vercel side comes first (the project, a **private** Blob store, the Sign in with Vercel app, the environment variables
-and the domain: [exact steps](../../web/agent-dashboard/README.md#setup-on-vercel)). Then, on the Mac:
+1. Set up the Vercel side first: the project, the private Blob store, the Sign in with Vercel app, the environment
+   variables and the domain ([setup on Vercel](../../web/agent-dashboard/README.md#set-up-on-vercel)).
+2. Copy the Blob store's read-write token (`vercel_blob_rw_...`) from the store's page on Vercel, and store it:
+
+   ```sh
+   pbpaste | scripts/agent-deploy token vercel-blob-token
+   ```
+
+3. Add `web:` to `~/agent/agent.yaml`, in block style:
+
+   ```yaml
+   web:
+     public_url: https://agent.guibibeau.com      # https, no trailing slash: a ticket's page is {public_url}/tickets/{id}
+     publish:
+       token_file: /run/user/1000/solos-agent-publish/vercel-blob-token
+       every_secs: 5                              # optional, 1 to 3600
+       heartbeat_secs: 300                        # optional, every_secs to 86400
+   ```
+
+4. Run `scripts/agent-deploy deploy`, or `scripts/agent-deploy restart` on the current release.
+5. Check it:
+
+   ```sh
+   scripts/agent-deploy status           # "publisher: active (configured: yes)", "dashboard index last uploaded 3s ago"
+   scripts/agent-deploy publish-logs     # "publish: uploaded tickets/tk_...json, tickets/index.json (2 unchanged)"
+   ```
+
+From then on, `deploy`, `rollback`, `start`, `stop` and `restart` install and restart the publisher with the agent. They
+stop it while `agent.db` is backed up or restored, so it never reads a file being replaced.
+
+The publisher's unit copies `tokens/vercel-blob-token`, and only that, into its own runtime directory,
+`/run/user/1000/solos-agent-publish/`. `agent publish` reads it once and deletes it. The agent's unit does not copy this
+token. A `web:` section without `publish:` only sets `public_url`, the link the Discord replies carry, and installs
+nothing.
+
+To make one look by hand, put a fresh copy of the token in the runtime directory first, because the command consumes it:
 
 ```sh
-# The Blob store's read-write token (vercel_blob_rw_...): from the store, or the project's BLOB_READ_WRITE_TOKEN.
-pbpaste | scripts/agent-deploy token vercel-blob-token
+ssh <box> '~/agent/current/bin/solos-swarm agent publish --config ~/agent/agent.yaml --state-dir ~/agent/state --once'
 ```
 
-and add to `~/agent/agent.yaml`:
-
-```yaml
-web:
-  public_url: https://agent.guibibeau.com      # https, no trailing slash: a ticket's page is {public_url}/tickets/{id}
-  publish:
-    token_file: /run/user/1000/solos-agent-publish/vercel-blob-token   # the unit copies tokens/vercel-blob-token here before each start
-    every_secs: 5                              # optional, 1 to 3600
-    heartbeat_secs: 300                        # optional: re-upload the index this often even when nothing changed
-```
-
-Write `publish:` in block style, as above: `scripts/agent-deploy` looks for it to know whether to run the publisher. Then
-`scripts/agent-deploy deploy` (or `restart` on the current release). From then on `switch`, `rollback`, `start`, `stop` and
-`restart` install and restart the publisher with the agent, and stop it while `agent.db` is backed up or restored, so it
-never reads a file being replaced. `status` shows it and how long ago the index went up; `publish-logs` is its journal.
-
-```sh
-scripts/agent-deploy status           # "publisher: active", "dashboard index last uploaded 3s ago"
-scripts/agent-deploy publish-logs     # "publish: uploaded tickets/tk_...json, tickets/index.json (2 unchanged)"
-```
-
-`token_file` is a one-use token like the others: the unit's `ExecStartPre` copies `tokens/vercel-blob-token`, and only
-that, into its own tmpfs runtime directory, `/run/user/1000/solos-agent-publish/`, and `agent publish` reads it once and
-deletes it. `solos-agent.service` does not copy this token, so it is never in the agent's runtime directory. A `web:`
-section without `publish:` only sets `public_url` (the link the Discord replies carry) and installs nothing.
-
-`solos-swarm agent publish --config ~/agent/agent.yaml --state-dir ~/agent/state --once` makes one look, prints what was
-uploaded as JSON and exits 1 if the API refused a blob. It consumes the token file, so put a fresh copy there first.
+It prints what it uploaded as JSON and exits 1 if the API refused a blob.
 
 ### What is published, and who can read it
 
-For each ticket: its title and the Router's scope; the request and every later message the ticket received from its
-Thread (the people's, bots' and the Router's notes), in full; **every reply the agent sent**, in full, with whether it was
-delivered; the Decisions about it; each Assignment's start, end and Reports; the spend and budget; and, for a browser, the
-pages it opened (title, status and address **without its query or fragment**, which carry tokens) and how many steps were
-refused or unanswered. Not published: what a browser typed (the Store holds only a digest), vault items and their grants'
-values, tokens, and anything outside `agent.db`. A message is cut at 100,000 characters, an Assignment keeps its latest 20
-Reports and a browser trail its latest 40 pages. The replies are the Store's own record of what was sent; the one-line answer
-to a Discord button or `stop` command is not in it and so is not on the page.
+For each ticket the publisher uploads:
 
-Treat the Blob store as holding what the agent says to you: it is private (every read needs a token, and the dashboard reads
-it server-side after a sign-in whose email is `ALLOWED_EMAILS`), but anyone who holds its read-write token can read all of
-it. The token rests at mode 0600 beside the others, in the same place and with the same exposure as `model.key`.
+- its title and the Router's scope
+- the request and every later message from its thread (people's, bots' and the Router's notes), in full
+- every reply the agent sent, in full, with whether it was delivered
+- the Decisions about it, each Assignment's start, end and Reports, and the spend and budget
+- for a browser, the pages it opened (title, status, and the address without its query or fragment, which carry tokens)
+  and how many steps were refused or unanswered
 
-An old ticket's page keeps working after the index stops listing it: the publisher never deletes a blob, and a ticket the
-agent resumes goes back to the index. The discord link in a reply can be followed a few seconds before the first upload
-of that ticket; the page says so and checks again by itself. `source_url` (the link to the original conversation) is made
-for Discord messages and for issues and pull requests on github.com; a Slack link needs the workspace's name, which the
-agent does not hold.
+It does not publish what a browser typed (the Store holds only a digest), vault items or their values, tokens, or
+anything outside `agent.db`. A message is cut at 100,000 characters, an Assignment keeps its latest 20 Reports, and a
+browser trail its latest 40 pages. The one-line answer to a Discord button or a `stop` command is not in the Store, so it
+is not on the page.
 
-### Rotating the dashboard's secrets
+The Blob store is private: every read needs a token, and the dashboard reads it on the server after a sign-in whose email
+is in `ALLOWED_EMAILS`. Anyone who holds the read-write token can read all of it. The token rests at mode 0600 beside
+the others, with the same exposure as `model.key`.
 
-- **The Blob token.** On the Blob store (Vercel dashboard, **Storage**), create a new read-write token or rotate the
-  existing one, then `pbpaste | scripts/agent-deploy token vercel-blob-token` and `scripts/agent-deploy restart`. The
-  dashboard app needs `BLOB_READ_WRITE_TOKEN` in its project too only if it is not reading with OIDC; update it there and
-  redeploy. A refused token is not retried: the publisher exits (`agent publish` says "the Blob token was refused"), systemd
-  restarts it five times in fifteen minutes, then leaves the unit failed. `status` shows that, and so does the dashboard
-  itself, which warns when its index is fifteen minutes old.
-- **The app's client secret, the session secret, the allowlist.** [web/agent-dashboard/README.md](../../web/agent-dashboard/README.md#rotating-things).
-- **Turning it off.** Remove the `web.publish` section and `scripts/agent-deploy restart`: it stops and disables the
-  publisher. The blobs stay in the store until it is emptied (`vercel blob empty-store`).
+The publisher never deletes a blob, so an old ticket's page keeps working after the index stops listing it, and a ticket
+the agent resumes goes back to the index. A reply's link can be followed a few seconds before the ticket's first
+upload. The page says so and checks again by itself. The link to the original conversation is made for Discord
+messages and for GitHub issues and pull requests. A Slack link needs the workspace's name, which the agent does not
+hold.
 
-### Failures
+Blob operations are billed, and a put is an "advanced operation". A working ticket changes its snapshot with each report
+and each reply, so a busy hour is tens of puts. An idle day is about 290: one index every five minutes.
 
-| What | What happens |
-|---|---|
-| Vercel Blob or the network is down | Each upload is tried five times with a doubling wait (honouring `retry-after`), then the look fails and the next one, after a growing wait up to five minutes, tries the same uploads again. Nothing is lost; the Store is not touched. |
-| The token is refused (401, 403) | The publisher exits with that message and stays down. See above. |
-| The API refuses one blob (another 4xx) | It is logged and skipped until that ticket's snapshot changes; the others and the index still go up. |
-| `agent.db` is missing, newer than this build understands, or being restored | The look fails with the reason and is tried again; a replaced file is noticed and read again from the start. |
-| The agent restarts | Nothing: the publisher holds no connection to it. |
-| The disk or the state directory is read-only | The look fails when it cannot write `publish-state.json`; what was uploaded stays uploaded and is uploaded again after the fix, which is harmless. |
+### Rotate the dashboard's secrets
 
-Blob operations are billed (a put is an "advanced operation"). A working ticket changes its snapshot with each report and
-each reply, so a busy hour is tens of puts; an idle day is about 290.
+- **The Blob token.** On Vercel, under **Storage**, create a new read-write token for the store or rotate the existing
+  one. Then run `pbpaste | scripts/agent-deploy token vercel-blob-token` and `scripts/agent-deploy restart`. The app reads the store
+  with OIDC through `BLOB_STORE_ID`, so the project needs no change. The publisher does not retry a refused token. It
+  exits with "the Blob token was refused", systemd starts it five times in 15 minutes, and then leaves the unit failed.
+  `status` shows that, and the dashboard warns when its index is fifteen minutes old.
+- **The app's client secret, the session secret and the allowlist.** See
+  [Rotate things](../../web/agent-dashboard/README.md#rotate-things).
+
+### Turn off the dashboard
+
+Remove the `web.publish` section and run `scripts/agent-deploy restart`. It stops and disables the publisher. The blobs
+stay in the store until you delete them or the store.
 
 ## Alerts from outside the agent
 
-The Watchdog runs inside `agent serve`, so it cannot say that serve itself is down or crash-looping. Two more units do:
+The Watchdog runs inside `agent serve`, so it cannot say that `serve` itself is down or crash-looping. The health check,
+`solos-swarm agent health`, can. Every deploy installs and enables it. It runs:
 
-- `solos-agent-health.timer` runs `solos-agent-health.service` (`solos-swarm agent health`) two minutes after boot and
-  every three minutes after each start.
-- `solos-agent.service` has `OnFailure=solos-agent-health.service`, so the check also runs at once when systemd gives up on
-  the agent (five failed starts in 15 minutes).
+- from `solos-agent-health.timer`, two minutes after boot and three minutes after each start of the check
+- at once when systemd gives up on the agent (five failed starts in 15 minutes), through `OnFailure=` in
+  `solos-agent.service`
 
-Each run asks, with no help from the agent:
+Each run checks the unit, its restarts, the broker socket, the free disk, the Discord token and the config
+([Health checks](#health-checks)). It needs nothing from the agent.
+
+A failure posts once per incident to the Watchdog's channel, `watchdog.operator`, which must be `source: discord`. It
+posts as the bot, through the API root of the config's `discord` Source. It posts again only when a new kind of
+problem joins the incident, and once when everything is well again ("`solos-agent` on `<host>` is healthy again after
+12m."). The next run tries a failed post again, and nothing is told twice. `state/health-state.json` holds the
+open incident, which kinds were told, the restart count, whether the check made a pause, and the channel the last good
+config named, so a config that no longer loads is still told to the right channel.
+
+The check uses the agent's own bot token. Its `ExecStartPre` copies `~/agent/tokens/discord-token` into
+`/run/user/1000/solos-agent-health/` before each run, and the directory goes when the run ends. The check never starts,
+stops or restarts anything.
+
+Deploys do not alert. While `scripts/agent-deploy` stops and starts the agent, it writes `state/health-hold`, an expiry
+time 30 minutes ahead. Until then the check records problems and tells nobody. A deploy, rollback, start or restart
+removes the hold when it finishes, so a deploy that went wrong alerts at the next run. `stop` leaves the hold in place.
+
+If Discord or the token is what is broken, nobody can be told. The check fails, which shows in
+`scripts/agent-deploy health-logs` and in `systemctl --user --failed`, and it tells Discord the next time it can. The
+check runs on the box it watches, so a box that is off, or a user manager that is gone, alerts nobody.
+
+## Pruning state and the disk floor
+
+`state/` grows with every Ticket: each repository Ticket's clone, every worker's transcript, a mirror per repository,
+the dependency caches and the Router's transcripts. The disk is shared with other production services, so
+`solos-agent-prune.timer` runs `solos-swarm agent prune --state-dir ~/agent/state --keep-days 14` every day at 04:30
+(the box's time, which is UTC, up to 15 minutes late). The timer is `Persistent`, so a day the box was off is made up at
+the next boot. The prune opens the Store read-only, runs at the lowest CPU and disk priority, and its last line says
+what it freed. What it removes is in [Prune](#prune).
+
+To see what a run would remove, with sizes, and what the daily runs freed:
+
+```sh
+ssh <box> '~/agent/current/bin/solos-swarm agent prune --state-dir ~/agent/state --keep-days 14 --dry-run'
+scripts/agent-deploy prune-logs
+```
+
+`--json` prints the report as JSON. A failed removal is listed, the rest goes ahead, and the exit status is 1, which
+shows the service as failed. If a person resumes a Ticket while a prune runs, the prune checks it again just before it
+removes the files, and the Ticket keeps them.
+
+### The disk floor
+
+The health check also guards the disk. When free space on the state directory's filesystem drops under
+`health.min_free_gb`, it writes `state/PAUSE`, starting with `paused by solos-agent-health: ...`, and alerts. That is the
+pause gate an operator has: no new Eval starts, the agent performs no Effect, and workers' next model calls wait. The check
+frees nothing.
+
+It lifts that pause once free space is back to `health.resume_free_gb`, and it lifts only a `PAUSE` that starts with
+its own line. It never overwrites or lifts a `PAUSE` a person wrote, and a `control.json` pause is a different file.
+The check runs every three minutes, so a disk that fills faster than that is not caught. A deploy also refuses to build
+under 30 GB free.
+
+```yaml
+health:
+  min_free_gb: 50        # default 5; 0 turns the floor off
+  # resume_free_gb: 60   # default: the floor plus a fifth of it, at least 1 GB more
+  # restart_burst: 3     # restarts since the last run that count as a crash loop
+```
+
+To free space when the floor trips:
+
+1. Run the prune by hand with a shorter `--keep-days`, after a `--dry-run`.
+2. Run `cargo clean` in `~/agent/target`, the build cache. The prune never touches it, and the next deploy rebuilds it.
+3. Delete old releases or backups only by hand. A deploy keeps five releases and twenty backups.
+
+## Reference
+
+### Layout on the box
+
+| Path under `~/agent` | What it is |
+|---|---|
+| `releases/<sha>/` | One read-only build of a commit: `bin/solos-swarm`, `node_modules`, `extensions`, `vendor/pstack`, `scripts/systemd`. The newest five are kept, plus `current` and `previous`. |
+| `current`, `previous` | Links to the release that serves and the one before it. `--pi-root` is `current`. |
+| `agent.yaml` | The production config. Not in git. |
+| `state/` | The agent's state, kept across releases ([below](#state-directory)). |
+| `tokens/` | One file per one-use credential, mode 0600 ([Tokens](#tokens)). |
+| `backups/<time>-<sha>/` | `agent.db*`, copied before every deploy and rollback while the agent is stopped. The newest twenty are kept. |
+| `target/` | The cargo build cache. Not pruned. |
+| `.agent-deploy` | The copy of `scripts/agent-deploy` that each command installs and runs on the box. |
+
+### State directory
+
+| Path under `~/agent/state` | What it is |
+|---|---|
+| `agent.db` (and `-wal`, `-shm`) | The Store. Only `agent serve` writes it. |
+| `tickets/<id>/` | Each Ticket's clone (`work/`), transcripts and host files. |
+| `router/` | The Router's transcripts. |
+| `forge/<owner>/<name>.git` | The host's mirror of each repository. |
+| `forge-stage/<ticket>/` | The bundles of a worker's commits that the host admitted, beside the mirrors. |
+| `deps/<owner>/<name>/<key>/` | A repository's installed dependencies. |
+| `trail/` | The browser's trail blobs, when a browser is configured. |
+| `mcp/` | `commands.jsonl` (operator commands such as `agent stop`), `inbox.jsonl` and `outbox.jsonl` (the `mcp` Source and Channel). |
+| `broker.sock` | The broker's socket. The health check asks it `GET /api/hello`. |
+| `github-identities.json`, `github-cursor.json` | The pinned GitHub accounts, and what the github Source has already read. |
+| `dream-slot` | The last day's dream slot, so a restart asks for no second dream. |
+| `publish-state.json` | The publisher's hash of each blob it uploaded. |
+| `health-state.json`, `health-hold` | The health check's memory, and the hold a deploy writes. |
+| `PAUSE`, `control.json` | Pause gates. The health check writes `PAUSE`, a drain writes `control.json`, and a person may write either. |
+
+### Units
+
+`scripts/agent-deploy` copies each unit from `releases/<sha>/scripts/systemd/` into `~/.config/systemd/user/` on every
+switch.
+
+| Unit | Runs | When | Runtime directory, tokens |
+|---|---|---|---|
+| `solos-agent.service` | `agent serve` | Always. Restarts 15 s after a failure. When systemd gives up (five starts in 15 minutes), the unit stays failed and the health check runs. | `/run/user/1000/solos-agent/`: every file in `tokens/` except `vercel-blob-token` |
+| `solos-agent-publish.service` | `agent publish` | Always, when `agent.yaml` has `web.publish`. Restarts 30 s after a failure; five starts in 15 minutes leave it failed. | `/run/user/1000/solos-agent-publish/`: `vercel-blob-token` |
+| `solos-agent-health.service`, `.timer` | `agent health` | 2 minutes after boot, then 3 minutes after each start; and on the agent's failure | `/run/user/1000/solos-agent-health/`: `discord-token` |
+| `solos-agent-prune.service`, `.timer` | `agent prune --keep-days 14` | Daily at 04:30, up to 15 minutes late, made up after downtime | none |
+
+The publisher, the health check and the prune run with `TOKIO_WORKER_THREADS=2`. The box has 128 cores, and one runtime
+thread per core filled the publisher's `TasksMax` and hung its uploads.
+
+### `scripts/agent-deploy`
+
+| Command | What it does |
+|---|---|
+| `deploy [REV]` | Builds `REV` (default `origin/main`) as a release, then switches to it ([Deploy a release](#deploy-a-release)). |
+| `rollback` | Switches to `previous`. |
+| `start`, `stop`, `restart` | The agent's unit, with the publisher and the timers. `stop` and `restart` drain. |
+| `status` | The release, the unit, `agent status`, the publisher, the timers, any health incident, and `agent health --dry-run`. |
+| `logs [ARGS]` | `journalctl` for the agent. Default `-n 100`. Any `journalctl` arguments, such as `-f` or `--since 1h`. |
+| `publish-logs [ARGS]`, `health-logs [ARGS]`, `prune-logs [ARGS]` | The same for the publisher, the health check and the prune. |
+| `token NAME` | Stores stdin as `~/agent/tokens/NAME`, mode 0600. `NAME` is letters, digits, `.`, `_` and `-`. |
+| `releases` | Lists the releases, newest first, with `current` and `previous` marked. |
+
+| Option or variable | Effect |
+|---|---|
+| `--drain SECONDS` | How long a drain waits. Default 90. |
+| `--no-drain` | No drain: stop at once. |
+| `AGENT_DRAIN_SECS` | The default for `--drain`. |
+| `AGENT_HOST` | The box. Default `remote-ai`. |
+
+On the box, `bash ~/agent/.agent-deploy --on-host drain [SECONDS]`, `--on-host resume` and
+`--on-host running-assignments` run one piece of a deploy alone. The tests use them.
+
+### Tokens
+
+| File in `tokens/` | What it is | Read by |
+|---|---|---|
+| `model.key` | The DeepSeek key, for the Router and the workers | `agent serve --credential-file` |
+| `discord-token` | The Discord bot token | `agent serve` (the discord Source's `token_file`) and `agent health` |
+| `github-app.pem` | The GitHub App's private key | `agent serve` (`github.key_file`) |
+| `vercel-blob-token` | The Blob store's read-write token | `agent publish` (`web.publish.token_file`) |
+
+### Health checks
 
 | Check | Fails when |
 |---|---|
 | `unit` | `systemctl --user show solos-agent` says anything but `active` (inactive, failed, or `activating` in its restart delay), the unit file is gone, or systemd cannot be asked |
-| `restarts` | systemd's `NRestarts` rose by `health.restart_burst` (3) or more since the last run: a crash loop that looks active when looked at |
+| `restarts` | systemd's `NRestarts` rose by `health.restart_burst` (3) or more since the last run: a crash loop that looks active |
 | `broker` | the unit has been up for 60 s and `GET /api/hello` on `state/broker.sock` does not answer 200 within 5 s |
-| `disk` | free space on the state directory's disk is under `health.min_free_gb` ([below](#the-disk-floor)) |
+| `disk` | free space on the state directory's disk is under `health.min_free_gb` |
 | `discord` | the bot token cannot read the Watchdog's channel: the network is down, the token is refused, or the bot lost access. Nothing is sent to find out |
-| `config` | `agent.yaml` does not load, which is the likeliest reason for a crash loop right after an edit |
+| `config` | `agent.yaml` does not load, the likeliest reason for a crash loop right after an edit |
 
-A failure posts once per incident to the Watchdog's Discord channel (`watchdog.operator`, which must be `source: discord`
-for this), as the bot, through the Discord API root of the config's `discord` source. After that it says nothing more
-for the same kinds of trouble; it posts again only if a new kind joins the incident, and once when everything is well
-again ("`solos-agent` on `<host>` is healthy again after 12m."). A post that fails (Discord is down) is tried again at the
-next run, and nothing is told twice. `state/health-state.json` is its memory: the open incident, which kinds were told, the
-restart count, whether it made a pause, and the channel the last good config named, so that a config that no longer loads
-is still told to the right channel.
-
-**The token.** It is the agent's own: `ExecStartPre` copies `~/agent/tokens/discord-token` into the check's private tmpfs
-runtime directory, `/run/user/1000/solos-agent-health/`, before each run, and the directory goes when the run ends.
-`agent health` reads that copy and keeps it (the unit's copy is the one that goes), and does not use the agent's runtime
-directory, which is gone when the agent is. The token already rests at mode 0600 in `tokens/`; what this adds is a tmpfs
-file that lives for the length of one run. The check never starts, stops or restarts anything.
-
-**Deploys do not alert.** `scripts/agent-deploy` writes `state/health-hold` (an expiry time) while it stops and starts the
-agent. Until it expires the check records problems and tells nobody. A deploy, rollback or restart removes the hold when it
-finishes, so a deploy that went wrong is told by the next run; `stop` leaves the hold for 30 minutes, so an agent you
-stopped on purpose is told about only if it is still down half an hour later.
-
-**What it cannot do.** If Discord itself (or the token) is what is broken, there is nobody to tell: the check fails, which
-shows in the journal (`scripts/agent-deploy health-logs`) and in `systemctl --user --failed`, and tells Discord the next
-time it can. It runs on the same box as the agent, so a box that is off, or a user manager that is gone, alerts nobody.
-`scripts/agent-deploy status` shows the timers, the last result, any open incident, and runs `agent health --dry-run`
-(checks and prints, posts and changes nothing). Every deploy re-enables the timers; they cannot be left off.
-
-## Pruning state and the disk floor
-
-`state/` grows with every Ticket: each repository Ticket's clone, every worker's transcript, a mirror per repository, the
-Router's transcripts. The disk is shared with other production services, so
-`solos-agent-prune.timer` runs `solos-swarm agent prune --state-dir ~/agent/state --keep-days 14` daily at 04:30 (local
-time, up to 15 minutes late; `Persistent`, so a day the box was off is made up). It opens the Store read-only, runs at the
-lowest CPU and disk priority, and its last line says what it freed.
-
-```sh
-ssh <box> '~/agent/current/bin/solos-swarm agent prune --state-dir ~/agent/state --keep-days 14 --dry-run'
-scripts/agent-deploy prune-logs        # what the daily runs freed
-```
+### Prune
 
 | What | Removed when | Never |
 |---|---|---|
-| `tickets/<id>/work`, plus `host/repo.json` and `prepared` | the Ticket ended more than N days ago (its end time is in the Store) | an open Ticket; a directory the Store has no Ticket for; `pi-settings.json`; a swarm's `swarm/` books |
+| `tickets/<id>/work`, with `host/repo.json` and `prepared` | the Ticket ended more than N days ago (its end time is in the Store) | an open Ticket; a directory the Store has no Ticket for; `pi-settings.json`; a swarm's `swarm/` books |
 | `tickets/<id>/*.rpc.jsonl`, `*.stderr` | the same | |
-| `forge/<owner>/<name>.git` | nothing has fetched into it for N days (`FETCH_HEAD`, `HEAD`, `config`, `packed-refs`) | a mirror used since. The next Ticket on that repository makes it again; clones are independent, so no clone needs it |
-| `deps/<owner>/<name>/<key>` | no Ticket has mounted it for N days (a Ticket's start marks `manifest.json` used), and a `tmp-*` directory of a build that died, by its age | a cache used since. The next Ticket on that repository builds it again |
+| `forge/<owner>/<name>.git` | nothing has fetched into it for N days (`FETCH_HEAD`, `HEAD`, `config`, `packed-refs`) | a mirror used since. The next Ticket on that repository makes it again |
+| `deps/<owner>/<name>/<key>` | no Ticket has mounted it for N days (a Ticket's start marks `manifest.json` used); a `tmp-*` directory of a build that died, by its age | a cache used since. The next Ticket on that repository builds it again |
 | `router/*.rpc.jsonl`, `*.stderr` | not written for N days | the newest of each kind, which a live session may be writing |
-| `trail/<id>/` | **only with `--include-trail`**, for Tickets that ended more than N days ago. `agent trail` then reports their blobs missing | by default |
-| `agent.db` and its WAL, `tokens/`, `backups/`, `releases/`, the vault, `browser/` | | always |
+| `trail/<id>/` | only with `--include-trail`, for Tickets that ended more than N days ago. `agent trail` then reports their blobs missing | by default |
+| `agent.db` and its WAL, `tokens/`, `backups/`, `releases/`, the vault, `browser/`, `~/agent/target` | | always |
 
-The markers go with the clone because a Ticket that ended can be resumed by a person's follow-up in its thread: with
-`repo.json` or `prepared` left behind the worker would find an empty `/work` and believe it was ready. Without them it clones
-again from the mirror (or from GitHub). A Ticket resumed *while a prune runs* is checked again just before its files are
-removed and keeps them. `--dry-run` prints exactly what a run would remove, with sizes (as allocated blocks, which is what
-removing frees). `--json` prints the report as JSON. A failed removal is listed, the rest goes ahead, and the exit
-status is 1, which shows the service as failed.
+The markers go with the clone because a person's follow-up in its thread can resume an ended Ticket. With `repo.json`
+or `prepared` left behind, the worker would find an empty `/work` and believe it was ready. Without them it clones
+again from the mirror, or from GitHub. `--dry-run` sizes are allocated blocks, which is what removing frees.
 
-Not pruned: `~/agent/target`, the cargo build cache, which is the other large grower (`cargo clean` by hand when the disk
-needs it), and old `releases/` (a deploy keeps the newest five) and `backups/` (twenty).
-
-### The disk floor
-
-`agent health` (above) also guards the disk. When free space on the state directory's filesystem is under
-`health.min_free_gb` (default 5; 0 turns the floor off), it writes `state/PAUSE`, starting with
-`paused by solos-agent-health: ...`, and alerts. That is the pause gate any operator has: no new Eval starts, no Effect is
-performed, and workers' next model calls wait. It frees nothing, so it is a stop before the disk is full, not a cleanup:
-run the prune by hand, or free space another way. The pause is lifted again, and only a `PAUSE` that starts with that
-line, once free space is back to `health.resume_free_gb` (default the floor plus a fifth of it, at least 1 GB more, so a
-disk hovering at the floor does not flap). A `PAUSE` a person wrote is never overwritten or lifted, and a `control.json`
-pause is a different file. The check runs every three minutes, so a disk that fills faster than that between two runs is not
-caught; the deploy also refuses to build under 30 GB free.
-
-```yaml
-health:
-  min_free_gb: 50       # this box's disk is 86% full: stop at 50 GB free rather than at none
-  # resume_free_gb: 60
-  # restart_burst: 3
-```
-
-## Stopping a Ticket by hand
-
-A stale Ticket (an Assignment that will never report, a request nobody wants any more) is stopped from the box the way a
-person's Stop button does it, through the running agent:
-
-```sh
-ssh <box> '~/agent/current/bin/solos-swarm agent stop --state-dir ~/agent/state --operator <your name> --ticket tk_0123456789abcdef --reason "stale after the deploy"'
-# tk_...: Stopped by <your name>.
-```
-
-The command is filed in `state/mcp/commands.jsonl` as the operator `mcp:<your name>`, which `agent serve` reads (the
-`kind: mcp` Source and Channel must be in `agent.yaml`, as in the example above). The Engine then asks the Policy whether
-that principal may stop work: `mcp:<your name>` must be in `policy.people` or `policy.approvers`, and anyone else is
-refused with "is not allowed to stop this work". The Ticket ends for good as `stopped` with the reason
-`stopped by <your name> on mcp: <reason>`, its Assignment ends exactly as it does for a person's Stop, and a later message in
-its thread does not resume it. The
-answer is posted on the command's own thread in the `mcp` Channel's outbox and printed here. Nothing writes the Store but
-the agent.
+### `agent stop`
 
 | Exit | Meaning |
 |---|---|
-| 0 | stopped, or already stopped or ended (`completed`, `dropped`); nothing more to do |
+| 0 | stopped, or already stopped or ended (`completed`, `dropped`) |
 | 1 | the agent refused (the Policy does not name the operator), or the Ticket does not exist |
-| 2 | no answer within `--wait-secs` (20): the agent is not running or not reading. The command stays filed and a running agent applies it if it reads it within 10 minutes; older than that it is not applied, so a restart never carries out last week's |
+| 2 | no answer within `--wait-secs` (20). The agent is not running or not reading. The command stays filed, and a running agent applies it if it reads it within 10 minutes. An older command is not applied, so a restart never carries out last week's |
 
-To clear stale Tickets, list the open ones (`scripts/agent-deploy status` prints them with their age) and stop each:
+`agent memo add`, `retire` and `forget` also exit 0 when done, 1 when the agent refused, and 2 with no answer in time.
 
-```sh
-ssh <box> 'for t in tk_aaa tk_bbb; do ~/agent/current/bin/solos-swarm agent stop --state-dir ~/agent/state --operator <your name> --ticket $t --reason "stale after the deploy"; done'
-```
+### Publisher failures
 
-## Not handled yet
+| What | What happens |
+|---|---|
+| Vercel Blob or the network is down | Each upload is tried five times with a doubling wait, honouring `retry-after`. Then the look fails, and the next look, after a growing wait of up to five minutes, tries the same uploads again. Nothing is lost, and the Store is not touched. |
+| The token is refused (401, 403) | The publisher exits with that message and stays down ([Rotate the dashboard's secrets](#rotate-the-dashboards-secrets)). |
+| The API refuses one blob (another 4xx) | It is logged and skipped until that ticket's snapshot changes. The others and the index still go up. |
+| `agent.db` is missing, newer than this build understands, or being restored | The look fails with the reason and is tried again. A replaced file is noticed and read again from the start. |
+| The agent restarts | Nothing. The publisher holds no connection to it. |
+| The disk or the state directory is read-only | The look fails when it cannot write `publish-state.json`. What was uploaded stays, and it is uploaded again after the fix, which is harmless. |
 
-- The disk floor is checked by `agent health` every three minutes, not by `agent serve`, and it pauses; it does not free
-  space. `~/agent/target`, old releases and backups are not part of the prune.
+### Limits
+
+- The disk floor pauses work and frees nothing. The health check, not `agent serve`, checks it, every three minutes.
 - The health check runs on the box it watches. Nothing alerts if the box or the user's systemd is gone.
-- The host does not run a repository's `evidence` command itself: the worker does, and the host checks the shape of its
-  block. A pull request's description is made once, so a later head pushed for a repair keeps the first head's evidence.
-  See [Installed dependencies and evidence](README.md#installed-dependencies-and-evidence).
-- A drain narrows what a deploy interrupts; a worker in the middle of a long tool call is still stopped.
+- A drain narrows what a deploy interrupts. A worker in the middle of a long tool call is still stopped.
+- The host does not run a repository's `evidence` command itself. The worker does, and the host checks the shape of its
+  block. A pull request's description is written once, so a later head keeps the first head's evidence.
+- Nothing merges, a CI failure does not resume a delivered Ticket, and no timer reads open pull requests again yet.
+  Those are PRs 3 to 5 of [the GitHub App design](github-app/prs.md).

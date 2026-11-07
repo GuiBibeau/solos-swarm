@@ -1,5 +1,8 @@
 # PR sequence
 
+> **Status, 2026-11-07.** PRs 1 (#63) and 2 (#75) are built. PRs 3 to 6 are not. The schema versions planned below for
+> PRs 3 and 5 (V8, V9) were taken by memory (#84, #86), so those PRs take the next free version.
+
 Six PRs. Each leaves `main` shippable, deletes what it replaces in the same change (nothing ships two ways), and ends in a behavior test that runs offline against the fake GitHub (`tests/support/fake_github.rs`, grown from the fake `tests/agent_github.rs` already holds) plus `file://` bare repositories through `github.git_base`, with the scripted harness and the real broker. No test calls GitHub or a model. Builds and tests run on the remote box. "Unedited" means an existing test passes without a change.
 
 Each PR also adds one feature recipe to `.claude/skills/verify-agent-mode/features/` and runs it on remote-ai through `/verify-agent-mode` against `GuiBibeau/solos-swarm-sandbox`, a throwaway repository the owner controls, with a real DeepSeek Router and real Pi workers. The verify config lists only the sandbox in `forge.repos`, so every token a run mints is narrowed to the sandbox. A recipe's evidence is a side effect on GitHub the model could not invent, read on the Mac with `gh`.

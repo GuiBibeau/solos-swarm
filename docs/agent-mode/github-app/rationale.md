@@ -1,5 +1,14 @@
 # The agent's own GitHub App
 
+> **Status, 2026-11-07.** Designed in #62. PRs 1 and 2 of [prs.md](prs.md) are built: the App replaces both personal
+> access tokens (#63), and a worker's `ready` delivers a pull request (#75). PRs 3 to 6 are not built. A CI failure does
+> not resume a delivered Ticket, review summaries and labels are not read, nothing merges, and `agent github init`
+> does not exist. The config accepts
+> `github.reconcile_secs` and `forge.repos.<repo>.{merge, ci, max_repairs}`, and records the last three in each Ticket's
+> terms, but no code acts on them yet. The store schema versions this design planned for PRs 3 and 5 (V8 and V9) went to
+> memory (#84, #86), so those PRs take the next free version. Setup as built: [GitHub App](../README.md#github-app) and
+> [Set up GitHub](../production.md#set-up-github).
+
 This is the design contract for letting the agent work on GitHub by itself, as the bot of a GitHub App the owner installs. It came out of an architect arena. Two candidate designs were written against the same task and grounding. A DeepSeek V4.1 Flash cross-judge scored them against a six-criterion rubric. Candidate B became the base, with grafts from candidate A, one change to intake, and fixes to B's named defects. The [Synthesis decision](#synthesis-decision) records all of it. The sketch files in `sketch/` are B's, amended for the synthesis; they are documentation, not compiled code.
 
 Where this design and the pstack design ([`../pstack/`](../pstack/rationale.md)) disagree about pull requests, CI and merging, this design wins. The table in [What the pstack plan keeps, amends, replaces](#what-the-pstack-plan-keeps-amends-replaces) is the explicit list.
@@ -34,7 +43,7 @@ What makes the shape non-obvious, and the constraints the design honors:
 
 ### (a) The owner creates, installs and configures the App
 
-The owner can do this today, before any code lands; PR 1 makes the agent use it. `manifest.json` beside this file holds the same settings as a GitHub App manifest, and `agent github init` (PR 6) will post it for you.
+The owner can do this by hand, and PR 1 (#63) makes the agent use it. `manifest.json` beside this file holds the same settings as a GitHub App manifest. `agent github init` (PR 6, not built) is planned to post it for you.
 
 On github.com, **Settings → Developer settings → GitHub Apps → New GitHub App**:
 
@@ -405,7 +414,7 @@ B's central move, a pull request is *owed* and not done, removes the forge from 
 - **Signed commits.** The bot's pushed commits are unsigned. A squash merge through the API makes a commit GitHub signs, so a base that requires signed commits still receives one. Is `merge_method: squash` then the only allowed method on such a repository, and should `check` say so?
 - **`ci: expected` with path-filtered workflows.** A PR whose workflows are filtered out reports no check at all, and the gate waits on `Pending { reported: 0 }` for ever. Should a forge check count as passed when nothing appears within N minutes of a push, or is setting `ci: none` on such repositories the right rule?
 - **Label or assignee.** Can an App's bot be an issue assignee? If it can, is assignment a better second gesture than a label, or should mention be the only gesture and PR 4's label listing be dropped?
-- **`jsonwebtoken` and RS256.** Does `jsonwebtoken` 10.3 with `rust_crypto` sign RS256 with the repository's current features, or does PR 1 need a feature flag or the `rsa` crate? Unverified.
+- **`jsonwebtoken` and RS256.** Does `jsonwebtoken` 10.3 with `rust_crypto` sign RS256 with the repository's current features, or does PR 1 need a feature flag or the `rsa` crate? *Answered in #63:* the JWT is signed with the `rsa` crate directly, whose private key zeroizes on drop.
 - **Should the delivery log ever replace polling?** If PR 3's polling is good enough in production, is the spike worth running at all?
 - **A foreign push to the bot's branch.** Should it park the Change, as here, or be adopted by fetching it and asking the worker to rebase? Parking is safe; adopting is friendlier.
 - **`.github/**` or `.github/workflows/**`** as the default `protected`, so a worker may edit issue templates?
@@ -417,4 +426,4 @@ B's central move, a pull request is *owed* and not done, removes the forge from 
 
 ## Next implementation step
 
-PR 1: write `github/app.rs` (`AppKey`, `Minter`, `Access`, `InstallToken`) and `github/identities.rs` against the fake GitHub's App endpoints, starting with the test that twenty concurrent `token` calls make one mint narrowed to one repository.
+*Done in #63, and PR 2 in #75. The next step is PR 3, watch and repair.* The step as planned: PR 1: write `github/app.rs` (`AppKey`, `Minter`, `Access`, `InstallToken`) and `github/identities.rs` against the fake GitHub's App endpoints, starting with the test that twenty concurrent `token` calls make one mint narrowed to one repository.
