@@ -1,10 +1,10 @@
 {
   "name": "solos-swarm-pi-runtime",
   "version": "0.1.0",
-  "description": "Pinned Pi coding-agent runtime and broker extensions for solos-swarm.",
+  "description": "The pinned Pi coding agent that solos-swarm runs in its sandboxes, and the Pi extensions that send its model calls and tool calls to the solos-swarm broker.",
   "license": "Apache-2.0",
   "repository": "https://github.com/GuiBibeau/solos-swarm",
-  "keywords": ["ai-agents", "multi-agent", "sandbox", "capability-broker", "pi-coding-agent"],
+  "keywords": ["ai-agents", "coding-agent", "llm", "pi-coding-agent", "sandbox"],
   "private": true,
   "type": "module",
   "engines": { "node": ">=22.19.0" },
