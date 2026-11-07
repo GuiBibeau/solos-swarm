@@ -31,7 +31,7 @@ pub struct CheckArgs {
 pub async fn check(args: CheckArgs, out: &mut dyn Write) -> Result<bool> {
     let config = AgentConfig::load(&args.config)?;
     let Some(github) = &config.github else {
-        bail!("the config has no github: section; see docs/agent-mode/README.md#github-app");
+        bail!("the config has no github: section; see docs/agent-mode/how-to/github-app.md");
     };
     let Some(forge) = &config.forge else {
         bail!("the config has no forge: section, whose repos are the repositories the App acts on");

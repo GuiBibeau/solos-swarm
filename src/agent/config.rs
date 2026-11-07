@@ -203,7 +203,7 @@ pub struct ReviewConfig {
 
 /// Where the setup is written down, for the sentences that tell an owner of
 /// the old shape what replaced it.
-const GITHUB_APP_DOC: &str = "docs/agent-mode/README.md#github-app";
+const GITHUB_APP_DOC: &str = "docs/agent-mode/how-to/github-app.md";
 
 /// `github:` in agent.yaml: the GitHub App every GitHub call is made as. The
 /// Source, the Channel and the forge share it; the repositories they act on
@@ -2627,7 +2627,7 @@ forge:
             let refused = format!("{:#}", AgentConfig::load(&path).unwrap_err());
             assert!(refused.contains(why), "{why}: {refused}");
             assert!(
-                refused.ends_with("see docs/agent-mode/README.md#github-app")
+                refused.ends_with("see docs/agent-mode/how-to/github-app.md")
                     && refused.lines().count() == 1,
                 "one sentence naming the migration doc: {refused}"
             );
