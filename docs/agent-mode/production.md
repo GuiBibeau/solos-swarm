@@ -109,6 +109,9 @@ executor:
   prices: {input_microusd_per_million: 300000, output_microusd_per_million: 1320000, cache_hit_microusd_per_million: 30000}
   max_workers: 4
   run_code: {}
+  # fetch_url reaches the public internet only: loopback, private, link-local and 100.64/10 (Tailscale) addresses are
+  # refused on every hop, so a worker steered by hostile text cannot probe this box's own services. To allow them:
+  #   fetch: {allow_private_networks: true}
 pstack: {}
 # No `budgets:` section: a session Ticket and the Router have no cap, and a swarm's budget is named by the Router
 # (or `executor.swarm.default_budget_microusd`). To cap them, add

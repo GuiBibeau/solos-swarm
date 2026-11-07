@@ -4,12 +4,13 @@
 //! agent that was talked into probing another host. The optional `fetch`
 //! policy is the part the broker enforces: which hosts, which methods and
 //! how fast, judged on the first URL and on every redirect hop. Separately,
-//! a swarm fetch never reaches a private, loopback or link-local address
-//! unless the policy says so, because the worker's host also runs services
-//! that must not be probed through it.
+//! a fetch never reaches a private, loopback or link-local address unless
+//! the policy says so, because the worker's host also runs services that
+//! must not be probed through it.
 //!
-//! Agent mode's own `fetch_url` keeps calling `fetch` and `fetch_with`, which
-//! this file does not change.
+//! Agent mode has no Goal and so no policy, but its `fetch_url` goes through
+//! the same guard ([`FetchGuard::open`]): any public host, and a private
+//! address only when the host's own config allows it.
 use super::FETCH_METHODS;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -180,6 +181,10 @@ pub struct FetchRefused {
     /// 0 for the URL the agent asked for, then one per redirect.
     pub hop: usize,
     pub retry_after_ms: Option<u64>,
+    /// For a refusal of a private address, the address the host name came to.
+    /// The model is not told it, since it names the host's own network; the
+    /// run's record is.
+    pub address: Option<IpAddr>,
 }
 
 impl std::fmt::Display for FetchRefused {
@@ -221,6 +226,9 @@ impl FetchRefused {
         if let Some(wait) = self.retry_after_ms {
             event["retry_after_ms"] = json!(wait);
         }
+        if let Some(address) = self.address {
+            event["address"] = json!(address.to_string());
+        }
         event
     }
 
@@ -235,6 +243,7 @@ impl FetchRefused {
             url: url.to_string(),
             hop: 0,
             retry_after_ms: None,
+            address: None,
         }
     }
 
@@ -250,6 +259,7 @@ impl FetchRefused {
             url: url.to_string(),
             hop: 0,
             retry_after_ms: None,
+            address: None,
         }
     }
 
@@ -267,6 +277,7 @@ impl FetchRefused {
             url: url.to_string(),
             hop: via.hop,
             retry_after_ms: None,
+            address: None,
         }
     }
 
@@ -274,12 +285,15 @@ impl FetchRefused {
         Self {
             reason: PRIVATE_ADDRESS,
             message: format!(
-                "fetch_url refused: {host:?} is {ip}, a private, loopback or link-local \
-                 address, and swarm fetches reach public addresses only. Nothing was sent."
+                "fetch_url refused: {host} resolves to a private address (loopback, private, \
+                 link-local, shared or reserved), and fetch_url reaches public addresses only. \
+                 Nothing was sent. Do not retry it or look for a way around; if the page is \
+                 needed, report that it is on a private network."
             ),
             url: url.to_string(),
             hop,
             retry_after_ms: None,
+            address: Some(ip),
         }
     }
 
@@ -293,6 +307,7 @@ impl FetchRefused {
             url: url.to_owned(),
             hop: 0,
             retry_after_ms: None,
+            address: None,
         }
     }
 
@@ -306,6 +321,7 @@ impl FetchRefused {
             url: url.to_owned(),
             hop: 0,
             retry_after_ms: Some(wait_ms),
+            address: None,
         }
     }
 }
@@ -322,6 +338,11 @@ pub(super) struct Redirect<'a> {
 pub struct FetchGuard<'a> {
     policy: Option<&'a FetchPolicy>,
     hosts: Vec<HostPattern>,
+    /// Whether a private address may be fetched. A policy decides it for a
+    /// swarm; agent mode's host config decides it for agent mode.
+    allow_private: bool,
+    #[cfg(test)]
+    seam: Seam,
 }
 
 impl<'a> FetchGuard<'a> {
@@ -337,7 +358,22 @@ impl<'a> FetchGuard<'a> {
                     .collect()
             })
             .unwrap_or_default();
-        Self { policy, hosts }
+        Self {
+            policy,
+            hosts,
+            allow_private: policy.is_some_and(|policy| policy.allow_private_networks),
+            #[cfg(test)]
+            seam: Seam::default(),
+        }
+    }
+
+    /// The guard of a fetch that has no Goal, as agent mode's `fetch_url`:
+    /// no host or method list and no rate, but the same refusal of a private
+    /// address on every hop unless `allow_private_networks`.
+    pub fn open(allow_private_networks: bool) -> Self {
+        let mut guard = Self::new(None);
+        guard.allow_private = allow_private_networks;
+        guard
     }
 
     /// The policy's host and method check on the request in `args`, before
@@ -403,10 +439,10 @@ impl<'a> FetchGuard<'a> {
     }
 
     /// A client that will connect to `url` only at the addresses vetted here:
-    /// a name is resolved once, every address must be public unless the
-    /// policy allows private networks, and the client is then pinned to
-    /// those addresses, so a second lookup cannot answer differently. It
-    /// goes through no proxy, which would open the connection itself.
+    /// a name is resolved once, every address must be public unless private
+    /// networks are allowed, and the client is then pinned to those
+    /// addresses, so a second lookup cannot answer differently. It goes
+    /// through no proxy, which would open the connection itself.
     pub(super) async fn pin(&self, url: &reqwest::Url, hop: usize) -> Result<reqwest::Client> {
         ensure!(
             matches!(url.scheme(), "https" | "http"),
@@ -419,19 +455,16 @@ impl<'a> FetchGuard<'a> {
         let literal = unbracketed(host).parse::<IpAddr>().ok();
         let addrs: Vec<SocketAddr> = match literal {
             Some(ip) => vec![SocketAddr::new(ip, port)],
-            None => tokio::net::lookup_host((host, port))
-                .await
-                .with_context(|| format!("cannot resolve {host}"))?
-                .collect(),
+            None => self.resolve(host, port).await?,
         };
         ensure!(!addrs.is_empty(), "cannot resolve {host}");
-        if !self
-            .policy
-            .is_some_and(|policy| policy.allow_private_networks)
+        if !self.allow_private
             && let Some(addr) = addrs.iter().find(|addr| !is_public_ip(addr.ip()))
         {
             return Err(FetchRefused::private(host, addr.ip(), url, hop).into());
         }
+        #[cfg(test)]
+        let addrs = self.seam.dial(addrs);
         let mut builder = reqwest::Client::builder()
             .no_proxy()
             .connect_timeout(CONNECT_TIMEOUT)
@@ -440,6 +473,67 @@ impl<'a> FetchGuard<'a> {
             builder = builder.resolve_to_addrs(host, &addrs);
         }
         Ok(builder.build()?)
+    }
+
+    /// Every address `host` resolves to.
+    async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+        #[cfg(test)]
+        if let Some(addrs) = self.seam.lookup(host, port) {
+            return Ok(addrs);
+        }
+        Ok(tokio::net::lookup_host((host, port))
+            .await
+            .with_context(|| format!("cannot resolve {host}"))?
+            .collect())
+    }
+}
+
+/// What a test can change about a guard's network: what a host name
+/// resolves to, and where a vetted connection then goes. Together they let a
+/// test fetch from a name that looks public, whose address passes the check,
+/// from a server that can only listen on loopback.
+#[cfg(test)]
+#[derive(Default)]
+struct Seam {
+    lookup: Option<Lookup>,
+    dial: Option<SocketAddr>,
+}
+
+#[cfg(test)]
+type Lookup = Box<dyn Fn(&str) -> Vec<IpAddr> + Send + Sync>;
+
+#[cfg(test)]
+impl Seam {
+    fn lookup(&self, host: &str, port: u16) -> Option<Vec<SocketAddr>> {
+        let answer = self.lookup.as_ref()?(host);
+        Some(
+            answer
+                .into_iter()
+                .map(|ip| SocketAddr::new(ip, port))
+                .collect(),
+        )
+    }
+
+    fn dial(&self, addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+        self.dial.map_or(addrs, |to| vec![to])
+    }
+}
+
+#[cfg(test)]
+impl FetchGuard<'_> {
+    /// Resolve names with `lookup`, in place of the system resolver.
+    pub(super) fn resolving(
+        mut self,
+        lookup: impl Fn(&str) -> Vec<IpAddr> + Send + Sync + 'static,
+    ) -> Self {
+        self.seam.lookup = Some(Box::new(lookup));
+        self
+    }
+
+    /// Connect to `to`, whatever address a name was vetted at.
+    pub(super) fn dialing(mut self, to: SocketAddr) -> Self {
+        self.seam.dial = Some(to);
+        self
     }
 }
 

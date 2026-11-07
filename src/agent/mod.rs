@@ -380,6 +380,7 @@ where
                 max_output_tokens,
                 temperature,
                 run_code,
+                fetch,
                 ..
             } => {
                 let code = match run_code {
@@ -427,6 +428,7 @@ where
                     code,
                     vault,
                     browser,
+                    allow_private_networks: fetch.allow_private_networks,
                 })
             }
         };

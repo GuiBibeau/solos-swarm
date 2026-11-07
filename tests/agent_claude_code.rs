@@ -198,6 +198,7 @@ fn serve_sampling(
             code: None,
             vault: None,
             browser: None,
+            allow_private_networks: false,
         }),
     })
     .unwrap();

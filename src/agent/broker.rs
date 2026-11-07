@@ -20,7 +20,7 @@ use super::pi_executor::private_dir;
 use super::ports::{Applied, Fact, FactSink, Forge, Proposal, Refusal as Unadmitted, Workspace};
 use super::pstack::{self, Pstack, Reader};
 use super::watchdog::usd;
-use crate::broker::{FETCH_TOTAL_BYTES, fetch, now_ms};
+use crate::broker::{FETCH_TOTAL_BYTES, FetchGuard, FetchRefused, fetch_guarded, now_ms};
 use crate::code::CodeExecutor;
 use crate::gateway::{self, PriceTable, Provider, Receipt, Temperature, Upstream};
 use crate::vault::Vault;
@@ -646,6 +646,12 @@ pub struct WorkerParts {
     pub vault: Option<VaultParts>,
     /// `None`: no browser tools.
     pub browser: Option<browser::BrowserParts>,
+    /// Off, `fetch_url` refuses an address that is loopback, private,
+    /// link-local, shared (carrier-grade NAT, Tailscale), unspecified or
+    /// multicast, whatever name the worker used for it and on every redirect
+    /// hop, because this host also runs services on those addresses. On, it
+    /// reaches them (`executor.fetch.allow_private_networks`).
+    pub allow_private_networks: bool,
 }
 
 pub struct VaultParts {
@@ -669,9 +675,8 @@ struct Inner {
     decide: DecideTerms,
     /// The model terms every admitted worker gets; `None` admits none.
     worker_terms: Option<ModelTerms>,
-    /// `fetch_url`'s egress, apart from the provider's transport.
-    client: reqwest::Client,
-    keyed: reqwest::Client,
+    /// Whether `fetch_url`, keyed or not, may reach a private address.
+    allow_private_networks: bool,
     grants: RwLock<BTreeMap<String, Arc<Grant>>>,
     /// A settlement above its hold means the ledger no longer bounds spend,
     /// so every later model call is refused.
@@ -853,19 +858,21 @@ impl AgentBroker {
                 "agent: charged {orphans} model calls a previous run left open at their hold"
             );
         }
-        let (worker_terms, local, vault, browser) = match workers {
+        let (worker_terms, local, vault, browser, allow_private_networks) = match workers {
             Some(WorkerParts {
                 terms,
                 code,
                 vault,
                 browser,
+                allow_private_networks,
             }) => (
                 Some(terms),
                 code,
                 vault.map(Arc::new),
                 browser.map(Arc::new),
+                allow_private_networks,
             ),
-            None => (None, None, None, None),
+            None => (None, None, None, None, false),
         };
         Ok(Self {
             inner: Arc::new(Inner {
@@ -876,12 +883,7 @@ impl AgentBroker {
                 decide,
                 environments: Environments::new(local, nodes),
                 worker_terms,
-                client: crate::swarm::http_client()?,
-                keyed: reqwest::Client::builder()
-                    .no_proxy()
-                    .connect_timeout(Duration::from_secs(10))
-                    .redirect(reqwest::redirect::Policy::none())
-                    .build()?,
+                allow_private_networks,
                 grants: RwLock::new(BTreeMap::new()),
                 overrun: AtomicBool::new(false),
                 jobs,
@@ -1967,7 +1969,10 @@ fn refused(refusal: Refused) -> Refusal {
 }
 
 /// `fetch_url` with swarm mode's limits: each call's bounds in `fetch`, and
-/// a read budget across the Assignment's calls.
+/// a read budget across the Assignment's calls. Every request, the first and
+/// each redirect hop, keyed or not, goes through one [`FetchGuard`], which
+/// refuses a private address after the name is resolved and sends only to
+/// the address it vetted.
 async fn fetch_url(
     broker: &AgentBroker,
     seat: &Arc<WorkerSeat>,
@@ -1984,15 +1989,45 @@ async fn fetch_url(
         .as_object_mut()
         .and_then(|args| args.remove("key"))
         .filter(|key| !key.is_null());
+    let guard = FetchGuard::open(broker.inner.allow_private_networks);
     let response = match key {
-        None => fetch(&broker.inner.client, &args)
+        None => fetch_guarded(&args, &guard)
             .await
-            .map_err(|err| refuse(StatusCode::BAD_GATEWAY, format!("{err:#}")))?,
-        Some(key) => secrets::fetch(broker, seat, vault, key, &args).await?,
+            .map_err(|err| fetch_failed(seat, &err, str::to_owned))?,
+        Some(key) => secrets::fetch(broker, seat, vault, &guard, key, &args).await?,
     };
     let bytes = response["body_bytes"].as_u64().unwrap_or(0);
     seat.fetched_bytes.fetch_add(bytes, Ordering::SeqCst);
     Ok(Json(response))
+}
+
+/// What a fetch that did not return a page comes to for the worker. The
+/// guard's refusal of a private address is this host's rule doing its work:
+/// the person running the host reads it in the log, with the address, and the
+/// model reads it as a refusal, without the address. `clean` scrubs the text
+/// the model gets.
+fn fetch_failed(seat: &WorkerSeat, err: &anyhow::Error, clean: impl Fn(&str) -> String) -> Refusal {
+    let Some(refused) = err.downcast_ref::<FetchRefused>() else {
+        return refuse(StatusCode::BAD_GATEWAY, clean(&format!("{err:#}")));
+    };
+    let host = reqwest::Url::parse(&refused.url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_default();
+    let address = refused
+        .address
+        .map_or_else(String::new, |address| format!(" at {address}"));
+    eprintln!(
+        "agent: fetch_url of the worker of {} on {} was refused ({}): {host}{address}, hop {}",
+        seat.assignment, seat.ticket, refused.reason, refused.hop
+    );
+    let reply = json!({
+        "refused": true,
+        "reason": refused.reason,
+        "error": clean(&refused.message),
+        "url": clean(&refused.url),
+    });
+    (StatusCode::FORBIDDEN, Json(reply))
 }
 
 #[derive(Debug, Deserialize)]

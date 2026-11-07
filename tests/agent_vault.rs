@@ -99,18 +99,26 @@ struct World {
 
 impl World {
     fn new(name: &str) -> Self {
-        Self::build(name, Some(true))
+        Self::build(name, Some(true), true)
     }
 
     fn without_approvers(name: &str) -> Self {
-        Self::build(name, Some(false))
+        Self::build(name, Some(false), true)
     }
 
     fn without_vault(name: &str) -> Self {
-        Self::build(name, None)
+        Self::build(name, None, true)
     }
 
-    fn build(name: &str, takes_approvals: Option<bool>) -> Self {
+    /// A host whose `fetch_url` reaches the public internet only, as a host
+    /// does by default.
+    fn on_public_networks_only(name: &str) -> Self {
+        Self::build(name, Some(true), false)
+    }
+
+    /// `allow_private_networks`: the sites the tests fetch from are on
+    /// loopback, so most worlds allow it.
+    fn build(name: &str, takes_approvals: Option<bool>, allow_private_networks: bool) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
             "agent-vault-{name}-{}-{}",
@@ -175,6 +183,7 @@ impl World {
                 code: None,
                 vault,
                 browser: None,
+                allow_private_networks,
             }),
         };
         let broker = AgentBroker::new(parts).unwrap();
@@ -495,6 +504,46 @@ async fn a_key_goes_to_its_host_on_every_hop_and_never_to_another_host() {
 }
 
 #[tokio::test]
+async fn a_keyed_fetch_to_a_private_address_is_refused_before_the_key_leaves() {
+    let mut w = World::on_public_networks_only("private");
+    let (site, away) = (
+        Site::start(w.store_path()).await,
+        Site::start(w.store_path()).await,
+    );
+    // An operator may list a loopback host for a key on purpose; the host's
+    // own rule still refuses to send anything there.
+    w.key("probe", &site.host, &[], Approval::None, "sk-private-probe");
+    w.ask();
+
+    let runtime = w.runtime.take().unwrap();
+    with_runtime(runtime, async {
+        let token = w.admit_worker().await;
+        let keyed = json!({"url": site.url("/echo"), "key": "probe"});
+        let (status, reply) = w.post("fetch_url", &token, keyed).await;
+        assert_eq!(status, 403, "{reply}");
+        assert_eq!(reply["refused"], true);
+        assert_eq!(reply["reason"], "private_address");
+        let why = reply["error"].as_str().unwrap();
+        assert!(
+            why.starts_with("fetch_url refused: 127.0.0.1 resolves to a private address"),
+            "{why}"
+        );
+        assert!(!reply.to_string().contains("sk-private-probe"), "{reply}");
+        // A keyless call does not reach it either, nor does one to a site
+        // the key is not for.
+        for url in [site.url("/echo"), away.url("/echo")] {
+            let (status, reply) = w.post("fetch_url", &token, json!({"url": url})).await;
+            assert_eq!(status, 403, "{reply}");
+            assert_eq!(reply["reason"], "private_address");
+        }
+    })
+    .await;
+
+    assert!(site.visits().is_empty(), "{:?}", site.visits());
+    assert!(away.visits().is_empty(), "{:?}", away.visits());
+}
+
+#[tokio::test]
 async fn a_site_that_echoes_the_key_comes_back_scrubbed() {
     let mut w = World::new("echo");
     let site = Site::start(w.store_path()).await;
@@ -594,14 +643,14 @@ async fn key_used_is_on_the_chain_before_the_site_sees_the_request() {
 }
 
 #[tokio::test]
-async fn a_keyed_fetch_goes_around_an_ambient_proxy_that_an_unkeyed_fetch_takes() {
+async fn no_fetch_goes_through_an_ambient_proxy() {
     if let Ok(proxy) = std::env::var(CHILD_PROXY_VAR) {
         return behind_a_proxy(&proxy).await;
     }
     let (proxy, requests) = fake_proxy();
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
-            "a_keyed_fetch_goes_around_an_ambient_proxy_that_an_unkeyed_fetch_takes",
+            "no_fetch_goes_through_an_ambient_proxy",
             "--exact",
             "--nocapture",
         ])
@@ -618,14 +667,10 @@ async fn a_keyed_fetch_goes_around_an_ambient_proxy_that_an_unkeyed_fetch_takes(
         .unwrap();
     assert!(status.success(), "the run behind the proxy failed");
     let requests = requests.lock().unwrap().clone();
-    assert_eq!(
-        requests.len(),
-        1,
-        "only the unkeyed fetch went through the proxy: {requests:?}"
-    );
     assert!(
-        !requests[0].to_ascii_lowercase().contains("authorization"),
-        "{requests:?}"
+        requests.is_empty(),
+        "a proxy opens the connection itself, where the private-address check cannot see \
+         it, so neither fetch went through it: {requests:?}"
     );
 }
 
@@ -651,21 +696,24 @@ async fn behind_a_proxy(proxy: &str) {
         assert_eq!(status, 200, "{keyed}");
         assert_ne!(keyed["body"], "proxied", "{keyed}");
         let (status, plain) = w.post("fetch_url", &token, json!({"url": url})).await;
-        assert_eq!(
-            (status, &plain["body"]),
-            (200, &json!("proxied")),
-            "the unkeyed fetch takes {proxy}, so this run can see a proxy: {plain}"
+        assert_eq!(status, 200, "{plain}");
+        assert_ne!(
+            plain["body"], "proxied",
+            "the unkeyed fetch ignores {proxy} too: {plain}"
         );
     })
     .await;
 
     assert_eq!(
         site.visits(),
-        [(
-            "/echo".to_owned(),
-            Some(format!("Bearer {KEY_WITH_JSON_ESCAPES}"))
-        )],
-        "the keyed request went straight to the site"
+        [
+            (
+                "/echo".to_owned(),
+                Some(format!("Bearer {KEY_WITH_JSON_ESCAPES}"))
+            ),
+            ("/echo".to_owned(), None)
+        ],
+        "both requests went straight to the site, the keyed one with its key"
     );
 }
 

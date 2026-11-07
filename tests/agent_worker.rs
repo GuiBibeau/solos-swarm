@@ -34,12 +34,15 @@ const ROUTER: &str = "router:
   prices: {input_microusd_per_million: 300000, output_microusd_per_million: 1200000, cache_hit_microusd_per_million: 6000}
   max_output_tokens: 2048
 ";
+/// The pages these tests fetch are on loopback, which `fetch_url` refuses
+/// unless the executor allows it.
 const WORKERS: &str = "executor:
   kind: pi
   provider: deepseek
   model: deepseek-flash
   prices: {input_microusd_per_million: 300000, output_microusd_per_million: 1200000, cache_hit_microusd_per_million: 6000}
   max_output_tokens: 2048
+  fetch: {allow_private_networks: true}
 ";
 
 /// The tool calls a worker's model makes for one prompt.

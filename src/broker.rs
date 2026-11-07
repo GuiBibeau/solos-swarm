@@ -1377,30 +1377,33 @@ fn bounded_headers(map: &reqwest::header::HeaderMap) -> (BTreeMap<String, String
 /// URL is reported: a worker that is bounced to a login page has to see that it
 /// was, rather than receiving a 200 from somewhere it never asked for.
 pub async fn fetch(client: &reqwest::Client, args: &Value) -> Result<Value> {
-    fetch_with(client, args, |_| {}).await
+    fetch_via(Egress::Shared(client), args, |_| {}).await
 }
 
-/// [`fetch`], where `hop` may change each request just before it is sent,
-/// the first and every redirect, judging it by that request's own URL.
-pub async fn fetch_with(
-    client: &reqwest::Client,
+/// [`fetch`] for `fetch_url` in swarm and agent mode: every request, the
+/// first and each redirect, goes through `guard`, which holds it to the
+/// Goal's fetch policy, if it has one, and sends it only to an address it has
+/// vetted. A request the guard refuses comes back as a [`FetchRefused`]
+/// error, before anything is sent.
+pub async fn fetch_guarded(args: &Value, guard: &FetchGuard<'_>) -> Result<Value> {
+    fetch_guarded_with(args, guard, |_| {}).await
+}
+
+/// [`fetch_guarded`], where `hop` may change each request just before it is
+/// sent, the first and every redirect, judging it by that request's own URL.
+/// The guard has already vetted that hop, so `hop` never sees a request that
+/// would be refused.
+pub async fn fetch_guarded_with(
     args: &Value,
+    guard: &FetchGuard<'_>,
     hop: impl Fn(&mut reqwest::Request),
 ) -> Result<Value> {
-    fetch_via(Egress::Shared(client), args, hop).await
-}
-
-/// [`fetch`] for the swarm broker's `fetch_url`: every request, the first and
-/// each redirect, goes through `guard`, which holds it to the Goal's fetch
-/// policy and sends it only to an address it has vetted. A request the guard
-/// refuses comes back as a [`FetchRefused`] error, before anything is sent.
-pub async fn fetch_guarded(args: &Value, guard: &FetchGuard<'_>) -> Result<Value> {
-    fetch_via(Egress::Guarded(guard), args, |_| {}).await
+    fetch_via(Egress::Guarded(guard), args, hop).await
 }
 
 /// How a fetch reaches the network.
 enum Egress<'a> {
-    /// One client for every hop, as agent mode and the keyed fetch use it.
+    /// One client for every hop, as the cluster node's `fetch_url` uses it.
     Shared(&'a reqwest::Client),
     /// A client pinned per hop, after the guard has judged that hop.
     Guarded(&'a FetchGuard<'a>),

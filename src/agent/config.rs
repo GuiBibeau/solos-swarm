@@ -569,6 +569,9 @@ pub enum ExecutorConfig {
         /// The workers' `run_code`. Without it they have none.
         #[serde(default)]
         run_code: Option<Box<RunCodeConfig>>,
+        /// What the workers' `fetch_url` may reach.
+        #[serde(default)]
+        fetch: FetchConfig,
         /// How `Plan::Swarm` Tickets run. Without it they fail.
         #[serde(default)]
         swarm: Option<Box<SwarmConfig>>,
@@ -640,6 +643,24 @@ pub struct SwarmConfig {
     /// neither set, an accept must name one.
     #[serde(default)]
     pub default_budget_microusd: Option<MicroUsd>,
+}
+
+/// What a worker's `fetch_url` may reach. A worker reads pages, issues and
+/// repositories whose text can tell it to fetch any URL, and this host may run
+/// other services on loopback and private addresses, so by default it
+/// reaches the public internet only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FetchConfig {
+    /// Off (the default), `fetch_url` refuses a request, and every redirect
+    /// hop, whose host resolves to a loopback, private (RFC 1918),
+    /// link-local (including the cloud metadata address), shared (100.64/10,
+    /// which Tailscale uses), unique-local IPv6, unspecified or multicast
+    /// address. On, workers may reach those, such as a service on this
+    /// network that they are meant to read. The browser has its own
+    /// `browser.allow_private_networks`.
+    #[serde(default)]
+    pub allow_private_networks: bool,
 }
 
 /// What a worker's `run_code` sandbox mounts and how many run at once.
@@ -1496,6 +1517,35 @@ budgets: {session_microusd: 500000}
             "{why}"
         );
         assert!(parse(&pi).unwrap().browser.is_none());
+    }
+
+    #[test]
+    fn fetch_url_reaches_public_addresses_only_unless_the_executor_says_otherwise() {
+        let pi = |fetch: &str| {
+            VALID.replace(
+                "executor: {kind: scripted}",
+                &format!(
+                    "executor: {{kind: pi, provider: deepseek, model: deepseek-flash, prices: \
+                     {{input_microusd_per_million: 300000, output_microusd_per_million: 1200000}}\
+                     {fetch}}}"
+                ),
+            )
+        };
+        let allowed = |yaml: &str| match parse(yaml).unwrap().executor {
+            ExecutorConfig::Pi { fetch, .. } => fetch.allow_private_networks,
+            other => panic!("{other:?}"),
+        };
+        assert!(!allowed(&pi("")), "private networks are off by default");
+        assert!(!allowed(&pi(", fetch: {}")));
+        assert!(!allowed(&pi(", fetch: {allow_private_networks: false}")));
+        assert!(allowed(&pi(", fetch: {allow_private_networks: true}")));
+        let why = parse(&pi(", fetch: {allow_private_network: true}"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            why.contains("allow_private_network"),
+            "a typo is refused, not read as off: {why}"
+        );
     }
 
     #[test]
