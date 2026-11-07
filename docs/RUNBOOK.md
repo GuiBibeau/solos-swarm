@@ -1,239 +1,236 @@
-# Runbook
+# Runbook: run a swarm on the box
 
-Operational commands for building, staging, running, and qualifying `solos-swarm`.
+This runbook takes one swarm run on a Linux host from build to evidence with `scripts/remote.py`. The script runs
+on the controller, your Mac, and drives the host over SSH. Each run is one Goal played by 1 to 30 sandboxed Pi
+agents under a transient systemd user unit. The host is `remote-ai` in the examples.
 
+Related pages:
 
-## 1. Host requirements and UIDs
+- [self-update-operations.md](self-update-operations.md): candidate channels, the promotion gate, drain and doctor
+  checks in detail.
+- [pause-mode.md](pause-mode.md): how `--refuse-peak`, `pause` and the `PAUSE` file hold model calls.
+- [goal-fetch-policy.md](goal-fetch-policy.md): the `fetch` policy and the scopes a Goal may name.
+- [dashboard.md](dashboard.md): watch one run in a browser through an SSH tunnel.
+- [running-a-tournament.md](running-a-tournament.md): a chain of runs under one spend ceiling.
+- [mvp-cluster.md](mvp-cluster.md): the frozen `mvp` cluster path (Raft, witness, evaluator). This runbook does not
+  cover it.
 
-| Requirement | Target |
-|---|---|
-| Kernel | Linux `6.1+` (Landlock v3+, seccomp-BPF, cgroups v2, userns) |
-| Toolchains | Rust `1.96.0`, Node `v24.18.0`, Python `3.11+` |
-| Packages | `bubblewrap`, `systemd`, `squashfs-tools`, `openssl` |
+## Before you start
 
-| Service | UID:GID | Owned paths |
-|---|---|---|
-| Control plane (`mvp serve`) | `999:985` | `/var/lib/solos-swarm/cp` (`0700`) |
-| Evaluator (`mvp evaluator-serve`) | `995:985` | `/var/lib/solos-swarm/evaluator/protected` (`0700`) |
-| Witness (`mvp witness-serve`) | `994:983` | `/var/lib/solos-swarm/witness` (`0700`) |
+On the controller you need:
 
+- A checkout of this repository. `deploy` ships its tracked files and its untracked files that git does not
+  ignore, so uncommitted work is what gets built.
+- An SSH alias for the host whose host key is already in `known_hosts`. The script connects with `BatchMode=yes`
+  and `StrictHostKeyChecking=yes`, so it never prompts.
+- The Pi auth file, `~/.pi/agent/auth.json`, with an entry of `"type": "api_key"` for the provider the run spends
+  against (`deepseek` or `venice`). The key leaves the Mac only over SSH stdin, at `start`.
 
-## 2. Build and verify
+On the host you need bubblewrap (`bwrap`), a systemd user manager, `python3`, Rust 1.96.0 with `cargo` in
+`~/.cargo/bin` or on `PATH`, and Node 24.18.0 unpacked at `~/.local/opt/node-v24.18.0-linux-x64`.
 
-```bash
-npm ci && npm run test:broker
-cargo build --release --locked
-cargo test --locked
-python3 -m unittest discover -s tests -p 'test_*.py'
-./target/release/solos-swarm doctor --pi-root . --node "$(command -v node)"
+Tell the script which host to use. Without this it uses the alias `solos-node`:
+
+```sh
+export SOLOS_SWARM_SSH_TARGET=remote-ai     # or pass --host remote-ai to each command
 ```
 
+## Check the host
 
-## 3. Stage tokenizers, local model, and SquashFS
-
-```bash
-# Stage SHA-256 verified tokenizers
-python3 scripts/bootstrap_tokenizers.py --output work/tokenizers
-
-# Stage llama.cpp (b11429) and Qwen3-4B-Q4_K_M.gguf (optional)
-python3 scripts/local_provider.py --directory /var/lib/solos-swarm/local-provider
-
-# Probe receiver token conformance
-python3 scripts/probe_tokenizer.py \
-  --base http://127.0.0.1:8080 \
-  --vectors /path/to/vectors.json \
-  --output /tmp/probe-report.json \
-  --verify-usage
-
-# Build read-only worker SquashFS rootfs
-python3 scripts/bootstrap_sandbox.py \
-  --userland /path/to/staged-userland \
-  --output /var/lib/solos-swarm/rootfs \
-  --size-mib 512
+```sh
+python3 scripts/remote.py doctor
 ```
 
+The output is one JSON document with `verdict` `PASS`, `WARN` or `FAIL` and a list of checks. Fix every `fail`
+check before you deploy. A `WARN` on `channel-stable` with `no promoted candidate` means no candidate is promoted
+yet, which the next two sections fix. Each check is described in
+[self-update-operations.md](self-update-operations.md#doctor).
 
-## 4. Offline bundles and startup identity
+## Build a candidate
 
-```bash
-# Create a bundle tar from a prepared source (the output must be outside the source)
-python3 scripts/bundle.py create \
-  --source /var/lib/solos-swarm/staging \
-  --output /var/lib/solos-swarm/bundle-out/candidate.tar \
-  --source-revision "$(git rev-parse HEAD)" \
-  --target x86_64-unknown-linux-gnu \
-  --requirements /path/to/requirements.json
-
-# Verify and import bundle
-python3 scripts/bundle.py verify /var/lib/solos-swarm/bundle-out/candidate.tar
-
-python3 scripts/bundle.py import /var/lib/solos-swarm/bundle-out/candidate.tar \
-  --destination /var/lib/solos-swarm/imported
-
-# Offline SPIFFE SVID ceremony
-./target/release/solos-swarm mvp offline-startup-request \
-  --config /var/lib/solos-swarm/cp/runtime.json \
-  --output /tmp/startup-requests.json
-
-./target/release/solos-swarm mvp offline-startup-assemble \
-  --config /var/lib/solos-swarm/cp/runtime.json \
-  --requests /tmp/startup-requests.json \
-  --certificates /tmp/issued-certs.json \
-  --epoch 1 \
-  --expires-ms 1776003600000 \
-  --output /var/lib/solos-swarm/cp/offline-startup-bundle.json
-```
-
-
-## 5. Start governed daemons
-
-```bash
-# 1. Witness (UID 994)
-./target/release/solos-swarm mvp witness-serve \
-  --config /var/lib/solos-swarm/witness/witness.json
-
-# 2. Evaluator (UID 995)
-./target/release/solos-swarm mvp evaluator-serve \
-  --bundle /var/lib/solos-swarm/evaluator/protected/bundle.json \
-  --certificate /var/lib/solos-swarm/evaluator/public/evaluator.der \
-  --private-key /var/lib/solos-swarm/evaluator/protected/key.der \
-  --ca /var/lib/solos-swarm/evaluator/public/ca.der \
-  --state /var/lib/solos-swarm/evaluator/protected/state/private.json \
-  --ipc-socket /var/lib/solos-swarm/evaluator/ipc/service.sock \
-  --broker-uid 999
-
-# 3. Control plane (UID 999)
-./target/release/solos-swarm mvp serve \
-  --config /var/lib/solos-swarm/cp/runtime.json
-```
-
-
-## 6. Standalone and remote 10-worker runs
-
-### Local 10-worker run
-
-```bash
-python3 scripts/prepare_case.py \
-  --seed 20260412 \
-  --goal /tmp/run-01/case/goal.json \
-  --expected /tmp/eval-01/expected.json
-
-./target/release/solos-swarm run \
-  --config /tmp/run-01/case/goal.json \
-  --run-dir /tmp/run-01/evidence \
-  --pi-root . \
-  --node "$(command -v node)" \
-  --credential-file /run/credentials/deepseek.key
-
-python3 scripts/check_run.py \
-  --run-dir /tmp/run-01/evidence \
-  --expected /tmp/eval-01/expected.json
-```
-
-### Remote systemd run (`SOLOS_SWARM_SSH_TARGET`)
-
-```bash
+```sh
 python3 scripts/remote.py deploy
-python3 scripts/remote.py start \
-  --candidate poc-candidate-01 \
-  --run-id run-20260412-01 \
-  --seed 20260412 \
-  --auth-file ~/.pi/agent/auth.json
-python3 scripts/remote.py status --run-id run-20260412-01
-python3 scripts/remote.py collect \
-  --run-id run-20260412-01 \
-  --output ./evidence/run-20260412-01
 ```
+
+`deploy` sends the source as a tar over SSH. The host builds it once with `cargo build --release --locked` and
+`npm ci --ignore-scripts`, copies in the pinned Node, and freezes the result read-only under
+`~/.local/share/solos-swarm/<candidate id>/`. The candidate id is the SHA-256 of the source archive. The command
+prints `{"candidate_id": ..., "path": ..., "existing": ...}`. `existing: true` means the same source was built
+before.
+
+If the build fails, the host keeps the staging directory, with its `build.log`, and the error names its path.
+`deploy` refuses a source tree that holds `auth.json`, `.env`, `credentials.json` or `node_modules`, and it leaves
+out `target/`, `target-linux/`, `runs/` and `work/`.
+
+## Promote the candidate
+
+New runs started with `--candidate current` use the candidate that the `stable` channel points at. To point it at
+the new build:
+
+```sh
+python3 scripts/remote.py candidates promote --candidate <candidate id>
+python3 scripts/remote.py candidates current
+```
+
+`promote` runs the promotion gate first: integrity, the candidate's own `doctor`, a zero-spend `smoke`, and an idle
+lifecycle probe under systemd. If a step fails, the pointer does not move. To try a build on `canary` first, add
+`--channel canary`.
+
+You can skip the channel and pass the candidate id to `start` instead. You must do that while no candidate is
+promoted, because `--candidate current` then fails with `Channel stable has no promoted candidate`.
+
+## Prepare the Goal
+
+Pick one of these:
+
+- **The synthetic reconciliation case.** Pass no Goal file. The host runs the candidate's `scripts/prepare_case.py`
+  with the run's `--seed` to make the Goal and its private expected result.
+- **A Goal you froze yourself.** Pass `--goal-file goal.json --expected-file expected.json` to `start`. The two go
+  together. Build them by hand or with a builder:
+  - `scripts/prepare_platform_case.py` for the live platform red team. Its Goal carries a `fetch` policy.
+  - `scripts/prepare_redteam_case.py --repo <checkout>` for a source review with no network.
+
+`Goal::validate` in `src/broker.rs` holds the full contract. Before the host writes the key to a file, it also
+checks these limits: 1 to 30 agents, one task per agent, a deadline of at most 21,600 seconds, a budget of at most
+1,000,000,000,000 microUSD, and a `fetch` policy, if any, with a non-empty `hosts` list and the `fetch_url` grant.
 
 ### Live-probe Goals: the `fetch` policy
 
-A Goal that grants `fetch_url` lets its agents reach the network through the broker. Its `scope` is a label and its
-prompt a request, so the Goal can also carry a `fetch` policy, which the broker enforces on every call:
+A Goal that grants `fetch_url` to probe a live target must carry a `fetch` policy when its scope is in
+`AUDIT_SCOPES`. The policy names the hosts, methods and rate the broker allows. See
+[goal-fetch-policy.md](goal-fetch-policy.md) for the fields, the refusals and the audit scopes.
 
-```json
-"fetch": {
-  "hosts": ["zelix-front-dev.fly.dev", "zelix-deck.vercel.app"],
-  "methods": ["GET", "HEAD", "OPTIONS"],
-  "per_agent_rps": 1,
-  "follow_redirects_off_list": false
-}
+## Start the run
+
+```sh
+python3 scripts/remote.py start --candidate current --run-id RUN --seed 1 \
+	--goal-file goal.json --expected-file expected.json --refuse-peak
 ```
 
-| Field | Meaning |
+- `RUN` is 1 to 48 lowercase letters, digits or hyphens, and must start with a letter or a digit. Use a new id for
+  each run.
+- `--seed` is always required. Without a Goal file it picks the synthetic case.
+- `--refuse-peak` makes the broker hold model calls Monday to Friday, 01:00 to 04:00 and 06:00 to 10:00 UTC. The
+  Goal deadline counts only the time that is not paused. See [pause-mode.md](pause-mode.md).
+- `--provider deepseek|venice` picks the auth-file entry. Without it, the script uses the Goal's own
+  `upstream.provider`, and then `deepseek`.
+
+The script asks the host to start the run, and sends the key only when the host asks for one. The host writes the
+key to a 0600 file and starts `solos-swarm run` as the user unit `solos-swarm-RUN.service`. systemd stops the unit
+after the Goal deadline plus 20 seconds, or plus 24 hours more with `--refuse-peak`. When the unit stops, its
+`ExecStopPost` step removes the key file and scores the run.
+
+If you run the same `start` again, it prints the run's status with `"existing": true` and starts nothing. If you run
+it with the same run id but another candidate or another Goal, the host refuses it.
+
+To test the lifecycle without a paid model call, add `--idle-probe`. With it, and only with it, `--deadline-seconds N`
+can shorten the deadline. An idle probe never qualifies as a live run.
+
+## Watch the run
+
+```sh
+python3 scripts/remote.py status --run-id RUN
+```
+
+`status` prints the unit's systemd state (`service`), `service_stopped`, and a `progress` block with the Goal status,
+agents running and filed, spent and held microUSD against the cap, whether an artifact exists, any pause, and
+whether the run can be resumed. After the run it also holds the checker's `report` and `cleanup_confirmed`.
+
+For a per-agent table, run `scripts/swarm_progress.py` on the host against the run directory. The host has no
+source checkout, so send the script from the Mac:
+
+```sh
+ssh remote-ai python3 - .local/state/solos-swarm/runs/RUN < scripts/swarm_progress.py
+```
+
+Spend that stays flat while agents run means the broker is paused: by the peak window, by an operator, or by a
+provider outage. An outage pause writes `alert.json` in the run directory, and `doctor` warns about it. To watch the
+run in a browser, see [dashboard.md](dashboard.md).
+
+## Pause, drain or cancel the run
+
+```sh
+python3 scripts/remote.py pause   --run-id RUN --reason "checking spend"    # hold model calls, keep the run up
+python3 scripts/remote.py unpause --run-id RUN
+python3 scripts/remote.py cancel  --run-id RUN                             # stop the unit and confirm it stopped
+```
+
+`cancel` stops the unit, so the normal stop path files a partial finding for each unfiled task, and the run's files
+stay for `collect`.
+
+`drain` also exists, but do not use it to continue a run later. A drained run ends with no partial findings and no
+artifact, and nothing can restart its agents: `run --resume` is not built. See
+[self-update-operations.md](self-update-operations.md#drain-pause-unpause).
+
+## Collect the evidence
+
+When `status` shows `service_stopped: true`:
+
+```sh
+python3 scripts/remote.py collect --run-id RUN --output evidence/RUN
+```
+
+`collect` refuses a run whose unit has not stopped, and an `--output` directory that already exists. It copies the
+run directory, but not its `code/` directory. That directory holds the agents' `run_code` scratch copies, which have
+reached 27 GB for one run. `collect-manifest.json` in the output says how many files and bytes it left on the host.
+To copy `code/` too, add `--include-code`.
+
+## Read the verdict
+
+When the unit stopped, its `ExecStopPost` step ran `scripts/check_run.py` from the candidate. The checker wrote
+these files into the run directory, so `collect` brings them back:
+
+- `report.json`: the verdict (`PASS`, `FAIL` or `INCONCLUSIVE`), the runtime, goal, evidence and cleanup verdicts,
+  and every check.
+- `summary.md`: the verdicts and the checks that did not pass.
+- `checker.log` and `checker-exit.json`: the checker's output and its exit code (0 `PASS`, 1 `FAIL`,
+  2 `INCONCLUSIVE`).
+
+Read the failed checks in `summary.md` before you act on the verdict. A `FAIL` can come from checks that do not fit
+your Goal: every step of the October 2026 tournament got `FAIL`, with `admitted-identities` among the failed checks.
+
+To score the evidence again on the Mac, pass the expected file that you started the run with:
+
+```sh
+python3 scripts/check_run.py --run-dir evidence/RUN --expected expected.json
+```
+
+## Recover a run that died
+
+Nothing restarts the agents of a drained or crashed run. `python3 scripts/remote.py resume --run-id RUN` only prints
+what a resume would settle and respawn. To carry the work forward, fork a new Goal from the dead run's transcripts
+with `scripts/recover_run.py`, and start it as a new run.
+
+1. Collect the dead run's evidence.
+2. Copy the Goal file that the dead run started with. `recover_run.py` edits the copy in place.
+3. Run `recover_run.py` with the dead run's expected file. It writes the new expected file to `--out`:
+
+```sh
+cp goal.json recovered-goal.json
+python3 scripts/recover_run.py --run-dir evidence/RUN --expected expected.json --seed 1 \
+	--goal recovered-goal.json --out recovered-expected.json
+```
+
+Each task of the new Goal carries the completed `fetch_url` calls and the worker's conclusions under
+`prior_evidence`. The new run pays again for the context it reads.
+
+## Roll back or remove candidates
+
+```sh
+python3 scripts/remote.py candidates rollback              # stable points at its previous candidate again
+python3 scripts/remote.py candidates prune                 # dry run: lists what would be removed
+python3 scripts/remote.py candidates prune --yes
+```
+
+A running run keeps the candidate it started on, whatever the pointer does. `prune` never removes a candidate that a
+run still needs. See [self-update-operations.md](self-update-operations.md#candidates-and-channels).
+
+## Files on the host
+
+| Path | What it holds |
 |---|---|
-| `hosts` (required, 1 to 64) | The hosts a request may name: an exact name, `*.example.com` for any name under that suffix (never the bare suffix; `*.com` is refused), or an IP address. Case and a trailing dot do not matter; a port is not part of the match. |
-| `methods` | The methods allowed (`GET HEAD POST PUT PATCH DELETE OPTIONS`). Left out, every method `fetch_url` supports. |
-| `per_agent_rps` | Calls per second one agent may make, 0.01 to 1000. A call that follows redirects counts once. Left out, no limit. |
-| `follow_redirects_off_list` | Default `false`: a redirect to a host off the list is refused and not followed. `true` follows it, though the URL the agent asked for must still be on the list. |
-| `allow_private_networks` | Default `false`: see below. |
-
-The broker judges the URL the agent asked for, then every redirect hop before it is requested. A refused call sends
-nothing. The agent gets a tool result, not an HTTP error, so a swarm worker can read it:
-
-```json
-{"refused": true, "reason": "redirect_off_list", "error": "fetch_url refused: ... redirects to https://accounts.google.com/..., whose host ... is not on this Goal's fetch allowlist ...", "url": "https://accounts.google.com/..."}
-```
-
-`reason` is `host_not_allowed`, `method_not_allowed`, `redirect_off_list`, `rate_limited` (with `retry_after_ms`),
-`private_address` or `header_not_allowed` (a `Host` header of the agent's own, which would name another site on a
-listed address; under a policy the broker sets `Host` from the URL). Each refusal is a `fetch_refused` event in the run's `events.jsonl` (agent, requested URL, the URL
-refused, hop, reason, and for a private address the address it came to), and `scripts/check_run.py` re-checks every completed `fetch_url` against the policy as a
-`fetch-scope` check. A policy needs the `fetch_url` grant, `Goal::validate` reads every field, and an unknown key or
-a missing `hosts` is refused, so a typo cannot leave a Goal looking restricted.
-
-**Private addresses.** Every swarm `fetch_url`, with a policy or without one, refuses an address that is loopback,
-private (RFC 1918), link-local (`169.254.0.0/16`, the cloud metadata address), carrier-grade NAT or Tailscale
-(`100.64.0.0/10`), multicast, reserved or documentation, and an IPv6 address that wraps one of those. A host name is
-resolved once per hop, all its addresses must be public, and the connection is then pinned to them, so a name that
-answers differently the second time cannot get past the check. Set `allow_private_networks: true` in a policy to
-reach one on purpose, such as a staging service on the same network. Without a policy there is no way to allow it:
-a Goal that must probe a private host names it in a policy.
-
-**Without a policy** the Goal behaves as before: any public host, any method, no rate limit. The one change is the
-private-address refusal above. Agent mode's own `fetch_url` (`src/agent/broker.rs`) goes through the same guard, with
-no policy: its switch is `executor.fetch.allow_private_networks` in the agent config (default `false`), described in
-[docs/agent-mode/README.md](agent-mode/README.md).
-
-**Audit scopes.** `scope` must be on the deployment allowlist: `synthetic-fixtures-only`, `public-web-research` and the
-`authorized-audit:<target>` scopes, each a reviewed authorization named in `src/broker.rs`
-(`AUDIT_SCOPES_BEFORE_FETCH_POLICY`, `AUDIT_SCOPES`). All share one envelope (deadline, spend and call limits). A
-target added to `AUDIT_SCOPES`, such as `authorized-audit:zelix`, must carry a `fetch` policy when its Goal grants
-`fetch_url`; the two scopes frozen before the policy existed keep running without one.
-
-`scripts/prepare_platform_case.py` emits the policy for the live platform red team (`--fetch-host`,
-`--fetch-methods`, `--fetch-rps`, `--allow-rpc`). A swarm Ticket in agent mode sets the same `fetch:` key in its Goal
-template. `scripts/prepare_redteam_case.py` builds a source-review Goal that grants no `fetch_url`, so it has none.
-
-
-## 7. Inspect, verify, and qualify
-
-```bash
-# Inspect snapshot state or causal explanation
-./target/release/solos-swarm mvp inspect \
-  --snapshot /var/lib/solos-swarm/cp/state-snapshot.json \
-  --kind explain \
-  --id intent-0042
-
-# Offline Merkle and ledger verification
-./target/release/solos-swarm mvp verify \
-  --snapshot /var/lib/solos-swarm/cp/state-snapshot.json \
-  --head /var/lib/solos-swarm/witness/checkpoints.json \
-  --trusted-key /etc/solos-swarm/trusted-keys.json \
-  --output /tmp/verify-report.json
-
-# Run qualification profile (quick | release-small | integration | acceptance | eval)
-./target/release/solos-swarm mvp qa \
-  --config /etc/solos-swarm/qa-config.json \
-  --profile release-small \
-  --output /tmp/qa-report.json
-
-# Gate and promote release
-python3 scripts/qualify.py \
-  --bundle /var/lib/solos-swarm/bundle-out \
-  --report /tmp/qa-report.json \
-  --profile /etc/solos-swarm/release-profile.json \
-  --attestation /var/lib/solos-swarm/cp/runtime-attestation.json \
-  --trusted-key /etc/solos-swarm/trusted-release-keys.json \
-  --verifier ./target/release/solos-swarm \
-  --promote /var/lib/solos-swarm/promoted-release.json
-```
+| `~/.local/share/solos-swarm/<candidate id>/` | One read-only candidate: the binary, the Pi tree, the scripts, `candidate.json`. |
+| `~/.local/share/solos-swarm/channels/<channel>.json` | The channel pointer. `<channel>.log.jsonl` beside it logs every promotion and refusal. |
+| `~/.local/state/solos-swarm/runs/<run>/` | The run: `request.json`, `config.yaml` (the Goal, in JSON), `events.jsonl`, `state.json`, the transcripts, `code/`, and the checker's files. |
+| `~/.local/state/solos-swarm/evaluators/<run>/expected.json` | The private expected result. `collect` does not copy it. |
+| `~/.local/state/solos-swarm/credentials/` | The run's key file, from `start` until the unit stops. |
