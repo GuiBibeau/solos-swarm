@@ -40,7 +40,7 @@ harness it uses), and `Gotchas`.
 | [Browse a page with a signed trail](./browser-trail.md) | 2026-11-04, v20261104-1815, 04ceeec | passed: `agent trail` 2 steps, 2 signatures ok, 2 blobs ok |
 | [Use an API key the model never sees](./keyed-fetch.md) | 2026-11-04, v20261104-1815, 04ceeec | passed: probe 401 without, 200 with the vault key, `key_used` on the chain, no test value in state |
 | [Chat on Discord with approvals](./discord-chat.md) | 2026-11-04, zelix, b04f9f2, scripted Router | passed: approval buttons, Approve, result |
-| [Follow up on a running request](./follow-up.md) | not yet | seeded |
+| [Follow up on a request](./follow-up.md) | not yet | seeded (`resume` now checks that the new worker's first prompt quotes its earlier replies) |
 | [Work on GitHub as the App's own bot](./github-app-auth.md) | not yet | seeded (needs the App created by hand) |
 | [Ask for a change and get a pull request from the bot](./github-pr.md) | not yet | seeded (needs the App created by hand and `owes: pull_request` on the sandbox) |
 

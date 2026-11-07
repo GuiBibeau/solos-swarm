@@ -1,6 +1,7 @@
 //! The long-running loop. One task owns the Engine, so state has one writer.
 //! Adapters run concurrently and send facts and Effect outcomes back to it.
 
+use super::earlier;
 use super::ports::{
     Answer, Applied, BoxFuture, Channel, Command, Delivered, Delivery, Execute, Executor, Fact,
     FactSink, Failure, Forge, Inbound, Launch, Order, Publish, Router, SendOptions, SendOutcome,
@@ -684,6 +685,7 @@ impl Runtime {
                     .iter()
                     .map(|input| self.delivered(input.clone()))
                     .collect::<Result<_>>()?;
+                let earlier = earlier::of(&found.assignments);
                 let origin = store
                     .trigger(&found.origin)
                     .with_context(|| format!("no trigger {}", found.origin))?;
@@ -699,6 +701,7 @@ impl Runtime {
                     repo: found.mandate.repo,
                     recovery: recovery || repeat,
                     inputs,
+                    earlier,
                 }))
             }
             Effect::Deliver {
