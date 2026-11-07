@@ -157,6 +157,7 @@ impl World {
                 code: Some(Arc::new(CodeExecutor::from_config(code).unwrap())),
                 vault: None,
                 browser: None,
+                allow_private_networks: false,
             }),
         };
         let broker = AgentBroker::with_jobs(parts, LIMITS).unwrap();

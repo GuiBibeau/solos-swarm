@@ -1991,6 +1991,8 @@ impl KeyedBroker {
                     asks_on: ["slack".to_owned()].into(),
                 }),
                 browser: None,
+                // The keyed sites these tests fetch from are on loopback.
+                allow_private_networks: true,
             }),
         };
         let broker = AgentBroker::new(parts).unwrap();

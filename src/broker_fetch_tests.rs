@@ -6,6 +6,7 @@ use axum::{
     http::Uri,
     response::{IntoResponse, Response},
 };
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn goal_json(scope: &str, fetch: Option<Value>) -> Value {
@@ -431,6 +432,9 @@ async fn serve(State(site): State<Arc<Site>>, uri: Uri) -> Response {
         "/to-own" => redirect("/ok".into()),
         "/to-off" => redirect("http://elsewhere.test/secret".into()),
         "/to-local" => redirect(format!("http://localhost:{}/ok", site.port)),
+        "/to-loopback" => redirect(format!("http://127.0.0.1:{}/secret", site.port)),
+        "/to-metadata" => redirect("http://169.254.169.254/latest/meta-data/".into()),
+        "/to-rebound" => redirect(format!("http://rebound.example.test:{}/secret", site.port)),
         _ => (StatusCode::OK, "hello").into_response(),
     }
 }
@@ -538,7 +542,7 @@ async fn private_addresses_are_refused_on_every_hop_unless_the_policy_allows_the
             let refusal = refusal_of(&error);
             assert_eq!(refusal.reason, "private_address", "{raw}");
             assert!(
-                refusal.message.contains("private, loopback or link-local")
+                refusal.message.contains("resolves to a private address")
                     && refusal.message.contains("Nothing was sent"),
                 "{refusal}"
             );
@@ -729,4 +733,214 @@ async fn without_a_policy_only_private_addresses_are_refused() {
     );
     assert_eq!(refusals(&dir).len(), 2, "that was a failure, not a refusal");
     fs::remove_dir_all(dir).unwrap();
+}
+
+/// What a name that looks public resolves to in these tests:
+/// `docs.example.test` is on the public internet, `rebound.example.test`
+/// answers with the host's loopback, `mixed.example.test` with both.
+fn answers(host: &str) -> Vec<IpAddr> {
+    let public: IpAddr = "93.184.216.34".parse().unwrap();
+    let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+    match host {
+        "docs.example.test" => vec![public],
+        "rebound.example.test" => vec![loopback],
+        "mixed.example.test" => vec![public, loopback],
+        other => panic!("{other} was not meant to be looked up"),
+    }
+}
+
+/// A guard for a fetch with no Goal, whose names resolve as `answers` says
+/// and whose connections go to `site`, the only server these tests have.
+fn open_guard(allow_private: bool, site: &Site) -> FetchGuard<'static> {
+    FetchGuard::open(allow_private)
+        .resolving(answers)
+        .dialing(SocketAddr::from(([127, 0, 0, 1], site.port)))
+}
+
+fn ok(page: &Value) -> (Value, Value) {
+    (page["status"].clone(), page["body"].clone())
+}
+
+#[tokio::test]
+async fn an_open_guard_refuses_every_private_address_and_allows_them_when_told() {
+    let (site, base) = site().await;
+    let port = site.port;
+    let refused = FetchGuard::open(false);
+    for raw in [
+        format!("{base}/ok"),
+        format!("http://localhost:{port}/ok"),
+        format!("http://[::1]:{port}/ok"),
+        format!("http://[fd00::1]:{port}/ok"),
+        format!("http://[fd12:3456:789a::1]:{port}/ok"),
+        format!("http://[fe80::1]:{port}/ok"),
+        format!("http://[::ffff:127.0.0.1]:{port}/ok"),
+        format!("http://[::]:{port}/ok"),
+        format!("http://0.0.0.0:{port}/ok"),
+        format!("http://2130706433:{port}/ok"),
+        "http://10.1.2.3/".to_owned(),
+        "http://172.16.0.9/".to_owned(),
+        "http://192.168.0.9/".to_owned(),
+        "http://169.254.169.254/latest/meta-data/".to_owned(),
+        "http://100.64.0.1/".to_owned(),
+        "http://100.100.100.100/".to_owned(),
+        "http://224.0.0.251/".to_owned(),
+        "http://[ff02::fb]/".to_owned(),
+    ] {
+        let error = fetch_guarded(&json!({"url": raw}), &refused)
+            .await
+            .unwrap_err();
+        let refusal = refusal_of(&error);
+        assert_eq!(
+            (refusal.reason, refusal.hop),
+            ("private_address", 0),
+            "{raw}"
+        );
+        assert!(
+            refusal.message.starts_with("fetch_url refused: ")
+                && refusal.message.contains("resolves to a private address")
+                && refusal.message.contains("Nothing was sent"),
+            "{refusal}"
+        );
+    }
+    assert_eq!(site.hits.load(Ordering::SeqCst), 0, "nothing was sent");
+
+    // The operator's say-so reaches the same pages, and a name that resolves
+    // to loopback too.
+    let allowed = FetchGuard::open(true);
+    for raw in [format!("{base}/ok"), format!("http://localhost:{port}/ok")] {
+        let page = fetch_guarded(&json!({"url": raw}), &allowed).await.unwrap();
+        assert_eq!(ok(&page), (json!(200), json!("hello")));
+    }
+    assert_eq!(site.hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn a_name_that_looks_public_is_refused_by_the_address_it_resolves_to() {
+    let (site, _) = site().await;
+    let port = site.port;
+    let guard = open_guard(false, &site);
+
+    // The model is told the host, never the address; the record has both.
+    let rebound = json!({"url": format!("http://rebound.example.test:{port}/x")});
+    let error = fetch_guarded(&rebound, &guard).await.unwrap_err();
+    let refusal = refusal_of(&error);
+    assert_eq!(refusal.reason, "private_address");
+    assert!(
+        refusal
+            .message
+            .contains("rebound.example.test resolves to a private address")
+            && !refusal.message.contains("127.0.0.1"),
+        "{refusal}"
+    );
+    assert_eq!(refusal.address, Some("127.0.0.1".parse().unwrap()));
+    let event = refusal.event("as_1", &rebound);
+    assert_eq!(event["reason"], "private_address");
+    assert_eq!(event["address"], "127.0.0.1");
+    assert_eq!(refusal.reply()["refused"], true);
+
+    // One private address among public ones is enough to refuse the name.
+    let mixed = json!({"url": format!("http://mixed.example.test:{port}/x")});
+    let error = fetch_guarded(&mixed, &guard).await.unwrap_err();
+    assert_eq!(refusal_of(&error).reason, "private_address");
+    assert_eq!(site.hits.load(Ordering::SeqCst), 0, "nothing was sent");
+
+    // The public name goes out, so the tests below mean what they say.
+    let public = json!({"url": format!("http://docs.example.test:{port}/ok")});
+    let page = fetch_guarded(&public, &guard).await.unwrap();
+    assert_eq!(ok(&page), (json!(200), json!("hello")));
+    assert_eq!(site.hits.load(Ordering::SeqCst), 1);
+    // And with the operator's say-so, so does the name that answers loopback.
+    let page = fetch_guarded(&rebound, &open_guard(true, &site))
+        .await
+        .unwrap();
+    assert_eq!(page["status"], 200);
+}
+
+#[tokio::test]
+async fn a_redirect_from_a_public_host_to_a_private_one_is_refused_at_that_hop() {
+    let (site, _) = site().await;
+    let port = site.port;
+    let guard = open_guard(false, &site);
+    for (path, refused_url, host) in [
+        (
+            "to-loopback",
+            format!("http://127.0.0.1:{port}/secret"),
+            "127.0.0.1",
+        ),
+        (
+            "to-metadata",
+            "http://169.254.169.254/latest/meta-data/".to_owned(),
+            "169.254.169.254",
+        ),
+        (
+            "to-rebound",
+            format!("http://rebound.example.test:{port}/secret"),
+            "rebound.example.test",
+        ),
+    ] {
+        let before = site.hits.load(Ordering::SeqCst);
+        // What a keyed fetch puts its key on: each request that is sent.
+        let sent = std::sync::Mutex::new(Vec::new());
+        let start = format!("http://docs.example.test:{port}/{path}");
+        let error = fetch_guarded_with(&json!({"url": start}), &guard, |request| {
+            sent.lock().unwrap().push(request.url().to_string());
+        })
+        .await
+        .unwrap_err();
+        let refusal = refusal_of(&error);
+        assert_eq!(refusal.reason, "private_address", "{path}");
+        assert_eq!(
+            (refusal.hop, refusal.url.as_str()),
+            (1, refused_url.as_str()),
+            "{path}"
+        );
+        assert!(
+            refusal
+                .message
+                .contains(&format!("fetch_url refused: {host} resolves")),
+            "{refusal}"
+        );
+        assert_eq!(
+            site.hits.load(Ordering::SeqCst),
+            before + 1,
+            "{path}: the first hop went out, the redirect did not"
+        );
+        assert_eq!(
+            *sent.lock().unwrap(),
+            [start],
+            "{path}: no request was built for the refused hop"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_name_is_resolved_once_per_hop_and_the_connection_goes_to_that_answer() {
+    let (site, _) = site().await;
+    let port = site.port;
+    // A name that answers a public address to the check and the host's
+    // loopback to anyone who asks again, as a rebinding attacker's does.
+    let lookups = Arc::new(AtomicUsize::new(0));
+    let asked = lookups.clone();
+    let guard = FetchGuard::open(false)
+        .resolving(move |_| {
+            if asked.fetch_add(1, Ordering::SeqCst) == 0 {
+                vec!["93.184.216.34".parse().unwrap()]
+            } else {
+                vec!["127.0.0.1".parse().unwrap()]
+            }
+        })
+        .dialing(SocketAddr::from(([127, 0, 0, 1], port)));
+    let rebind = json!({"url": format!("http://rebind.example.test:{port}/ok")});
+    let page = fetch_guarded(&rebind, &guard).await.unwrap();
+    assert_eq!(page["status"], 200);
+    assert_eq!(
+        lookups.load(Ordering::SeqCst),
+        1,
+        "one lookup, which the client was pinned to"
+    );
+
+    // The next hop is a fresh lookup, judged on its own answer.
+    let error = fetch_guarded(&rebind, &guard).await.unwrap_err();
+    assert_eq!(refusal_of(&error).reason, "private_address");
+    assert_eq!(lookups.load(Ordering::SeqCst), 2);
 }

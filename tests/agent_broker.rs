@@ -388,6 +388,8 @@ fn workers(vault: Option<VaultParts>, browser: Option<BrowserParts>) -> WorkerPa
         code: None,
         vault,
         browser,
+        // The pages these tests fetch are on loopback.
+        allow_private_networks: true,
     }
 }
 
@@ -1640,6 +1642,102 @@ async fn counting_page() -> (
     (url, hits, web)
 }
 
+/// A broker whose host lets `fetch_url` reach private networks or not, with
+/// one worker admitted.
+fn fetching_worker(
+    scratch: &Scratch,
+    allow_private_networks: bool,
+) -> (Runtime, Served, Arc<WorkerSeat>) {
+    let runtime = scratch.runtime(Arc::new(Holding::default()), true);
+    let served = serve_on(
+        scratch,
+        Scripted::new(),
+        runtime.facts(),
+        1_000_000,
+        TERMS,
+        Nodes::default(),
+        WorkerParts {
+            allow_private_networks,
+            ..workers(None, None)
+        },
+        None,
+    );
+    let seat = WorkerSeat::new(
+        TicketId::new("tk_1"),
+        AssignmentId::new("as_1"),
+        scratch.state(),
+        500_000,
+    );
+    let seat = served
+        .broker
+        .admit_worker(WORKER.into(), seat, "You are a worker.".into())
+        .unwrap();
+    (runtime, served, seat)
+}
+
+#[tokio::test]
+async fn fetch_url_refuses_loopback_and_private_addresses_unless_the_host_allows_them() {
+    let (url, hits, web) = counting_page().await;
+    let port = url.rsplit(':').next().unwrap().trim_end_matches('/');
+    let scratch = Scratch::new("fetch-private");
+    let (_runtime, served, seat) = fetching_worker(&scratch, false);
+
+    // Each address a worker steered by a page might try, by number or by a
+    // name that resolves to this host: the first is the page on loopback.
+    let targets = [
+        url.clone(),
+        format!("http://localhost:{port}/"),
+        format!("http://[::1]:{port}/"),
+        format!("http://[fd00::1]:{port}/"),
+        format!("http://[::ffff:127.0.0.1]:{port}/"),
+        format!("http://0.0.0.0:{port}/"),
+        "http://169.254.169.254/latest/meta-data/".to_owned(),
+        "http://10.0.0.1/".to_owned(),
+        "http://172.16.0.1/".to_owned(),
+        "http://192.168.1.1/".to_owned(),
+        "http://100.64.0.1/".to_owned(),
+        "http://224.0.0.1/".to_owned(),
+    ];
+    for target in &targets {
+        seat.begin_turn();
+        let (status, reply) = served
+            .post("tool/fetch_url", Some(WORKER), json!({"url": target}))
+            .await;
+        assert_eq!(status, 403, "{target}: {reply}");
+        assert_eq!(reply["refused"], true, "{target}: {reply}");
+        assert_eq!(reply["reason"], "private_address", "{target}: {reply}");
+        let why = reply["error"].as_str().unwrap();
+        assert!(
+            why.starts_with("fetch_url refused: ")
+                && why.contains("resolves to a private address")
+                && why.contains("Nothing was sent"),
+            "{target}: {why}"
+        );
+    }
+    let (_, first) = served
+        .post("tool/fetch_url", Some(WORKER), json!({"url": url}))
+        .await;
+    assert!(
+        first["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("fetch_url refused: 127.0.0.1 resolves to a private address"),
+        "{first}"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "no request was sent");
+
+    // The host's say-so reaches the same page.
+    let scratch = Scratch::new("fetch-private-allowed");
+    let (_runtime, allowed, _seat) = fetching_worker(&scratch, true);
+    let (status, page) = allowed
+        .post("tool/fetch_url", Some(WORKER), json!({"url": url}))
+        .await;
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(page["body"], "page");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    web.abort();
+}
+
 #[tokio::test]
 async fn a_worker_that_ignores_its_refusals_has_its_turn_stopped_and_pays_for_no_model_call_after()
 {
@@ -1830,9 +1928,7 @@ impl Looper {
             Nodes::default(),
             WorkerParts {
                 terms: worker_terms,
-                code: None,
-                vault: None,
-                browser: None,
+                ..workers(None, None)
             },
             None,
         );

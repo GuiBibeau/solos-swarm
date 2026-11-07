@@ -1267,6 +1267,7 @@ mod tests {
                     code: None,
                     vault: None,
                     browser: None,
+                    allow_private_networks: false,
                 }),
             };
             let broker =

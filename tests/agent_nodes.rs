@@ -255,6 +255,7 @@ impl World {
                 code: local,
                 vault: None,
                 browser: None,
+                allow_private_networks: false,
             }),
         };
         let nodes = Nodes {

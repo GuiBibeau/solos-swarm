@@ -177,7 +177,7 @@ nothing. The agent gets a tool result, not an HTTP error, so a swarm worker can 
 `reason` is `host_not_allowed`, `method_not_allowed`, `redirect_off_list`, `rate_limited` (with `retry_after_ms`),
 `private_address` or `header_not_allowed` (a `Host` header of the agent's own, which would name another site on a
 listed address; under a policy the broker sets `Host` from the URL). Each refusal is a `fetch_refused` event in the run's `events.jsonl` (agent, requested URL, the URL
-refused, hop, reason), and `scripts/check_run.py` re-checks every completed `fetch_url` against the policy as a
+refused, hop, reason, and for a private address the address it came to), and `scripts/check_run.py` re-checks every completed `fetch_url` against the policy as a
 `fetch-scope` check. A policy needs the `fetch_url` grant, `Goal::validate` reads every field, and an unknown key or
 a missing `hosts` is refused, so a typo cannot leave a Goal looking restricted.
 
@@ -190,8 +190,9 @@ reach one on purpose, such as a staging service on the same network. Without a p
 a Goal that must probe a private host names it in a policy.
 
 **Without a policy** the Goal behaves as before: any public host, any method, no rate limit. The one change is the
-private-address refusal above. Agent mode's own `fetch_url` (`src/agent/broker.rs`) does not go through this guard
-yet, so it has no private-address check.
+private-address refusal above. Agent mode's own `fetch_url` (`src/agent/broker.rs`) goes through the same guard, with
+no policy: its switch is `executor.fetch.allow_private_networks` in the agent config (default `false`), described in
+[docs/agent-mode/README.md](agent-mode/README.md).
 
 **Audit scopes.** `scope` must be on the deployment allowlist: `synthetic-fixtures-only`, `public-web-research` and the
 `authorized-audit:<target>` scopes, each a reviewed authorization named in `src/broker.rs`

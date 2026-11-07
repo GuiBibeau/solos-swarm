@@ -1,8 +1,10 @@
 use super::toolbox::Resource;
-use super::{AgentBroker, Refusal, Reply, VaultParts, WorkerSeat, failed, forbidden, refuse};
+use super::{
+    AgentBroker, Refusal, Reply, VaultParts, WorkerSeat, failed, fetch_failed, forbidden, refuse,
+};
 use crate::agent::environment::LOCAL;
 use crate::agent::ports::Fact;
-use crate::broker::fetch_with;
+use crate::broker::{FetchGuard, fetch_guarded_with};
 use crate::vault::{Admission, GrantState, ItemKind, SecretName, UseContext, policy};
 use axum::{Json, http::StatusCode};
 use serde_json::{Value, json};
@@ -19,11 +21,14 @@ const NOTE: &str = "You never see these values. `use` names the tools that take 
                     ticket's channels, so the item cannot be used.";
 
 /// `fetch_url` with a key. A host without a vault holds `fetch_url` for
-/// keyless requests, so a key is refused here with the reason.
+/// keyless requests, so a key is refused here with the reason. The key's
+/// hosts say where the key may go; `guard` says where this host lets any
+/// request go, and it judges each hop before the key is put on it.
 pub(super) async fn fetch(
     broker: &AgentBroker,
     seat: &WorkerSeat,
     vault: Option<&VaultParts>,
+    guard: &FetchGuard<'_>,
     key: Value,
     args: &Value,
 ) -> Result<Value, Refusal> {
@@ -73,20 +78,14 @@ pub(super) async fn fetch(
     if let Err(why) = broker.inner.facts.ask(used).await.map_err(failed)? {
         return Err(refuse(StatusCode::CONFLICT, why));
     }
-    let sent = fetch_with(&broker.inner.keyed, args, |request| {
-        key.reveal_into(request)
-    })
-    .await;
+    let sent = fetch_guarded_with(args, guard, |request| key.reveal_into(request)).await;
     let scrubber = parts.vault.scrubber().map_err(failed)?;
     match sent {
         Ok(mut response) => {
             scrubber.clean_json(&mut response);
             Ok(response)
         }
-        Err(err) => Err(refuse(
-            StatusCode::BAD_GATEWAY,
-            scrubber.clean(&format!("{err:#}")),
-        )),
+        Err(err) => Err(fetch_failed(seat, &err, |text| scrubber.clean(text))),
     }
 }
 

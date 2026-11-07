@@ -271,6 +271,7 @@ async fn broker_on(
             code: None,
             vault: None,
             browser: None,
+            allow_private_networks: false,
         }),
     })
     .unwrap();

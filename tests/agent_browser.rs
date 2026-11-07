@@ -482,6 +482,7 @@ impl World {
                     asks_on: setup.asks_on.iter().map(|s| (*s).to_owned()).collect(),
                 }),
                 browser,
+                allow_private_networks: false,
             }),
         };
         let broker = AgentBroker::new(parts).unwrap();

@@ -295,7 +295,22 @@ provider through the real broker. It runs on macOS too. Swarm mode is the first 
     account is untouched. Its tools: `worker_report` (status, text, question; the spend comes from the ledger),
     `worker_handback` (a follow-up that is not the Ticket's goes to the Router, once), `run_code` (the shared
     `CodeExecutor`, now with configurable mounts and a caller-owned scratch directory; swarm runs keep their exact
-    sandbox command) and `fetch_url` (`broker::fetch`, swarm mode's limits). `SWARM_TOOLSET=worker` selects them.
+    sandbox command) and `fetch_url` (`broker::fetch_guarded`, swarm mode's limits and its private-address guard,
+    below). `SWARM_TOOLSET=worker` selects them.
+  - `fetch_url` reaches the public internet only. A page, an issue or a repository can tell a worker to fetch any
+    URL, and this host may run other services on loopback and private addresses, so every request and every
+    redirect hop, keyed or not, is refused when its host resolves to a loopback, private (RFC 1918), link-local
+    (including the cloud metadata address `169.254.169.254`), shared (`100.64.0.0/10`, which Tailscale uses),
+    unique-local IPv6 (`fc00::/7`), unspecified or multicast address, or an IPv6 address that wraps one of those.
+    A name is resolved once per hop, every address it has must be public, and the connection is pinned to those
+    addresses, so a name that answers differently the second time cannot get past the check. The worker reads
+    `fetch_url refused: <host> resolves to a private address ...` as a 403 with `reason: private_address` and nothing
+    was sent; the agent's log gets a line `agent: fetch_url of the worker of <assignment> on <ticket> was refused
+    (private_address): <host> at <address>, hop <n>`, with the address the model is not told. For a host that
+    must reach a service on its own network, `executor: {kind: pi, ..., fetch: {allow_private_networks: true}}`
+    turns the check off for every worker's `fetch_url` (default `false`; the browser's own switch is
+    `browser.allow_private_networks`). `fetch_url` goes through no proxy, since the proxy would open the connection
+    itself and the check could not see where it goes, so `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` do not apply to it.
   - It is prompted with its Assignment (title, scope, matched rules, every Input so far, how to report, and with
     `recovery` a note to check `/work` before repeating outside actions), then with each later batch of Inputs
     between turns. A turn that ends with no Report, or with `progress` only, counts as `waiting`, unless its last
@@ -1209,7 +1224,8 @@ and join text inside the braces with `~`.
   on every call and every redirect hop: `fetch: {hosts: [app.example.com, "*.example.org"], methods: [GET, HEAD],
   per_agent_rps: 1}`. A host name is a plain scalar, but `*.suffix` needs quotes in YAML. Its fields, the refusals and
   the audit scopes are in [docs/RUNBOOK.md](../RUNBOOK.md#live-probe-goals-the-fetch-policy). A swarm `fetch_url`
-  refuses private, loopback and link-local addresses unless the policy sets `allow_private_networks: true`.
+  refuses private, loopback and link-local addresses unless the policy sets `allow_private_networks: true`. A
+  session worker's `fetch_url` has no Goal, and `executor.fetch.allow_private_networks` is its switch.
 
 `agent serve` renders each template for one and two agents as it loads the config, and refuses one that does not
 make a valid Goal. The example below is `tests/fixtures/goal-template.yaml`:
@@ -1556,7 +1572,9 @@ value replaced by `[vault:<name>]`. The executor must be `pi`.
 The grant holds for the Ticket's life, across its Assignments, and so does a Deny. Each keyed call writes `KeyUsed`
 (the key, the method and the first URL) to the chain before the request leaves. The key goes on a redirect only
 when that hop's own URL is one of the key's hosts, never over plain http to a host other than loopback, and never
-through a proxy that `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY` names. The response headers, the body and any
+through a proxy that `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY` names. A keyed call is also a `fetch_url` call, so
+a request whose host resolves to a private address, loopback included, is refused before the key is put on it,
+unless `executor.fetch.allow_private_networks` is on; a key for a service on this host's own network needs it. The response headers, the body and any
 error text are scrubbed of every value in the vault, in each encoding the scrubber knows, before the model sees
 them.
 
@@ -1841,7 +1859,9 @@ Publish ─ push the branch (lease) ─ find or open the pull request ─ read i
   use them, such as an API call with a token. Per-node capability leases (the `mvp` `DispatchPermit` design) are a
   later step. Until then, connect only machines whose mounts and secrets you would hand to the agent host.
 - A worker names a vault key and never sees its value. The broker sends the key only to the key's hosts, over
-  https or to loopback, never through an ambient proxy, and only after `KeyUsed` is on the chain. What comes back
+  https or to loopback, never through an ambient proxy, and only after `KeyUsed` is on the chain. A key whose host is
+  on a private network (a loopback one included) is sent there only under `executor.fetch.allow_private_networks`:
+  `fetch_url`'s refusal of private addresses comes first, and the key is never put on a request it refuses. What comes back
   is scrubbed of every vault value, which catches a value the server echoes in a known encoding but not one it
   transforms any other way. A first use that needs a person waits for a click, never for text, and is refused at
   once on a Ticket whose channels cannot show the buttons. The vault file and its key are refused wherever a sandbox
