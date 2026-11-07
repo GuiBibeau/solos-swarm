@@ -378,6 +378,7 @@ where
                 prices,
                 max_input_bytes,
                 max_output_tokens,
+                temperature,
                 run_code,
                 ..
             } => {
@@ -397,6 +398,7 @@ where
                     max_input_bytes: *max_input_bytes,
                     max_output_tokens: *max_output_tokens,
                     call_limit: None,
+                    temperature: Some(*temperature),
                 };
                 let vault = match &config.vault {
                     None => None,
@@ -670,6 +672,7 @@ fn router_session(
             max_input_bytes: *max_input_bytes,
             max_output_tokens: *max_output_tokens,
             call_limit: Some(half_an_eval),
+            temperature: None,
         },
         system_prompt: Some(
             pi_router::system_prompt(

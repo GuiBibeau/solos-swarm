@@ -326,30 +326,50 @@ provider through the real broker. It runs on macOS too. Swarm mode is the first 
     does not nudge the worker to report: that would spend another model call on a budget that may be gone, add a
     second prompt path to the turn, and still need this fallback when the nudge ends in text too. Claude Code
     sessions do not say their last text yet, so they keep the old behavior.
-  - The broker stops a worker that loops (`src/agent/broker/repeat.rs`). A circle is one call, or up to three calls
-    in turn, repeated three times with byte-identical arguments (`A A A`, `A B A B A B`); the call that closes the
-    third round is refused with a reason (HTTP 429, read by the model as the tool's error) that asks it to change its
-    approach or report `ready`, `blocked` or `failed`. The refused call is never run, and while the circle goes on
-    every call of it stays refused. A call that comes back among others that differ, such as a test run between
-    edits, is no circle, and a new turn starts the count again. A tool whose registry entry says `repeatable` is
-    never refused and ends any circle it falls into: `job_wait`, `browser_act` and `browser_read` (what they answer
-    moves between calls), `worker_report` and `worker_handback` (which must always get through) and the Router's
-    tools. `repeatable` is not part of the tool schema, so `extensions/agent-tools.json` does not carry it. The
-    refusal quotes what the call answered the first time on one line (a command's exit code and the first lines of
-    its stdout and stderr, else the start of the result), so the model sees it already has the answer.
+  - The broker stops a worker that loops or makes no progress (`src/agent/broker/repeat.rs`), per seat and per
+    turn, in steps that each catch what the one before cannot. A circle is one call, or up to ten calls in turn,
+    repeated three times with byte-identical arguments (`A A A`, `A B A B A B`, five `sed -n` slices of one file
+    gone round three times); the call that closes the third round is refused with a reason (HTTP 429, read by the
+    model as the tool's error) that asks it to change its approach or report `ready`, `blocked` or `failed`. The
+    refused call is never run, and while the circle goes on every call of it stays refused. A call that comes back
+    among others that differ, such as a test run between edits, is no circle, and a new turn starts the count
+    again. A tool whose registry entry says `repeatable` is never refused and ends any circle it falls into:
+    `job_wait`, `browser_act` and `browser_read` (what they answer moves between calls), `worker_report` and
+    `worker_handback` (which must always get through) and the Router's tools. `repeatable` is not part of the tool
+    schema, so `extensions/agent-tools.json` does not carry it. The refusal quotes what the call answered the first
+    time on one line (a command's exit code and the first lines of its stdout and stderr, else the start of the
+    result), so the model sees it already has the answer.
   - A refusal alone does not stop a model that ignores it (one Ticket sent the same refused `run_code` call 767
     times, a model call each, about $2.25), so the guard counts the calls it refuses and stops the turn: after 3
     refused calls in a row with no call that went through between them (`A A A A A` is stopped at the fifth call,
-    `A B A B A B A B` at the eighth), or 10 refused calls in one turn however far apart. From then on the broker
-    answers the seat's tool calls with the stop and refuses its next model call before any hold or upstream call, so
-    it costs nothing, which ends a Pi turn exactly as a failed provider call does. The seat keeps `ModelFailure::Stuck`
-    and the host reports `failed` in the worker's place: `I got stuck repeating the same step and stopped. Reply here
-    to have me try again with a different approach.` It is recorded with the Ticket like the failed-call Report, so
-    the person hears it once and a restart sends nothing. A reply on the thread starts a new turn, which starts the
-    count again. A Claude Code session has no turn to end on a refused model call: its session ends on the error and
-    the Assignment fails with that reason, as for any session that dies. No sampling parameter is sent to slow a loop:
-    DeepSeek's API documents `frequency_penalty` and `presence_penalty` as no longer supported, so they would have no
-    effect.
+    `A B A B A B A B` at the eighth, a five-call circle at the seventeenth), or 10 refused calls in one turn however
+    far apart.
+  - Some loops are no circle (one that is eleven calls round or more, or whose calls differ by a counter), so the
+    guard also stops a turn on what it brings: 30 calls in a row of tools that may not repeat, each a call the
+    worker already made this turn and each answering what it had already been answered (a command's exit code and
+    output, a response without its headers), a hard ceiling of 200 such tool calls in a turn, and a ceiling of 250
+    model calls in a turn (compactions included), which is the only bound on a loop made of `repeatable` tools. A
+    call of a `repeatable` tool is neither a call that found nothing new nor a tool call of the ceiling, so
+    waiting on a job with `job_wait` is not penalised, and a call that is the same but answers something new, such
+    as reading the log a build is writing, is progress. The thresholds are from the transcripts of the Tickets that
+    looped and of the ones that did not: a normal turn has at most 2 or 3 such calls in a row, including after a
+    compaction, and the longest turn that ended well made 128 tool calls, while the loops made 767 and 1,107.
+  - From then on the broker answers the seat's tool calls with the stop and refuses its next model call before any
+    hold or upstream call, so it costs nothing, which ends a Pi turn exactly as a failed provider call does. The
+    seat keeps `ModelFailure::Stuck` with what the worker kept doing, read from the arguments of its latest calls
+    (the command's program and the file it names, else the command, else the tool), and the host reports `failed` in
+    the worker's place, for example: `I kept re-reading the same parts of meteora-dlmm-allocate-encode.js without
+    making progress, so I stopped. Reply here to have me try again with a different approach.` (a ceiling says `I
+    made 200 tool calls without finishing, so I stopped.`) It is recorded with the Ticket like the failed-call
+    Report, so the person hears it once and a restart sends nothing. A reply on the thread starts a new turn, which
+    starts every count again. A Claude Code session has no turn to end on a refused model call: its session ends on
+    the error and the Assignment fails with that reason, as for any session that dies.
+  - Workers sample at `executor.temperature`, 0.6 unless the config says otherwise (0 to 2); the Router and swarm
+    mode keep the shared upstream body's 0, which swarm mode pins byte for byte. A model decoded greedily is the
+    likelier to go round in circles, and DeepSeek's V4 model card recommends 1.0 (its API default is 1; an older
+    table says 0.0 for code). Its `thinking` is off here, so the temperature takes effect. No frequency or presence
+    penalty is sent: DeepSeek's API documents `frequency_penalty` and `presence_penalty` as no longer supported, so
+    they would have no effect.
   - At start, an Assignment the last run left running, or pending with its Launch performed, ends with "host
     restarted", oldest Ticket first. One that was working starts again with `recovery` through
     `Engine::restart` (the end and the new launch in one transaction); one that waited for input, an answer or a
@@ -519,7 +539,8 @@ provider through the real broker. It runs on macOS too. Swarm mode is the first 
   runs with reasoning off; tools become functions with `input_schema` as their parameters; the upstream gets the
   lower of the request's `max_tokens` and the broker's, and `stop_sequences` as `stop`. Images, documents, server
   tools and misplaced blocks are refused as `invalid_request_error`, and `tool_choice`, `temperature`, `metadata`
-  and the rest are not forwarded (the broker sets temperature 0). The reply's content is text then `tool_use` blocks,
+  and the rest are not forwarded (the broker sets the temperature: a worker's `executor.temperature`, else 0). The
+  reply's content is text then `tool_use` blocks,
   `stop_reason` is `tool_use` when it calls a tool, `max_tokens` for `length` (a call cut off by it is dropped),
   `refusal` for `content_filter`, else `end_turn`, and `usage` puts prompt cache hits in `cache_read_input_tokens`,
   apart from `input_tokens`. `stream: true` gets `message_start`, a `content_block_start`, one

@@ -1248,6 +1248,7 @@ mod tests {
                 max_input_bytes: 65_536,
                 max_output_tokens: 1_024,
                 call_limit: None,
+                temperature: None,
             };
             let parts = BrokerParts {
                 dir: dir.clone(),
