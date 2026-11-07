@@ -28,14 +28,16 @@ Google publishes no single Rust style guide of its own. What exists, and what we
 | No `dbg!`, `todo!`, `unimplemented!` left behind | `dbg_macro`, `todo`, `unimplemented` |
 | No glob imports (test `use super::*` is exempt by default) | `wildcard_imports` |
 
-## Not adopted yet (follow-ups, counts at adoption)
+## Not adopted yet: follow-ups
+
+The counts are from the adoption in #13 (2026-10-28) and were not measured again since.
 
 | Lint | Why deferred |
 |---|---|
-| `unwrap_used`, `expect_used` | about 110 hits in non-test code (kernel, ledger, qa, runtime, scheduler); each needs a decision on panic vs error, and some sit on the ledger/hold path. `clippy.toml` already exempts tests. |
-| `enum_glob_use` | 3 `use ScenarioKind::*` in qa.rs and scenarios.rs; large match arms to requalify. |
-| `must_use_candidate` | about 150 hits, noisy for a binary crate; API-surface decision. |
-| `cast_possible_truncation`, `cast_sign_loss`, `cast_possible_wrap` | about 70 `as` casts, many in timing and accounting code; each needs a checked conversion and a test. |
-| `missing_errors_doc`, `missing_panics_doc`, `missing_docs` | about 300 and 23 hits; the crate is a binary, not a published API. |
-| `print_stdout` | CLI output is intentional. |
-| Glob/line-width overrides, nightly rustfmt options | Google uses stable defaults; we do the same. |
+| `unwrap_used`, `expect_used` | About 110 hits in non-test code (kernel, ledger, qa, runtime, scheduler). Each needs a decision between a panic and an error, and some sit on the ledger's hold path. `clippy.toml` already exempts tests. |
+| `enum_glob_use` | Three `use ScenarioKind::*` in `qa.rs` and `scenarios.rs`, each over large match arms that would need the full path. |
+| `must_use_candidate` | About 150 hits, which is noise for a binary crate. Adopting it is a decision about the public API. |
+| `cast_possible_truncation`, `cast_sign_loss`, `cast_possible_wrap` | About 70 `as` casts, many in timing and accounting code. Each needs a checked conversion and a test. |
+| `missing_errors_doc`, `missing_panics_doc`, `missing_docs` | About 300 and 23 hits. The crate is a binary, not a published API. |
+| `print_stdout` | The CLI prints on purpose. |
+| Glob and line-width overrides, nightly rustfmt options | Google uses the stable defaults, and so do we. |

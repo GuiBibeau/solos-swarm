@@ -1,9 +1,16 @@
 # Benchmarks
 
-Measured 10-agent execution metrics, tokenizer conformance, release microbenchmarks, and cluster SLOs.
+This page holds dated records and targets. Sections 1 to 3 are measurements recorded when the reference docs were
+published in commit `3151874` (2026-10-26), and none was run again since. Sections 4 and 5 are targets, not
+measurements. For live agent-mode measurements, see `solos-swarm agent bench` in
+[docs/agent-mode/README.md](agent-mode/README.md).
 
 
 ## 1. Live 10-agent run (`record-reconciliation-v1`)
+
+A dated record. The run predates the current `remote.py` candidate channels, its evidence is not in this
+repository, and its model, `deepseek-chat`, is not the `deepseek-flash` model that Goals name today. The dashboard's
+demo preset (`dashboard/app.js`) replays the same run.
 
 | Metric | Value |
 |---|---|
@@ -11,7 +18,7 @@ Measured 10-agent execution metrics, tokenizer conformance, release microbenchma
 | Runtime | Node `v24.18.0`, `pi-coding-agent` `1.1.0`, Tier `P` |
 | Model | `deepseek-chat` |
 | Wall-clock duration | `124,782 ms` (`124.78 s`) |
-| Completed workers | `10 / 10` (`agent-00` .. `agent-09`) |
+| Completed workers | `10 / 10` (`agent-00` to `agent-09`) |
 | Completed shard tasks | `10 / 10` (`0` duplicate claims) |
 | Shard findings | `10 / 10` exact (`15` mismatches) |
 | Final artifact | Exact match (`score: 1.0`) |
@@ -40,6 +47,9 @@ Measured 10-agent execution metrics, tokenizer conformance, release microbenchma
 
 ## 2. Local receiver conformance (`Qwen3-4B` + `llama.cpp`)
 
+A dated record. The pins still match `scripts/local_provider.py` and `scripts/bootstrap_tokenizers.py`. To measure
+again, follow [mvp-cluster.md](mvp-cluster.md#stage-tokenizers-the-local-model-and-the-sandbox-image).
+
 | Check | Result |
 |---|---|
 | `llama.cpp` build | `b11429` (`llama-server` SHA-256 `5faf410b...2231d`) |
@@ -49,7 +59,10 @@ Measured 10-agent execution metrics, tokenizer conformance, release microbenchma
 | Tested slot contexts | `4,096` and `16,384` tokens/slot |
 
 
-## 3. Kernel microbenchmarks (`cargo test --release --locked`)
+## 3. Kernel microbenchmarks
+
+A dated record. Only the last row maps to a test in today's tree: `one_hundred_thousand_attenuation_cases` in
+`src/security.rs`. No current test asserts the timing rows.
 
 | Operation | Workload | Measured p99 | Target SLO |
 |---|---|---:|---:|
@@ -63,6 +76,8 @@ Measured 10-agent execution metrics, tokenizer conformance, release microbenchma
 
 
 ## 4. Target cluster SLOs (`500` agents, `N >= 3` nodes)
+
+Targets for the `mvp` cluster path. Nothing in this repository has measured them.
 
 | Metric | Target |
 |---|---|
@@ -78,7 +93,10 @@ Measured 10-agent execution metrics, tokenizer conformance, release microbenchma
 | 300-task fan-out placement | `<= 5 s` on `5` nodes |
 
 
-## 5. Security invariants (`SEC-NF-1` .. `SEC-NF-29`)
+## 5. Security invariants (`SEC-NF-1` to `SEC-NF-29`)
+
+Targets from the original technical requirements, which were removed in commit `3151874`. No code or test in this
+repository uses the `SEC-NF` ids.
 
 | ID | Invariant | Target |
 |---|---|---|
