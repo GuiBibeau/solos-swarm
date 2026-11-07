@@ -69,6 +69,8 @@ const READ_RECENT: usize = 20;
 pub(crate) const REPORT_TEXT_CHARS: usize = 8_000;
 const QUESTION_CHARS: usize = 1_000;
 const FAILURE_CHARS: usize = 400;
+/// How long a Router session's start waits for the core to pick its memos.
+const ROUTER_MEMOS_WAIT: Duration = Duration::from_secs(5);
 /// What a worker whose turn the broker stopped for looping or for making no
 /// progress reads, in the refusal of every tool call it makes after.
 fn turn_stopped(stopped: Stopped) -> String {
@@ -1270,27 +1272,25 @@ async fn session(State(broker): State<AgentBroker>, headers: HeaderMap) -> Reply
 
 impl AgentBroker {
     /// The global memo index for a Router session starting now. A session
-    /// starts without one when the runtime cannot answer, rather than not
-    /// at all.
+    /// starts without one when the runtime does not answer within
+    /// [`ROUTER_MEMOS_WAIT`], rather than not at all; the runtime may still
+    /// record the index it picks then as shown.
     async fn router_memos(&self) -> Option<String> {
         let fact = Fact::ShowMemos {
             to: MemoAudience::Router,
         };
-        match self.inner.facts.ask(fact).await {
-            Ok(Ok(Applied::Memos(index))) => (!index.text.is_empty()).then_some(index.text),
-            Ok(Ok(other)) => {
-                eprintln!("agent: the router's memos came back as {other:?}; none are shown");
-                None
+        let asked = tokio::time::timeout(ROUTER_MEMOS_WAIT, self.inner.facts.ask(fact)).await;
+        let why = match asked {
+            Ok(Ok(Ok(Applied::Memos(index)))) => {
+                return (!index.text.is_empty()).then_some(index.text);
             }
-            Ok(Err(why)) => {
-                eprintln!("agent: the router's memos were refused: {why}; none are shown");
-                None
-            }
-            Err(err) => {
-                eprintln!("agent: the router's memos are not available: {err:#}; none are shown");
-                None
-            }
-        }
+            Ok(Ok(Ok(other))) => format!("they came back as {other:?}"),
+            Ok(Ok(Err(why))) => format!("they were refused: {why}"),
+            Ok(Err(err)) => format!("{err:#}"),
+            Err(_) => format!("the runtime did not answer in {ROUTER_MEMOS_WAIT:?}"),
+        };
+        eprintln!("agent: a router session starts with no memos: {why}");
+        None
     }
 }
 

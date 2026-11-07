@@ -754,6 +754,8 @@ async fn a_router_session_starts_with_the_global_memos_and_the_chain_records_it(
     remember(&mut engine, "repo:acme/widgets", "Tests run with ./check.");
     drop(engine);
 
+    // The runtime's Source reads the triggers file, which holds nothing.
+    std::fs::write(scratch.triggers(), "").unwrap();
     let runtime = scratch.runtime(Arc::new(Holding::default()), false);
     let served = serve(&scratch, Scripted::new(), runtime.facts(), 1_000_000);
     with_runtime(runtime, async {
