@@ -71,7 +71,7 @@ npm ci --ignore-scripts --no-audit --no-fund && npm run test:broker
 python3 -m venv work/dashboard-python && work/dashboard-python/bin/pip install -r scripts/requirements-dashboard.txt
 work/dashboard-python/bin/python -m unittest discover -s tests -p 'test_*.py'
 node --test tests/dashboard-*.test.mjs
-./target/release/solos-swarm smoke --dir work/smoke   # broker, ledger, pause, drain and resume; no key, network or sandbox
+./target/release/solos-swarm smoke --dir work/smoke   # broker, ledger, pause, drain and resume, with no key, network or sandbox
 ```
 
 CI (`.github/workflows/ci.yml`) runs the same Rust tests through `cargo-nextest` (`.config/nextest.toml`), in
@@ -95,7 +95,7 @@ auth file):
 
 ```sh
 python3 scripts/remote.py doctor                                 # host and controller health, no spend
-python3 scripts/remote.py deploy                                 # build an immutable candidate; prints its id
+python3 scripts/remote.py deploy                                 # build an immutable candidate and print its id
 python3 scripts/remote.py candidates promote --candidate ID      # gate (integrity, doctor, smoke, idle probe), then switch
 python3 scripts/remote.py start --candidate current --run-id RUN --seed 1 --goal-file goal.json --expected-file expected.json --refuse-peak
 python3 scripts/remote.py status --run-id RUN

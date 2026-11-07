@@ -99,24 +99,24 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   `GET /tools` and the refusal in `/tool` all read the registry, which replaces `job_host`'s own check. The three
   sandbox builders bind `bwrap::SYSTEM_BINDS`. No change in behavior: every tool-list test and golden argv test
   passes unedited.
-- Agent mode, the vault (#43; PR 2 of PR #36's design): `src/vault.rs` and `src/vault/` keep one sealed file of logins
+- Agent mode, the vault (#43, PR 2 of PR #36's design): `src/vault.rs` and `src/vault/` keep one sealed file of logins
   and API keys per machine, in the AES-256-GCM envelope that moved from `src/artifacts.rs` to `src/sealed.rs` with
   its bytes unchanged. A value leaves the vault only inside an allowed admission, as a login fill or a key header.
   `solos-swarm vault init | add-login | add-key | list | remove` reads `vault: {path, key_file}` from agent.yaml or
   node.yaml and prints no value. Nothing in agent mode used the vault yet.
-- Agent mode, the trail (#39; first step of the verifiable browser, PR #36's design): `agent-core` gains `trail`
+- Agent mode, the trail (#39, first step of the verifiable browser, PR #36's design): `agent-core` gains `trail`
   (`TrailAction`, `StepBody`, `SignedStep` and the `Digest`, `TrailKey` and `Signature` hex newtypes, with no crypto
   type) and `Engine::{trail_ask, trail_done}`, which write `TrailAsked` before a browser acts and `TrailDone` after,
   one pending step per Assignment, numbered by the core; a `Close` is admitted after its Assignment or Ticket ends. The
   store's schema is v4 (a `trails` table, one row per Assignment), so an older build refuses the file instead of
   failing on an event it cannot read, and `Fact::{TrailAsk, TrailDone}` reach the Engine through the runtime. Nothing
   writes a step yet.
-- Agent mode, the browser module (#46; PR 6 of PR #36's design): `src/browse/` runs one Lightpanda per Assignment in a
+- Agent mode, the browser module (#46, PR 6 of PR #36's design): `src/browse/` runs one Lightpanda per Assignment in a
   bwrap sandbox, the only caller of the new `Bwrap::share_net`, and drives it over CDP on a Unix socket. Each answer
   is scrubbed of vault values, digested and signed with this machine's Ed25519 trail key, and `verify_step` checks it.
   A login fills only a password input in the main document of one of its sites, after an origin check.
   `solos-swarm browser init-key` writes the trail key. No broker tool called it yet.
-- Agent mode, approvals of vault items (#47; PR #36's design): a Ticket holds a grant per item (`SecretId`, `local/github-gui`;
+- Agent mode, approvals of vault items (#47, PR #36's design): a Ticket holds a grant per item (`SecretId`, `local/github-gui`;
   `SecretGrant` Waiting, Granted or Denied), and `Engine::{ask_secret, answer_secret, use_key}` ask a person once per
   Ticket, take only a click from the person the item names (or a Policy approver when it names none), and record a keyed
   use before it leaves (`SecretAsked`, `SecretAnswered`, `KeyUsed`). The answer reaches the worker as
@@ -126,7 +126,7 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   Approve and Stop, and `Fact::{SecretAsk, KeyUsed}` reach the Engine through the runtime. The store's schema is v5 (no
   new table), so an older build refuses a file that can hold grants; stored Tickets and messages read back unchanged.
   Nothing asks yet.
-- Agent mode, keyed `fetch_url` and `vault_list` (#48; PR #36's design): with `vault:` in agent.yaml, `agent serve` opens
+- Agent mode, keyed `fetch_url` and `vault_list` (#48, PR #36's design): with `vault:` in agent.yaml, `agent serve` opens
   the vault, and refuses to start when it or its key sits under the Tickets' directory, `--pi-root` or `--node`'s
   install. A worker's `fetch_url` takes `key`: the broker writes `KeyUsed` to the chain first, then sends the key as
   its header only on hops whose own URL is one of the key's hosts (`broker::fetch_with`), over a client that ignores
@@ -134,7 +134,7 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   asks once in the thread and answers 409 until the click comes back as an Input. `vault_list` (only with a vault)
   lists the keys and logins a Ticket may use, without values, and where the Ticket stands with each. Swarm mode's
   `fetch_url` is unchanged.
-- Agent mode, the browser tools (#49; PR #36's design): with `browser:` in agent.yaml, `agent serve` pins this host's trail
+- Agent mode, the browser tools (#49, PR #36's design): with `browser:` in agent.yaml, `agent serve` pins this host's trail
   key, opens `Browsers` and a trail blob store under the state directory, and refuses to start when the key, the
   blobs or the browser sockets sit where a sandbox can read them. Workers get `browser_open`, `browser_act`,
   `browser_read` and, with a vault, `browser_login`. Each step is `TrailAsked` on the chain before the browser acts
@@ -145,7 +145,7 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   the agent stops, before the runtime does. A first use of a login or key is refused at once on a Ticket whose
   channels cannot show the Allow and Deny buttons. The worker's system prompt and the Router's environment note tell
   of the browser.
-- Agent mode, `solos-swarm agent trail` (#51; PR #36's design, the last PR of its first build): it opens the Store
+- Agent mode, `solos-swarm agent trail` (#51, PR #36's design, the last PR of its first build): it opens the Store
   read-only, checks the event chain, then walks each Ticket's browser steps from the events, so a schema 3 or 4 file
   reads too. Each signed step must verify under the key trusted for its environment (the public half of
   `browser.audit_key`, or `--trust <environment>=ed25519:<hex>`, so a verifier elsewhere needs no secret), answer the
@@ -158,7 +158,7 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
 - `verify-agent-mode` (#52): `.claude/skills/verify-agent-mode/`, a skill that ships the checkout to the remote box,
   starts `agent serve` with a real DeepSeek Router and Pi workers, drives it through `solos-swarm mcp --operator`,
   and keeps the evidence (chain, effects, spend, replies, `agent trail`). Its `features/` hold one recipe per feature.
-- Agent mode, pstack PR 1 (#54; design in #53): with `pstack:` in agent.yaml, every worker starts in poteto-mode.
+- Agent mode, pstack PR 1 (#54, design in #53): with `pstack:` in agent.yaml, every worker starts in poteto-mode.
   `vendor/pstack/` holds pstack 0.15.36 verbatim, pinned by a `MANIFEST` that `scripts/pstack-sync` writes, and
   `agent serve` refuses to start when one byte differs. The system prompt gains the solos-swarm adapter
   (`docs/harness/solos-swarm.md`), and a new worker tool, `read`, reads files under `/pstack`, confined by the kernel
@@ -184,7 +184,7 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   `current`, restarts and waits until healthy. On a failure it switches back and restores `agent.db`. It also has
   `rollback`, `status`, `logs`, `token NAME`, `start`, `stop`, `restart` and `releases`. How-to:
   `docs/agent-mode/production.md`.
-- Agent mode, the GitHub App, App PR 1 (#63; design in #62): one App key replaces both personal access tokens. A
+- Agent mode, the GitHub App, App PR 1 (#63, design in #62): one App key replaces both personal access tokens. A
   top-level `github:` section (`app_id`, `key_file`, `poll_secs`, `reconcile_secs`, `writes`, `api_base`,
   `git_base`), and the github Source reads its repositories from `forge.repos`. The old `token_file`, `identity` and
   per-Source fields fail config load with a sentence that names the migration. `src/agent/github/app.rs` signs an
@@ -234,7 +234,7 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   step safe to repeat after a crash, while the Ticket waits in `Stage::Delivering`. No new worker tool. Store schema
   7. `src/agent/forge.rs` becomes `src/agent/forge/`. New per-repository keys: `owes`, `protected`, `max_pushes`,
   `max_change_bytes`, `merge`, `ci` and `max_repairs`. Nothing acted on the last three yet.
-- Agent mode, memory PR 1 (#82; design in `docs/agent-mode/memory/`): a relaunched worker's first prompt quotes the
+- Agent mode, memory PR 1 (#82, design in `docs/agent-mode/memory/`): a relaunched worker's first prompt quotes the
   Ticket's earlier `ready`, `blocked` and `failed` Reports and its latest `progress`, oldest first, in at most 6,000
   characters (`src/agent/earlier.rs`). No core or schema change.
 - Agent mode, a repository's dependencies and evidence (#83): `forge.repos.<repo>.deps: {kind: bun}` installs a
