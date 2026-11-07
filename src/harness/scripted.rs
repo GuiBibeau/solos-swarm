@@ -41,7 +41,7 @@ pub enum Call {
 }
 
 /// The most model calls one `Call::Agent` turn makes.
-pub const AGENT_CALLS: usize = 200;
+pub const AGENT_CALLS: usize = 300;
 
 /// `script[k]` is what a session calls on its `k`-th prompt. A prompt past the
 /// end makes the model call and no tool call.

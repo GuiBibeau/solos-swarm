@@ -184,6 +184,44 @@ pub fn upstream_body(model: &str, request: &Value, max_output_tokens: u64) -> Va
     json!({"model":model,"messages":request["messages"],"tools":request.get("tools").cloned().unwrap_or(json!([])),"max_tokens":max_output_tokens,"thinking":{"type":"disabled"},"temperature":0,"stream":false})
 }
 
+/// A sampling temperature, 0 to 2 as DeepSeek's chat completions take it.
+/// Always finite, so equality is total.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[serde(try_from = "f64")]
+pub struct Temperature(f64);
+
+impl Eq for Temperature {}
+
+impl TryFrom<f64> for Temperature {
+    type Error = String;
+
+    fn try_from(value: f64) -> std::result::Result<Self, String> {
+        if value.is_finite() && (0.0..=2.0).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(format!("a temperature is 0 to 2, not {value}"))
+        }
+    }
+}
+
+impl Temperature {
+    /// What agent mode's workers sample at unless `executor.temperature`
+    /// says otherwise.
+    pub const WORKER: Self = Self(0.6);
+
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
+/// `body` (an [`upstream_body`]) sampled at `temperature` instead of 0. Only
+/// agent mode's workers call this: `upstream_body` stays what swarm mode
+/// pins byte for byte, and the Router judges at 0.
+pub fn sampled(mut body: Value, temperature: Temperature) -> Value {
+    body["temperature"] = json!(temperature.get());
+    body
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +250,33 @@ mod tests {
                     assert_eq!(new, old, "{body}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_sampled_body_differs_from_the_shared_one_only_in_its_temperature() {
+        let request = json!({"messages":[{"role":"user","content":"x"}],
+                             "tools":[{"type":"function","function":{"name":"claim_task"}}]});
+        let shared = upstream_body("deepseek-flash", &request, 2_048);
+        assert_eq!(shared["temperature"], json!(0), "the shared body is greedy");
+        let warm = sampled(shared.clone(), Temperature::WORKER);
+        assert_eq!(warm["temperature"], json!(0.6));
+        let mut cooled = warm;
+        cooled["temperature"] = json!(0);
+        assert_eq!(
+            serde_json::to_vec(&cooled).unwrap(),
+            serde_json::to_vec(&shared).unwrap(),
+            "nothing else moved"
+        );
+    }
+
+    #[test]
+    fn a_temperature_is_a_finite_number_from_zero_to_two() {
+        for fine in [0.0, 0.6, 1.0, 2.0] {
+            assert_eq!(Temperature::try_from(fine).unwrap().get(), fine);
+        }
+        for bad in [-0.1, 2.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(Temperature::try_from(bad).is_err(), "{bad}");
         }
     }
 

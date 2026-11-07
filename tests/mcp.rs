@@ -210,6 +210,7 @@ fn terms() -> ModelTerms {
         max_input_bytes: 65_536,
         max_output_tokens: 2_048,
         call_limit: None,
+        temperature: None,
     }
 }
 

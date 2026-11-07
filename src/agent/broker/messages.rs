@@ -38,7 +38,7 @@ async fn reply(
     let grant = broker.authenticate(headers)?;
     let terms = &grant.terms;
     let chat = Chat::read(body).map_err(|why| refuse(StatusCode::BAD_REQUEST, why))?;
-    let upstream = chat.upstream(&terms.upstream.model, terms.max_output_tokens);
+    let upstream = terms.sample(chat.upstream(&terms.upstream.model, terms.max_output_tokens));
     let call = Call {
         input_bytes: serde_json::to_vec(&upstream)
             .map_err(|why| refuse(StatusCode::BAD_REQUEST, why))?

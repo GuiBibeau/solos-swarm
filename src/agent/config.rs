@@ -21,7 +21,7 @@ use super::trail::TrailStoreConfig;
 use super::{discord, github, mcp, pstack, slack};
 use crate::browse::BrowserConfig;
 use crate::code::{self, Mount};
-use crate::gateway::{PriceTable, upstream_profile};
+use crate::gateway::{PriceTable, Temperature, upstream_profile};
 use crate::vault::VaultConfig;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Deserializer};
@@ -506,6 +506,15 @@ fn default_max_output_tokens() -> u64 {
     8_192
 }
 
+/// DeepSeek's V4 model card recommends 1.0 and its API defaults to 1; its
+/// older table gives 0.0 for code, whose exact tool arguments (a path, a line
+/// range) a high temperature garbles. 0.6 is the low end of the 0.6 to 1.0
+/// that agentic runs use: enough randomness to leave a loop, and low enough
+/// for a command to come out as meant.
+fn default_temperature() -> Temperature {
+    Temperature::WORKER
+}
+
 fn default_max_batch() -> usize {
     6
 }
@@ -542,6 +551,13 @@ pub enum ExecutorConfig {
         max_input_bytes: usize,
         #[serde(default = "default_max_output_tokens")]
         max_output_tokens: u64,
+        /// What the workers' model calls are sampled at, 0 to 2. At 0 the
+        /// model decodes greedily, and a greedy model goes round in circles
+        /// when it is stuck (one worker made 1,107 calls in a five-call
+        /// circle); some randomness lets it leave one. The Router judges at 0
+        /// whatever this is, and so does swarm mode.
+        #[serde(default = "default_temperature")]
+        temperature: Temperature,
         /// Worker sessions that may live at once; a launch past it waits.
         #[serde(default = "default_max_workers")]
         max_workers: usize,
@@ -2289,6 +2305,24 @@ forge:
                 }),
             ),
             (
+                "a temperature above 2",
+                workers(|yaml| {
+                    yaml.replace("max_workers: 3", "max_workers: 3\n  temperature: 2.5")
+                }),
+            ),
+            (
+                "a negative temperature",
+                workers(|yaml| {
+                    yaml.replace("max_workers: 3", "max_workers: 3\n  temperature: -0.1")
+                }),
+            ),
+            (
+                "a temperature that is no number",
+                workers(|yaml| {
+                    yaml.replace("max_workers: 3", "max_workers: 3\n  temperature: .nan")
+                }),
+            ),
+            (
                 "an unknown field",
                 workers(|yaml| yaml.replace("concurrency: 2", "concurrency: 2\n    network: true")),
             ),
@@ -2299,6 +2333,27 @@ forge:
                 "{case}: the case did not change the config"
             );
             assert!(parse(&yaml).is_err(), "{case}: accepted\n{yaml}");
+        }
+    }
+
+    #[test]
+    fn the_workers_temperature_is_optional_and_has_a_default() {
+        let temperature = |yaml: String| {
+            let config = parse(&yaml).unwrap();
+            let ExecutorConfig::Pi { temperature, .. } = config.executor else {
+                panic!("{:?}", config.executor)
+            };
+            temperature.get()
+        };
+        assert_eq!(temperature(workers(|yaml| yaml)), 0.6);
+        for (given, wanted) in [("0", 0.0), ("0.9", 0.9), ("1", 1.0), ("2", 2.0)] {
+            let yaml = workers(|yaml| {
+                yaml.replace(
+                    "max_workers: 3",
+                    &format!("max_workers: 3\n  temperature: {given}"),
+                )
+            });
+            assert_eq!(temperature(yaml), wanted, "temperature: {given}");
         }
     }
 

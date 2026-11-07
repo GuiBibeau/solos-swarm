@@ -744,12 +744,20 @@ async fn counting_page() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<(
     (url, hits, web)
 }
 
-const STUCK: &str = "I got stuck repeating the same step and stopped. Reply here to have me try \
-                     again with a different approach.";
+/// What the person reads of a worker that kept calling `fetch_url`.
+const FETCH_LOOP: &str = "I kept calling fetch_url with the same arguments without making \
+                          progress, so I stopped.";
+
+/// What the host tells the person of a worker that was stopped for `what`.
+fn stuck(what: &str) -> String {
+    format!("{what} Reply here to have me try again with a different approach.")
+}
 
 /// What a Ticket whose worker looped and was stopped shows: the person was
-/// told once, in plain words, and the Ticket waits for them.
-fn assert_told_once_that_it_got_stuck(scratch: &Scratch) {
+/// told once, in plain words that say what it was doing, and the Ticket
+/// waits for them.
+fn assert_told_once_that_it_got_stuck(scratch: &Scratch, what: &str) {
+    let said = stuck(what);
     assert_eq!(
         scratch.replies(),
         [
@@ -758,7 +766,7 @@ fn assert_told_once_that_it_got_stuck(scratch: &Scratch) {
         ],
         "an acknowledgement, then exactly one reply that says why nothing came"
     );
-    assert_eq!(scratch.sent()[1].text, STUCK);
+    assert_eq!(scratch.sent()[1].text, said);
     let tickets = scratch.tickets();
     let [ticket] = &tickets[..] else {
         panic!("{tickets:?}")
@@ -766,7 +774,7 @@ fn assert_told_once_that_it_got_stuck(scratch: &Scratch) {
     let report = ticket.latest_report().unwrap();
     assert_eq!(
         (report.status, report.text.as_str()),
-        (ReportStatus::Failed, STUCK)
+        (ReportStatus::Failed, said.as_str())
     );
     assert_eq!(ticket.stage(), Stage::Failed);
     assert!(ticket.ended.is_none(), "a person may still answer");
@@ -805,7 +813,7 @@ async fn a_worker_that_repeats_one_call_forever_is_stopped_with_one_report_and_a
 
     serve().await;
 
-    assert_told_once_that_it_got_stuck(&scratch);
+    assert_told_once_that_it_got_stuck(&scratch, FETCH_LOOP);
     assert_eq!(
         model.worker_calls(),
         5,
@@ -882,7 +890,7 @@ async fn two_calls_that_go_round_forever_are_stopped_after_a_bounded_number_of_m
 
     serve().await;
 
-    assert_told_once_that_it_got_stuck(&scratch);
+    assert_told_once_that_it_got_stuck(&scratch, FETCH_LOOP);
     assert_eq!(
         model.worker_calls(),
         8,
@@ -937,6 +945,212 @@ async fn a_worker_that_repeats_a_report_many_times_is_not_stopped() {
     assert_settled(&scratch.store());
 }
 
+/// A looping model whose `n`-th tool call is `fetch_url` of the page
+/// `pages(n)` of a counting page, and ends the turn with `ready` after
+/// `calls` of them where it has a number.
+fn fetching(
+    url: String,
+    pages: impl Fn(usize) -> usize + Send + Sync + 'static,
+    calls: Option<usize>,
+) -> Arc<Model> {
+    let seen = AtomicUsize::new(0);
+    Model::looping(Box::new(move |_| {
+        let n = seen.fetch_add(1, Ordering::SeqCst);
+        match calls {
+            Some(calls) if n == calls => vec![report("ready", "Found it.")],
+            Some(calls) if n > calls => Vec::new(),
+            _ => vec![("fetch_url", json!({"url": format!("{url}p{}", pages(n))}))],
+        }
+    }))
+}
+
+#[tokio::test]
+async fn a_worker_that_goes_round_five_calls_is_stopped_at_the_seventeenth_and_says_what_it_did() {
+    let scratch = Scratch::new("loop-five");
+    scratch.ask("t-ask", "T1", "Find where the bps range is checked");
+    let (url, hits, web) = counting_page().await;
+    // Five different calls in turn, as the worker that made 1,107 did.
+    let model = fetching(url, |n| n % 5, None);
+    let serve = || async {
+        let host = scratch.host(agent_loop(), model.clone());
+        scratch.serve(scratch.config(false, ""), host).await;
+    };
+
+    serve().await;
+
+    assert_told_once_that_it_got_stuck(&scratch, FETCH_LOOP);
+    assert_eq!(
+        model.worker_calls(),
+        17,
+        "fourteen calls that ran, the fifteenth closes the third round, two more are refused"
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        14,
+        "a refused call is never run"
+    );
+    let results = model.tool_results();
+    assert_eq!(results.len(), 16, "{results:?}");
+    for refused in &results[14..] {
+        assert!(
+            refused.contains("these 5 calls in turn, 3 times over"),
+            "{refused}"
+        );
+    }
+    let tickets = scratch.tickets();
+    let account = format!("ticket:{}", tickets[0].id);
+    let rows = scratch.store().spend(&account).unwrap();
+    assert_eq!(rows.len(), 17, "one row for each model call that was made");
+    assert!(rows.iter().all(|r| r.state == SpendState::Settled));
+    assert_settled(&scratch.store());
+
+    serve().await;
+
+    assert_eq!(scratch.sent().len(), 2, "a restart tells nothing again");
+    assert_eq!(model.worker_calls(), 17);
+    web.abort();
+}
+
+#[tokio::test]
+async fn a_worker_whose_calls_bring_nothing_new_is_stopped_after_thirty_of_them() {
+    let scratch = Scratch::new("loop-nothing-new");
+    scratch.ask("t-ask", "T1", "Find where the bps range is checked");
+    let (url, hits, web) = counting_page().await;
+    // Seventeen pages in turn: too long a round for the circle check, and
+    // the page is the same each time.
+    let model = fetching(url, |n| n % 17, None);
+
+    scratch
+        .serve(
+            scratch.config(false, ""),
+            scratch.host(agent_loop(), model.clone()),
+        )
+        .await;
+
+    assert_told_once_that_it_got_stuck(&scratch, FETCH_LOOP);
+    assert_eq!(
+        model.worker_calls(),
+        47,
+        "seventeen new calls, thirty that bring nothing, the last of them refused"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 46);
+    assert!(
+        model.tool_results().iter().all(|r| r.contains("page")),
+        "every call before the last ran"
+    );
+    assert_settled(&scratch.store());
+    web.abort();
+}
+
+#[tokio::test]
+async fn a_worker_is_stopped_at_the_ceiling_of_tool_calls_however_different_they_are() {
+    let scratch = Scratch::new("loop-tool-ceiling");
+    scratch.ask("t-ask", "T1", "Find where the bps range is checked");
+    let (url, hits, web) = counting_page().await;
+    let model = fetching(url, |n| n, None);
+
+    scratch
+        .serve(
+            scratch.config(false, ""),
+            scratch.host(agent_loop(), model.clone()),
+        )
+        .await;
+
+    assert_told_once_that_it_got_stuck(
+        &scratch,
+        "I made 200 tool calls without finishing, so I stopped.",
+    );
+    assert_eq!(model.worker_calls(), 201);
+    assert_eq!(hits.load(Ordering::SeqCst), 200);
+    assert_settled(&scratch.store());
+    web.abort();
+}
+
+#[tokio::test]
+async fn a_worker_that_only_reports_progress_is_stopped_at_the_ceiling_of_model_calls() {
+    let scratch = Scratch::new("loop-model-ceiling");
+    scratch.ask("t-ask", "T1", "Go through the logs");
+    // A report is no call the guard counts, so only the model calls do.
+    let model = Model::looping(Box::new(|_| vec![report("progress", "Still going.")]));
+
+    scratch
+        .serve(
+            scratch.config(false, ""),
+            scratch.host(agent_loop(), model.clone()),
+        )
+        .await;
+
+    assert_eq!(model.worker_calls(), 250);
+    assert_eq!(
+        scratch.replies(),
+        [
+            ("T1".to_owned(), MessageKind::Acknowledgement),
+            ("T1".to_owned(), MessageKind::Attention)
+        ],
+        "progress tells nobody, and the host tells the person once"
+    );
+    assert_eq!(
+        scratch.sent()[1].text,
+        stuck("I made 250 model calls without finishing, so I stopped.")
+    );
+    let tickets = scratch.tickets();
+    let report = tickets[0].latest_report().unwrap();
+    assert_eq!(report.status, ReportStatus::Failed);
+    assert_eq!(tickets[0].stage(), Stage::Failed);
+    assert_settled(&scratch.store());
+}
+
+#[tokio::test]
+async fn a_long_session_of_different_calls_is_not_stopped() {
+    let scratch = Scratch::new("long-session");
+    scratch.ask("t-ask", "T1", "Find where the bps range is checked");
+    let (url, hits, web) = counting_page().await;
+    // Eighty different calls, then the answer.
+    let model = fetching(url, |n| n, Some(80));
+
+    scratch
+        .serve(
+            scratch.config(false, ""),
+            scratch.host(agent_loop(), model.clone()),
+        )
+        .await;
+
+    assert_eq!(scratch.replies(), ack_and_result("T1"));
+    assert_eq!(scratch.sent()[1].text, "Found it.");
+    assert_eq!(hits.load(Ordering::SeqCst), 80);
+    assert_eq!(model.worker_calls(), 81);
+    assert_settled(&scratch.store());
+    web.abort();
+}
+
+#[tokio::test]
+async fn workers_are_sampled_at_the_executors_temperature_and_the_router_at_zero() {
+    for (executor, wanted) in [("", json!(0.6)), ("  temperature: 0.9\n", json!(0.9))] {
+        let scratch = Scratch::new("temperature");
+        scratch.ask("t-ask", "T1", "Count the lines");
+        let model = Model::new(Box::new(|_| vec![report("ready", "Done.")]));
+
+        scratch
+            .serve(
+                scratch.config(true, executor),
+                scratch.host(scripted(), model.clone()),
+            )
+            .await;
+
+        let bodies = model.bodies.lock().unwrap().clone();
+        let (router, workers): (Vec<_>, Vec<_>) = bodies
+            .iter()
+            .partition(|body| last_text(body).contains(" new candidate"));
+        assert!(!router.is_empty() && !workers.is_empty(), "{bodies:?}");
+        for body in &workers {
+            assert_eq!(body["temperature"], wanted, "a worker call: {executor:?}");
+        }
+        for body in &router {
+            assert_eq!(body["temperature"], json!(0), "the Router's call");
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_refusal_of_a_looped_run_code_quotes_its_exit_code_and_output() {
     if !sandbox() {
@@ -958,7 +1172,11 @@ async fn a_refusal_of_a_looped_run_code_quotes_its_exit_code_and_output() {
         )
         .await;
 
-    assert_told_once_that_it_got_stuck(&scratch);
+    assert_told_once_that_it_got_stuck(
+        &scratch,
+        "I kept re-running `echo found it; echo and more; echo oops >&2` without making \
+         progress, so I stopped.",
+    );
     assert_eq!(model.worker_calls(), 5);
     let results = model.tool_results();
     assert!(

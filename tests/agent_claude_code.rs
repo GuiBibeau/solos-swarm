@@ -17,7 +17,7 @@ use solos_swarm::agent::{
     Adapters, AgentConfig, PiHost, RunOptions, Runtime, STORE_FILE, TICKETS_DIR, serve_with,
 };
 use solos_swarm::gateway::anthropic::Chat;
-use solos_swarm::gateway::{Dispatch, PriceTable, Provider, Upstream};
+use solos_swarm::gateway::{Dispatch, PriceTable, Provider, Temperature, Upstream};
 use solos_swarm::harness::PiHarness;
 use solos_swarm::remote::daemon::{AgentEndpoint, SandboxConfig, SecretsConfig};
 use solos_swarm::remote::{Node, NodeConfig, tls};
@@ -134,6 +134,7 @@ fn terms() -> ModelTerms {
         max_input_bytes: 65_536,
         max_output_tokens: MAX_OUTPUT,
         call_limit: None,
+        temperature: None,
     }
 }
 
@@ -154,6 +155,15 @@ impl Drop for Served {
 }
 
 fn serve(scratch: &Scratch, budget_microusd: u64) -> Served {
+    serve_sampling(scratch, budget_microusd, None)
+}
+
+/// [`serve`], with the worker's calls sampled at `temperature`.
+fn serve_sampling(
+    scratch: &Scratch,
+    budget_microusd: u64,
+    temperature: Option<Temperature>,
+) -> Served {
     let provider = Scripted::new();
     let adapters = Adapters {
         sources: Vec::new(),
@@ -181,7 +191,10 @@ fn serve(scratch: &Scratch, budget_microusd: u64) -> Served {
             ..DecideTerms::default()
         },
         workers: Some(WorkerParts {
-            terms: terms(),
+            terms: ModelTerms {
+                temperature,
+                ..terms()
+            },
             code: None,
             vault: None,
             browser: None,
@@ -269,6 +282,19 @@ fn events(stream: &str) -> Vec<(String, Value)> {
             (event.strip_prefix("event: ").unwrap().to_owned(), data)
         })
         .collect()
+}
+
+#[tokio::test]
+async fn a_messages_call_is_sampled_at_the_workers_temperature() {
+    let scratch = Scratch::new("temperature");
+    let served = serve_sampling(&scratch, 500_000, Some(Temperature::try_from(0.6).unwrap()));
+
+    let (status, message) = served.json(Some(WORKER), &asks(false)).await;
+
+    assert_eq!(status, 200, "{message}");
+    let sent = &served.provider.bodies()[0];
+    assert_eq!(sent["temperature"], json!(0.6));
+    assert_eq!(sent["stream"], json!(false), "nothing else moved");
 }
 
 #[tokio::test]

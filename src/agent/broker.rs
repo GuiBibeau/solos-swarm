@@ -22,7 +22,7 @@ use super::pstack::{self, Pstack, Reader};
 use super::watchdog::usd;
 use crate::broker::{FETCH_TOTAL_BYTES, fetch, now_ms};
 use crate::code::CodeExecutor;
-use crate::gateway::{self, PriceTable, Provider, Receipt, Upstream};
+use crate::gateway::{self, PriceTable, Provider, Receipt, Temperature, Upstream};
 use crate::vault::Vault;
 use anyhow::{Context, Result, anyhow, ensure};
 use axum::{
@@ -68,14 +68,21 @@ const READ_RECENT: usize = 20;
 pub(crate) const REPORT_TEXT_CHARS: usize = 8_000;
 const QUESTION_CHARS: usize = 1_000;
 const FAILURE_CHARS: usize = 400;
-/// What a worker whose turn the broker stopped for looping reads, in the
-/// refusal of every tool call it makes after.
-const TURN_STOPPED: &str = "Your turn is stopped because you kept sending calls that were \
-    refused, and the person is told you got stuck. Do not call any more tools.";
+/// What a worker whose turn the broker stopped for looping or for making no
+/// progress reads, in the refusal of every tool call it makes after.
+fn turn_stopped(stopped: Stopped) -> String {
+    format!(
+        "Your turn is stopped because you {}, and the person is told you got stuck. Do not \
+         call any more tools.",
+        stopped.note()
+    )
+}
+
 /// Why the model call after that is refused. A harness that has no turn to
 /// end, such as Claude Code, shows this as the session's error.
-const STUCK_REASON: &str =
-    "the turn was stopped because the worker kept repeating calls that were refused";
+fn stuck_reason(stopped: Stopped) -> String {
+    format!("the turn was stopped because the worker {}", stopped.note())
+}
 
 /// Who a session is.
 #[derive(Clone, Debug)]
@@ -286,26 +293,32 @@ impl WorkerSeat {
 
     /// Refuse a tool call that repeats the seat's latest calls too often,
     /// and say what the call answered before. Once the refusals reach the
-    /// limit the turn is stopped: that call and each one after it is told
-    /// so, and runs nothing.
+    /// limit, the calls stop bringing anything new, or the turn passes its
+    /// ceiling of tool calls, the turn is stopped: that call and each one
+    /// after it is told so, and runs nothing.
     fn repeat_refused(&self, tool: &str, args: &Value, repeatable: bool) -> Option<Refusal> {
         let mut repeats = self.guard();
-        if repeats.stopped().is_some() {
-            return Some(refuse(StatusCode::TOO_MANY_REQUESTS, TURN_STOPPED));
-        }
-        let repeated = repeats.call(tool, args, repeatable)?;
-        let mut why = repeated.why(tool, repeats.earlier(tool, args));
         if let Some(stopped) = repeats.stopped() {
-            let (count, within) = match stopped {
-                Stopped::InARow(count) => (count, "in a row"),
-                Stopped::InTurn(count) => (count, "in this turn"),
-            };
+            return Some(refuse(StatusCode::TOO_MANY_REQUESTS, turn_stopped(stopped)));
+        }
+        let repeated = repeats.call(tool, args, repeatable);
+        let stopped = repeats.stopped();
+        let mut why = match repeated {
+            Some(repeated) => repeated.why(tool, repeats.earlier(tool, args)),
+            None if stopped.is_none() => return None,
+            None => String::new(),
+        };
+        if let Some(stopped) = stopped {
             eprintln!(
-                "agent: the worker of {} on {} sent {count} refused calls {within}, last {tool}; \
-                 its turn is stopped",
-                self.assignment, self.ticket
+                "agent: the worker of {} on {} {}, last {tool}; its turn is stopped",
+                self.assignment,
+                self.ticket,
+                stopped.note()
             );
-            why = format!("{why} {TURN_STOPPED}");
+            if !why.is_empty() {
+                why.push(' ');
+            }
+            why.push_str(&turn_stopped(stopped));
         }
         Some(refuse(StatusCode::TOO_MANY_REQUESTS, why))
     }
@@ -316,10 +329,26 @@ impl WorkerSeat {
         self.guard().answered(tool, args, answer);
     }
 
-    /// The guard stopped the turn: the seat's model calls are refused, which
-    /// ends a Pi turn, until the next turn begins.
-    fn turn_stopped(&self) -> bool {
-        self.guard().stopped().is_some()
+    /// A model call is about to be made: note it, and say whether the turn is
+    /// stopped, by what the guard saw of the tool calls or by this call being
+    /// past the turn's ceiling. Then the seat's model calls are refused,
+    /// which ends a Pi turn, until the next turn begins; this is why, and
+    /// what the host tells the person.
+    fn stopped_before_model_call(&self) -> Option<(String, ModelFailure)> {
+        let mut repeats = self.guard();
+        let was = repeats.stopped();
+        repeats.model_call();
+        let stopped = repeats.stopped()?;
+        if was.is_none() {
+            eprintln!(
+                "agent: the worker of {} on {} {}; its turn is stopped",
+                self.assignment,
+                self.ticket,
+                stopped.note()
+            );
+        }
+        let said = repeats.sentence()?;
+        Some((stuck_reason(stopped), ModelFailure::Stuck(said)))
     }
 }
 
@@ -337,9 +366,12 @@ pub enum ModelFailure {
     /// limit, or the stop after an overrun. The text is the broker's reason.
     Failed(String),
     /// The broker stopped the turn: the worker kept sending the same call
-    /// after it was refused, so the call after the stop was refused too,
-    /// with no model call spent.
-    Stuck,
+    /// after it was refused, or made calls that brought nothing new, or
+    /// passed the turn's ceiling of calls, so the call after the stop was
+    /// refused too, with no model call spent. The text is what the host
+    /// tells the person in the worker's place, in the worker's words: what it
+    /// kept doing, and that it stopped.
+    Stuck(String),
 }
 
 impl ModelFailure {
@@ -349,11 +381,12 @@ impl ModelFailure {
     /// words what stopped the work and how to go on.
     pub fn report(&self) -> (ReportStatus, String) {
         match self {
-            Self::Stuck => (
+            Self::Stuck(what) => (
                 ReportStatus::Failed,
-                "I got stuck repeating the same step and stopped. Reply here to have me try \
-                 again with a different approach."
-                    .to_owned(),
+                format!(
+                    "{} Reply here to have me try again with a different approach.",
+                    clip(what, FAILURE_CHARS).0
+                ),
             ),
             Self::BudgetReached { committed, budget } => (
                 ReportStatus::Blocked,
@@ -445,6 +478,20 @@ pub struct ModelTerms {
     /// The longest one call may take before it is dropped and its hold
     /// released, or no limit beyond the transport's own.
     pub call_limit: Option<Duration>,
+    /// What the calls are sampled at. `None` leaves the shared upstream body's
+    /// 0, as the Router judges and as swarm mode runs; workers have one, since
+    /// a model decoded greedily is the more likely to go round in circles.
+    pub temperature: Option<Temperature>,
+}
+
+impl ModelTerms {
+    /// The upstream body `upstream_body` made, sampled as these terms say.
+    pub(crate) fn sample(&self, upstream: Value) -> Value {
+        match self.temperature {
+            Some(temperature) => gateway::sampled(upstream, temperature),
+            None => upstream,
+        }
+    }
 }
 
 /// What one token admits.
@@ -1214,7 +1261,11 @@ async fn model(
             grant.principal.tools().contains(&name)
         }),
         max_output_tokens: terms.max_output_tokens,
-        upstream: gateway::upstream_body(&terms.upstream.model, &body, terms.max_output_tokens),
+        upstream: terms.sample(gateway::upstream_body(
+            &terms.upstream.model,
+            &body,
+            terms.max_output_tokens,
+        )),
     };
     call.send(&broker, &grant).await
 }
@@ -1252,13 +1303,14 @@ impl Call {
         named: &mut Option<ModelFailure>,
     ) -> Reply {
         let terms = &grant.terms;
-        // First of all: a looping worker's turn ends here, with no hold, no
-        // upstream call and no cost.
+        // First of all: the turn of a worker that loops, makes no progress or
+        // has made its ceiling of calls ends here, with no hold, no upstream
+        // call and no cost.
         if let Principal::Worker(seat) = &grant.principal
-            && seat.turn_stopped()
+            && let Some((reason, failure)) = seat.stopped_before_model_call()
         {
-            *named = Some(ModelFailure::Stuck);
-            return Err(forbidden(STUCK_REASON));
+            *named = Some(failure);
+            return Err(forbidden(reason));
         }
         if self.input_bytes > terms.max_input_bytes {
             return Err(forbidden("request exceeds the model limit"));
@@ -2779,12 +2831,13 @@ mod tests {
         let (_, long) = ModelFailure::Failed("x".repeat(5_000)).report();
         assert!(long.chars().count() < 600, "a long reason is cut: {long}");
 
-        let (status, text) = ModelFailure::Stuck.report();
+        let sentence = "I kept re-reading the same parts of encode.js without making progress, so \
+                        I stopped.";
+        let (status, text) = ModelFailure::Stuck(sentence.into()).report();
         assert_eq!(status, ReportStatus::Failed);
         assert_eq!(
             text,
-            "I got stuck repeating the same step and stopped. Reply here to have me try again \
-             with a different approach."
+            format!("{sentence} Reply here to have me try again with a different approach.")
         );
     }
 }

@@ -31,7 +31,7 @@ use solos_swarm::agent::{Adapters, AgentConfig, RunOptions, Runtime, STORE_FILE}
 use solos_swarm::browse::fake::FakeCdp;
 use solos_swarm::browse::{BrowserConfig, Browsers, Launcher, TrailSigner};
 use solos_swarm::code::{OutputBounds, Started};
-use solos_swarm::gateway::{Dispatch, PriceTable, Provider, Upstream, upstream_body};
+use solos_swarm::gateway::{Dispatch, PriceTable, Provider, Temperature, Upstream, upstream_body};
 use solos_swarm::vault::{SandboxView, Vault, VaultConfig};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -285,6 +285,7 @@ fn terms() -> ModelTerms {
         max_input_bytes: 65_536,
         max_output_tokens: MAX_OUTPUT,
         call_limit: None,
+        temperature: None,
     }
 }
 
@@ -602,6 +603,7 @@ async fn a_call_past_its_limit_is_dropped_and_charged_its_hold_while_an_unlimite
     let limited = Grant {
         terms: ModelTerms {
             call_limit: Some(SLOW / 3),
+            temperature: None,
             ..terms()
         },
         ..grant(1_000_000)
@@ -1712,14 +1714,13 @@ async fn a_worker_that_ignores_its_refusals_has_its_turn_stopped_and_pays_for_no
         "and nothing was held or charged"
     );
     let failure = seat.take_model_failure();
-    assert_eq!(failure, Some(ModelFailure::Stuck));
+    assert_eq!(failure, Some(ModelFailure::Stuck(FETCH_LOOP.into())));
     assert_eq!(seat.take_model_failure(), None, "told once");
     let (status, text) = failure.unwrap().report();
     assert_eq!(status, ReportStatus::Failed);
     assert_eq!(
         text,
-        "I got stuck repeating the same step and stopped. Reply here to have me try again with \
-         a different approach."
+        format!("{FETCH_LOOP} Reply here to have me try again with a different approach.")
     );
 
     for call in ["other", "status"] {
@@ -1789,8 +1790,360 @@ async fn refusals_that_are_spread_over_a_turn_are_stopped_at_the_ceiling_too() {
     assert_eq!(refusals, 10);
     let (status, refused) = ask().await;
     assert_eq!(status, 403, "ten refusals in a turn stop it: {refused}");
-    assert_eq!(seat.take_model_failure(), Some(ModelFailure::Stuck));
+    assert_eq!(
+        seat.take_model_failure(),
+        Some(ModelFailure::Stuck(FETCH_LOOP.into()))
+    );
     web.abort();
+}
+
+/// What the host tells the person when a worker kept calling `fetch_url`.
+const FETCH_LOOP: &str = "I kept calling fetch_url with the same arguments without making \
+                          progress, so I stopped.";
+
+/// A worker on a seat of its own, whose `fetch_url` reaches a loopback page
+/// that counts its hits, and whose model calls reach `provider`.
+struct Looper {
+    served: Served,
+    _runtime: Runtime,
+    seat: Arc<WorkerSeat>,
+    provider: Arc<Scripted>,
+    url: String,
+    hits: Arc<std::sync::atomic::AtomicUsize>,
+    web: tokio::task::JoinHandle<()>,
+}
+
+impl Looper {
+    async fn new(scratch: &Scratch, temperature: Option<Temperature>) -> Self {
+        let provider = Scripted::new();
+        let runtime = scratch.runtime(Arc::new(Holding::default()), true);
+        let worker_terms = ModelTerms {
+            temperature,
+            ..terms()
+        };
+        let served = serve_on(
+            scratch,
+            provider.clone(),
+            runtime.facts(),
+            1_000_000,
+            TERMS,
+            Nodes::default(),
+            WorkerParts {
+                terms: worker_terms,
+                code: None,
+                vault: None,
+                browser: None,
+            },
+            None,
+        );
+        let seat = WorkerSeat::new(
+            TicketId::new("tk_loop"),
+            AssignmentId::new("as_1"),
+            scratch.state(),
+            500_000,
+        );
+        let seat = served
+            .broker
+            .admit_worker(WORKER.into(), seat, "You are a worker.".into())
+            .unwrap();
+        let (url, hits, web) = counting_page().await;
+        seat.begin_turn();
+        Self {
+            served,
+            _runtime: runtime,
+            seat,
+            provider,
+            url,
+            hits,
+            web,
+        }
+    }
+    /// `fetch_url` of the page named `page`.
+    async fn fetch(&self, page: impl std::fmt::Display) -> (u16, Value) {
+        let args = json!({"url": format!("{}{page}", self.url)});
+        self.served.post("tool/fetch_url", Some(WORKER), args).await
+    }
+    /// A model call, as Pi makes one after each tool result.
+    async fn ask(&self) -> (u16, Value) {
+        let request = model_request_for("worker_report", "fix it");
+        self.served.post("model", Some(WORKER), request).await
+    }
+    fn hits(&self) -> usize {
+        self.hits.load(Ordering::SeqCst)
+    }
+    /// Every call of `pages` in turn, each followed by a model call, until
+    /// a tool call is refused: how many were sent, and the refusal.
+    async fn go_round(&self, pages: usize, most: usize) -> (usize, Value) {
+        for sent in 1..=most {
+            let (status, answer) = self.fetch((sent - 1) % pages).await;
+            if status == 429 {
+                return (sent, answer);
+            }
+            assert_eq!(status, 200, "call {sent}: {answer}");
+            assert_eq!(self.ask().await.0, 200, "model call after call {sent}");
+        }
+        panic!("{most} calls and none was refused")
+    }
+}
+
+impl Drop for Looper {
+    fn drop(&mut self) {
+        self.web.abort();
+    }
+}
+
+#[tokio::test]
+async fn a_five_call_cycle_is_stopped_at_the_seventeenth_call_and_says_what_it_was_doing() {
+    let scratch = Scratch::new("cycle-of-five");
+    let worker = Looper::new(&scratch, None).await;
+
+    let (sent, refused) = worker.go_round(5, 100).await;
+
+    assert_eq!(sent, 15, "the third round is refused at its last call");
+    let why = refused["error"].as_str().unwrap();
+    assert!(why.contains("these 5 calls in turn, 3 times over"), "{why}");
+    assert!(!why.contains("Your turn is stopped"), "not yet: {why}");
+    assert_eq!(worker.ask().await.0, 200, "still asked after the refusal");
+    for call in 16..=17 {
+        let (status, refused) = worker.fetch((call - 1) % 5).await;
+        assert_eq!(status, 429, "call {call}: {refused}");
+        assert_eq!(worker.seat.take_model_failure(), None);
+        if call == 17 {
+            let why = refused["error"].as_str().unwrap();
+            assert!(
+                why.contains(
+                    "Your turn is stopped because you sent 3 refused calls in a row, and the \
+                     person is told you got stuck. Do not call any more tools."
+                ),
+                "{why}"
+            );
+        } else {
+            assert_eq!(worker.ask().await.0, 200);
+        }
+    }
+    assert_eq!(worker.hits(), 14, "a refused call is never run");
+    let calls = worker.provider.calls();
+    let (status, refused) = worker.ask().await;
+    assert_eq!(status, 403, "{refused}");
+    assert_eq!(worker.provider.calls(), calls, "the provider was not asked");
+    assert_eq!(
+        worker.seat.take_model_failure(),
+        Some(ModelFailure::Stuck(FETCH_LOOP.into()))
+    );
+}
+
+#[tokio::test]
+async fn calls_that_find_nothing_new_are_stopped_after_thirty_and_a_new_turn_may_go_on() {
+    let scratch = Scratch::new("nothing-new");
+    let worker = Looper::new(&scratch, None).await;
+
+    // Seventeen pages in turn: too long a round to be a circle, and the page
+    // says the same every time.
+    let (sent, refused) = worker.go_round(17, 100).await;
+
+    assert_eq!(
+        sent,
+        17 + 30,
+        "seventeen new calls, then thirty that bring nothing"
+    );
+    assert_eq!(worker.hits(), 46, "the refused call is never run");
+    let why = refused["error"].as_str().unwrap();
+    assert!(
+        why.contains(
+            "Your turn is stopped because you made 30 calls in a row that found nothing new"
+        ),
+        "{why}"
+    );
+    let calls = worker.provider.calls();
+    let (status, refused) = worker.ask().await;
+    assert_eq!(status, 403, "{refused}");
+    assert!(
+        refused["error"].as_str().unwrap().contains(
+            "the turn was stopped because the worker made 30 calls in a row that found nothing new"
+        ),
+        "{refused}"
+    );
+    assert_eq!(worker.provider.calls(), calls);
+    assert_eq!(
+        worker.seat.take_model_failure(),
+        Some(ModelFailure::Stuck(FETCH_LOOP.into()))
+    );
+
+    worker.seat.begin_turn();
+    assert_eq!(worker.ask().await.0, 200, "a new turn may ask the model");
+    assert_eq!(worker.fetch(3).await.0, 200, "and run a tool");
+}
+
+#[tokio::test]
+async fn a_turn_is_stopped_at_its_ceiling_of_tool_calls() {
+    let scratch = Scratch::new("tool-ceiling");
+    let worker = Looper::new(&scratch, None).await;
+
+    // Every call is a different one, so nothing but the ceiling stops them.
+    for call in 0..200 {
+        assert_eq!(
+            worker.fetch(format!("page{call}")).await.0,
+            200,
+            "call {call}"
+        );
+    }
+    let (status, refused) = worker.fetch("page200").await;
+
+    assert_eq!(status, 429, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("Your turn is stopped because you made 200 tool calls in this turn"),
+        "{refused}"
+    );
+    assert_eq!(worker.hits(), 200);
+    assert_eq!(worker.ask().await.0, 403);
+    assert_eq!(
+        worker.seat.take_model_failure(),
+        Some(ModelFailure::Stuck(
+            "I made 200 tool calls without finishing, so I stopped.".into()
+        ))
+    );
+}
+
+#[tokio::test]
+async fn a_turn_is_stopped_at_its_ceiling_of_model_calls_and_runs_no_tool_after() {
+    let scratch = Scratch::new("model-ceiling");
+    let worker = Looper::new(&scratch, None).await;
+
+    for call in 1..=250 {
+        assert_eq!(worker.ask().await.0, 200, "model call {call}");
+    }
+    assert_eq!(
+        worker.fetch("page").await.0,
+        200,
+        "the tools are not stopped yet"
+    );
+    let (status, refused) = worker.ask().await;
+
+    assert_eq!(status, 403, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("the turn was stopped because the worker made 250 model calls in this turn"),
+        "{refused}"
+    );
+    assert_eq!(worker.provider.calls(), 250, "the 251st was not sent");
+    assert_eq!(
+        worker.seat.take_model_failure(),
+        Some(ModelFailure::Stuck(
+            "I made 250 model calls without finishing, so I stopped.".into()
+        ))
+    );
+    assert_eq!(
+        worker.fetch("page").await.0,
+        429,
+        "a stopped turn runs no tool"
+    );
+    assert_eq!(worker.hits(), 1);
+}
+
+#[tokio::test]
+async fn a_long_turn_of_different_calls_is_not_stopped() {
+    let scratch = Scratch::new("long-varied");
+    let worker = Looper::new(&scratch, None).await;
+
+    // Eighty different calls, a model call after each, and the same few
+    // pages read again between them: the way a long ticket goes.
+    for call in 0..80 {
+        assert_eq!(
+            worker.fetch(format!("part{call}")).await.0,
+            200,
+            "call {call}"
+        );
+        assert_eq!(worker.ask().await.0, 200, "model call {call}");
+        if call % 10 == 9 {
+            assert_eq!(worker.fetch("index").await.0, 200, "call {call}");
+        }
+    }
+    assert_eq!(worker.seat.take_model_failure(), None);
+    assert_eq!(worker.hits(), 88);
+}
+
+#[tokio::test]
+async fn waiting_for_a_job_over_and_over_is_not_a_loop() {
+    let scratch = Scratch::new("job-polling");
+    let (_runtime, served, _fake) = serve_with_a_node_a_vault_and_a_browser(&scratch);
+    let run = |code: String| {
+        let args = json!({"code": code});
+        served.post("tool/run_code", Some(THERE), args)
+    };
+    let wait = || served.post("tool/job_wait", Some(THERE), json!({"job": "job_1"}));
+    let ask = || {
+        let request = model_request_for("worker_report", "fix it");
+        served.post("model", Some(THERE), request)
+    };
+
+    // More waits than the turn has tool calls, between different commands.
+    for call in 0..150 {
+        assert_ne!(
+            run(format!("tail -n {call} build.log")).await.0,
+            429,
+            "run {call}"
+        );
+        for _ in 0..3 {
+            assert_ne!(wait().await.0, 429, "a repeat of a wait is normal");
+        }
+    }
+    assert_eq!(ask().await.0, 200, "the turn goes on");
+    assert_ne!(
+        run("one more".into()).await.0,
+        429,
+        "450 waits are not tool calls of the turn's ceiling"
+    );
+}
+
+#[tokio::test]
+async fn workers_sample_at_the_configured_temperature_and_the_router_at_zero() {
+    let scratch = Scratch::new("temperature");
+    let sampled = Temperature::try_from(0.6).unwrap();
+    let worker = Looper::new(&scratch, Some(sampled)).await;
+
+    assert_eq!(worker.ask().await.0, 200);
+    let (status, reply) = worker.served.model("judge eval ev_1").await;
+    assert_eq!(status, 200, "{reply}");
+
+    let sent = worker.provider.bodies.lock().unwrap().clone();
+    let [for_worker, for_router] = &sent[..] else {
+        panic!("{sent:?}")
+    };
+    assert_eq!(for_worker["temperature"], json!(0.6));
+    let mut unsampled = upstream_body(
+        "deepseek-flash",
+        &model_request_for("worker_report", "fix it"),
+        MAX_OUTPUT,
+    );
+    unsampled["temperature"] = json!(0.6);
+    assert_eq!(
+        for_worker, &unsampled,
+        "only the temperature differs from the shared body"
+    );
+    assert_eq!(
+        for_router,
+        &upstream_body(
+            "deepseek-flash",
+            &model_request("judge eval ev_1"),
+            MAX_OUTPUT
+        ),
+        "the Router's call is the shared body, byte for byte"
+    );
+    assert_eq!(for_router["temperature"], json!(0));
+
+    // A worker whose terms name none keeps the shared body's 0.
+    let other = Scratch::new("temperature-none");
+    let worker = Looper::new(&other, None).await;
+    assert_eq!(worker.ask().await.0, 200);
+    assert_eq!(
+        worker.provider.bodies.lock().unwrap()[0]["temperature"],
+        json!(0)
+    );
 }
 
 #[tokio::test]
