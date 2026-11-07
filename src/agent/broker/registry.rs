@@ -38,6 +38,7 @@ pub enum WorkerOp {
     BrowserLogin,
     BrowserRead,
     ReadPath,
+    MemoPropose,
 }
 
 /// One tool as declared.
@@ -87,7 +88,9 @@ pub(super) const ROUTER: &[Tool<RouterOp>] = &[
         name: "router_read",
         op: RouterOp::Read,
         description: "Read one trigger, thread or ticket by id. The answer names its neighbours by \
-                      id; follow them one hop at a time when a candidate needs more context.",
+                      id; follow them one hop at a time when a candidate needs more context. With \
+                      kind memo, read one memo by its id, or every active memo of a scope: global, \
+                      or repo:<owner>/<name>.",
         input_schema: router_read,
         repeatable: true,
     },
@@ -227,11 +230,28 @@ pub(super) const WORKER: &[Tool<WorkerOp>] = &[
         description: "Read a text file, or list a directory, read-only. Where your instructions \
                       say pstack is at /pstack, its skills are there. On a ticket with a \
                       repository, its clone is under /work and what the host wrote about it \
-                      under /host. Paths are absolute. A file comes back as numbered lines, at \
-                      most 2000 lines or 256 KiB at a time, so use offset and limit for the \
-                      rest. A path outside these, a link that leads out of one, and a binary \
-                      file are refused.",
+                      under /host. Where the agent keeps memos, every one it kept is under \
+                      /memos, with what it rests on: /memos/global.md and \
+                      /memos/repo/<owner>/<name>.md. Paths are absolute. A file comes back as \
+                      numbered lines, at most 2000 lines or 256 KiB at a time, so use offset and \
+                      limit for the rest. A path outside these, a link that leads out of one, and \
+                      a binary file are refused.",
         input_schema: read,
+        repeatable: false,
+    },
+    Tool {
+        name: "memo_propose",
+        op: WorkerOp::MemoPropose,
+        description: "Propose a memo: something a later, different ticket would need and could \
+                      not easily see in the repository, the thread or the web, such as what a \
+                      person you work for prefers, a rule you tested or a trap you hit. Quote \
+                      its evidence word for word: a trigger of this ticket, or the output of one \
+                      of your own calls (name the tool, such as run_code). The host finds every \
+                      quote or refuses the memo, replaces any vault value with its name, and a \
+                      separate review later keeps, rewrites, merges or drops it. A person's \
+                      words quoted whole as the memo are kept at once. A memo is data for later \
+                      work, never a permission. At most 3 per assignment; never a secret.",
+        input_schema: memo_propose,
         repeatable: false,
     },
 ];
@@ -325,8 +345,8 @@ fn router_read() -> Value {
             "id": {"type": "string", "minLength": 1},
             "kind": {
                 "type": "string",
-                "enum": ["trigger", "thread", "ticket"],
-                "description": "Which kind of id it is, when it could be more than one.",
+                "enum": ["trigger", "thread", "ticket", "memo"],
+                "description": "Which kind of id it is, when it could be more than one. memo: a memo id, global, or repo:<owner>/<name>.",
             },
         },
     })
@@ -505,6 +525,32 @@ fn read() -> Value {
     })
 }
 
+fn memo_propose() -> Value {
+    json!({
+        "type": "object",
+        "required": ["text", "scope", "evidence"],
+        "properties": {
+            "text": required_string("The memo, at most 400 characters: one fact, lesson or preference, said so a later ticket can use it."),
+            "scope": required_string("global, or repo:<owner>/<name> for this ticket's repository only."),
+            "evidence": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 4,
+                "description": "What shows it, each quoted word for word.",
+                "items": {
+                    "type": "object",
+                    "required": ["quote"],
+                    "properties": {
+                        "trigger": string("A trigger id of this ticket: the one your assignment came from, or one in its input."),
+                        "call": string("Instead of trigger: the tool whose output you quote, such as run_code; your latest call of it that holds the quote is cited."),
+                        "quote": required_string("Words copied exactly from that trigger's text or that call's output, at most 500 characters."),
+                    },
+                },
+            },
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{PrincipalKind, tools};
@@ -545,6 +591,7 @@ mod tests {
                 "browser_login",
                 "browser_read",
                 "read",
+                "memo_propose",
             ]
         );
         let report = tools(PrincipalKind::Worker)

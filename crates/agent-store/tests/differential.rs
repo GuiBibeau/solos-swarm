@@ -21,7 +21,8 @@ use common::{
 };
 use solos_agent_core::change::{Deliverable, RepoName};
 use solos_agent_core::memo::{
-    Memo, MemoActor, MemoAudience, MemoAuthor, MemoIn, MemoReview, MemoScope, MemoSource, MemoState,
+    Memo, MemoActor, MemoAudience, MemoAuthor, MemoIn, MemoReview, MemoScope, MemoSource,
+    MemoState, MemoTrust, PROPOSAL_TTL_MS,
 };
 use solos_agent_core::model::{
     Accept, Acknowledge, Actor, Addressed, Approval, AssignmentId, AssignmentState, ChannelRef,
@@ -45,7 +46,7 @@ const SECRETS: [&str; 3] = ["local/github-gui", "local/openai", "laptop/gh"];
 const TRIGGER_TEXT: &str = "please look at this, \"quoted\" and ünïcode";
 
 /// Every public Engine command, by the name `Op::name` gives it.
-const COMMANDS: [&str; 24] = [
+const COMMANDS: [&str; 26] = [
     "receive",
     "evaluate_due",
     "decide(accept)",
@@ -70,6 +71,8 @@ const COMMANDS: [&str; 24] = [
     "retire_memo",
     "forget_memo",
     "show_memos",
+    "revise_memo",
+    "expire_memos",
 ];
 
 struct Lcg(u64);
@@ -123,6 +126,8 @@ enum Op {
     RetireMemo(MemoId, MemoActor, String),
     ForgetMemo(MemoId, String, Actor),
     ShowMemos(MemoAudience),
+    ReviseMemo(MemoId, MemoReview, String, Option<MemoId>),
+    ExpireMemos,
     SetPolicy(AllowlistPolicy),
     Advance(u64),
     /// SQLite only: the effect runner takes up to this many due Effects.
@@ -158,6 +163,8 @@ impl Op {
             Op::RetireMemo(..) => "retire_memo",
             Op::ForgetMemo(..) => "forget_memo",
             Op::ShowMemos(_) => "show_memos",
+            Op::ReviseMemo(..) => "revise_memo",
+            Op::ExpireMemos => "expire_memos",
             Op::SetPolicy(_) => "set_policy",
             Op::Advance(_) => "advance_clock",
             Op::RunEffects(_) => "run_effects",
@@ -201,6 +208,10 @@ fn apply<R: Repositories>(
         Op::RetireMemo(m, by, reason) => e.retire_memo(m, by.clone(), reason).map(unit),
         Op::ForgetMemo(m, source, by) => e.forget_memo(m, source, by.clone()).map(unit),
         Op::ShowMemos(to) => e.show_memos(to.clone()).map(|index| index.text),
+        Op::ReviseMemo(m, review, text, merges) => e
+            .revise_memo(m, review.clone(), text.clone(), merges.as_ref())
+            .map(|id| id.to_string()),
+        Op::ExpireMemos => e.expire_memos().map(|ids| format!("{ids:?}")),
         Op::SetPolicy(p) => {
             e.set_policy(p.clone());
             Ok(String::new())
@@ -777,7 +788,7 @@ fn gen_memo_op(rng: &mut Lcg, r: &MemoryRepositories) -> Op {
         "checked against the transcript".to_owned()
     };
     let review_name = if rng.chance(5) { "" } else { "review:diff" };
-    match rng.below(14) {
+    match rng.below(17) {
         0..=4 => gen_propose_memo(rng, r),
         5..=6 => Op::ActivateMemo(
             pick_memo(rng, r, |m| m.state == MemoState::Proposed),
@@ -803,11 +814,35 @@ fn gen_memo_op(rng: &mut Lcg, r: &MemoryRepositories) -> Op {
             Op::ForgetMemo(m, source, by)
         }
         10 => Op::ShowMemos(MemoAudience::Router),
-        _ => {
+        11..=13 => {
             let ticket = pick_ticket(rng, r, |_| true);
             let assignment = pick_assignment(rng, r, &ticket);
             Op::ShowMemos(MemoAudience::Worker { ticket, assignment })
         }
+        14..=15 => {
+            let m = pick_memo(rng, r, |m| m.state == MemoState::Proposed);
+            let scope = r.memos.get(&m).map(|m| m.scope.clone());
+            let merges = rng.chance(40).then(|| {
+                pick_memo(rng, r, |other| {
+                    other.is_active()
+                        && other.trust != MemoTrust::Person
+                        && Some(&other.scope) == scope.as_ref()
+                })
+            });
+            let text = match rng.below(10) {
+                0 => String::new(),
+                1 => TRIGGER_TEXT.to_owned(),
+                _ => format!("Revised lesson {}: ü", rng.below(1_000)),
+            };
+            let review = MemoReview {
+                by: review_name.into(),
+                reason,
+            };
+            Op::ReviseMemo(m, review, text, merges)
+        }
+        // Now and then a week passes first, so a proposal is due.
+        _ if rng.chance(30) => Op::Advance(PROPOSAL_TTL_MS),
+        _ => Op::ExpireMemos,
     }
 }
 

@@ -916,28 +916,7 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
                 }
             };
             memo::check_text(&text).map_err(Error::Invalid)?;
-            if !(1..=memo::MAX_MEMO_SOURCES).contains(&sources.len()) {
-                return Err(Error::Invalid(format!(
-                    "a memo cites 1 to {} sources",
-                    memo::MAX_MEMO_SOURCES
-                )));
-            }
-            let mut trust = MemoTrust::Person;
-            for source in &sources {
-                let trigger = match source {
-                    MemoSource::Trigger { trigger, .. } => tx.trigger(trigger),
-                    MemoSource::Ticket { ticket } => {
-                        tx.require_ticket(ticket)?;
-                        None
-                    }
-                    MemoSource::Operator | MemoSource::Call { .. } => None,
-                };
-                let allowed = trigger.as_ref().map(|t| allowed_person(policy, t));
-                let found = trigger.as_ref().zip(allowed);
-                let one =
-                    memo::source_trust(source, &text, &author, found).map_err(Error::Invalid)?;
-                trust = trust.min(one);
-            }
+            let trust = tx.memo_trust(policy, &sources, &text, &author)?;
             if let Some(held) = tx
                 .live_memos()
                 .into_iter()
@@ -1011,6 +990,162 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
         })
     }
 
+    /// The review keeps what a proposed memo says, in its own words: `text`
+    /// instead of the proposal's, and with `merges`, in place of that active
+    /// memo of the same scope too. A memo's text never changes, so the words
+    /// kept are a new memo, active at once, by the proposal's author, that
+    /// cites the proposal's sources (and the merged memo's), its trust
+    /// derived from them and `text` anew. The proposal and the merged memo
+    /// are retired in the same commit, each naming the new one. A person's
+    /// memo is merged into nothing: only a person changes it. Returns the
+    /// new memo's id.
+    pub fn revise_memo(
+        &mut self,
+        memo: &MemoId,
+        review: MemoReview,
+        text: String,
+        merges: Option<&MemoId>,
+    ) -> Result<MemoId, Error> {
+        self.run(|tx, policy| {
+            memo::check_name("a review's name", &review.by).map_err(Error::Invalid)?;
+            memo::check_reason(&review.reason).map_err(Error::Invalid)?;
+            memo::check_text(&text).map_err(Error::Invalid)?;
+            let proposal = tx.require_memo(memo)?;
+            if proposal.state != MemoState::Proposed {
+                return Err(Error::Refused(format!(
+                    "{memo} is {}",
+                    proposal.state.name()
+                )));
+            }
+            let mut sources = proposal.sources.clone();
+            let merged = match merges {
+                None if text == proposal.text => {
+                    return Err(Error::Invalid(format!(
+                        "that is what {memo} says already; keep it instead"
+                    )));
+                }
+                None => None,
+                Some(other) => {
+                    let m = tx.require_memo(other)?;
+                    if m.id == proposal.id || !m.is_active() || m.scope != proposal.scope {
+                        return Err(Error::Refused(format!(
+                            "{other} is not an active memo of {} beside {memo}",
+                            proposal.scope
+                        )));
+                    }
+                    if m.trust == MemoTrust::Person {
+                        return Err(Error::Refused(format!(
+                            "{other} is a person's word, which only a person changes"
+                        )));
+                    }
+                    for source in &m.sources {
+                        if !sources.contains(source) {
+                            sources.push(source.clone());
+                        }
+                    }
+                    Some(m)
+                }
+            };
+            let trust = tx.memo_trust(policy, &sources, &text, &proposal.author)?;
+            let replaced =
+                |id: &MemoId| *id == proposal.id || merged.as_ref().is_some_and(|m| m.id == *id);
+            if let Some(held) = tx
+                .live_memos()
+                .into_iter()
+                .find(|m| !replaced(&m.id) && m.scope == proposal.scope && m.text == text)
+            {
+                return Err(Error::Refused(format!("{} already holds it", held.id)));
+            }
+            let id = MemoId(key(
+                "mm",
+                &[
+                    &proposal.scope.to_string(),
+                    &text,
+                    memo.as_str(),
+                    &tx.now.to_string(),
+                ],
+            ));
+            if tx.memo(&id).is_some() {
+                return Err(Error::Refused(format!("{id} was just written")));
+            }
+            let by = MemoActor::Review {
+                by: review.by.clone(),
+            };
+            let why = match merged {
+                Some(m) => {
+                    let why = format!("merged with {} into {id} by the review", m.id);
+                    let other = format!("merged with {} into {id} by the review", proposal.id);
+                    tx.retire(m, &by, other);
+                    why
+                }
+                None => format!("kept by the review in other words, as {id}"),
+            };
+            let (scope, author) = (proposal.scope.clone(), proposal.author.clone());
+            tx.retire(proposal, &by, why);
+            let text_sha256 = Digest::of(text.as_bytes());
+            tx.event(DomainEvent::MemoProposed {
+                memo: id.clone(),
+                scope: scope.clone(),
+                trust,
+                author: author.clone(),
+                text_sha256: text_sha256.clone(),
+                active: false,
+            });
+            tx.event(DomainEvent::MemoActivated {
+                memo: id.clone(),
+                by: review.by.clone(),
+                reason_sha256: Digest::of(review.reason.as_bytes()),
+            });
+            tx.save_memo(Memo {
+                id: id.clone(),
+                scope,
+                text,
+                text_sha256,
+                sources,
+                trust,
+                author,
+                state: MemoState::Active {
+                    since_ms: tx.now,
+                    review: Some(review),
+                },
+                created_ms: tx.now,
+                verified_ms: tx.now,
+            });
+            Ok(id)
+        })
+    }
+
+    /// Retire every proposal no review decided within
+    /// [`memo::PROPOSAL_TTL_MS`], under the name [`memo::EXPIRY`], and say
+    /// which. Nothing is written when none is due.
+    pub fn expire_memos(&mut self) -> Result<Vec<MemoId>, Error> {
+        let due = |m: &Memo, now: Ms| {
+            m.state == MemoState::Proposed
+                && now.saturating_sub(m.created_ms) >= memo::PROPOSAL_TTL_MS
+        };
+        let now = self.clock.now_ms();
+        if !self.repos.live_memos().iter().any(|m| due(m, now)) {
+            return Ok(Vec::new());
+        }
+        self.run(|tx, _| {
+            let by = MemoActor::Review {
+                by: memo::EXPIRY.to_owned(),
+            };
+            let reason = format!(
+                "no review decided it within {} days",
+                memo::PROPOSAL_TTL_MS / 86_400_000
+            );
+            let mut expired = Vec::new();
+            for m in tx.live_memos() {
+                if due(&m, tx.now) {
+                    expired.push(m.id.clone());
+                    tx.retire(m, &by, reason.clone());
+                }
+            }
+            Ok(expired)
+        })
+    }
+
     /// Take a proposed or active memo out of use for good, with why. A
     /// person may retire any memo; the review only a model's or an external
     /// one, so a person's word stands until a person takes it back.
@@ -1018,7 +1153,7 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
         self.run(|tx, policy| {
             memo_actor(policy, &by)?;
             memo::check_reason(reason).map_err(Error::Invalid)?;
-            let mut m = tx.require_memo(memo)?;
+            let m = tx.require_memo(memo)?;
             if !m.is_live() {
                 return Err(Error::Refused(format!("{memo} is {}", m.state.name())));
             }
@@ -1027,17 +1162,7 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
                     "{memo} is a person's word, which only a person retires"
                 )));
             }
-            tx.event(DomainEvent::MemoRetired {
-                memo: memo.clone(),
-                by: by.clone(),
-                reason_sha256: Digest::of(reason.as_bytes()),
-            });
-            m.state = MemoState::Retired {
-                by,
-                reason: reason.to_owned(),
-                at_ms: tx.now,
-            };
-            tx.save_memo(m);
+            tx.retire(m, &by, reason.to_owned());
             Ok(())
         })
     }
@@ -1083,7 +1208,7 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
                 }
                 scopes.extend(t.mandate.repo.map(MemoScope::Repo));
             }
-            let index = memo::memo_index(&tx.live_memos(), &scopes, to.budget());
+            let index = memo::memo_index(&tx.live_memos(), &scopes, to.budget(), &to);
             if !index.text.is_empty() {
                 tx.event(DomainEvent::MemosShown {
                     to,
@@ -1307,6 +1432,53 @@ impl<R: Repositories> Tx<'_, R> {
     }
     fn save_memo(&mut self, memo: Memo) {
         self.changes.memos.insert(memo.id.clone(), memo);
+    }
+    /// Retire `memo` for good: its reason in its row, the reason's digest on
+    /// the chain.
+    fn retire(&mut self, mut memo: Memo, by: &MemoActor, reason: String) {
+        self.event(DomainEvent::MemoRetired {
+            memo: memo.id.clone(),
+            by: by.clone(),
+            reason_sha256: Digest::of(reason.as_bytes()),
+        });
+        memo.state = MemoState::Retired {
+            by: by.clone(),
+            reason,
+            at_ms: self.now,
+        };
+        self.save_memo(memo);
+    }
+    /// What `sources` make a memo that says `text` by `author` worth: the
+    /// least of what each gives, each checked as it is cited.
+    fn memo_trust(
+        &self,
+        policy: &impl Policy,
+        sources: &[MemoSource],
+        text: &str,
+        author: &MemoAuthor,
+    ) -> Result<MemoTrust, Error> {
+        if !(1..=memo::MAX_MEMO_SOURCES).contains(&sources.len()) {
+            return Err(Error::Invalid(format!(
+                "a memo cites 1 to {} sources",
+                memo::MAX_MEMO_SOURCES
+            )));
+        }
+        let mut trust = MemoTrust::Person;
+        for source in sources {
+            let trigger = match source {
+                MemoSource::Trigger { trigger, .. } => self.trigger(trigger),
+                MemoSource::Ticket { ticket } => {
+                    self.require_ticket(ticket)?;
+                    None
+                }
+                MemoSource::Operator | MemoSource::Call { .. } => None,
+            };
+            let allowed = trigger.as_ref().map(|t| allowed_person(policy, t));
+            let found = trigger.as_ref().zip(allowed);
+            let one = memo::source_trust(source, text, author, found).map_err(Error::Invalid)?;
+            trust = trust.min(one);
+        }
+        Ok(trust)
     }
     fn save_thread(&mut self, thread: Thread) {
         self.changes.threads.insert(thread.key.clone(), thread);

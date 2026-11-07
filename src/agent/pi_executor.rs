@@ -106,6 +106,15 @@ values: fetch_url's key adds a key only on its own hosts";
 const LOGIN: &str = ", and browser_login fills a login only on its own site";
 const APPROVE: &str = ". When a call says a person must approve, end your turn: their answer comes \
 back as new input.";
+/// What memos are for, said once to a worker that may propose them.
+pub const MEMORY: &str = "\
+Memos carry what a later, different ticket would need and could not easily see from the repository, the \
+thread or the web: what the people you work for prefer, a rule you tested, a trap you hit. Propose one with \
+memo_propose only for that. Do not memo what git, /work or the thread already shows, or what matters to this \
+ticket alone. When someone asks you to remember something, propose it quoting their message. Propose a lesson \
+only after you tested it, quoting the call whose output showed it. Never put a secret, a token or a password \
+in a memo. A separate review keeps, rewrites, merges or drops each proposal; the memos kept are under \
+/memos.";
 
 /// The worker's system prompt: its instructions, the tools it was granted
 /// and its budget, if it has one.
@@ -143,8 +152,13 @@ pub fn system_prompt(budget_microusd: Option<MicroUsd>, tools: &[String]) -> Str
         ),
         None => "this ticket has no cap.".to_owned(),
     };
+    let memory = if has("memo_propose") {
+        format!("\n\n{MEMORY}")
+    } else {
+        String::new()
+    };
     format!(
-        "{WORKER_INSTRUCTIONS}\n\nTools: {}\nBudget: {budget}",
+        "{WORKER_INSTRUCTIONS}{memory}\n\nTools: {}\nBudget: {budget}",
         text.join(" ")
     )
 }
@@ -1117,8 +1131,8 @@ async fn failed(
 #[cfg(test)]
 mod tests {
     use super::{
-        PREPARED, PiExecutor, PiExecutorParts, QUIET_TURN, WORK_DIR, assignment_text,
-        delivery_text, repository_text, system_prompt,
+        MEMORY, PREPARED, PiExecutor, PiExecutorParts, QUIET_TURN, WORK_DIR, WORKER_INSTRUCTIONS,
+        assignment_text, delivery_text, repository_text, system_prompt,
     };
     use crate::agent::broker::{AgentBroker, BrokerParts, DecideTerms, ModelTerms, WorkerParts};
     use crate::agent::config::{EvidenceConfig, HarnessKind};
@@ -1458,6 +1472,15 @@ mod tests {
         assert!(
             !bare.contains("browser") && !bare.contains("vault_list"),
             "{bare}"
+        );
+        assert!(
+            !bare.contains("Memos carry"),
+            "no memo_propose, no word of it"
+        );
+        let remembers = granted(&["worker_report", "fetch_url", "read", "memo_propose"]);
+        assert!(
+            remembers.contains(&format!("{WORKER_INSTRUCTIONS}\n\n{MEMORY}\n\nTools: ")),
+            "what memos are for, after the rules and before the tools: {remembers}"
         );
 
         let browsing = granted(&[

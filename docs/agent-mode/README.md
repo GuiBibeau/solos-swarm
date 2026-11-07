@@ -34,7 +34,7 @@ and its MIT-licensed prototype `deepseek-ai/dsh-superagent-prototype` (docs 000-
 | P12 Vault and verifiable browser | Done: the first build. Designed in #36 and built in eight PRs: capabilities in the tool registry (#38), the sealed envelope and the vault with its `solos-swarm vault` CLI (#43), approvals of vault items in the core, Slack and Discord (#47), keyed `fetch_url` and `vault_list` (#48), the trail in the core and schema V4 (#39), the `browse` module (#46), the browser tools (#49), and `solos-swarm agent trail` (#51). A worker uses an API key it never sees. `fetch_url {key}` writes `KeyUsed` to the chain, sends the key only to the key's hosts, on each redirect hop that stays there and through no proxy, scrubs every vault value from what comes back, and asks the item's owner in the thread before its first use on a Ticket. A worker also browses with a headless Lightpanda on this host and signs in with a vault login it never sees. Each browser step is on the chain as asked before the browser acts, then answered with the step this host's trail key signed, and the page and the exact View the model got are blobs in the state directory. `solos-swarm agent trail` checks a trail with public keys only: the chain, each step's signature and answer, each browser session's order and close, and every blob. Setup is in [Vault and API keys](#vault-and-api-keys), [Browser](#browser) and [Check a trail](#check-a-trail). [`vault-browser/`](vault-browser/rationale.md) holds the design: a write-only vault of logins and API keys used only on the machine that holds them, keyed `fetch_url` with first-use approval in chat, and a Lightpanda browser per Assignment whose every step is recorded in the chain and signed with Ed25519 by the machine that ran it. The PRs in [`prs.md`](vault-browser/prs.md) are the plan: browsers on nodes and keys in the browser (PRs 9 and 10) come later. |
 | P13 pstack as the coding method | Building. PRs 1 and 2 of [`prs.md`](pstack/prs.md) are done. PR 1 (#54) puts pstack in every worker with the vendored tree pinned by its MANIFEST, the entry into poteto-mode, the solos-swarm adapter and the `read` tool. PR 2 gives a Ticket a repository. The Router names one of `forge.repos`, the host clones it from its own mirror into the Ticket's `work/` before the worker starts, and the worker reads the clone and commits in it. Setup is in [Repositories](#repositories). Designed in #53. [`pstack/`](pstack/rationale.md) holds the design: pstack vendored verbatim and pinned, entered by the host, with a `read` tool, delegates that run as jobs on their own pool, repository workspaces cloned from a host mirror, pull requests published from a sandbox-made bundle so no token reaches a model or sandbox, a `ready` gate on host-recorded checks, cross-family review, and merges behind a click. Built in the PRs of [`prs.md`](pstack/prs.md). |
 | P14 The agent's own GitHub App | Designed in #62. PRs 1 and 2 of [`prs.md`](github-app/prs.md) are built: the App replaces the tokens, and a worker's `ready` delivers a pull request (see [Repositories](#repositories)). [`github-app/`](github-app/rationale.md) holds the design: the agent works on GitHub as the bot of a GitHub App the owner installs on chosen repositories. One App key replaces both personal access tokens, and the host mints installation tokens per repository and per read or write, never with the `workflows` permission. A pull request is owed, not done: the worker commits and reports `ready`, the host admits its commits from a sandbox-made bundle (ancestry, the bot as every commit's author, protected paths, size) and delivers the branch and the pull request as a durable Effect, with no new worker tool. Intake stays the github Source's REST polling, plus a pass that reads every open pull request again every five minutes. CI failures resume the Ticket within a bound, reviewers' comments reach it, and a merge, pinned to the head, needs a Discord click or an approving review by an approver. Suspending the App on GitHub is a kill switch that waits instead of crashing. It supersedes PRs 3, 4 and 7 of [`pstack/prs.md`](pstack/prs.md) where they conflict. Built in the PRs of [`prs.md`](github-app/prs.md). |
-| P15 Memory | Designed in #82. PR 1 of [`memory/design.md`](memory/design.md) is built (#82): a relaunched worker is told what it said (see [How the agent talks](#how-the-agent-talks)). PR 2 is built (#84): memos in the core and in `agent.db` (schema 8), written by the owner with `agent memo` or the MCP memo tools, and shown as a quoted index in the Router's system prompt and each worker's first prompt, with `memos_shown` on the chain. [`memory/`](memory/design.md) holds the design, which applies Anthropic's "The components of agent memory" to agent mode: the Store, the chain, the transcripts and each Ticket's `/work` already keep the agent's experience, but nothing learned on one Ticket reaches a later, different one, and a resumed Ticket's new worker knows what the person said but not what it answered. The plan is five PRs. PR 1 (done) quotes a Ticket's earlier `ready`, `blocked` and `failed` Reports and its latest `progress` in the first prompt of a relaunched Assignment, with no core or schema change. PR 2 (done) adds `Memo`, a core aggregate in a table of `agent.db` that is on the hash chain, with trust derived by the core from where a memo came from, and a small quoted index in the Router's and the workers' prompts. PRs 3 to 5 add `memo_propose` for workers and the review that keeps or drops what they propose, a daily dream Ticket that checks memos against the transcripts, and forgetting and review. Per the owner's decisions, promotion is autonomous at the highest thinking effort, with host-checked quotes and provenance, instead of waiting for a click. [`memory/graph.json`](memory/graph.json) is the design's data. |
+| P15 Memory | Designed in #82. PR 1 of [`memory/design.md`](memory/design.md) is built (#82): a relaunched worker is told what it said (see [How the agent talks](#how-the-agent-talks)). PR 2 is built (#84): memos in the core and in `agent.db` (schema 8), written by the owner with `agent memo` or the MCP memo tools, and shown as a quoted index in the Router's system prompt and each worker's first prompt, with `memos_shown` on the chain. PR 3 is built (#85): workers propose memos with `memo_propose`, quoting evidence the broker finds or refuses, and a separate review call at DeepSeek's highest thinking effort keeps, rewrites, merges or rejects each one, with no click; `/memos` and `router_read {kind: memo}` read them (see [Memory](#memory)). [`memory/`](memory/design.md) holds the design, which applies Anthropic's "The components of agent memory" to agent mode: the Store, the chain, the transcripts and each Ticket's `/work` already keep the agent's experience, but nothing learned on one Ticket reaches a later, different one, and a resumed Ticket's new worker knows what the person said but not what it answered. The plan is five PRs. PR 1 (done) quotes a Ticket's earlier `ready`, `blocked` and `failed` Reports and its latest `progress` in the first prompt of a relaunched Assignment, with no core or schema change. PR 2 (done) adds `Memo`, a core aggregate in a table of `agent.db` that is on the hash chain, with trust derived by the core from where a memo came from, and a small quoted index in the Router's and the workers' prompts. PR 3 (done) adds `memo_propose` for workers and the review that keeps or drops what they propose. PRs 4 and 5 add a daily dream Ticket that checks memos against the transcripts, and forgetting and review. Per the owner's decisions, promotion is autonomous at the highest thinking effort, with host-checked quotes and provenance, instead of waiting for a click. [`memory/graph.json`](memory/graph.json) is the design's data. |
 
 ## Later steps
 
@@ -871,6 +871,47 @@ threshold, and the Goal's budget and a retry's remaining budget work as P5 of th
 or `control.json`) still stops every model call and every Effect, the loop guard still refuses a worker that repeats
 itself, and the model's input and output limits still apply. [production.md](production.md#the-production-config)
 shows the config of an agent with no caps.
+
+## Memory
+
+Memos are what the agent learned on one Ticket that a later, different one should know
+([design](memory/design.md)). The owner writes them with `solos-swarm agent memo add` or the MCP tool
+`agent_memo_add`, and they are active at once. Workers on Pi propose them too, and a review decides each one, with no
+click. It is on wherever workers run on Pi, and every field is optional:
+
+```yaml
+memory:
+  proposals: true            # workers may propose memos and read /memos; false: only the owner writes them
+  daily_microusd: 500000     # the review's cap per UTC day on the `memory` account; absent: no cap
+  review:
+    model: deepseek-flash    # the workers' model unless set; provider, if set, must be the workers'
+    thinking: max            # DeepSeek's reasoning_effort, with thinking on: low, high or max (the default)
+    max_output_tokens: 131072  # default 65536, or 131072 at max: DeepSeek's thinking-mode defaults
+```
+
+- **Proposing.** `memo_propose {text, scope, evidence}`: at most 400 characters, scope `global` or the Ticket's own
+  `repo:<owner>/<name>`, and 1 to 4 pieces of evidence, each `{trigger, quote}` (the Trigger the Ticket came from or
+  one in its input) or `{call, quote}` (the tool whose answer it quotes, such as `run_code`). The broker keeps what
+  each of the seat's calls answered and finds every quote, word for word with runs of whitespace taken as one, or
+  refuses the proposal with why before anything reaches the Engine. Vault values in the text and the quotes become
+  `[vault:<name>]`. An Assignment proposes at most 3. The core derives the trust: a person's words quoted whole are
+  `person` and active at once; the output of the worker's own `run_code` or jobs is `model`; a stranger's or a bot's
+  words, a page, a file or any other tool's answer make it `external`.
+- **The review.** Every other proposal goes to a separate model call with `thinking: {type: enabled}` and
+  `reasoning_effort: max` (DeepSeek's documented highest; see
+  [thinking mode](https://api-docs.deepseek.com/guides/thinking_mode)), fixed instructions, the proposal with its
+  quotes and where each came from, and the active memos of its scope, all as data. It answers one JSON decision:
+  `keep`; `rewrite` (its words become a new memo that cites the same evidence, and the proposal is retired naming
+  it); `merge` (one new memo in place of the proposal and a `model` or `external` memo it repeats, both retired); or
+  `reject`. Its instructions reject what is instruction-shaped (permissions, tools, budgets, targets) and what
+  outside text asks for. The host checks the answer and applies it through the Engine. Any other answer, a failed
+  call, a pause or a refusal leaves the proposal proposed, never active. Reviews run in the background, one at a time,
+  each proposal at most once per run; a start reviews what the last run left proposed, and a proposal no review
+  decides is retired as `expiry` after 7 days. The calls are held and settled on the ledger's `memory` account.
+- **Reading.** `read` serves `/memos/global.md` and `/memos/repo/<owner>/<name>.md`: every active memo of the scope,
+  with who kept it, why, and its evidence, every model or outside line quoted, rendered from the Store as it is read
+  (so a forgotten memo is in no file). The Router reads the same with `router_read {kind: memo, id: global}` or a
+  memo's id. When the index in a prompt leaves memos out, its last line says where to read them.
 
 ## Slack app setup
 
@@ -1996,6 +2037,14 @@ package comes from npmjs); prefer the text `bun.lock`. `kind` is a variant for n
   `trail/` can be checked on any machine. Open: nothing anchors the chain's head outside `agent.db`, so a trail can
   still be cut at a clean session boundary without detection. The design is in
   [`vault-browser/`](vault-browser/rationale.md).
+- A memo is data in every prompt it reaches: each line is `>`-quoted and labelled with its trust, and no memo can
+  grant a permission or change a budget, a tool or a rule (the core never reads memo text for a decision). A worker
+  writes no memo: it proposes one with quotes the broker finds or refuses, the core derives its trust from where the
+  quotes came from, and a person's words quoted whole are the only worker proposal active at once. Everything else
+  waits for the review, a separate model call that is told to reject instruction-shaped memos and what outside text
+  asks for, whose answer the host checks before the Engine applies it; a review that fails changes nothing. Open:
+  the review is a model, so a hostile page that reads as a plain fact can still be kept, labelled `external`;
+  `agent memo retire` and `forget` take it back, and PR 4's dream checks memos against the transcripts.
 
 ## Open decisions
 

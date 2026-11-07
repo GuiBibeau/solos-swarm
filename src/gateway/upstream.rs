@@ -89,6 +89,7 @@ impl Provider for OpenAiCompatible {
             // non-reasoning model rejects `reasoning_effort: "none"`, so that is
             // only sent where the Goal declared reasoning off.
             let mut body = body;
+            let limit = response_limit(&body);
             if dialect == Dialect::OpenAi {
                 let disabled = body["thinking"]["type"] == json!("disabled");
                 if let Some(object) = body.as_object_mut() {
@@ -117,7 +118,7 @@ impl Provider for OpenAiCompatible {
                 .map_err(|_| anyhow::anyhow!("provider response interrupted"))?
             {
                 ensure!(
-                    bytes.len() + chunk.len() <= 262_144,
+                    bytes.len() + chunk.len() <= limit,
                     "provider response exceeds limit"
                 );
                 bytes.extend_from_slice(&chunk);
@@ -126,6 +127,18 @@ impl Provider for OpenAiCompatible {
         })
     }
 }
+/// The most a provider's answer may be. A call with thinking on also brings
+/// back its reasoning (`reasoning_content`), up to its whole output ceiling,
+/// so it may be larger; every call with thinking off, as swarm mode and agent
+/// sessions send, keeps the 256 KiB bound.
+fn response_limit(body: &Value) -> usize {
+    if body["thinking"]["type"] == json!("enabled") {
+        4 * 1024 * 1024
+    } else {
+        262_144
+    }
+}
+
 /// Models whose `reasoning_effort` field is meaningful on an OpenAI-compatible
 /// gateway. Kept beside the catalog admission so adding a model to one without
 /// the other is visible.
@@ -251,6 +264,14 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn only_a_call_with_thinking_on_may_bring_back_more_than_256_kib() {
+        let shared = upstream_body("deepseek-flash", &json!({"messages": []}), 8_192);
+        assert_eq!(response_limit(&shared), 262_144, "swarm mode and sessions");
+        let thinking = json!({"model": "deepseek-flash", "thinking": {"type": "enabled"}});
+        assert_eq!(response_limit(&thinking), 4 * 1024 * 1024);
     }
 
     #[test]

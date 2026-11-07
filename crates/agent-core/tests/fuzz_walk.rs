@@ -38,13 +38,19 @@
 //!
 //! 13. A memo never disappears and never changes what it is (scope, trust,
 //!     author, digest); its state moves only Proposed to Active (by
-//!     `activate_memo`), Proposed or Active to Retired (by `retire_memo`), and
-//!     anything but Forgotten to Forgotten (by `forget_memo`).
+//!     `activate_memo`), Proposed or Active to Retired (by `retire_memo`, or
+//!     by `revise_memo`, which retires the proposal and the memo it merges),
+//!     Proposed to Retired by `expire_memos`, and anything but Forgotten to
+//!     Forgotten (by `forget_memo`). A memo appears only by `propose_memo`
+//!     or `revise_memo`.
 //! 14. An Active memo is a person's word or carries the review that kept it,
 //!     and the review never retires a person's memo.
 //! 15. A new memo's trust is the least of its sources' trust, recomputed here
-//!     from the Trigger it quotes and the Policy, and it is Active at once
-//!     exactly when that is Person.
+//!     from the Trigger it quotes and the Policy. A proposed one is Active at
+//!     once exactly when that is Person; one `revise_memo` writes is Active
+//!     with its review.
+//! 20. `expire_memos` retires, under the expiry's name, exactly the
+//!     proposals at least seven days old.
 //! 16. A Forgotten memo holds no text and no quote, and keeps its digest.
 //! 17. No event holds a memo's text.
 //! 18. A MemosShown names only active memos of its audience's scopes, and is
@@ -62,8 +68,8 @@
 use solos_agent_core::change::{Deliverable, RepoName};
 use solos_agent_core::ids::key;
 use solos_agent_core::memo::{
-    Memo, MemoActor, MemoAudience, MemoAuthor, MemoIn, MemoReview, MemoScope, MemoSource,
-    MemoState, MemoTrust,
+    EXPIRY, Memo, MemoActor, MemoAudience, MemoAuthor, MemoIn, MemoReview, MemoScope, MemoSource,
+    MemoState, MemoTrust, PROPOSAL_TTL_MS,
 };
 use solos_agent_core::model::{
     Accept, Acknowledge, Actor, ActorKind, Addressed, Approval, Ask, AssignmentId, AssignmentState,
@@ -84,7 +90,7 @@ use std::rc::Rc;
 
 const THREADS: [&str; 3] = ["th1", "th2", "th3"];
 const SECRETS: [&str; 3] = ["local/github-gui", "local/openai", "laptop/gh"];
-const ROLLS: usize = 145;
+const ROLLS: usize = 151;
 /// Every Trigger's text, so a memo can quote one word for word.
 const TRIGGER_TEXT: &str = "please look at this";
 const REPOS: [&str; 2] = ["acme/widgets", "o/other"];
@@ -175,6 +181,10 @@ enum Cmd {
     RetireMemo(MemoRef, MemoActor, String),
     ForgetMemo(MemoRef, String, Actor),
     ShowMemos(AudienceSpec),
+    /// The review keeps the first in other words, merging the second.
+    ReviseMemo(MemoRef, MemoReview, String, Option<MemoRef>),
+    /// Expire the proposals no review decided, after moving the clock.
+    ExpireMemos(u64),
 }
 
 /// The kth memo proposed in the walk, or an id.
@@ -278,6 +288,8 @@ enum Op {
     RetireMemo(MemoId, MemoActor, String),
     ForgetMemo(MemoId, String, Actor),
     ShowMemos(MemoAudience),
+    ReviseMemo(MemoId, MemoReview, String, Option<MemoId>),
+    ExpireMemos(u64),
 }
 
 impl Op {
@@ -308,6 +320,8 @@ impl Op {
             Op::RetireMemo(..) => "retire_memo",
             Op::ForgetMemo(..) => "forget_memo",
             Op::ShowMemos(_) => "show_memos",
+            Op::ReviseMemo(..) => "revise_memo",
+            Op::ExpireMemos(_) => "expire_memos",
         }
     }
 }
@@ -501,6 +515,13 @@ fn resolve(w: &World, cmd: &Cmd) -> Op {
                 assignment: a,
             })
         }
+        Cmd::ReviseMemo(m, review, text, merges) => Op::ReviseMemo(
+            memo(m),
+            review.clone(),
+            text.clone(),
+            merges.as_ref().map(memo),
+        ),
+        Cmd::ExpireMemos(after) => Op::ExpireMemos(*after),
     }
 }
 
@@ -543,6 +564,13 @@ fn apply(w: &mut World, op: &Op) -> Result<String, Error> {
         Op::RetireMemo(m, by, reason) => e.retire_memo(m, by.clone(), reason).map(unit),
         Op::ForgetMemo(m, source, by) => e.forget_memo(m, source, by.clone()).map(unit),
         Op::ShowMemos(to) => e.show_memos(to.clone()).map(|index| index.text),
+        Op::ReviseMemo(m, review, text, merges) => e
+            .revise_memo(m, review.clone(), text.clone(), merges.as_ref())
+            .map(|id| id.to_string()),
+        Op::ExpireMemos(after) => {
+            w.now.set(w.now.get() + after);
+            e.expire_memos().map(|ids| format!("{ids:?}"))
+        }
     }
 }
 
@@ -792,6 +820,7 @@ fn has_target(roll: usize, r: &MemoryRepositories) -> bool {
             .memos
             .values()
             .any(|m| !matches!(m.state, MemoState::Forgotten { .. })),
+        145..=147 => r.memos.values().any(|m| m.state == MemoState::Proposed),
         _ => true,
     }
 }
@@ -1319,6 +1348,33 @@ fn gen_cmd(rng: &mut Lcg, w: &mut World) -> Cmd {
                 ))
             }
         }
+        145..=147 => {
+            let m = pick_memo(rng, r, |m| m.state == MemoState::Proposed);
+            let scope = match &m {
+                MemoRef::Nth(k) => memo_order(r)
+                    .get(*k)
+                    .and_then(|id| r.memos.get(id))
+                    .map(|m| m.scope.clone()),
+                MemoRef::Id(_) => None,
+            };
+            let merges = rng.chance(40).then(|| {
+                pick_memo(rng, r, |other| {
+                    other.is_active()
+                        && other.trust != MemoTrust::Person
+                        && Some(&other.scope) == scope.as_ref()
+                })
+            });
+            let review = MemoReview {
+                by: gen_review_name(rng),
+                reason: gen_reason(rng),
+            };
+            Cmd::ReviseMemo(m, review, gen_memo_text(rng), merges)
+        }
+        148..=150 => Cmd::ExpireMemos(if rng.chance(35) {
+            PROPOSAL_TTL_MS
+        } else {
+            rng.pick(&[0, 1_000])
+        }),
         _ => {
             let t = pick_ticket(rng, r, |t| latest_is(t, AssignmentState::Running));
             let Op::Note(ticket) = resolve(w, &Cmd::Note(t.clone())) else {
@@ -1538,8 +1594,9 @@ fn describe(kind: &str) -> (&'static str, &'static str) {
         ),
         "13-memo-transition" => (
             "A memo changed state other than by its command",
-            "Proposed to Active by activate_memo, live to Retired by retire_memo, to Forgotten by \
-             forget_memo; a new memo only by propose_memo",
+            "Proposed to Active by activate_memo, live to Retired by retire_memo or revise_memo, \
+             Proposed to Retired by expire_memos, to Forgotten by forget_memo; a new memo only \
+             by propose_memo or revise_memo",
         ),
         "14-memo-active-unreviewed" => (
             "A memo is active with no review and is not a person's word",
@@ -1551,7 +1608,12 @@ fn describe(kind: &str) -> (&'static str, &'static str) {
         ),
         "15-memo-trust" => (
             "A new memo's trust or state is not what its sources give",
-            "trust is the least of its sources' trust; Active at once exactly when Person",
+            "trust is the least of its sources' trust; a proposal is Active at once exactly when \
+             Person, and a revision is Active with its review",
+        ),
+        "20-memo-expiry" => (
+            "expire_memos retired the wrong memos or left a due one",
+            "exactly the proposals at least seven days old are retired, under the expiry's name",
         ),
         "16-memo-forgotten-text" => (
             "A forgotten memo still holds text, or lost its digest",
@@ -1771,7 +1833,15 @@ impl Checker {
         }
 
         self.secrets(w.engine.policy(), &op, &result, &before, after, &mut found);
-        memos(&policy, &op, &result, &before, after, &mut found);
+        memos(
+            &policy,
+            &op,
+            &result,
+            &before,
+            after,
+            w.now.get(),
+            &mut found,
+        );
 
         let mut trail_events = false;
         for event in fresh_events {
@@ -2200,6 +2270,7 @@ fn memos(
     result: &Result<String, Error>,
     before: &MemoryRepositories,
     after: &MemoryRepositories,
+    now_ms: u64,
     found: &mut Found,
 ) {
     let fresh_events = &after.events[before.events.len().min(after.events.len())..];
@@ -2247,13 +2318,24 @@ fn memos(
         let allowed = match (&was.state, &now.state) {
             (a, b) if a == b => true,
             (MemoState::Proposed, MemoState::Active { .. }) => by == "activate_memo",
+            (MemoState::Proposed, MemoState::Retired { .. }) if by == "expire_memos" => true,
             (MemoState::Proposed | MemoState::Active { .. }, MemoState::Retired { .. }) => {
-                by == "retire_memo"
+                by == "retire_memo" || by == "revise_memo"
             }
             (MemoState::Forgotten { .. }, _) => false,
             (_, MemoState::Forgotten { .. }) => by == "forget_memo",
             _ => false,
         };
+        if by == "expire_memos" && was.state != now.state {
+            let fits = matches!(
+                &now.state,
+                MemoState::Retired { by: MemoActor::Review { by }, at_ms, .. }
+                    if by == EXPIRY && at_ms.saturating_sub(was.created_ms) >= PROPOSAL_TTL_MS
+            );
+            if !fits {
+                found.push(("20-memo-expiry", format!("{id}: {was:?} -> {now:?}")));
+            }
+        }
         if !allowed {
             found.push((
                 "13-memo-transition",
@@ -2267,13 +2349,21 @@ fn memos(
     }
     for (id, now) in &after.memos {
         if !before.memos.contains_key(id) {
-            if by != "propose_memo" {
+            if by != "propose_memo" && by != "revise_memo" {
                 found.push(("13-memo-transition", format!("{id} appeared by {by}")));
             }
             let expected = expected_trust(policy, after, now);
             let at_once = matches!(now.state, MemoState::Active { review: None, .. });
             let waits = now.state == MemoState::Proposed;
-            let state_fits = if now.trust == MemoTrust::Person {
+            let state_fits = if by == "revise_memo" {
+                matches!(
+                    now.state,
+                    MemoState::Active {
+                        review: Some(_),
+                        ..
+                    }
+                )
+            } else if now.trust == MemoTrust::Person {
                 at_once
             } else {
                 waits
@@ -2325,6 +2415,15 @@ fn memos(
                 .is_none_or(|was| was.text_sha256 == now.text_sha256);
             if !now.text.is_empty() || quoted || !kept {
                 found.push(("16-memo-forgotten-text", format!("{id}: {now:?}")));
+            }
+        }
+    }
+    if matches!(op, Op::ExpireMemos(_)) && result.is_ok() {
+        for (id, m) in &after.memos {
+            if m.state == MemoState::Proposed
+                && now_ms.saturating_sub(m.created_ms) >= PROPOSAL_TTL_MS
+            {
+                found.push(("20-memo-expiry", format!("{id} is due and still proposed")));
             }
         }
     }
@@ -2857,6 +2956,13 @@ fn show(cmd: &Op) -> String {
             format!("forget_memo {m} by {source}:{} ({:?})", by.id, by.kind)
         }
         Op::ShowMemos(to) => format!("show_memos {to:?}"),
+        Op::ReviseMemo(m, review, text, merges) => format!(
+            "revise_memo {m} by {:?} into {:?} ({} chars) merging {merges:?}",
+            review.by,
+            text.chars().take(24).collect::<String>(),
+            text.chars().count()
+        ),
+        Op::ExpireMemos(after) => format!("expire_memos after {after}ms"),
     }
 }
 
@@ -2992,6 +3098,8 @@ fn seeded_random_walk_keeps_atomicity_and_effect_integrity() {
             "retire_memo",
             "forget_memo",
             "show_memos",
+            "revise_memo",
+            "expire_memos",
         ] {
             let ok = outcomes.get(name).map_or(0, |o| o.0);
             assert!(ok > 0, "{name} never succeeded\n{report}");

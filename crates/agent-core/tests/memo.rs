@@ -4,8 +4,9 @@
 
 use solos_agent_core::change::RepoName;
 use solos_agent_core::memo::{
-    MAX_MEMO_CHARS, Memo, MemoActor, MemoAudience, MemoAuthor, MemoIn, MemoIndex, MemoReview,
-    MemoScope, MemoSource, MemoState, MemoTrust, ROUTER_INDEX_BYTES, WORKER_INDEX_BYTES,
+    EXPIRY, MAX_MEMO_CHARS, Memo, MemoActor, MemoAudience, MemoAuthor, MemoIn, MemoIndex,
+    MemoReview, MemoScope, MemoSource, MemoState, MemoTrust, PROPOSAL_TTL_MS, ROUTER_INDEX_BYTES,
+    WORKER_INDEX_BYTES,
 };
 use solos_agent_core::model::{
     Accept, Acknowledge, Actor, Addressed, AssignmentId, ChannelRef, DomainEvent, MemoId, Plan,
@@ -642,7 +643,9 @@ fn an_index_stays_in_its_budget_and_counts_what_it_leaves_out() {
     assert!(
         router
             .text
-            .contains("more global memos are not shown here.")
+            .contains(r#"more global memos: router_read {"kind": "memo", "id": "global"})"#),
+        "the Router reads the rest by router_read: {}",
+        router.text
     );
     let worker = worker_index(&mut w, &ticket, &assignment);
     assert!(
@@ -651,6 +654,21 @@ fn an_index_stays_in_its_budget_and_counts_what_it_leaves_out() {
         worker.text.len()
     );
     assert!(worker.shown.len() > router.shown.len());
+    // A worker reads the rest with read, at the pages /memos serves.
+    assert!(
+        worker
+            .text
+            .contains("more global memos: read /memos/global.md)"),
+        "{}",
+        worker.text
+    );
+    assert!(
+        worker
+            .text
+            .contains("more memos about o/r: read /memos/repo/o/r.md)"),
+        "{}",
+        worker.text
+    );
     // The freshest come first, and what is shown is what is recorded.
     assert!(worker.text.contains("Lesson 39"));
     let shown = w.shown_events();
@@ -671,4 +689,225 @@ fn a_memo_that_reads_like_a_card_or_a_ticket_is_still_quoted_line_by_line() {
     assert!(lines[1..].iter().all(|line| line.starts_with("> ")));
     assert!(!index.text.lines().any(|line| line.starts_with("eval ")));
     assert!(!index.text.lines().any(|line| line.starts_with("Ticket ")));
+}
+
+/// A worker's proposal on o/r, from the output of its own `run_code` call.
+fn proposal(w: &mut World, ticket: &TicketId, assignment: &AssignmentId, text: &str) -> MemoId {
+    w.engine
+        .propose_memo(MemoIn {
+            scope: repo("o/r"),
+            text: text.into(),
+            sources: vec![MemoSource::Call {
+                assignment: assignment.clone(),
+                call: "run_code#1".into(),
+                tool: "run_code".into(),
+                transcript: Digest::of(br#"{"stdout":"cargo test: 3 failed"}"#),
+                quote: "cargo test: 3 failed".into(),
+            }],
+            author: MemoAuthor::Worker {
+                ticket: ticket.clone(),
+                assignment: assignment.clone(),
+            },
+        })
+        .unwrap()
+}
+
+fn kinds_since(w: &World, from: usize) -> Vec<&'static str> {
+    w.engine.repos().events[from..]
+        .iter()
+        .map(|e| match &e.event {
+            DomainEvent::MemoProposed { active: false, .. } => "proposed",
+            DomainEvent::MemoProposed { active: true, .. } => "proposed active",
+            DomainEvent::MemoActivated { .. } => "activated",
+            DomainEvent::MemoRetired { .. } => "retired",
+            _ => "other",
+        })
+        .collect()
+}
+
+#[test]
+fn the_review_keeps_a_proposal_in_its_own_words_as_a_new_memo_with_the_same_sources() {
+    let mut w = World::new();
+    let (ticket, assignment) = w.running("th1", Some("o/r"));
+    let p = proposal(
+        &mut w,
+        &ticket,
+        &assignment,
+        "cargo test fails here, use ./check",
+    );
+    let said = "Tests on o/r run with ./check; cargo test fails there.";
+    w.advance(10);
+    let from = w.engine.repos().events.len();
+
+    let q = w
+        .engine
+        .revise_memo(&p, review("precise and durable"), said.into(), None)
+        .unwrap();
+
+    let (was, now) = (w.memo(&p), w.memo(&q));
+    assert!(
+        matches!(&was.state, MemoState::Retired { by: MemoActor::Review { .. }, reason, .. }
+            if reason.contains(q.as_str())),
+        "the proposal names what kept it: {was:?}"
+    );
+    assert_eq!(
+        was.text, "cargo test fails here, use ./check",
+        "its text stays"
+    );
+    assert_eq!(now.text, said);
+    assert_eq!(now.text_sha256, Digest::of(said.as_bytes()));
+    assert_eq!(
+        (now.sources.clone(), now.author.clone()),
+        (was.sources, was.author)
+    );
+    assert_eq!(now.trust, MemoTrust::Model);
+    assert!(
+        matches!(&now.state, MemoState::Active { review: Some(r), .. } if r.reason == "precise and durable")
+    );
+    assert_eq!(kinds_since(&w, from), ["retired", "proposed", "activated"]);
+    let index = worker_index(&mut w, &ticket, &assignment);
+    assert_eq!(index.shown, std::slice::from_ref(&q));
+    assert!(
+        index
+            .text
+            .contains(&format!("> [{q} · model · o/r] {said}"))
+    );
+    let chain = serde_json::to_string(&w.engine.repos().events).unwrap();
+    assert!(!chain.contains("./check"), "no event holds memo text");
+
+    // A decided proposal is decided; the same words are a keep, not a
+    // rewrite; and words a live memo holds already are refused, naming it.
+    let again = w.engine.revise_memo(&p, review("x"), "Other.".into(), None);
+    assert!(matches!(again, Err(Error::Refused(_))), "{again:?}");
+    let p2 = proposal(&mut w, &ticket, &assignment, "Use ./check.");
+    let same = w
+        .engine
+        .revise_memo(&p2, review("x"), "Use ./check.".into(), None);
+    assert!(matches!(same, Err(Error::Invalid(_))), "{same:?}");
+    let held = w.engine.revise_memo(&p2, review("x"), said.into(), None);
+    assert!(
+        matches!(&held, Err(Error::Refused(why)) if why.contains(q.as_str())),
+        "{held:?}"
+    );
+    for bad in ["", "a\rb", &"x".repeat(MAX_MEMO_CHARS + 1)] {
+        let refused = w.engine.revise_memo(&p2, review("x"), bad.into(), None);
+        assert!(matches!(refused, Err(Error::Invalid(_))), "{bad:?}");
+    }
+    assert_eq!(w.memo(&p2).state, MemoState::Proposed, "nothing changed");
+}
+
+#[test]
+fn a_merge_replaces_both_memos_with_one_that_cites_both_and_never_a_persons_word() {
+    let mut w = World::new();
+    let (ticket, assignment) = w.running("th1", Some("o/r"));
+    let older = proposal(&mut w, &ticket, &assignment, "Use ./check for tests.");
+    w.engine.activate_memo(&older, review("tested")).unwrap();
+    let person = w.remember(repo("o/r"), "Never run the e2e suite.");
+    let elsewhere = w.remember(MemoScope::Global, "Answer in French.");
+    w.advance(1);
+    let page = w
+        .engine
+        .propose_memo(MemoIn {
+            scope: repo("o/r"),
+            text: "./check needs SOLOS_FAST=1.".into(),
+            sources: vec![MemoSource::Call {
+                assignment: assignment.clone(),
+                call: "fetch_url#2".into(),
+                tool: "fetch_url".into(),
+                transcript: Digest::of(b"page"),
+                quote: "export SOLOS_FAST=1 before ./check".into(),
+            }],
+            author: MemoAuthor::Worker {
+                ticket: ticket.clone(),
+                assignment: assignment.clone(),
+            },
+        })
+        .unwrap();
+    let merged = "Tests run with ./check, with SOLOS_FAST=1 set.";
+    for (into, why) in [
+        (&person, "a person's word"),
+        (&elsewhere, "not an active memo of repo:o/r"),
+        (&page, "not an active memo"),
+    ] {
+        let refused = w
+            .engine
+            .revise_memo(&page, review("merge"), merged.into(), Some(into));
+        assert!(
+            matches!(&refused, Err(Error::Refused(text)) if text.contains(why)),
+            "{into}: {refused:?}"
+        );
+    }
+    assert_eq!(w.memo(&page).state, MemoState::Proposed);
+    assert!(w.memo(&person).is_active() && w.memo(&older).is_active());
+    let from = w.engine.repos().events.len();
+
+    let one = w
+        .engine
+        .revise_memo(
+            &page,
+            review("one memo, not two"),
+            merged.into(),
+            Some(&older),
+        )
+        .unwrap();
+
+    let memo = w.memo(&one);
+    assert_eq!(memo.trust, MemoTrust::External, "the least of its sources");
+    assert_eq!(
+        memo.sources.len(),
+        2,
+        "both memos' sources: {:?}",
+        memo.sources
+    );
+    assert!(memo.sources.contains(&w.memo(&older).sources[0]));
+    assert!(memo.sources.contains(&w.memo(&page).sources[0]));
+    for gone in [&older, &page] {
+        assert!(
+            matches!(&w.memo(gone).state, MemoState::Retired { reason, .. } if reason.contains(one.as_str())),
+            "{gone}"
+        );
+    }
+    assert_eq!(
+        kinds_since(&w, from),
+        ["retired", "retired", "proposed", "activated"]
+    );
+    let index = worker_index(&mut w, &ticket, &assignment);
+    assert!(index.shown.contains(&one) && index.shown.contains(&person));
+    assert!(!index.shown.contains(&older));
+}
+
+#[test]
+fn a_proposal_no_review_decides_expires_after_seven_days_and_nothing_else_does() {
+    let mut w = World::new();
+    let (ticket, assignment) = w.running("th1", Some("o/r"));
+    let waits = proposal(&mut w, &ticket, &assignment, "Waits for its review.");
+    let kept = proposal(&mut w, &ticket, &assignment, "Kept by its review.");
+    w.engine.activate_memo(&kept, review("useful")).unwrap();
+    let person = w.remember(MemoScope::Global, "Answer in French.");
+    let events = w.engine.repos().events.len();
+
+    w.advance(PROPOSAL_TTL_MS - 2);
+    assert_eq!(w.engine.expire_memos().unwrap(), []);
+    assert_eq!(w.engine.repos().events.len(), events, "nothing is written");
+    let late = proposal(&mut w, &ticket, &assignment, "Proposed a week later.");
+    w.advance(2);
+
+    assert_eq!(
+        w.engine.expire_memos().unwrap(),
+        std::slice::from_ref(&waits)
+    );
+
+    assert!(matches!(
+        &w.memo(&waits).state,
+        MemoState::Retired { by: MemoActor::Review { by }, reason, .. }
+            if by == EXPIRY && reason.contains("7 days")
+    ));
+    assert_eq!(w.memo(&late).state, MemoState::Proposed);
+    assert!(w.memo(&kept).is_active() && w.memo(&person).is_active());
+    assert_eq!(w.engine.expire_memos().unwrap(), [], "once");
+    let late_review = w.engine.activate_memo(&waits, review("too late"));
+    assert!(
+        matches!(late_review, Err(Error::Refused(_))),
+        "{late_review:?}"
+    );
 }

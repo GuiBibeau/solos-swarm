@@ -475,6 +475,13 @@ where
             nodes: nodes.map(Listener::environments).unwrap_or_default(),
         };
         let broker = AgentBroker::with_pstack(parts, job_limits, remote, pstack)?;
+        if let Some(memory) = config.memory_parts()? {
+            eprintln!(
+                "agent: workers propose memos; {} decides each",
+                memory.review.name()
+            );
+            broker.set_memory(memory);
+        }
         let forge = config
             .forge
             .as_ref()
@@ -566,6 +573,8 @@ where
         let (listener, socket) = broker::bind(state_dir)?;
         let app = self.broker.router()?;
         let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        // What the last run left proposed is reviewed once in this one.
+        drop(self.broker.review_pending());
         Ok(Served {
             reaper: broker::browser::spawn_reaper(&self.broker),
             broker: self.broker,

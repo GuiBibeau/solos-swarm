@@ -9,7 +9,7 @@ use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use solos_agent_core::change::{BranchName, CommitSha, Harvest, RepoName};
 use solos_agent_core::delivery::Observed;
-use solos_agent_core::memo::{MemoAudience, MemoIndex, MemoScope};
+use solos_agent_core::memo::{Memo, MemoAudience, MemoIn, MemoIndex, MemoReview, MemoScope};
 use solos_agent_core::model::{
     Actor, Ask, AssignmentId, Candidate, ChannelRef, Decision, EvalId, Input, MemoId, MicroUsd,
     OutboundMessage, Plan, Report, ReportIn, SecretGrant, SecretId, TicketId, Trigger, TriggerId,
@@ -469,6 +469,28 @@ pub enum Fact {
     ShowMemos {
         to: MemoAudience,
     },
+    /// A worker proposes a memo whose quotes the broker found where they
+    /// say they are. Asked, so the answer carries the memo as kept.
+    ProposeMemo(MemoIn),
+    /// The review's decision on a proposed memo. Asked.
+    ReviewMemo {
+        memo: MemoId,
+        review: MemoReview,
+        decision: MemoDecision,
+    },
+}
+
+/// What the review decided about a proposed memo.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemoDecision {
+    /// Active as proposed.
+    Keep,
+    /// Kept in these words instead.
+    Rewrite { text: String },
+    /// Kept in these words, in place of the active memo `into` too.
+    Merge { into: MemoId, text: String },
+    /// Retired.
+    Reject,
 }
 
 /// An operator's order about the agent's memos. The Source vouches for who
@@ -548,6 +570,11 @@ pub enum Applied {
     Secret(SecretGrant),
     /// The memo index a session is shown.
     Memos(MemoIndex),
+    /// A memo as the core keeps it, once proposed.
+    Memo(Box<Memo>),
+    /// The review's decision applied: the memo it made active, the
+    /// proposal or the one in its words, or `None` for a rejection.
+    Reviewed(Option<MemoId>),
     Done,
 }
 
