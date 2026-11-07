@@ -25,6 +25,9 @@ RuntimeDirectory=solos-agent-publish
 RuntimeDirectoryMode=0700
 UMask=0077
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# The async runtime starts one worker thread per core (128 on the box), which alone filled TasksMax and left no
+# thread for DNS or connections, so uploads hung silently. Two are plenty for a 5-second poll.
+Environment=TOKIO_WORKER_THREADS=2
 ExecStartPre=/bin/sh -c 'cp "$HOME/agent/tokens/vercel-blob-token" "$RUNTIME_DIRECTORY/vercel-blob-token"'
 ExecStart=%h/agent/current/bin/solos-swarm agent publish --config %h/agent/agent.yaml --state-dir %h/agent/state
 KillSignal=SIGTERM
@@ -38,7 +41,7 @@ Nice=10
 CPUWeight=10
 IOWeight=10
 MemoryMax=512M
-TasksMax=128
+TasksMax=256
 NoNewPrivileges=yes
 StandardOutput=journal
 StandardError=journal
