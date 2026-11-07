@@ -95,6 +95,58 @@ fn forgetting_a_memo_erases_its_text_from_the_file_and_the_chain_still_verifies(
     assert_eq!(state, "forgotten");
 }
 
+/// Whether the file at `path` holds `text`, byte for byte.
+fn holds(path: &std::path::Path, text: &str) -> bool {
+    std::fs::read(path).is_ok_and(|bytes| {
+        bytes
+            .windows(text.len())
+            .any(|window| window == text.as_bytes())
+    })
+}
+
+#[test]
+fn after_a_forget_the_text_is_in_neither_the_database_file_nor_its_wal() {
+    let db = TempDb::new("memo-bytes");
+    let wal = db.path.with_file_name("agent.db-wal");
+    let now = Rc::new(Cell::new(1_000));
+    let mut e = engine(&db, &now);
+    let canary = "canary 7f3e9a: the owner's private note";
+    let id = remember(&mut e, MemoScope::Global, canary);
+    // A retire rewrites the row while it still holds the text, so a stale
+    // copy would be left in the page's free space without secure_delete.
+    let alice = MemoActor::Operator {
+        source: "slack".into(),
+        by: Actor::person("alice"),
+    };
+    e.retire_memo(&id, alice, "superseded").unwrap();
+    for n in 0..40 {
+        now.set(now.get() + 1);
+        remember(
+            &mut e,
+            MemoScope::Global,
+            &format!("filler {n}: {}", "z".repeat(300)),
+        );
+    }
+    assert!(
+        holds(&db.path, canary) || holds(&wal, canary),
+        "the text was written before it was forgotten"
+    );
+
+    e.forget_memo(&id, "slack", Actor::person("alice")).unwrap();
+
+    assert!(!holds(&db.path, canary), "agent.db still holds the text");
+    assert!(!holds(&wal, canary), "agent.db-wal still holds the text");
+    // The Store goes on, and still holds nothing of it after more writes
+    // and a close.
+    remember(&mut e, MemoScope::Global, "Answer in French.");
+    e.repos().verify_chain().unwrap();
+    drop(e);
+    assert!(!holds(&db.path, canary));
+    assert!(!holds(&wal, canary));
+    let reopened = SqliteStore::open(&db.path).unwrap();
+    assert_eq!(reopened.read_memo(&id).unwrap().unwrap().text, "");
+}
+
 #[test]
 fn memos_and_their_events_survive_a_reopen() {
     let db = TempDb::new("memo-reopen");

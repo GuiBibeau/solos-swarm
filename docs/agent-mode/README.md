@@ -1366,7 +1366,10 @@ production box ([production.md](production.md) has the units and the rollout):
   of `forge.repos`), `retire MEMO --reason TEXT` and `forget MEMO` are filed like `agent stop` and applied by the Engine
   only if the Policy names `mcp:NAME`. An operator's memo is their own word, so it is active at once. A memo's text is in
   its row of `agent.db` (schema 8) and only its digest is on the event chain, so `forget` erases the text and the chain
-  still verifies; a `memos_shown` event names the memos each session was shown. `list [--all] [--json]` reads the Store.
+  still verifies. The Store writes with SQLite's `secure_delete` and empties its WAL after a forget, so the text is in
+  neither `agent.db` nor `agent.db-wal` afterwards; the `add` order in `state/mcp/commands.jsonl` and the transcripts of
+  workers that were shown it keep it until they are pruned. A `memos_shown` event names the memos each session was
+  shown. `list [--all] [--json]` reads the Store.
 
 ## Web dashboard
 
