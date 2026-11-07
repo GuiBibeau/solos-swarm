@@ -5,7 +5,8 @@
 //! path the checks refuse, and `agent serve` and the `vault` CLI judge with
 //! one view.
 
-use crate::agent::config::{AgentConfig, ClaudeConfig, ExecutorConfig, RunCodeConfig};
+use crate::agent::config::{AgentConfig, ClaudeConfig, DepsConfig, ExecutorConfig, RunCodeConfig};
+use crate::agent::forge::DEPS_DIR;
 use crate::agent::{TICKETS_DIR, pstack};
 use crate::bwrap::Bwrap;
 use crate::code::Mount;
@@ -110,6 +111,13 @@ impl Exposure {
             }
         }
         visible.extend(host.state_dir.as_ref().map(|state| state.join(TICKETS_DIR)));
+        // The repositories' installed dependencies, which a Ticket's run_code
+        // mounts, and the package manager that built them and that it runs.
+        visible.extend(host.state_dir.as_ref().map(|state| state.join(DEPS_DIR)));
+        if let Some(forge) = &config.forge {
+            let binaries = forge.repos().values().filter_map(|repo| repo.deps.as_ref());
+            visible.extend(binaries.filter_map(DepsConfig::binary_path));
+        }
         visible.extend(host.node.as_deref().map(|node| node_root(node).to_owned()));
         visible.extend(host.pi_root.clone());
         visible.extend(host.pstack.clone());
@@ -271,6 +279,68 @@ budgets: {session_microusd: 500000}
         };
         assert_eq!(pstack_mounts(Some(tree)), 1);
         assert_eq!(pstack_mounts(None), 0, "no pstack, no /pstack mount");
+    }
+
+    const DEPS: &str = "forge:
+  kind: local
+  remote: /srv/remote
+  identity: {name: bot, email: bot@example.com}
+  repos:
+    acme/widgets: {about: Widgets., base: main, deps: {kind: bun, binary: /opt/bun/bin/bun}}
+    acme/docs: {about: Docs., base: main}
+";
+
+    #[test]
+    fn the_dependency_cache_and_the_package_manager_are_in_the_view_and_a_secret_may_not_sit_there()
+    {
+        let (without, host) = representative();
+        let config: AgentConfig = serde_yaml::from_str(&format!("{CONFIG}{DEPS}")).unwrap();
+        let view = Exposure::new(&config, &host).view();
+        let state = Path::new("/srv/state");
+
+        for seen in [
+            state.join("deps"),
+            state.join("deps/acme/widgets/key/node_modules/.bun/x/index.js"),
+            PathBuf::from("/opt/bun/bin/bun"),
+        ] {
+            assert!(
+                view.hides(&seen).is_err(),
+                "{} is bound into a sandbox, so no secret may be there",
+                seen.display()
+            );
+        }
+        for kept in [
+            state.join("agent.db"),
+            state.join("forge"),
+            PathBuf::from("/opt/bun"),
+        ] {
+            assert!(view.hides(&kept).is_ok(), "{} is not bound", kept.display());
+        }
+        let bare = Exposure::new(&without, &host).view();
+        assert!(
+            bare.hides(Path::new("/opt/bun/bin/bun")).is_ok(),
+            "a config with no deps binds no package manager"
+        );
+    }
+
+    #[test]
+    fn the_extras_a_ticket_adds_are_read_from_the_deps_directory_the_view_holds() {
+        let (config, host) = representative();
+        let view = Exposure::new(&config, &host).view();
+        let cache = Path::new("/srv/state/deps/acme/widgets/key");
+        let extras = crate::code::Extras {
+            binds: vec![crate::code::Bind::ReadOnly {
+                source: cache.join("node_modules"),
+                target: PathBuf::from("/work/node_modules"),
+            }],
+            ..crate::code::Extras::default()
+        };
+        for bind in &extras.binds {
+            let crate::code::Bind::ReadOnly { source, .. } = bind else {
+                continue;
+            };
+            assert!(view.hides(source).is_err(), "{} is bound", source.display());
+        }
     }
 
     #[test]

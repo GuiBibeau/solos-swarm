@@ -6,7 +6,9 @@
 //! done, so a Ticket a person later resumes clones again instead of finding an
 //! empty directory) and the worker's transcripts; the forge mirrors nobody has
 //! fetched into for that long (the next Ticket on the repository makes one
-//! again); and the Router's old transcripts. It never touches an open Ticket,
+//! again); the installed-dependency caches no Ticket has mounted for that long
+//! (the next Ticket on the repository builds one again); and the Router's old
+//! transcripts. It never touches an open Ticket,
 //! `agent.db`, a directory it cannot match to a Ticket, or, unless asked
 //! (`include_trail`), the trail's blobs, which `agent trail` needs to check a
 //! browser's steps.
@@ -16,7 +18,7 @@
 //! the plan keeps its clone. Both are testable without a Store: they ask a
 //! [`Ledger`].
 
-use super::forge::{FORGE_DIR, REPO_JSON};
+use super::forge::{DEPS_DIR, DEPS_MANIFEST, DEPS_SCRATCH_PREFIX, FORGE_DIR, REPO_JSON};
 use super::pi_executor::{HOST_DIR, PREPARED, WORK_DIR, dir_name};
 use super::{ROUTER_DIR, STORE_FILE, TICKETS_DIR, TRAIL_DIR};
 use anyhow::{Context, Result, bail, ensure};
@@ -104,6 +106,10 @@ pub enum Kind {
     RouterTranscript,
     /// A forge mirror nobody has used for `keep_days`.
     ForgeMirror,
+    /// An installed-dependencies cache no Ticket has mounted for `keep_days`,
+    /// or the scratch directory of a build that died. The next Ticket on the
+    /// repository builds the cache again.
+    DepsCache,
 }
 
 impl Kind {
@@ -114,6 +120,7 @@ impl Kind {
             Self::Trail => "trail blobs",
             Self::RouterTranscript => "router transcripts",
             Self::ForgeMirror => "forge mirror",
+            Self::DepsCache => "dependency cache",
         }
     }
 }
@@ -220,6 +227,7 @@ pub fn plan(options: &Options, ledger: &dyn Ledger, now_ms: Ms) -> Result<Plan> 
         options.keep_days,
     );
     mirror_items(&mut plan, &state.join(FORGE_DIR), cutoff, options.keep_days)?;
+    deps_items(&mut plan, &state.join(DEPS_DIR), cutoff, options.keep_days)?;
     Ok(plan)
 }
 
@@ -373,6 +381,38 @@ fn mirror_items(plan: &mut Plan, forge: &Path, cutoff: Ms, keep_days: u64) -> Re
                     paths: vec![mirror],
                     why: format!("not fetched into for {keep_days} days"),
                 });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `deps/<owner>/<name>/<key>`, whose manifest nothing has touched since
+/// `cutoff` (a Ticket's start marks its cache used), and the `tmp-*` scratch
+/// directories of builds older than that. Any other name is not ours.
+fn deps_items(plan: &mut Plan, deps: &Path, cutoff: Ms, keep_days: u64) -> Result<()> {
+    for (_, owner) in subdirectories(deps)? {
+        for (_, repo) in subdirectories(&owner)? {
+            for (name, dir) in subdirectories(&repo)? {
+                let (used, what) = if name.starts_with(DEPS_SCRATCH_PREFIX) {
+                    (modified(&dir), "a build that did not finish")
+                } else if name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    (
+                        modified(&dir.join(DEPS_MANIFEST)).or_else(|| modified(&dir)),
+                        "a cache",
+                    )
+                } else {
+                    continue;
+                };
+                if used.unwrap_or(0) < cutoff {
+                    plan.items.push(Item {
+                        kind: Kind::DepsCache,
+                        ticket: None,
+                        bytes: du(&dir),
+                        paths: vec![dir],
+                        why: format!("{what} not used for {keep_days} days"),
+                    });
+                }
             }
         }
     }

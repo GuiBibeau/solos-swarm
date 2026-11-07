@@ -21,7 +21,7 @@ use super::ports::{Applied, Fact, FactSink, Forge, Proposal, Refusal as Unadmitt
 use super::pstack::{self, Pstack, Reader};
 use super::watchdog::usd;
 use crate::broker::{FETCH_TOTAL_BYTES, FetchGuard, FetchRefused, fetch_guarded, now_ms};
-use crate::code::CodeExecutor;
+use crate::code::{CodeExecutor, Extras};
 use crate::gateway::{self, PriceTable, Provider, Receipt, Temperature, Upstream};
 use crate::vault::Vault;
 use anyhow::{Context, Result, anyhow, ensure};
@@ -125,6 +125,9 @@ pub struct WorkerSeat {
     environment: Option<String>,
     /// A repository Ticket's `<ticket>/host`.
     host_dir: Option<PathBuf>,
+    /// What this host adds to its `run_code` sandbox, such as the repository's
+    /// installed dependencies.
+    extras: Extras,
     /// The Ticket's whole budget, which every Assignment of it shares, or
     /// `None` where it has no cap.
     pub budget_microusd: Option<MicroUsd>,
@@ -159,6 +162,7 @@ impl WorkerSeat {
             work_dir,
             environment: None,
             host_dir: None,
+            extras: Extras::default(),
             budget_microusd: budget_microusd.into(),
             since_ms: now_ms(),
             turn: Mutex::new(None),
@@ -182,6 +186,12 @@ impl WorkerSeat {
     /// `host_dir` what the host wrote about it.
     pub fn on_repository(mut self, host_dir: PathBuf) -> Self {
         self.host_dir = Some(host_dir);
+        self
+    }
+
+    /// Its `run_code` sandbox gets `extras` too.
+    pub fn with_extras(mut self, extras: Extras) -> Self {
+        self.extras = extras;
         self
     }
 
@@ -958,6 +968,7 @@ impl AgentBroker {
     pub async fn admit_ready(
         &self,
         seat: &WorkerSeat,
+        text: &str,
     ) -> std::result::Result<ReadyAdmission, NotAdmitted> {
         let id = seat.ticket.clone();
         let found = self
@@ -1051,6 +1062,14 @@ impl AgentBroker {
         // What the Engine will make of it, for the words the worker reads.
         let admission = ready_gate(&ticket, terms, Some(&harvest))
             .map_err(|refused| NotAdmitted::refused(refused.tell()))?;
+        // The report becomes the pull request's description, so where the
+        // repository wants evidence in it, a new head is not proposed without.
+        // A reply on a head already delivered is not a description.
+        if matches!(admission, Admission::Propose(_))
+            && let Some(evidence) = &workspace.evidence
+        {
+            super::forge::check_evidence(text, evidence).map_err(NotAdmitted::refused)?;
+        }
         Ok(ReadyAdmission {
             admission,
             round: ticket.change.as_ref().map_or(1, |change| change.pushes + 1),
@@ -1832,7 +1851,7 @@ async fn report(broker: &AgentBroker, seat: &Arc<WorkerSeat>, args: Value) -> Re
     // A `ready` on a Ticket that owes a change or a pull request is admitted by
     // the host before it is recorded, or refused with what to do next.
     let admitted = if status == ReportStatus::Ready {
-        let admitted = broker.admit_ready(seat).await.map_err(|refused| {
+        let admitted = broker.admit_ready(seat, &text).await.map_err(|refused| {
             let status = if refused.conflict {
                 StatusCode::CONFLICT
             } else {
@@ -1956,6 +1975,7 @@ fn job_host<'a>(
         ticket: &seat.ticket,
         assignment: &seat.assignment,
         work_dir: &seat.work_dir,
+        extras: &seat.extras,
     }
 }
 

@@ -5,7 +5,7 @@
 //! environment on each call, so a node that went offline is a clear tool
 //! error, and the executor holds a Launch until the node is back.
 
-use crate::code::{CodeExecutor, OutputBounds, Started};
+use crate::code::{CodeExecutor, Extras, OutputBounds, Started};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use solos_agent_core::change::CommitSha;
@@ -23,6 +23,10 @@ pub const LOCAL: &str = "local";
 pub struct Work<'a> {
     pub ticket: &'a TicketId,
     pub dir: &'a Path,
+    /// What this host adds to the Ticket's sandbox (a repository's installed
+    /// dependencies). A node's own sandbox ignores it: a repository Ticket
+    /// never runs on one.
+    pub extras: &'a Extras,
 }
 
 /// The environment cannot take a command now, but may later: a node that
@@ -63,7 +67,7 @@ impl ExecutionEnvironment for Local {
         Ok(())
     }
     fn run_code(&self, work: Work<'_>, args: &Value) -> Result<Started> {
-        self.0.start_in(work.dir, args)
+        self.0.start_in_with(work.dir, work.extras, args)
     }
     fn job(
         &self,
@@ -72,7 +76,8 @@ impl ExecutionEnvironment for Local {
         timeout: Duration,
         bounds: OutputBounds,
     ) -> Result<Started> {
-        self.0.start_job_in(work.dir, code, timeout, bounds)
+        self.0
+            .start_job_in_with(work.dir, work.extras, code, timeout, bounds)
     }
 }
 

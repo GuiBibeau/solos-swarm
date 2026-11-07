@@ -243,7 +243,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_browser_sandbox_shares_the_host_network() {
+    fn only_the_browser_and_the_dependency_build_share_the_host_network() {
         fn callers(dir: &Path, found: &mut Vec<PathBuf>) {
             for entry in std::fs::read_dir(dir).unwrap() {
                 let path = entry.unwrap().path();
@@ -262,7 +262,14 @@ mod tests {
         let mut found = Vec::new();
         callers(&root.join("src"), &mut found);
         found.retain(|path| !path.ends_with("src/bwrap.rs"));
-        assert_eq!(found, [root.join("src/browse/lightpanda.rs")]);
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                root.join("src/agent/forge/deps.rs"),
+                root.join("src/browse/lightpanda.rs")
+            ]
+        );
     }
 
     #[test]

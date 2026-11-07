@@ -5,7 +5,9 @@
 
 use super::mirror::{Mirrors, Remote};
 use crate::agent::config::Identity;
-use crate::agent::ports::{BoxFuture, Execute, Forge, Proposal, Refusal, TicketDirs, Workspace};
+use crate::agent::ports::{
+    BoxFuture, Dependencies, Execute, Forge, Proposal, Refusal, TicketDirs, Workspace,
+};
 use anyhow::{Context, Result, bail};
 use solos_agent_core::change::{Harvest, RepoName};
 use solos_agent_core::delivery::Observed;
@@ -47,6 +49,10 @@ impl Forge for LocalForge {
                 .admit(proposal.repo, &proposal, &self.identity)
                 .await
         })
+    }
+
+    fn dependencies<'a>(&'a self, workspace: &'a Workspace) -> BoxFuture<'a, Dependencies> {
+        Box::pin(self.mirrors.dependencies(workspace))
     }
 
     fn execute<'a>(&'a self, job: Execute<'a>) -> BoxFuture<'a, Result<Observed>> {

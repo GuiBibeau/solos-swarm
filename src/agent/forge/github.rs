@@ -8,7 +8,7 @@ use super::mirror::{Branch, Mirrors, Remote};
 use crate::agent::config::Identity;
 use crate::agent::github::{self, Access, GithubApi, Got, InstallToken, Minter, quiet, shape};
 use crate::agent::ports::{
-    BoxFuture, Execute, Forge, Proposal, Publish, Refusal, TicketDirs, Workspace,
+    BoxFuture, Dependencies, Execute, Forge, Proposal, Publish, Refusal, TicketDirs, Workspace,
 };
 use anyhow::{Context, Result, bail};
 use reqwest::{Method, Url};
@@ -88,6 +88,11 @@ impl Forge for GithubForge {
             let bot = Identity { name, email };
             self.mirrors.admit(proposal.repo, &proposal, &bot).await
         })
+    }
+
+    /// The dependencies come from the host's mirror, so they need no token.
+    fn dependencies<'a>(&'a self, workspace: &'a Workspace) -> BoxFuture<'a, Dependencies> {
+        Box::pin(self.mirrors.dependencies(workspace))
     }
 
     /// Publish, every step a no-op where it is already true: the branch holds

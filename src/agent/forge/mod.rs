@@ -3,11 +3,15 @@
 //! reaches the forge as a bundle made in a fresh sandbox, judged and pushed
 //! from the host's own mirror (see [`mirror`]).
 
+mod deps;
+mod evidence;
 mod github;
 mod local;
 mod mirror;
 mod paths;
 
+pub use deps::{MANIFEST as DEPS_MANIFEST, SCRATCH_PREFIX as DEPS_SCRATCH_PREFIX};
+pub use evidence::check as check_evidence;
 pub use github::{GithubForge, body, closes, ticket_marker, title};
 pub use local::LocalForge;
 pub(crate) use mirror::GIT_WAIT;
@@ -27,6 +31,9 @@ pub const FORGE_DIR: &str = "forge";
 /// `<state>/forge-stage`, beside the mirrors, not in them: a mirror that is
 /// made again must not lose the bundle a queued Publish will push.
 pub const STAGE_DIR: &str = "forge-stage";
+/// `<state>/deps`, the repositories' installed dependencies, which every
+/// Ticket's `run_code` mounts read-only (see [`deps`]).
+pub const DEPS_DIR: &str = "deps";
 
 /// The forge `config` names, with its mirrors under `dir`. GitHub's goes
 /// through the App `github` opened, whose key was read once.
@@ -66,9 +73,11 @@ mod tests {
     use super::github::github_remote;
     use super::mirror::{Mirrors, REPO_JSON, Remote, fetch};
     use super::{LocalForge, open};
-    use crate::agent::config::{ForgeConfig, Identity, RepoConfig};
+    use crate::agent::config::{
+        DepsConfig, DepsKind, EvidenceConfig, ForgeConfig, Identity, RepoConfig,
+    };
     use crate::agent::github::{Access, InstallToken};
-    use crate::agent::ports::{Forge, TicketDirs, Workspace};
+    use crate::agent::ports::{Dependencies, Forge, TicketDirs, Workspace};
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use solos_agent_core::change::{Deliverable, RepoName};
     use std::collections::BTreeMap;
@@ -127,7 +136,15 @@ mod tests {
 
     impl World {
         fn new(name: &str) -> Self {
+            Self::with(name, |_, _| {})
+        }
+
+        /// A world whose repositories `edit` has changed; it is given the
+        /// world's directory, for paths in the terms.
+        fn with(name: &str, edit: impl FnOnce(&Path, &mut BTreeMap<RepoName, RepoConfig>)) -> Self {
             let root = std::env::temp_dir().join(format!("forge-{name}-{}", uuid::Uuid::new_v4()));
+            let mut terms = repos();
+            edit(&root, &mut terms);
             let upstream = root.join("upstream");
             std::fs::create_dir_all(&upstream).unwrap();
             git(&upstream, &["init", "--quiet", "--initial-branch=main"]);
@@ -150,7 +167,7 @@ mod tests {
                 ],
             );
             let forge = LocalForge {
-                mirrors: Mirrors::new(root.join("forge"), &repos()),
+                mirrors: Mirrors::new(root.join("forge"), &terms),
                 identity: identity(),
                 remote,
             };
@@ -159,6 +176,23 @@ mod tests {
                 forge,
                 upstream,
             }
+        }
+
+        /// Commit `files` to the upstream's main and push them to the remote.
+        fn push_files(&self, files: &[(&str, &str)]) -> String {
+            for (path, text) in files {
+                let at = self.upstream.join(path);
+                std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+                std::fs::write(at, text).unwrap();
+            }
+            git(&self.upstream, &["add", "-A"]);
+            git(&self.upstream, &["commit", "--quiet", "-m", "files"]);
+            let bare = self.root.join("remote/acme/widgets.git");
+            git(
+                &self.upstream,
+                &["push", "--quiet", bare.to_str().unwrap(), "main"],
+            );
+            git(&self.upstream, &["rev-parse", "HEAD"])
         }
 
         fn ticket(&self, id: &str) -> (PathBuf, PathBuf) {
@@ -214,6 +248,7 @@ mod tests {
                 base: "main".into(),
                 base_commit: tip.clone(),
                 notes: Some("Tests run with ./check.".into()),
+                evidence: None,
             }
         );
         let written = std::fs::read(w.root.join("tk_1/host").join(REPO_JSON)).unwrap();
@@ -319,6 +354,7 @@ mod tests {
             base: "main".into(),
             base_commit: "0123456789abcdef".into(),
             notes: None,
+            evidence: None,
         };
         std::fs::write(host.join(REPO_JSON), serde_json::to_vec(&made).unwrap()).unwrap();
         std::fs::write(work.join("mine"), "the worker's").unwrap();
@@ -462,6 +498,178 @@ mod tests {
         let err = forge.prepare(&widgets(), dirs).await.unwrap_err();
         assert_eq!(err.to_string(), "acme/widgets has no branch trunk");
         assert!(!host.join(REPO_JSON).exists());
+    }
+
+    /// A package manager stand-in: it leaves bun's layout and writes down
+    /// the lockfile it was given, which only the base commit's files can be.
+    const FAKE_BUN: &str = r#"#!/bin/sh
+set -eu
+mkdir -p node_modules/.bun/x@1/node_modules/x node_modules/.facts
+echo 1 > node_modules/.bun/x@1/node_modules/x/index.js
+ln -s .bun/x@1/node_modules/x node_modules/x
+echo "lock: $(cat bun.lock)" > node_modules/.facts/seen.txt
+"#;
+
+    const PACKAGE: &str = r#"{"name":"acme","workspaces":["apps/*"]}"#;
+
+    fn with_deps(root: &Path, terms: &mut BTreeMap<RepoName, RepoConfig>) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(root).unwrap();
+        let bun = root.join("bun");
+        std::fs::write(&bun, FAKE_BUN).unwrap();
+        std::fs::set_permissions(&bun, std::fs::Permissions::from_mode(0o755)).unwrap();
+        terms.get_mut(&widgets()).unwrap().deps = Some(DepsConfig {
+            kind: DepsKind::Bun,
+            binary: Some(bun),
+            timeout_secs: 60,
+            max_bytes: 1 << 30,
+            memory_bytes: 16 << 30,
+        });
+    }
+
+    fn sandbox() -> bool {
+        let found = cfg!(target_os = "linux")
+            && Path::new("/usr/bin/bwrap").is_file()
+            && Path::new("/usr/bin/prlimit").is_file();
+        if !found {
+            eprintln!("skipped: a build needs Linux, /usr/bin/bwrap and /usr/bin/prlimit");
+        }
+        found
+    }
+
+    fn seen_in(w: &World, key: &str) -> String {
+        let path = w
+            .root
+            .join("deps/acme/widgets")
+            .join(key)
+            .join("node_modules/.facts/seen.txt");
+        std::fs::read_to_string(path).unwrap().trim().to_owned()
+    }
+
+    fn ready(found: &Dependencies) -> &str {
+        match found {
+            Dependencies::Ready { key, .. } => key,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dependencies_are_built_from_the_base_commit_in_the_mirror_and_never_from_the_workers_tree()
+     {
+        if !sandbox() {
+            return;
+        }
+        let w = World::with("deps", with_deps);
+        w.push_files(&[
+            ("package.json", PACKAGE),
+            ("bun.lock", "lock one"),
+            ("apps/web/package.json", r#"{"name":"web"}"#),
+        ]);
+        let first = w.prepare(&widgets(), "tk_1").await.unwrap();
+
+        let found = w.forge.dependencies(&first).await;
+
+        let key = ready(&found).to_owned();
+        assert_eq!(seen_in(&w, &key), "lock: lock one");
+        let work = w.root.join("tk_1/work");
+        let exclude = std::fs::read_to_string(work.join(".git/info/exclude")).unwrap();
+        assert!(
+            exclude.lines().any(|line| line == "node_modules/")
+                && exclude.lines().any(|line| line == "/.bun/"),
+            "the clone keeps what the cache puts there out of its commits: {exclude}"
+        );
+
+        // The worker changes the lockfile in its clone and commits it on a branch.
+        std::fs::write(work.join("bun.lock"), "lock BY THE WORKER").unwrap();
+        std::fs::write(work.join("package.json"), r#"{"name":"mine"}"#).unwrap();
+        git(&work, &["checkout", "--quiet", "-b", "worker"]);
+        git(&work, &["commit", "--quiet", "-am", "the worker's"]);
+        assert_eq!(
+            w.forge.dependencies(&first).await,
+            found,
+            "the same base commit is the same cache"
+        );
+        // Whatever the clone says, a build reads the mirror: take the cache away.
+        std::fs::remove_dir_all(w.root.join("deps")).unwrap();
+        let again = w.forge.dependencies(&first).await;
+        assert_eq!(ready(&again), key);
+        assert_eq!(
+            seen_in(&w, &key),
+            "lock: lock one",
+            "not the worker's lockfile"
+        );
+
+        // A new lockfile on the base is a new cache for the next Ticket.
+        let later = w.push_files(&[("bun.lock", "lock two")]);
+        let second = w.prepare(&widgets(), "tk_2").await.unwrap();
+        assert_eq!(second.base_commit, later);
+        let newer = w.forge.dependencies(&second).await;
+        assert_ne!(ready(&newer), key, "the key changes when the lockfile does");
+        assert_eq!(seen_in(&w, ready(&newer)), "lock: lock two");
+        assert_eq!(
+            seen_in(&w, &key),
+            "lock: lock one",
+            "the first Ticket's cache is not touched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repository_that_cannot_be_installed_is_unavailable_with_the_reason_and_still_clones()
+    {
+        let w = World::with("nolock", with_deps);
+        w.push_files(&[("package.json", PACKAGE)]);
+
+        let workspace = w.prepare(&widgets(), "tk_1").await.unwrap();
+        let found = w.forge.dependencies(&workspace).await;
+
+        let Dependencies::Unavailable { why } = found else {
+            panic!("{found:?}")
+        };
+        assert!(why.contains("no bun.lock at its root"), "{why}");
+        assert!(
+            w.root.join("tk_1/work/package.json").is_file(),
+            "the Ticket has its clone"
+        );
+        assert!(!w.root.join("deps").exists(), "nothing was built");
+    }
+
+    #[tokio::test]
+    async fn a_repository_that_asks_for_no_dependencies_gets_none_and_a_clone_as_before() {
+        let w = World::new("nodeps");
+        let workspace = w.prepare(&widgets(), "tk_1").await.unwrap();
+
+        assert_eq!(w.forge.dependencies(&workspace).await, Dependencies::None);
+
+        assert!(!w.root.join("tk_1/work/.git/info/exclude").exists());
+        let written = std::fs::read_to_string(w.root.join("tk_1/host").join(REPO_JSON)).unwrap();
+        assert!(!written.contains("evidence"), "{written}");
+    }
+
+    #[tokio::test]
+    async fn what_a_repositorys_pull_requests_must_carry_is_fixed_in_the_clone_with_repo_json() {
+        let evidence = EvidenceConfig {
+            command: "./verify --json".into(),
+            heading: "## Evidence".into(),
+        };
+        let w = World::with("evidence", |_, terms| {
+            terms.get_mut(&widgets()).unwrap().evidence = Some(evidence.clone());
+        });
+
+        let workspace = w.prepare(&widgets(), "tk_1").await.unwrap();
+
+        assert_eq!(workspace.evidence, Some(evidence.clone()));
+        let written = std::fs::read(w.root.join("tk_1/host").join(REPO_JSON)).unwrap();
+        let read: Workspace = serde_json::from_slice(&written).unwrap();
+        assert_eq!(
+            read.evidence,
+            Some(evidence),
+            "a recovery gets the terms of the clone"
+        );
+        assert_eq!(
+            w.prepare(&widgets(), "tk_1").await.unwrap(),
+            workspace,
+            "and so does a second launch"
+        );
     }
 
     #[test]

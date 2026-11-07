@@ -3528,6 +3528,8 @@ struct Played {
     rounds: Arc<Mutex<VecDeque<Vec<Step>>>>,
     seen: Arc<Mutex<Vec<Vec<Answer>>>>,
     prompts: Arc<Mutex<Vec<String>>>,
+    /// What Pi's own sandbox would be started with, per worker.
+    argvs: Arc<Mutex<Vec<Vec<String>>>>,
 }
 
 struct PlayedSession {
@@ -3536,6 +3538,7 @@ struct PlayedSession {
     round: Option<Vec<Step>>,
     seen: Arc<Mutex<Vec<Vec<Answer>>>>,
     prompts: Arc<Mutex<Vec<String>>>,
+    argvs: Arc<Mutex<Vec<Vec<String>>>>,
 }
 
 impl solos_swarm::harness::AgentHarness for Played {
@@ -3553,6 +3556,7 @@ impl solos_swarm::harness::AgentHarness for Played {
             round,
             seen: self.seen.clone(),
             prompts: self.prompts.clone(),
+            argvs: self.argvs.clone(),
         })
     }
 }
@@ -3584,6 +3588,12 @@ impl solos_swarm::harness::Session for PlayedSession {
                 .lock()
                 .unwrap()
                 .push(session["system_prompt"].as_str().unwrap_or("").to_owned());
+            let argv = solos_swarm::harness::PiHarness::command(&self.spec)
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            self.argvs.lock().unwrap().push(argv);
             let mut answers = Vec::new();
             for (tool, arguments) in steps {
                 let (status, reply) = self.post(&format!("tool/{tool}"), arguments).await?;
@@ -3610,6 +3620,7 @@ struct Shipping {
     tip: String,
     seen: Arc<Mutex<Vec<Vec<Answer>>>>,
     prompts: Arc<Mutex<Vec<String>>>,
+    argvs: Arc<Mutex<Vec<Vec<String>>>>,
 }
 
 impl Shipping {
@@ -3684,6 +3695,7 @@ budgets: {{session_microusd: {BUDGET}}}
             tip,
             seen: Arc::default(),
             prompts: Arc::default(),
+            argvs: Arc::default(),
         })
     }
 
@@ -3707,6 +3719,7 @@ budgets: {{session_microusd: {BUDGET}}}
             rounds: Arc::new(Mutex::new(rounds.into())),
             seen: self.seen.clone(),
             prompts: self.prompts.clone(),
+            argvs: self.argvs.clone(),
         };
         let pi_root = self.scratch.root.join("pi");
         let host = PiHost {
@@ -4158,6 +4171,317 @@ async fn a_ready_the_host_refuses_commits_nothing_and_says_what_to_do_and_the_fi
     assert_eq!(
         ticket.ended.as_ref().map(|e| e.outcome),
         Some(TicketOutcome::Completed)
+    );
+}
+
+#[tokio::test]
+async fn a_pull_request_of_a_repository_that_wants_evidence_is_not_opened_without_it() {
+    let Some(d) = Shipping::new("evidence", ", evidence: {command: \"./verify --json\"}").await
+    else {
+        return;
+    };
+    d.ask(12, 101, "@solos-bot fix the flaky retry test");
+    let good = r#"{"ok":true,"sha":"HEAD","dirty":false,"versions":{"@biomejs/biome":"2.5.13"}}"#;
+    let report = |json: &str| format!("Fixed it.\n\n## Evidence\n\n```json\n{json}\n```");
+    let steps = vec![
+        run_code(&commit(
+            "fix.txt",
+            "fixed",
+            "jobs: read the clock after arming",
+        )),
+        // 1: none at all
+        ready("Fixed it."),
+        // 2: the checks failed
+        ready(&report(r#"{"ok":false,"dirty":false}"#)),
+        // 3: cut in the middle, as a long report is
+        ready(&report(r#"{"ok":true,"steps":[{"name":"lint","ok":tr"#)),
+        // 4: the command's output
+        ready(&report(good)),
+    ];
+
+    let summary = d.serve(None, vec![steps]).await;
+
+    assert_eq!(summary.effects_pending, 0);
+    let answers = d.answers(0);
+    for n in [1, 2, 3] {
+        assert_eq!(
+            (answers[n].0.as_str(), answers[n].1),
+            ("worker_report", 409),
+            "{n}"
+        );
+    }
+    let none = said_in(&answers[1]);
+    assert!(
+        none.starts_with("Not accepted:")
+            && none.contains("`./verify --json`")
+            && none.contains("`## Evidence`")
+            && none.contains("report blocked"),
+        "{none}"
+    );
+    let failed = said_in(&answers[2]);
+    assert!(failed.contains("does not say `\"ok\": true`"), "{failed}");
+    let cut = said_in(&answers[3]);
+    assert!(
+        cut.contains("does not parse") && cut.contains("8,000"),
+        "{cut}"
+    );
+    assert_eq!(
+        (answers[4].0.as_str(), answers[4].1),
+        ("worker_report", 200),
+        "{:?}",
+        answers[4]
+    );
+    let prompts = d.prompts.lock().unwrap().clone();
+    assert!(
+        prompts[0].contains("must carry evidence")
+            && prompts[0].contains("run `./verify --json` in /work"),
+        "{}",
+        prompts[0]
+    );
+
+    let pulls = d.fake.hub().pulls.clone();
+    let [pull] = &pulls[..] else {
+        panic!("one pull request, and none for the refused readies: {pulls:?}")
+    };
+    let body = pull["body"].as_str().unwrap();
+    assert!(
+        body.starts_with(&report(good)),
+        "the evidence reaches the description as it was written, `@biomejs/biome` and all: {body}"
+    );
+    assert_eq!(
+        d.ticket().ended.as_ref().map(|e| e.outcome),
+        Some(TicketOutcome::Completed)
+    );
+}
+
+/// A package manager stand-in: `install` leaves bun's layout, anything else
+/// says it ran, so the test can tell `bun` and `node` came from the mount.
+const FAKE_BUN: &str = "#!/bin/sh
+set -eu
+case \"${1:-}\" in
+install)
+  mkdir -p node_modules/.bun/x@1/node_modules/x apps/web/node_modules
+  echo 1 > node_modules/.bun/x@1/node_modules/x/index.js
+  ln -s .bun/x@1/node_modules/x node_modules/x
+  ln -s ../../../node_modules/.bun/x@1/node_modules/x apps/web/node_modules/x
+  ;;
+*) echo \"fake-bun $*\" ;;
+esac
+";
+
+/// Make the repository an installable one, with a package manager that is
+/// `script`, and its terms say so.
+fn installable(d: &Shipping, script: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let bun = d.scratch.root.join("bun");
+    std::fs::write(&bun, script).unwrap();
+    std::fs::set_permissions(&bun, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let upstream = d.scratch.root.join("upstream");
+    for (path, text) in [
+        ("package.json", r#"{"name":"acme","workspaces":["apps/*"]}"#),
+        ("bun.lock", "lock one"),
+        ("apps/web/package.json", r#"{"name":"web"}"#),
+    ] {
+        let at = upstream.join(path);
+        std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+        std::fs::write(at, text).unwrap();
+    }
+    git(&upstream, &["add", "-A"]);
+    git(&upstream, &["commit", "--quiet", "-m", "manifests"]);
+    git(
+        &upstream,
+        &["push", "--quiet", d.bare().to_str().unwrap(), "main"],
+    );
+    let path = d.scratch.root.join("agent.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap();
+    let asked = format!(
+        "owes: pull_request, deps: {{kind: bun, binary: {}, timeout_secs: 60}}}}",
+        bun.display()
+    );
+    assert!(yaml.contains("owes: pull_request}"));
+    std::fs::write(&path, yaml.replace("owes: pull_request}", &asked)).unwrap();
+}
+
+#[tokio::test]
+async fn a_worker_runs_the_repositorys_scripts_offline_on_a_cache_mounted_read_only() {
+    let Some(d) = Shipping::new("deps", "").await else {
+        return;
+    };
+    installable(&d, FAKE_BUN);
+    d.ask(12, 101, "@solos-bot fix the flaky retry test");
+    let steps = vec![
+        // 0: bun and node are the host's, first on PATH, and HOME is not the clone
+        run_code("bun --version; node -v; echo HOME=$HOME; echo PATH=$PATH"),
+        // 1: the packages are there, and a workspace's links lead into them
+        run_code(
+            "ls /work/node_modules/.bun/x@1/node_modules/x && ls -l /work/apps/web/node_modules/x",
+        ),
+        // 2: the cache cannot be written to
+        run_code("touch /work/node_modules/probe 2>&1; echo rc=$?"),
+        run_code(
+            "{ echo evil > /work/node_modules/.bun/x@1/node_modules/x/index.js; } 2>&1; echo rc=$?",
+        ),
+        // 4: what a tool writes in a workspace's node_modules goes nowhere
+        run_code("touch /work/apps/web/node_modules/.vite-temp && echo writable"),
+        // 5: the clone is clean: nothing the cache brings is untracked
+        run_code("git status --porcelain; echo status-done"),
+        run_code(&commit(
+            "fix.txt",
+            "fixed",
+            "jobs: read the clock after arming",
+        )),
+        run_code("git ls-files | tr '\\n' ' '; echo"),
+        ready("Fixed it."),
+    ];
+
+    let summary = d.serve(None, vec![steps]).await;
+
+    assert_eq!(summary.effects_pending, 0);
+    let answers = d.answers(0);
+    let out = |n: usize| {
+        let (_, status, reply) = &answers[n];
+        assert_eq!(*status, 200, "{n}: {reply}");
+        reply["stdout"].as_str().unwrap_or_default().to_owned()
+    };
+    let tools = out(0);
+    assert!(
+        tools.matches("fake-bun --version").count() == 1
+            && tools.contains("fake-bun -v")
+            && tools.contains("HOME=/tmp/home")
+            && tools.contains("PATH=/runtime/bun:/venv/bin:/usr/local/bin:/usr/bin:/bin"),
+        "{tools}"
+    );
+    let layout = out(1);
+    assert!(
+        layout.contains("index.js")
+            && layout.contains(
+                "/work/apps/web/node_modules/x -> ../../../node_modules/.bun/x@1/node_modules/x"
+            ),
+        "{layout}"
+    );
+    for n in [2, 3] {
+        let probe = out(n);
+        assert!(
+            probe.contains("Read-only file system") && probe.contains("rc=1"),
+            "{n}: {probe}"
+        );
+    }
+    assert_eq!(out(4), "writable\n");
+    assert_eq!(
+        out(5),
+        "status-done\n",
+        "the tree is clean for an evidence check"
+    );
+    assert_eq!(
+        out(7).lines().next().unwrap(),
+        "README.md apps/web/package.json bun.lock fix.txt package.json ",
+        "what the worker committed has no node_modules and no cache"
+    );
+
+    // What the worker was told, and what Pi's own sandbox does not hold.
+    let prompts = d.prompts.lock().unwrap().clone();
+    assert!(
+        prompts[0].contains("Dependencies: the repository's are installed, read-only"),
+        "{}",
+        prompts[0]
+    );
+    let argv = d.argvs.lock().unwrap()[0].join("\n");
+    assert!(
+        argv.contains("--tmpfs\n/work\n")
+            && !argv.contains("/work/node_modules")
+            && !argv.contains("deps/acme")
+            && !argv.contains("/runtime/bun"),
+        "Pi's /work is a tmpfs for its settings; the clone is only in run_code: {argv}"
+    );
+
+    // The cache is the host's, keyed, whole, and the clone holds none of it.
+    let repo = d.scratch.root.join("state/deps/acme/widgets");
+    let caches: Vec<PathBuf> = std::fs::read_dir(&repo)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    let [cache] = &caches[..] else {
+        panic!("one cache and no scratch left: {caches:?}")
+    };
+    assert!(cache.join("manifest.json").is_file());
+    assert!(
+        cache
+            .join("node_modules/.bun/x@1/node_modules/x/index.js")
+            .is_file()
+    );
+    assert_eq!(
+        std::fs::read_to_string(cache.join("node_modules/.bun/x@1/node_modules/x/index.js"))
+            .unwrap(),
+        "1\n",
+        "the worker's write did not reach it"
+    );
+    let ticket = d.ticket();
+    let work = d.work_of(&ticket.id);
+    for mount in ["node_modules", "apps/web/node_modules"] {
+        let empty =
+            std::fs::read_dir(work.join(mount)).map_or(true, |mut left| left.next().is_none());
+        assert!(empty, "{mount} in the clone is only the mount point");
+    }
+    let branch = format!("solos/{}/fix-the-flaky-retry-test", ticket.id);
+    let pushed = git_dir(&d.bare(), &["ls-tree", "-r", "--name-only", &branch]);
+    assert!(!pushed.contains("node_modules"), "{pushed}");
+    assert_eq!(
+        ticket.ended.as_ref().map(|e| e.outcome),
+        Some(TicketOutcome::Completed)
+    );
+}
+
+#[tokio::test]
+async fn a_build_that_failed_is_told_to_the_worker_which_goes_on_without_dependencies() {
+    let Some(d) = Shipping::new("deps-failed", "").await else {
+        return;
+    };
+    installable(
+        &d,
+        "#!/bin/sh\necho 'error: GET https://registry.npmjs.org/x - 503' >&2\nexit 1\n",
+    );
+    d.ask(12, 101, "@solos-bot fix the flaky retry test");
+    let steps = vec![
+        run_code("ls /work/node_modules 2>&1; command -v bun || echo no-bun"),
+        run_code(&commit(
+            "fix.txt",
+            "fixed",
+            "jobs: read the clock after arming",
+        )),
+        ready("Fixed it, and I could not run the checks: no dependencies."),
+    ];
+
+    let summary = d.serve(None, vec![steps]).await;
+
+    assert_eq!(summary.effects_pending, 0);
+    let prompts = d.prompts.lock().unwrap().clone();
+    assert!(
+        prompts[0].contains("Dependencies: the host could not install the repository's (")
+            && prompts[0].contains(
+                "the install failed (exit status: 1): error: GET https://registry.npmjs.org/x - 503"
+            )
+            && prompts[0].contains("do not claim checks you could not run"),
+        "{}",
+        prompts[0]
+    );
+    let answers = d.answers(0);
+    let seen = answers[0].2["stdout"].as_str().unwrap();
+    assert!(
+        seen.contains("No such file or directory") && seen.contains("no-bun"),
+        "the sandbox has nothing of it: {seen}"
+    );
+    let ticket = d.ticket();
+    assert_eq!(
+        ticket.ended.as_ref().map(|e| e.outcome),
+        Some(TicketOutcome::Completed),
+        "a build that fails does not fail the Ticket"
+    );
+    assert_eq!(d.fake.hub().pull_posts.len(), 1);
+    let repo = d.scratch.root.join("state/deps/acme/widgets");
+    assert_eq!(
+        std::fs::read_dir(&repo).unwrap().count(),
+        0,
+        "no cache, no scratch directory"
     );
 }
 

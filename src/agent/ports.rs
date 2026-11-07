@@ -3,6 +3,8 @@
 //! Adapters never write state: they report facts, and the runtime applies
 //! them as Engine commands.
 
+use super::config::EvidenceConfig;
+use crate::code::Extras;
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use solos_agent_core::change::{BranchName, CommitSha, Harvest, RepoName};
@@ -174,6 +176,16 @@ pub trait Forge: Send + Sync {
         proposal: Proposal<'a>,
     ) -> BoxFuture<'a, Result<std::result::Result<Harvest, Refusal>>>;
 
+    /// The dependencies the repository's `deps` has installed for the commit
+    /// `workspace`'s clone started from, built now if no earlier Ticket's
+    /// build left them. It never fails a Ticket: a build that could not run
+    /// is [`Dependencies::Unavailable`], with the reason the worker is told.
+    /// The build reads the host's mirror at that commit, never a worker's
+    /// tree. The default is a forge with no such cache.
+    fn dependencies<'a>(&'a self, _workspace: &'a Workspace) -> BoxFuture<'a, Dependencies> {
+        Box::pin(async { Dependencies::None })
+    }
+
     /// Make the forge match the Store, then say what it now holds. Every
     /// step is an "ensure", so running it again after a crash at any point
     /// converges and says the same thing. A decided no (the branch moved, the
@@ -342,6 +354,26 @@ pub struct Workspace {
     pub base_commit: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+    /// What the repository's config said its pull requests must carry when
+    /// the clone was made, so a Ticket in flight keeps its terms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<EvidenceConfig>,
+}
+
+/// What [`Forge::dependencies`] found for a Ticket's repository.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Dependencies {
+    /// The repository asks for none.
+    None,
+    /// Installed: what the Ticket's `run_code` sandbox adds to have them.
+    Ready {
+        /// What the cache is keyed by, for the worker's prompt and the log.
+        key: String,
+        extras: Extras,
+    },
+    /// The build could not run, in one line the worker reads. The Ticket goes
+    /// on without them.
+    Unavailable { why: String },
 }
 
 /// What an adapter observed, applied by the runtime as an Engine command.

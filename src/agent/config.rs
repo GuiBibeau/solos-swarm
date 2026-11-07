@@ -24,7 +24,7 @@ use crate::code::{self, Mount};
 use crate::gateway::{PriceTable, Temperature, upstream_profile};
 use crate::vault::VaultConfig;
 use anyhow::{Context, Result, bail, ensure};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use solos_agent_core::AllowlistPolicy;
 use solos_agent_core::change::{Deliverable, ForgeTerms, MergeMode, RepoName};
 use solos_agent_core::model::MicroUsd;
@@ -211,6 +211,16 @@ pub struct RepoConfig {
     /// The largest change, in bytes of commits, a ready is admitted with.
     #[serde(default = "max_change_bytes")]
     pub max_change_bytes: u64,
+    /// Dependencies the host installs for the repository's base commit, in a
+    /// cache every Ticket's `run_code` mounts read-only. Without it, nothing
+    /// is installed, and the sandbox is offline.
+    #[serde(default)]
+    pub deps: Option<DepsConfig>,
+    /// What a pull request of this repository must carry in its description,
+    /// and the command whose output it is. Without it, a ready report is not
+    /// checked for it.
+    #[serde(default)]
+    pub evidence: Option<EvidenceConfig>,
 }
 
 impl Default for RepoConfig {
@@ -227,7 +237,144 @@ impl Default for RepoConfig {
             max_pushes: max_pushes(),
             max_repairs: max_repairs(),
             max_change_bytes: max_change_bytes(),
+            deps: None,
+            evidence: None,
         }
+    }
+}
+
+/// `forge.repos.<repo>.deps`: the host builds, from the base branch's
+/// lockfile and package manifests alone, a directory of installed dependencies,
+/// and each Ticket's `run_code` mounts it read-only at the repository's
+/// `node_modules` paths. The build runs in its own sandbox that reaches the
+/// network (the only place on the host's behalf that does besides the
+/// browser), with no home, token, vault or agent state, no lifecycle script
+/// (so no code of the repository runs), and the default npm registry only: a
+/// repository's `bunfig.toml` and `.npmrc` are never read.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DepsConfig {
+    pub kind: DepsKind,
+    /// The package manager's executable, an absolute path. For `bun`, by
+    /// default `$HOME/.bun/bin/bun`. It is bound read-only into the build
+    /// sandbox and, as `bun` and as `node`, into every Ticket's.
+    #[serde(default)]
+    pub binary: Option<PathBuf>,
+    /// The longest a build may run.
+    #[serde(default = "deps_timeout_secs")]
+    pub timeout_secs: u64,
+    /// The most disk a build may use, scratch included; a bigger one is
+    /// killed and the dependencies are unavailable.
+    #[serde(default = "deps_max_bytes")]
+    pub max_bytes: u64,
+    /// The address space the repository's commands may use in a Ticket's
+    /// `run_code`, in place of `executor.run_code.memory_bytes` where that is
+    /// lower: bun (JavaScriptCore) reserves a great deal of it and aborts
+    /// under about 8 GiB. A cap on address space, not on memory used, and
+    /// only for Tickets on this repository.
+    #[serde(default = "deps_memory_bytes")]
+    pub memory_bytes: u64,
+}
+
+/// Which package manager installs a repository's dependencies. One variant
+/// each: the key, the files it reads and the sandbox's tools are its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DepsKind {
+    /// `bun install --frozen-lockfile --ignore-scripts` from `bun.lock`.
+    Bun,
+}
+
+impl DepsKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bun => "bun",
+        }
+    }
+}
+
+/// The range of `deps.timeout_secs`.
+pub const DEPS_TIMEOUT_RANGE: std::ops::RangeInclusive<u64> = 10..=3_600;
+/// The range of `deps.max_bytes`.
+pub const DEPS_BYTES_RANGE: std::ops::RangeInclusive<u64> = 1 << 20..=64 << 30;
+
+fn deps_timeout_secs() -> u64 {
+    600
+}
+
+fn deps_max_bytes() -> u64 {
+    8 << 30
+}
+
+fn deps_memory_bytes() -> u64 {
+    16 << 30
+}
+
+impl DepsConfig {
+    /// The package manager's executable: `binary`, or its usual place under
+    /// `$HOME`.
+    pub fn binary_path(&self) -> Option<PathBuf> {
+        if let Some(binary) = &self.binary {
+            return Some(binary.clone());
+        }
+        let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
+        match self.kind {
+            DepsKind::Bun => Some(PathBuf::from(home).join(".bun/bin/bun")),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        let binary = self.binary_path();
+        ensure!(
+            binary.as_ref().is_some_and(|binary| binary.is_absolute()),
+            "binary must be an absolute path (it defaults to $HOME/.bun/bin/bun, and HOME is not set)"
+        );
+        ensure!(
+            DEPS_TIMEOUT_RANGE.contains(&self.timeout_secs),
+            "timeout_secs must be {}..={}",
+            DEPS_TIMEOUT_RANGE.start(),
+            DEPS_TIMEOUT_RANGE.end()
+        );
+        ensure!(
+            DEPS_BYTES_RANGE.contains(&self.max_bytes),
+            "max_bytes must be 1 MiB..=64 GiB"
+        );
+        ensure!(
+            code::MEMORY_RANGE.contains(&self.memory_bytes),
+            "memory_bytes must be 256 MiB..=16 GiB"
+        );
+        Ok(())
+    }
+}
+
+/// `forge.repos.<repo>.evidence`: the repository's checks want proof of a
+/// command in every pull request. The worker is told to run `command` in
+/// `/work` once everything is committed and to put its JSON under `heading`
+/// in its ready report, which is the pull request's description. The host
+/// refuses a ready that opens a pull request without it: the heading, then a
+/// ```json fence whose object says `ok: true` and does not say `dirty: true`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceConfig {
+    /// A shell command, such as `bun run solos dev verify --scope unit --json`.
+    pub command: String,
+    #[serde(default = "evidence_heading")]
+    pub heading: String,
+}
+
+fn evidence_heading() -> String {
+    "## Evidence".into()
+}
+
+impl EvidenceConfig {
+    fn validate(&self) -> Result<()> {
+        let one_line = |text: &str| !text.trim().is_empty() && !text.chars().any(char::is_control);
+        ensure!(one_line(&self.command), "command must be one line of text");
+        ensure!(
+            one_line(&self.heading) && self.heading.trim_start_matches('#').starts_with(' '),
+            "heading must be a markdown heading on one line, such as \"## Evidence\""
+        );
+        Ok(())
     }
 }
 
@@ -1094,6 +1241,20 @@ impl AgentConfig {
                     bail!("forge.repos.{repo}.protected {glob:?} is not a path glob: {why}");
                 }
             }
+            if let Some(deps) = &terms.deps {
+                deps.validate()
+                    .with_context(|| format!("forge.repos.{repo}.deps"))?;
+            }
+            if let Some(evidence) = &terms.evidence {
+                evidence
+                    .validate()
+                    .with_context(|| format!("forge.repos.{repo}.evidence"))?;
+                ensure!(
+                    terms.owes == Deliverable::PullRequest,
+                    "forge.repos.{repo}.evidence is for a pull request's description, and owes is \
+                     not pull_request"
+                );
+            }
             ensure!(
                 terms.max_pushes >= 1,
                 "forge.repos.{repo}.max_pushes must be at least 1"
@@ -1385,8 +1546,9 @@ impl SwarmConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentConfig, Budgets, ChannelConfig, ClaudeConfig, ExecutorConfig, ForgeConfig,
-        GithubConfig, HarnessKind, JobLimits, RepoConfig, RouterConfig, SourceConfig,
+        AgentConfig, Budgets, ChannelConfig, ClaudeConfig, DepsConfig, DepsKind, EvidenceConfig,
+        ExecutorConfig, ForgeConfig, GithubConfig, HarnessKind, JobLimits, RepoConfig,
+        RouterConfig, SourceConfig,
     };
     use solos_agent_core::change::{Deliverable, RepoName};
     use std::collections::BTreeMap;
@@ -1996,6 +2158,128 @@ forge:
             ),
             (MergeMode::Auto, false, 3, 0)
         );
+    }
+
+    const DEPS_AND_EVIDENCE: &str = "owes: pull_request
+      deps: {kind: bun, binary: /opt/bun/bin/bun}
+      evidence: {command: \"bun run solos dev verify --scope unit --json\"}";
+
+    #[test]
+    fn a_repository_may_ask_for_installed_dependencies_and_evidence_in_its_pull_requests() {
+        let repo = |name: &str| RepoName::try_from(name.to_owned()).unwrap();
+        let config = parse(&forged(|yaml| {
+            yaml.replace("owes: pull_request", DEPS_AND_EVIDENCE)
+        }))
+        .unwrap();
+        let forge = config.forge.unwrap();
+        let repos = forge.repos();
+
+        let widgets = &repos[&repo("acme/widgets")];
+        assert_eq!(
+            widgets.deps,
+            Some(DepsConfig {
+                kind: DepsKind::Bun,
+                binary: Some(PathBuf::from("/opt/bun/bin/bun")),
+                timeout_secs: 600,
+                max_bytes: 8 << 30,
+                memory_bytes: 16 << 30,
+            }),
+            "ten minutes, 8 GiB of disk and 16 GiB of address space unless it says otherwise"
+        );
+        assert_eq!(
+            widgets.evidence,
+            Some(EvidenceConfig {
+                command: "bun run solos dev verify --scope unit --json".into(),
+                heading: "## Evidence".into(),
+            })
+        );
+        let docs = &repos[&repo("acme/docs")];
+        assert_eq!(
+            (docs.deps.clone(), docs.evidence.clone()),
+            (None, None),
+            "a repository that asks for neither gets neither"
+        );
+        let found = widgets.deps.as_ref().unwrap();
+        assert_eq!(found.binary_path(), Some(PathBuf::from("/opt/bun/bin/bun")));
+        let usual = DepsConfig {
+            binary: None,
+            ..found.clone()
+        };
+        if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+            assert_eq!(
+                usual.binary_path(),
+                Some(PathBuf::from(home).join(".bun/bin/bun")),
+                "bun's usual place"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dependency_cache_or_evidence_that_cannot_work_is_refused_where_it_is_written() {
+        let on_widgets = |extra: &str| {
+            forged(|yaml| {
+                yaml.replace(
+                    "owes: pull_request",
+                    &format!("owes: pull_request\n      {extra}"),
+                )
+            })
+        };
+        for (yaml, why) in [
+            (on_widgets("deps: {kind: npm}"), "unknown variant `npm`"),
+            (
+                on_widgets("deps: {kind: bun, caches: 1}"),
+                "unknown field `caches`",
+            ),
+            (
+                on_widgets("deps: {kind: bun, binary: bun}"),
+                "forge.repos.acme/widgets.deps: binary must be an absolute path",
+            ),
+            (
+                on_widgets("deps: {kind: bun, binary: /b, timeout_secs: 5}"),
+                "forge.repos.acme/widgets.deps: timeout_secs must be 10..=3600",
+            ),
+            (
+                on_widgets("deps: {kind: bun, binary: /b, timeout_secs: 3601}"),
+                "timeout_secs must be 10..=3600",
+            ),
+            (
+                on_widgets("deps: {kind: bun, binary: /b, max_bytes: 1000}"),
+                "max_bytes must be 1 MiB..=64 GiB",
+            ),
+            (
+                on_widgets("deps: {kind: bun, binary: /b, memory_bytes: 17179869185}"),
+                "memory_bytes must be 256 MiB..=16 GiB",
+            ),
+            (
+                on_widgets("evidence: {command: \"\"}"),
+                "forge.repos.acme/widgets.evidence: command must be one line of text",
+            ),
+            (
+                on_widgets("evidence: {command: \"a\\nb\"}"),
+                "command must be one line of text",
+            ),
+            (
+                on_widgets("evidence: {command: x, heading: Evidence}"),
+                "heading must be a markdown heading",
+            ),
+            (
+                on_widgets("evidence: {command: x, heading: \"##Evidence\"}"),
+                "heading must be a markdown heading",
+            ),
+            (
+                forged(|yaml| {
+                    yaml.replace(
+                        "acme/docs: {about: The handbook., base: release/2026}",
+                        "acme/docs: {about: The handbook., base: release/2026, evidence: {command: x}}",
+                    )
+                }),
+                "forge.repos.acme/docs.evidence is for a pull request's description, and owes is \
+                 not pull_request",
+            ),
+        ] {
+            let refused = format!("{:#}", parse(&yaml).unwrap_err());
+            assert!(refused.contains(why), "{refused}");
+        }
     }
 
     #[test]
