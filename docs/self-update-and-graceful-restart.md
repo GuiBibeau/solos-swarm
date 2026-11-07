@@ -1,9 +1,12 @@
 # Self-update, graceful degradation and graceful restart
 
-Status: partly implemented on branch `self-update-graceful-restart`. Sections marked
-**Implemented** have code and tests. Sections marked **Designed** do not.
+Status: PR #14 (merged 2026-10-28) shipped the channel pointers, the promotion gate, prune, `doctor`, the
+drain and pause gate, the outage pause, `Store::resume`, `resume-plan` and `smoke`. Not built as of 2026-11-07:
+`run --resume`, signed pointers, the canary promotion timer, the stall watchdog, the disk-floor pause, the off-host
+alert and the model-fallback hook. Sections marked **Implemented** have code and tests. Sections marked
+**Designed** do not. For the commands, see [self-update-operations.md](self-update-operations.md).
 
-## 1. How it works today
+## 1. How it worked before PR #14
 
 - `remote.py deploy` builds one immutable candidate on the host. The directory is
   `~/.local/share/solos-swarm/<sha256 of the source archive>`. It is read-only (0555) and holds
@@ -19,15 +22,15 @@ Status: partly implemented on branch `self-update-graceful-restart`. Sections ma
   the host synthesize the artifact.
 - `Store` (`src/broker.rs`) is the only mutable state. Every change appends to a hash-chained
   `events.jsonl` (fsync) and then rewrites `state.json`. The state holds agents, tasks, findings,
-  intents, board, `spent_microusd` and `held_microusd`. A model call is `reserve` (hold at the
-  peak price) → `dispatched` → `settle` (once) or a release on provider error.
+  intents, board, `spent_microusd` and `held_microusd`. A model call is `reserve` (a hold at the
+  peak price), then `dispatched`, then `settle` (once), or a release on provider error.
   `accounting_failed` is terminal. The chain is verified offline by `check_run.py`.
 - The `mvp`/kernel path (`src/kernel.rs`, `runtime.rs`, Raft) has its own durable state with
   `budget_pauses`, `rate_pauses`, `ResumeGoal` and quota pauses (`quota.rs`). It resumes a goal
   after a pause. It is a different product path from `run` and shares no code with it.
 - Pause mode (PR #12) refuses `/model` with 503 `{paused, retry_after_s}` before any reservation, in a
   weekday peak window (`SWARM_REFUSE_PEAK=1`) or while `<run-dir>/PAUSE` exists. The Pi extension waits and
-  asks again. The Goal deadline stops counting while paused. This branch makes `control.json` the single
+  asks again. The Goal deadline stops counting while paused. PR #14 makes `control.json` the single
   source: a broker pause (outage, drain) and an operator pause both write it, and the `PAUSE` file and the peak
   window are inputs to the same `effective_control` answer. The wire behaviour is unchanged.
 
@@ -37,7 +40,7 @@ The kernel path resumes goals, but not `run`.
 
 Gaps this design closes:
 
-| Gap | Effect today |
+| Gap | Effect before PR #14 |
 |---|---|
 | No pointer to "the candidate new runs use" | Operator hand-copies a hash. No rollback target. |
 | Candidate trust is re-hash vs. its own manifest | A consistent swap of files plus manifest passes. |
@@ -62,14 +65,14 @@ Mapping:
 | `current` pointer | `channels/<channel>.json`: id, tree sha256, history, gate result |
 | background check | none by design. The operator or CI runs `deploy` then `candidates promote`. A host timer that runs `promote` for a built canary is a later step. |
 | never swap under a running process | A run pins its candidate in `request.json`. Pointers are only read by `start`. |
-| applies on next start | New runs use `current`. A running run changes candidate only through drain → resume. |
+| applies on next start | New runs use `current`. A running run could change candidate only through a drain and then a resume, and `run --resume` is not built. |
 | keep N versions | `candidates prune --keep N`, which also protects anything a run still needs. |
 | rollback | `candidates rollback`, and automatic restore if the switch does not verify. |
 | `doctor` | `remote.py doctor`; the binary's own `doctor` still checks Pi and bwrap. |
 
 ## 3. Design
 
-### (a) Channels and the pointer — Implemented
+### (a) Channels and the pointer: Implemented
 
 `DATA/channels/<channel>.json`, channel is `stable` or `canary`:
 
@@ -94,7 +97,7 @@ Mapping:
   ed25519 key held off the run user and the pointer stores the signature. `ed25519-dalek` is
   already a dependency.
 
-### (b) Promotion gate — Implemented
+### (b) Promotion gate: Implemented
 
 `candidates promote --candidate <id> [--channel]` takes a per-channel lock and runs, in order:
 
@@ -112,11 +115,12 @@ A failing step stops the gate. The pointer is unchanged, and `channels/<channel>
 a `promotion_refused` row. Only a passing gate writes the pointer. "Rollback on a failed probe" is
 therefore a refusal to switch, plus a restore if the post-switch re-verify fails.
 
-The idle-probe step is exercised against stubs offline. It has **not** run against systemd yet.
+The idle-probe step is exercised against stubs offline. It has **not** run against systemd yet. On 2026-11-07
+`remote-ai` still had no channel pointer, so no promotion had run there.
 
 ### (c) Drain and resume of a running run
 
-**Drain — Implemented.** `remote.py drain --run-id R [--grace-seconds N]` writes
+**Drain: Implemented.** `remote.py drain --run-id R [--grace-seconds N]` writes
 `control.json` (`{"mode":"drain"}`) into the run directory, then waits for the unit to stop.
 The runtime polls it every 200 ms (`control_watch`).
 
@@ -151,7 +155,7 @@ reads the same `effective_control` answer (see [pause-mode.md](pause-mode.md)).
 | An in-flight model call's response | **no** | the outcome is unknown, so the hold is charged |
 | Pi session context, in-flight tool calls | **no** | `run_code`/`fetch_url` are read-only and are re-run |
 
-**Resume — Implemented as validation and the Store; the runtime entry is Designed.**
+**Resume: Implemented as validation and the Store. The runtime entry is Designed.**
 `Store::resume(dir, goal)` rebuilds the Store from `state.json` after these checks:
 
 - the hash chain verifies end to end (a torn final line is trimmed and reported; anything else is
@@ -210,7 +214,7 @@ against the log tail, orphans charged. That works today in the Store and `resume
 | Stalled agent | **Designed.** Per-agent deadline: no broker call for `stall_seconds` (an agent with `reserved` calls older than the provider timeout is not stalled). The runtime then retires the agent: `defer_task` files its partial finding from `notes`, and the process is killed. The nudge loop already caps at 200 attempts but has no clock. | Designed |
 | Partial results | Every stop path except a drain files them. A drained run's results are in `state.json` and the next segment. | Existing |
 
-### (e) `doctor` — Implemented
+### (e) `doctor`: Implemented
 
 `remote.py doctor` runs on the host and adds a controller-side check. Output is one JSON document
 with `verdict` PASS/WARN/FAIL and a list of checks: channel pointers verify (tree hash), disk,
@@ -231,7 +235,7 @@ with `verdict` PASS/WARN/FAIL and a list of checks: channel pointers verify (tre
 | `accounting_failed` | status | Refused | same |
 | Drain with a long call | grace | Charge ceiling, `unknown_charged` | `an_expired_drain_grace_charges...` |
 | Drain, normal | quiescent | `held == 0`, `resume.json` | `the_control_file_drains_once...`, `a_drain_cannot_be_lifted...` |
-| Provider outage | 5 consecutive | Pause, alert, no call burned | `broker_outage_http`, `outages_pause_after...` |
+| Provider outage | 5 consecutive | Pause, alert, no call burned | `tests/broker_outage_http.rs`, `outages_pause_after...` |
 | Pointer write fails mid-switch | `os.replace` error | Old pointer intact | `test_switch_is_atomic...` |
 | Gate fails | gate verdict | `current` unchanged, log row | `test_failed_gate_leaves_current_unchanged...` |
 | New candidate does not verify after the switch | re-verify | Old pointer restored | `test_post_switch_verification_failure...` |
@@ -244,24 +248,26 @@ systemd, `doctor` on a real host, the drain against real Pi agents under bubblew
 sandbox path cannot be run on a Mac. A live drain-then-resume of an idle probe is the first thing
 to run on the box once approved.
 
-## 5. Manual probe procedure (not run; the tournament run is live)
+## 5. Manual probe procedure
 
-Run only when no live run needs the host. All steps are read-only or zero-spend.
+Not run yet (2026-11-07). Run it only when no live run needs the host. All steps are read-only or zero-spend.
 
 1. `remote.py deploy`, then `remote.py doctor`. Expect no FAIL.
 2. `remote.py candidates promote --candidate <id> --channel canary`. This runs the gate, including the idle probe.
-3. `remote.py start --candidate current --run-id probe-1 --seed 1 --idle-probe --deadline-seconds 60`, then
-   `remote.py drain --run-id probe-1 --grace-seconds 10`. Expect `drained: true` and `held_microusd: 0`.
-4. `remote.py resume --run-id probe-1 --candidate current`. Expect a plan with `charge_microusd: 0`.
-5. `remote.py candidates rollback --channel canary`, then `status` to confirm `current` moved back.
+3. `remote.py start --candidate <id> --run-id probe-1 --seed 1 --idle-probe --deadline-seconds 60`, then
+   `remote.py drain --run-id probe-1 --grace-seconds 10`. Expect `drained: true` and `held_microusd: 0`. Pass the
+   id, because `--candidate current` reads the `stable` pointer, not `canary`.
+4. `remote.py resume --run-id probe-1 --candidate <id>`. Expect a plan with `charge_microusd: 0`.
+5. `remote.py candidates rollback --channel canary`, then `remote.py candidates current --channel canary` to confirm
+   the pointer moved back. A rollback needs a previous candidate on the channel, so promote two builds first.
 
 ## 6. Rollout order
 
-1. This branch: pointer, gate, prune, doctor, pause/drain gate, `Store::resume`, `resume-plan`,
+1. Shipped in PR #14: pointer, gate, prune, doctor, pause and drain gate, `Store::resume`, `resume-plan`,
    `smoke`. It changes only the host controller and the broker. Candidates that were already
    deployed keep working. Their manifests lack `tree_sha256`, and `promote` computes the hash
    itself.
-2. `run --resume` (deliberately not shipped in the first PR; no experimental half-built path) plus the `check_run.py` segment rule (section 3c list), then a live drain and
-   resume of an idle probe.
-3. Stall watchdog, disk floor pause, off-host alert, fallback hook.
-4. Signed pointers; a host timer for canary promotion.
+2. Not built: `run --resume` (left out of the first PR on purpose, so no half-built path ships), plus the
+   `check_run.py` segment rule (the list in section 3c), then a live drain and resume of an idle probe.
+3. Not built: stall watchdog, disk floor pause, off-host alert, fallback hook.
+4. Not built: signed pointers, and a host timer for canary promotion.

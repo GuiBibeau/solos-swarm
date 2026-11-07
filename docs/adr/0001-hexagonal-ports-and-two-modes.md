@@ -3,6 +3,9 @@
 - Status: proposed
 - Date: 2026-11-02
 - Plan: [docs/agent-mode/README.md](../agent-mode/README.md)
+- Shipped since: `crates/agent-core` with its boundary test (#18), the `AgentHarness` port (#19),
+  `swarm::run_goal` as a library call (#20), the SQLite store `crates/agent-store` (#21), and swarm Tickets that run
+  `Plan::Swarm` through it (#28). The roadmap in the plan tracks the rest.
 
 ## Context
 
@@ -13,12 +16,12 @@ ships GitHub and Feishu Sources; Slack and schedules are ours to add),
 isolated Worker sessions per task, two-stage event filtering, Thread subscriptions with pass-through, async tools,
 separate compute, state and execution, and a Watchdog.
 
-The live `run` path is about 6k lines (`src/main.rs`, `src/broker.rs`, `src/broker_control.rs`, `src/code.rs`,
-`src/progress.rs`). It hard-wires Pi (the Pi launch in `src/harness.rs`, with its `bwrap` argv built by `src/bwrap.rs`),
-one hosted OpenAI-compatible upstream (`provider_for` always builds `OpenAiCompatible` behind the existing `Provider`
-trait in `src/gateway/upstream.rs`), a Goal-shaped `Store` that holds the event log, the ledger and the
-swarm's task board together, and `agent-NN` identities. The `mvp` cluster path (about 55k lines) has its own copies
-of the provider trait, broker, Pi launcher, extension and ledger. `run` uses it only for
+This section describes the code on 2026-11-02. The live `run` path was about 6k lines (`src/main.rs`,
+`src/broker.rs`, `src/broker_control.rs`, `src/code.rs`, `src/progress.rs`). It hard-wired Pi (the Pi launch in `src/harness.rs`, with its `bwrap` argv built by `src/bwrap.rs`),
+one hosted OpenAI-compatible upstream (`provider_for` always built `OpenAiCompatible` behind the existing `Provider`
+trait in `src/gateway/upstream.rs`), a Goal-shaped `Store` that held the event log, the ledger and the
+swarm's task board together, and `agent-NN` identities. The `mvp` cluster path (about 55k lines) had its own copies
+of the provider trait, broker, Pi launcher, extension and ledger. `run` used it only for
 `provider::completion_usage`.
 
 ## Decision
@@ -36,8 +39,9 @@ of the provider trait, broker, Pi launcher, extension and ledger. `run` uses it 
    call, under the Ticket's budget. `solos-swarm run` stays as a thin composition root for batch use.
 4. **One workspace, one binary, one CI.** The pure agent domain is the workspace crate `crates/agent-core`
    (`solos-agent-core`). Its `tests/boundary.rs` refuses any dependency outside `serde`, `serde_json` and `sha2`, and
-   any `std::` path outside an allowlist of pure modules (a source scan, not a proof). Adapters and the swarm core stay in the root crate until they are
-   stable enough to split. `default-members` makes `cargo test` and `cargo clippy` cover both.
+   any `std::` path outside an allowlist of pure modules. That test scans the source and is not a proof. Adapters
+   and the swarm core stay in the root crate until they are stable enough to split. `default-members` makes
+   `cargo test` and `cargo clippy` cover every member.
 5. **Functional core, effect queue.** Agent-core commands return their external work as `Effect`s committed in the
    same `ChangeSet` as the state change ("stored first, done after"). Adapters perform effects and report facts back
    through Engine commands. The prototype's core is synchronous too, but its ports enqueue work as calls. Returning

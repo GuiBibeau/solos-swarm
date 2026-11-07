@@ -13,18 +13,18 @@ model got are kept as blobs, so `solos-swarm agent trail` can later prove what t
 
 ## How to get to it (user POV)
 
-- Any request whose work needs a web page, from any chat surface: the Router accepts it and the worker browses.
+- Any request whose work needs a web page, from any chat platform: the Router accepts it and the worker browses.
 - `solos-swarm agent trail --state-dir <state> --config <agent.yaml> [--ticket <id>] [--json] [--strict]` to check.
 
 ## Driving it with bin/mcp.sh
 
-Preconditions: a run launched with `overlays/browser.yaml` (Lightpanda 1.0.2 at `/home/debian/work/ci/lightpanda/1.0.2/lightpanda`, sha256 `ae7d01d2…37e19e`); `launch.sh` prints the trail key's public half (`ed25519:…`); doctor clean.
+Preconditions: a run launched with `overlays/browser.yaml` (Lightpanda 1.0.2 at `/home/debian/work/ci/lightpanda/1.0.2/lightpanda`, sha256 `ae7d01d2…37e19e`), and a clean doctor. `launch.sh` prints the trail key's public half (`ed25519:…`).
 
 - `browse`: `bin/mcp.sh $RUN request "Open https://example.com in the browser and tell me the page's main heading and the text of its link."`, then `replies <thread> result 540`. The result names "Example Domain" and the link "Learn more" (to iana.org); `curl -s https://example.com` shows the same.
-- `trail-signed`, `trail-blobs`, `browser-closes`: `bin/evidence.sh $RUN browser-trail`; `trail.txt` ends with `N steps, N signatures ok, M blobs ok, 0 problems` and `exit 0`, and `events.jsonl` has as many `trail_done` as `trail_asked`, the last a `close`. On the box, `ssh remote-ai "cd ~/work/verify/$RUN && bin/solos-swarm agent trail --state-dir state --config agent.yaml --ticket <ticket>"` prints each step.
+- `trail-signed`, `trail-blobs`, `browser-closes`: `bin/evidence.sh $RUN browser-trail`; `trail.txt` starts with `chain ok`, has a `N steps, N signatures ok, M blobs ok, 0 problems` line per Ticket, and ends with `exit 0`, and `events.jsonl` has as many `trail_done` as `trail_asked`, the last a `close`. On the box, `ssh remote-ai "cd ~/work/verify/$RUN && bin/solos-swarm agent trail --state-dir state --config agent.yaml --ticket <ticket>"` prints each step.
 
 ## Gotchas
 
-- `--block-private-networks` is on by default, so a page on the box's loopback is unreachable from the browser; use a public page, or add `allow_private_networks: true` to the browser overlay for a local page.
-- example.com's body text changes over time (in 2026 it shows a multilingual notice); verify the heading and link, not the paragraph.
-- A relaunch empties `state/`: run `evidence.sh` (which runs `agent trail`) before relaunching.
+- The host starts Lightpanda with `--block-private-networks` by default, so the browser cannot reach a page on the box's loopback. Use a public page, or add `allow_private_networks: true` to the browser overlay for a local page.
+- example.com's body text changes over time: in 2026 it shows a multilingual notice. Verify the heading and the link, not the paragraph.
+- A relaunch empties `state/`. Run `evidence.sh`, which runs `agent trail`, before you relaunch.
