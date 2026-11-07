@@ -1,12 +1,14 @@
 //! The long-running loop. One task owns the Engine, so state has one writer.
 //! Adapters run concurrently and send facts and Effect outcomes back to it.
 
+use super::dream::{self, DreamSchedule};
 use super::earlier;
 use super::ports::{
     Answer, Applied, BoxFuture, Channel, Command, Delivered, Delivery, Execute, Executor, Fact,
     FactSink, Failure, Forge, Inbound, Launch, MemoCommand, MemoDecision, MemoOrder, Order,
     Publish, Router, SendOptions, SendOutcome, Source,
 };
+use super::utc;
 use super::watchdog;
 use crate::broker::now_ms;
 use crate::gateway;
@@ -14,13 +16,14 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use solos_agent_core::change::{BranchName, CommitSha, RepoName};
 use solos_agent_core::delivery::{ForgeJob, Observed};
+use solos_agent_core::engine::Citing;
 use solos_agent_core::ids::key;
 use solos_agent_core::memo::{
     MemoActor, MemoAudience, MemoAuthor, MemoIn, MemoReview, MemoScope, MemoSource,
 };
 use solos_agent_core::model::{
     Actor, AssignmentId, AssignmentState, Candidate, Effect, EvalId, Input, InputBody, MemoId,
-    MessageId, MessageKind, Ms, OutboundMessage, Plan, Stage, Ticket, TicketId, Trigger,
+    MessageId, MessageKind, Ms, OutboundMessage, Plan, Stage, Ticket, TicketId, Trigger, Verdict,
 };
 use solos_agent_core::{AllowlistPolicy, Engine, Error, Intake, Policy, Repositories};
 use solos_agent_store::{EffectId, QueuedEffect, SqliteStore};
@@ -125,6 +128,12 @@ pub struct Runtime {
     memo_repos: Option<BTreeSet<RepoName>>,
     /// When unreviewed proposals were last expired.
     memos_expired: Option<Instant>,
+    /// When the daily dream is asked for, if the agent dreams.
+    dream: Option<DreamSchedule>,
+    /// When the clock was last looked at for the dream, and the latest slot
+    /// this run asked for.
+    dream_checked: Option<Instant>,
+    dreamed: Option<Ms>,
 }
 
 impl Runtime {
@@ -171,7 +180,16 @@ impl Runtime {
             global_memos: None,
             memo_repos: None,
             memos_expired: None,
+            dream: None,
+            dream_checked: None,
+            dreamed: None,
         }
+    }
+
+    /// Ask for the dream each day as `schedule` says (see `dream`).
+    pub fn with_dream(mut self, schedule: Option<DreamSchedule>) -> Self {
+        self.dream = schedule;
+        self
     }
 
     /// Before `run` returns, run `closing` while the facts it sends are
@@ -244,6 +262,7 @@ impl Runtime {
             self.gate();
             self.evaluate()?;
             self.expire_memos()?;
+            self.ask_for_dream()?;
             self.dispatch(&mut work, &facts)?;
             let drained =
                 !sources_open && sources.is_empty() && inbound.is_empty() && work.is_empty();
@@ -473,6 +492,15 @@ impl Runtime {
                 };
                 (what, self.propose_memo(proposal))
             }
+            Fact::RetireMemo {
+                memo,
+                by,
+                reason,
+                citing,
+            } => (
+                format!("retirement of {memo} by the dream"),
+                self.dream_retire(&memo, by, &reason, citing),
+            ),
             Fact::ReviewMemo {
                 memo,
                 review,
@@ -682,6 +710,7 @@ impl Runtime {
                             source: source.clone(),
                             by: by.clone(),
                         },
+                        supersedes: None,
                     }),
                 };
                 let done = match &added {
@@ -783,6 +812,23 @@ impl Runtime {
         Ok(Applied::Reviewed(kept))
     }
 
+    /// The dream retires a memo: the Engine takes it only from the dream's
+    /// running Assignment, and never for a person's memo.
+    fn dream_retire(
+        &mut self,
+        memo: &MemoId,
+        by: MemoActor,
+        reason: &str,
+        citing: Citing,
+    ) -> Result<Applied, Error> {
+        let scope = self.engine.repos().memo(memo).map(|m| m.scope);
+        self.engine.retire_memo_citing(memo, by, reason, citing)?;
+        if scope == Some(MemoScope::Global) {
+            self.global_memos_changed();
+        }
+        Ok(Applied::Done)
+    }
+
     /// Retire the proposals no review decided within a week, at most once
     /// a minute. A Store error stops the runtime.
     fn expire_memos(&mut self) -> Result<()> {
@@ -808,6 +854,54 @@ impl Runtime {
         }
     }
 
+    /// Look at the latest daily slot once: when a Ticket ended since the
+    /// last dream began, receive the dream's Trigger, whose id names the
+    /// slot, then note the slot (in the schedule's marker), so a restart in
+    /// the same slot asks for nothing new. The host judges the Trigger in the
+    /// Router's place (see `job`). A Store error stops the runtime.
+    fn ask_for_dream(&mut self) -> Result<()> {
+        let Some(schedule) = &self.dream else {
+            return Ok(());
+        };
+        if self
+            .dream_checked
+            .is_some_and(|at| at.elapsed() < schedule.every)
+        {
+            return Ok(());
+        }
+        self.dream_checked = Some(Instant::now());
+        let now = (schedule.clock)();
+        let Some(slot) = schedule.latest(now) else {
+            return Ok(());
+        };
+        if self.dreamed.is_some_and(|seen| seen >= slot)
+            || schedule.looked_at().is_some_and(|seen| seen >= slot)
+        {
+            self.dreamed = Some(slot);
+            return Ok(());
+        }
+        self.dreamed = Some(slot);
+        let due = match dream::due(self.engine.repos(), now) {
+            Ok(due) => due,
+            Err(why) => bail!("the dream's due check: {why}"),
+        };
+        if due {
+            // Received before the slot is noted, so a crash between the two
+            // asks again after the restart, which the Trigger's id makes a
+            // duplicate.
+            match self.engine.receive(dream::trigger(slot)) {
+                Ok(Intake::Stored { .. }) => {
+                    eprintln!("agent: the dream of {} is asked for", utc::format(slot));
+                }
+                Ok(_) => {}
+                Err(Error::Store(why)) => bail!("the dream's trigger: {why}"),
+                Err(err) => eprintln!("agent: the dream's trigger was refused: {err}"),
+            }
+        }
+        schedule.look(slot);
+        Ok(())
+    }
+
     /// A session's worker gets the memo index the core picks as its Launch
     /// is performed, and the core records which memos it was shown. A swarm's
     /// agents get none.
@@ -815,7 +909,7 @@ impl Runtime {
         let Job::Launch(mut launch) = job else {
             return Ok(job);
         };
-        if matches!(launch.plan, Plan::Session { .. }) {
+        if matches!(launch.plan, Plan::Session { .. }) && !dream::is_dream_trigger(&launch.origin) {
             let to = MemoAudience::Worker {
                 ticket: launch.ticket.clone(),
                 assignment: launch.assignment.clone(),
@@ -901,6 +995,10 @@ impl Runtime {
     fn job(&self, effect: Effect, repeat: bool) -> Result<Job> {
         let store = self.engine.repos();
         Ok(match effect {
+            Effect::Assess(candidate) if dream::is_dream_candidate(&candidate) => {
+                let verdict = dream::verdict(store, &candidate, now_ms())?;
+                Job::Decide(candidate.eval, verdict)
+            }
             Effect::Assess(candidate) => Job::Assess(candidate),
             Effect::Launch {
                 ticket,
@@ -1226,6 +1324,8 @@ fn observed_ticket(observed: &Observed) -> &TicketId {
 
 enum Job {
     Assess(Candidate),
+    /// The host's own verdict, given in the Router's place: the dream's.
+    Decide(EvalId, Verdict),
     Launch(Box<Launch>),
     Deliver(Delivery),
     /// Make the forge hold a head and a pull request for it.
@@ -1248,6 +1348,7 @@ impl Job {
                 Ok(())
             }
             Job::Assess(candidate) => shared.router.assess(candidate, facts).await,
+            Job::Decide(eval, verdict) => facts.send(Fact::Verdict { eval, verdict }).await,
             Job::Forge(job) => {
                 let forge = shared
                     .forge
@@ -1446,6 +1547,7 @@ mod tests {
                     source: "slack".into(),
                     by: Actor::person("alice"),
                 },
+                supersedes: None,
             })
             .unwrap();
         let queued = runtime.engine.repos().pending_effects().unwrap();
@@ -1593,6 +1695,7 @@ mod tests {
                 state: MemoState::Proposed,
                 created_ms: at,
                 verified_ms: at,
+                supersedes: None,
             }
         };
         let save = |runtime: &mut Runtime, memo: Memo| {

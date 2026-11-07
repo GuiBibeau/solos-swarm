@@ -1,7 +1,7 @@
 use crate::StoreError;
 use rusqlite::{Connection, TransactionBehavior};
 
-pub(crate) const LATEST: u32 = 8;
+pub(crate) const LATEST: u32 = 9;
 
 /// Aggregates are JSON in `body`; the other columns index the port's queries.
 const V1: &str = "
@@ -143,8 +143,17 @@ CREATE TABLE IF NOT EXISTS memos (
 CREATE INDEX IF NOT EXISTS memos_live ON memos (scope, id) WHERE state IN ('proposed', 'active');
 ";
 
+/// No new table. A file whose memos can supersede one another, cite a line
+/// of a transcript, be retired by the dream with what it cites, or name the
+/// memo that replaced them, and whose events can say what a proposal
+/// supersedes, is one an older build refuses to open, instead of dropping
+/// `Memo.supersedes` and a retirement's `replaced_by` and `evidence` when it
+/// rewrites a memo, or failing on a source or an actor it cannot read. A
+/// version 8 memo reads as one that supersedes nothing.
+const V9: &str = "";
+
 /// Migration `n` is `MIGRATIONS[n - 1]`.
-const MIGRATIONS: [&str; LATEST as usize] = [V1, V2, V3, V4, V5, V6, V7, V8];
+const MIGRATIONS: [&str; LATEST as usize] = [V1, V2, V3, V4, V5, V6, V7, V8, V9];
 
 /// Applies the migrations the file lacks. The write lock makes a second
 /// process that opens the file at the same time wait, then find nothing to do.
@@ -181,7 +190,7 @@ pub(crate) fn version(conn: &Connection) -> Result<u32, StoreError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LATEST, V1, V2, V3, V4, V5, V6, V7, V8, migrate, version};
+    use super::{LATEST, V1, V2, V3, V4, V5, V6, V7, V8, V9, migrate, version};
     use rusqlite::Connection;
 
     #[test]
@@ -203,6 +212,7 @@ mod tests {
         conn.execute_batch(V6).unwrap();
         conn.execute_batch(V7).unwrap();
         conn.execute_batch(V8).unwrap();
+        conn.execute_batch(V9).unwrap();
     }
 
     #[test]

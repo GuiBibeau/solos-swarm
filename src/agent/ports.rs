@@ -9,7 +9,10 @@ use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use solos_agent_core::change::{BranchName, CommitSha, Harvest, RepoName};
 use solos_agent_core::delivery::Observed;
-use solos_agent_core::memo::{Memo, MemoAudience, MemoIn, MemoIndex, MemoReview, MemoScope};
+use solos_agent_core::engine::Citing;
+use solos_agent_core::memo::{
+    Memo, MemoActor, MemoAudience, MemoIn, MemoIndex, MemoReview, MemoScope,
+};
 use solos_agent_core::model::{
     Actor, Ask, AssignmentId, Candidate, ChannelRef, Decision, EvalId, Input, MemoId, MicroUsd,
     OutboundMessage, Plan, Report, ReportIn, SecretGrant, SecretId, TicketId, Trigger, TriggerId,
@@ -477,6 +480,15 @@ pub enum Fact {
         memo: MemoId,
         review: MemoReview,
         decision: MemoDecision,
+    },
+    /// The dream retires a memo, citing what shows it is wrong, stale or a
+    /// duplicate, whose lines the broker found in the original transcripts.
+    /// Asked.
+    RetireMemo {
+        memo: MemoId,
+        by: MemoActor,
+        reason: String,
+        citing: Citing,
     },
 }
 

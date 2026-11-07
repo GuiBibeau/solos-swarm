@@ -1,7 +1,9 @@
 //! Schema 8 holds memos, one row each. The text is in the row and only its
 //! digest on the chain, so forgetting a memo erases its text from the file
 //! and the chain still verifies; a file from schema 7 opens with its rows
-//! and its chain as they were.
+//! and its chain as they were. Schema 9 adds what a memo supersedes, what
+//! replaced a retired one and what the dream cited; a schema 8 file's memos
+//! read back as superseding nothing.
 
 mod common;
 
@@ -30,6 +32,7 @@ fn remember(engine: &mut SqlEngine, scope: MemoScope, text: &str) -> MemoId {
                 source: "slack".into(),
                 by: Actor::person("alice"),
             },
+            supersedes: None,
         })
         .unwrap()
 }
@@ -213,10 +216,71 @@ fn a_schema_7_file_opens_with_its_rows_and_chain_and_then_holds_memos() {
     drop(raw);
 
     let mut e = engine(&db, &now);
-    assert_eq!(e.repos().schema_version().unwrap(), 8);
+    assert_eq!(e.repos().schema_version().unwrap(), 9);
     assert_eq!(sqlite_contents(e.repos()), before);
     assert_eq!(e.repos().verify_chain().unwrap(), chain);
     let id = remember(&mut e, MemoScope::Global, "Answer in French.");
     assert!(e.repos().read_memo(&id).unwrap().unwrap().is_live());
     assert_eq!(e.repos().verify_chain().unwrap().len, chain.len + 1);
+}
+
+/// Rows exactly as a schema 8 build wrote them: an active memo, and one an
+/// operator retired, whose state names no replacement and cites nothing.
+const V8_ACTIVE: &str = r#"{"id":"mm_v8active","scope":"repo:acme/widgets","text":"Tests run with cargo test.","text_sha256":"sha256:1111111111111111111111111111111111111111111111111111111111111111","sources":[{"kind":"call","assignment":"as_1","call":"run_code#2","tool":"run_code","transcript":"sha256:2222222222222222222222222222222222222222222222222222222222222222","quote":"test result: ok"}],"trust":"model","author":{"kind":"worker","ticket":"tk_1","assignment":"as_1"},"state":{"state":"active","since_ms":5,"review":{"by":"review:deepseek-flash@max","reason":"a tested lesson"}},"created_ms":4,"verified_ms":5}"#;
+const V8_RETIRED: &str = r#"{"id":"mm_v8retired","scope":"global","text":"Answer in French.","text_sha256":"sha256:3333333333333333333333333333333333333333333333333333333333333333","sources":[{"kind":"operator"}],"trust":"person","author":{"kind":"operator","source":"slack","by":{"id":"alice","kind":"person"}},"state":{"state":"retired","by":{"kind":"operator","source":"slack","by":{"id":"alice","kind":"person"}},"reason":"changed my mind","at_ms":9},"created_ms":2,"verified_ms":2}"#;
+
+#[test]
+fn a_schema_8_file_opens_at_9_and_its_memos_read_back_as_superseding_nothing() {
+    let db = TempDb::new("memo-v8");
+    let now = Rc::new(Cell::new(1_000));
+    drop(engine(&db, &now));
+    // What a schema 8 build left: version 8, and memo rows of its shape.
+    let raw = db.raw();
+    raw.execute_batch("DELETE FROM schema_version WHERE version > 8;")
+        .unwrap();
+    for (id, scope, state, body) in [
+        ("mm_v8active", "repo:acme/widgets", "active", V8_ACTIVE),
+        ("mm_v8retired", "global", "retired", V8_RETIRED),
+    ] {
+        raw.execute(
+            "INSERT INTO memos (id, scope, state, body) VALUES (?1, ?2, ?3, ?4)",
+            [id, scope, state, body],
+        )
+        .unwrap();
+    }
+    drop(raw);
+
+    let e = engine(&db, &now);
+    assert_eq!(e.repos().schema_version().unwrap(), 9);
+    let active = e
+        .repos()
+        .read_memo(&MemoId::new("mm_v8active"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(active.supersedes, None);
+    assert!(active.is_active());
+    assert_eq!(
+        serde_json::to_string(&active).unwrap(),
+        V8_ACTIVE,
+        "the same bytes back"
+    );
+    let retired = e
+        .repos()
+        .read_memo(&MemoId::new("mm_v8retired"))
+        .unwrap()
+        .unwrap();
+    match &retired.state {
+        MemoState::Retired {
+            replaced_by,
+            evidence,
+            reason,
+            ..
+        } => {
+            assert_eq!((replaced_by, evidence.len()), (&None, 0));
+            assert_eq!(reason, "changed my mind");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(serde_json::to_string(&retired).unwrap(), V8_RETIRED);
+    assert_eq!(e.repos().live_memos().len(), 1);
 }

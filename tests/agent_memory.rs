@@ -16,7 +16,7 @@ use solos_agent_core::model::{
     TriggerId,
 };
 use solos_agent_store::SqliteStore;
-use solos_swarm::agent::broker::memory::MemoryParts;
+use solos_swarm::agent::broker::memory::{DreamTerms, MemoryParts};
 use solos_swarm::agent::broker::review::{Effort, INSTRUCTIONS, ReviewTerms};
 use solos_swarm::agent::broker::{
     self, Account, AgentBroker, BrokerParts, DecideTerms, Grant, ModelTerms, Principal, VaultParts,
@@ -29,7 +29,9 @@ use solos_swarm::agent::ports::{BoxFuture, Channel, Delivery, Executor, Fact, Fa
 use solos_swarm::agent::scripted::ScriptedRouter;
 use solos_swarm::agent::{Adapters, RunOptions, Runtime, STORE_FILE};
 use solos_swarm::code::{Ended, OutputBounds, Started};
-use solos_swarm::gateway::{Dispatch, PriceTable, Provider, Upstream};
+use solos_swarm::gateway::{
+    Dispatch, PriceTable, Provider, Upstream, thinking_body, upstream_body,
+};
 use solos_swarm::vault::{
     Approval, ItemKind, KeyScheme, NewItem, SandboxView, SecretValue, Vault, VaultConfig,
 };
@@ -169,6 +171,8 @@ struct World {
     provider: Arc<Scripted>,
     executor: Arc<Starting>,
     node: Arc<Node>,
+    /// The agent dreams, with this daily cap on the `memory` account.
+    dream: Option<Option<u64>>,
 }
 
 impl World {
@@ -189,7 +193,13 @@ impl World {
             node: Arc::new(Node {
                 stdout: Mutex::default(),
             }),
+            dream: None,
         }
+    }
+    /// The agent dreams, and `memory` is capped at `daily` a day.
+    fn dreaming(mut self, daily: Option<u64>) -> Self {
+        self.dream = Some(daily);
+        self
     }
     fn state(&self) -> PathBuf {
         self.root.join("state")
@@ -241,6 +251,7 @@ impl World {
             max_output_tokens: 2_048,
             call_limit: None,
             temperature: None,
+            thinking: None,
         };
         let parts = BrokerParts {
             dir: self.state(),
@@ -272,7 +283,11 @@ impl World {
                 },
                 effort: Effort::Max,
             },
-            daily_microusd: None,
+            daily_microusd: self.dream.flatten(),
+            dream: self.dream.map(|_| DreamTerms {
+                effort: Effort::Max,
+                max_output_tokens: Effort::Max.max_output_tokens(),
+            }),
         });
         let router = Grant {
             principal: Principal::Router,
@@ -1102,4 +1117,106 @@ async fn a_review_that_fails_leaves_the_proposal_proposed_and_the_next_start_rev
         assert_eq!(w.provider.reviews().len(), 4, "once");
     })
     .await;
+}
+
+/// One model call of the dream's seat and one of an ordinary worker, the
+/// same request: the dream's goes with thinking on at max, every earlier
+/// reasoning passed back, on the `memory` account; the worker's is the
+/// shared body, byte for byte, on its Ticket's. A `memory` cap stops the
+/// dream's calls before they leave.
+#[tokio::test]
+async fn the_dreams_calls_think_on_the_memory_account_and_stop_at_its_daily_cap() {
+    let request = json!({"model": "deepseek-flash", "messages": [
+        {"role": "user", "content": "Dream."},
+        {"role": "assistant", "content": null, "reasoning_content": "R1: read the index.",
+         "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "read", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "{}"},
+        {"role": "assistant", "content": "Reading."},
+        {"role": "user", "content": "Go on."},
+    ]});
+    let seats = |world: &World, served: &Served| {
+        std::fs::create_dir_all(world.state().join("work")).unwrap();
+        let dream = WorkerSeat::new(
+            TicketId::new("tk_dream"),
+            AssignmentId::new("as_dream"),
+            world.state().join("work"),
+            None,
+        )
+        .dreaming(world.state().join("tickets"));
+        let dream = served
+            .broker
+            .admit_worker("dream-token".into(), dream, "You are the dream.".into())
+            .unwrap();
+        assert!(dream.is_dream());
+        let worker = WorkerSeat::new(
+            TicketId::new("tk_work"),
+            AssignmentId::new("as_work"),
+            world.state().join("work"),
+            None,
+        );
+        served
+            .broker
+            .admit_worker(WORKER.into(), worker, "You are a worker.".into())
+            .unwrap();
+        let tools = served.broker.seat_tools(&dream);
+        assert!(tools.contains(&"memo_retire") && tools.contains(&"read"));
+        assert!(!tools.contains(&"fetch_url") && !tools.contains(&"worker_handback"));
+    };
+
+    let world = World::new("dream-calls").dreaming(Some(1_000_000));
+    let runtime = world.runtime();
+    let served = world.serve(runtime.facts(), None);
+    seats(&world, &served);
+    world.provider.answer(Review::Says("Done.".into()));
+    let (status, answer) = served.post("model", "dream-token", request.clone()).await;
+    assert_eq!(status, 200, "{answer}");
+    let (status, answer) = served.post("model", WORKER, request.clone()).await;
+    assert_eq!(status, 200, "{answer}");
+    let bodies = world.provider.bodies.lock().unwrap().clone();
+    let [dream, worker] = &bodies[..] else {
+        panic!("{bodies:?}")
+    };
+    let thinking = thinking_body("deepseek-flash", &request, 131_072, "max");
+    assert_eq!(
+        serde_json::to_vec(dream).unwrap(),
+        serde_json::to_vec(&thinking).unwrap()
+    );
+    assert_eq!(
+        dream["messages"][1]["reasoning_content"],
+        "R1: read the index."
+    );
+    assert_eq!(
+        dream["messages"][3]["reasoning_content"], "",
+        "never missing"
+    );
+    let shared = upstream_body("deepseek-flash", &request, 2_048);
+    assert_eq!(
+        serde_json::to_vec(worker).unwrap(),
+        serde_json::to_vec(&shared).unwrap()
+    );
+    assert_eq!(worker["thinking"]["type"], "disabled");
+    let store = world.store();
+    assert!(store.committed("memory", 0).unwrap() > 0);
+    assert_eq!(store.committed("ticket:tk_dream", 0).unwrap(), 0);
+    assert!(store.committed("ticket:tk_work", 0).unwrap() > 0);
+    served.server.abort();
+
+    let capped = World::new("dream-cap").dreaming(Some(1));
+    let runtime = capped.runtime();
+    let served = capped.serve(runtime.facts(), None);
+    seats(&capped, &served);
+    let (status, answer) = served.post("model", "dream-token", request.clone()).await;
+    assert_eq!(status, 403, "{answer}");
+    assert!(
+        answer["error"]
+            .as_str()
+            .unwrap()
+            .contains("memory's daily spend cap (the review's and the dream's) is reached"),
+        "{answer}"
+    );
+    assert!(
+        capped.provider.bodies.lock().unwrap().is_empty(),
+        "nothing left"
+    );
+    served.server.abort();
 }

@@ -778,6 +778,7 @@ fn gen_propose_memo(rng: &mut Lcg, r: &MemoryRepositories) -> Op {
         text,
         sources,
         author,
+        supersedes: None,
     })
 }
 

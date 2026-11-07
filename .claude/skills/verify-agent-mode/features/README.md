@@ -45,6 +45,7 @@ harness it uses), and `Gotchas`.
 | [Ask for a change and get a pull request from the bot](./github-pr.md) | not yet | seeded (needs the App created by hand and `owes: pull_request` on the sandbox) |
 | [The owner's memory shapes later work](./memo-owner.md) | not yet | seeded |
 | [Workers remember, and the review decides](./memo-remember.md) | not yet | seeded |
+| [The daily dream checks memory against the transcripts](./dream.md) | not yet | seeded |
 
 Not yet mapped, each a real surface: Swarm Tickets (`executor.swarm`, the Router choosing `Plan::Swarm`), schedules,
 remote nodes, Claude Code workers, the Watchdog's alerts, Slack, `agent bench`, and swarm mode itself (`solos-swarm run`, verified by

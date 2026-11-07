@@ -13,5 +13,6 @@ pub use pause::{effective_control, paused_reply, peak_retry_after, unix_secs};
 pub use pricing::{PriceTable, Receipt, Usage, completion_usage};
 pub use upstream::{
     Dialect, Dispatch, OpenAiCompatible, Provider, Temperature, Upstream, admit_request, endpoint,
-    provider_for, reasoning_model, sampled, upstream_body, upstream_profile, venice_model,
+    provider_for, reasoning_model, sampled, thinking_body, upstream_body, upstream_profile,
+    venice_model,
 };

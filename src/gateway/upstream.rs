@@ -197,6 +197,30 @@ pub fn upstream_body(model: &str, request: &Value, max_output_tokens: u64) -> Va
     json!({"model":model,"messages":request["messages"],"tools":request.get("tools").cloned().unwrap_or(json!([])),"max_tokens":max_output_tokens,"thinking":{"type":"disabled"},"temperature":0,"stream":false})
 }
 
+/// The body sent upstream for an admitted request of a session that thinks,
+/// which only agent mode's dream is: its messages and tools, DeepSeek's
+/// thinking on at `effort` (`reasoning_effort`), the output ceiling, and no
+/// streaming. No temperature: DeepSeek documents that thinking mode ignores
+/// it. With tools, DeepSeek wants every earlier answer's `reasoning_content`
+/// back on every later request, or it answers 400. Pi keeps and sends it; an
+/// assistant message that came without one is sent with an empty one, as Pi
+/// itself does for DeepSeek, rather than refused upstream. `upstream_body`,
+/// which swarm mode and every other session send, is untouched.
+pub fn thinking_body(model: &str, request: &Value, max_output_tokens: u64, effort: &str) -> Value {
+    let mut messages = request["messages"].clone();
+    if let Some(messages) = messages.as_array_mut() {
+        for message in messages {
+            if message["role"] == "assistant"
+                && !message["reasoning_content"].is_string()
+                && let Some(fields) = message.as_object_mut()
+            {
+                fields.insert("reasoning_content".into(), json!(""));
+            }
+        }
+    }
+    json!({"model":model,"messages":messages,"tools":request.get("tools").cloned().unwrap_or(json!([])),"max_tokens":max_output_tokens,"thinking":{"type":"enabled"},"reasoning_effort":effort,"stream":false})
+}
+
 /// A sampling temperature, 0 to 2 as DeepSeek's chat completions take it.
 /// Always finite, so equality is total.
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
@@ -264,6 +288,43 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_thinking_body_keeps_every_reasoning_and_differs_from_the_shared_one_only_in_thinking() {
+        let request = json!({"model":"deepseek-flash","temperature":0.7,"stream":true,
+            "messages":[
+                {"role":"system","content":"s"},
+                {"role":"user","content":"Dream."},
+                {"role":"assistant","content":null,"reasoning_content":"R1",
+                 "tool_calls":[{"id":"c1","type":"function","function":{"name":"read","arguments":"{}"}}]},
+                {"role":"tool","tool_call_id":"c1","content":"ok"},
+                {"role":"assistant","content":"done"},
+            ],
+            "tools":[{"type":"function","function":{"name":"read"}}]});
+        let body = thinking_body("deepseek-flash", &request, 131_072, "max");
+        assert_eq!(body["thinking"], json!({"type": "enabled"}));
+        assert_eq!(body["reasoning_effort"], "max");
+        assert_eq!(body["max_tokens"], 131_072);
+        assert_eq!(body["stream"], false);
+        assert!(
+            body.get("temperature").is_none(),
+            "thinking mode ignores it"
+        );
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(
+            messages[2]["reasoning_content"], "R1",
+            "passed back as it came"
+        );
+        assert_eq!(messages[4]["reasoning_content"], "", "never missing");
+        assert!(messages[0].get("reasoning_content").is_none());
+        assert!(messages[3].get("reasoning_content").is_none());
+        assert_eq!(body["tools"], request["tools"]);
+        assert_eq!(response_limit(&body), 4 * 1024 * 1024);
+        // The same request on the shared body: thinking off, as before.
+        let shared = upstream_body("deepseek-flash", &request, 131_072);
+        assert_eq!(shared["thinking"], json!({"type": "disabled"}));
+        assert_eq!(shared["messages"], request["messages"]);
     }
 
     #[test]

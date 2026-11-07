@@ -475,6 +475,7 @@ impl World {
                     max_output_tokens: 1_024,
                     call_limit: None,
                     temperature: None,
+                    thinking: None,
                 },
                 code: None,
                 vault: Some(VaultParts {

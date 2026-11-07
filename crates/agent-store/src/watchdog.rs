@@ -112,6 +112,15 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Whether an alert with `id` was ever recorded.
+    pub fn has_alert(&self, id: &str) -> Result<bool, StoreError> {
+        let found: u32 = self
+            .conn
+            .prepare_cached("SELECT COUNT(*) FROM watchdog_alerts WHERE id = ?1")?
+            .query_row([id], |row| row.get(0))?;
+        Ok(found > 0)
+    }
+
     /// Whether the Watchdog has retried one of the Ticket's Assignments.
     pub fn watchdog_retried(&self, ticket: &TicketId) -> Result<bool, StoreError> {
         let found: u32 = self

@@ -14,8 +14,9 @@ pub use watchdog::{OperatorConfig, ThresholdsConfig, WatchdogConfig};
 pub use web::{DEFAULT_API_URL, PublishConfig, WebConfig};
 
 use super::broker::ModelTerms;
-use super::broker::memory::MemoryParts;
+use super::broker::memory::{DreamTerms, MemoryParts};
 use super::broker::review::{Effort, ReviewTerms};
+use super::dream::{self, DreamSchedule};
 use super::goal_template::GoalTemplates;
 use super::jobs::{self, JobLimits};
 use super::links::TicketLinks;
@@ -109,10 +110,16 @@ pub struct MemoryConfig {
     /// The review's model and thinking; each field the workers' unless set.
     #[serde(default)]
     pub review: ReviewConfig,
-    /// What the review may commit per UTC day on the `memory` account.
-    /// Absent: no cap, and every call is still held and settled there.
+    /// What the review and the dream may commit per UTC day on the
+    /// `memory` account. Absent: no cap, and every call is still held and
+    /// settled there.
     #[serde(default)]
     pub daily_microusd: Option<MicroUsd>,
+    /// The daily dream: a Ticket that checks the memos against the
+    /// transcripts of the Tickets that ended since the last one. On by
+    /// default wherever workers propose memos.
+    #[serde(default)]
+    pub dream: DreamConfig,
 }
 
 fn proposals() -> bool {
@@ -125,6 +132,46 @@ impl Default for MemoryConfig {
             proposals: proposals(),
             review: ReviewConfig::default(),
             daily_microusd: None,
+            dream: DreamConfig::default(),
+        }
+    }
+}
+
+/// `memory.dream`: when the daily dream is asked for, and how it thinks.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DreamConfig {
+    #[serde(default = "dream_enabled")]
+    pub enabled: bool,
+    /// The time of day, UTC, `HH:MM`: before the daily prune (04:30 by
+    /// default), so the transcripts it reads are still there.
+    #[serde(default = "dream_at")]
+    pub at: TimeOfDay,
+    /// DeepSeek's `reasoning_effort` for the dream's calls, with thinking on:
+    /// `low`, `high` or `max`, the default.
+    #[serde(default)]
+    pub thinking: Effort,
+    /// What one of the dream's calls may answer, reasoning included. By
+    /// default what DeepSeek allows in thinking mode at that effort.
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
+}
+
+fn dream_enabled() -> bool {
+    true
+}
+
+fn dream_at() -> TimeOfDay {
+    TimeOfDay(3 * 3_600_000 + 30 * 60_000)
+}
+
+impl Default for DreamConfig {
+    fn default() -> Self {
+        Self {
+            enabled: dream_enabled(),
+            at: dream_at(),
+            thinking: Effort::default(),
+            max_output_tokens: None,
         }
     }
 }
@@ -1292,7 +1339,29 @@ impl AgentConfig {
                 .is_none_or(|max| (1..=393_216).contains(&max)),
             "memory.review.max_output_tokens must be 1..=393216"
         );
+        ensure!(
+            memory
+                .dream
+                .max_output_tokens
+                .is_none_or(|max| (1..=393_216).contains(&max)),
+            "memory.dream.max_output_tokens must be 1..=393216"
+        );
         Ok(())
+    }
+
+    /// When the daily dream is asked for: where workers run on Pi and
+    /// propose memos, unless `memory.dream.enabled` is false. Its slot is
+    /// remembered in `state_dir`, so a restart in the same day asks for
+    /// nothing new.
+    pub fn dream_schedule(&self, state_dir: &Path) -> Option<DreamSchedule> {
+        let dreams = matches!(self.executor, ExecutorConfig::Pi { .. })
+            && self.memory.proposals
+            && self.memory.dream.enabled;
+        dreams.then(|| {
+            let mut schedule = DreamSchedule::daily(self.memory.dream.at.0);
+            schedule.marker = Some(state_dir.join(dream::SLOT_FILE));
+            schedule
+        })
     }
 
     /// The review of workers' memos and its account, where workers run on
@@ -1323,10 +1392,19 @@ impl AgentConfig {
                 .unwrap_or(effort.max_output_tokens()),
             call_limit: Some(REVIEW_CALL_LIMIT),
             temperature: None,
+            thinking: None,
         };
+        let dream = &self.memory.dream;
+        let dream = dream.enabled.then(|| DreamTerms {
+            effort: dream.thinking,
+            max_output_tokens: dream
+                .max_output_tokens
+                .unwrap_or(dream.thinking.max_output_tokens()),
+        });
         Ok(Some(MemoryParts {
             review: ReviewTerms { terms, effort },
             daily_microusd: self.memory.daily_microusd,
+            dream,
         }))
     }
 

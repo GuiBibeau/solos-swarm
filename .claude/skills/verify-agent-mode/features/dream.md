@@ -1,0 +1,47 @@
+# The daily dream checks memory against the transcripts
+
+Once a day, at `memory.dream.at` (03:30 UTC by default), the agent asks itself for a dream when a Ticket ended since the
+last one. The dream is an ordinary Ticket that the host judges in the Router's place. Before its sandbox starts, the
+host stages into its `/work`, read-only, a digest of each Ticket that ended, copies of their workers' transcripts, and
+every live memo. Its model calls go with DeepSeek's thinking on at `max` effort and are charged to the `memory`
+account. It corrects a memo the transcripts contradict (`memo_propose` with `supersedes`), merges duplicates, retires
+stale memos (`memo_retire`) and proposes lessons that showed in two Tickets or more, each citing transcript lines that
+the host checks against the original files. The review decides its proposals, and the Watchdog's operator gets one
+digest of what changed.
+
+## Sub-features
+
+- `asked`: a day with an ended Ticket gets a `dream:<slot>` trigger and a Ticket whose mandate source and requester are `dream`. A day with none gets no trigger and no Ticket.
+- `staged`: the dream's `/work` holds `tickets/index.json`, one `tickets/<ticket>.json` per ended Ticket, `transcripts/<ticket>/<assignment>.rpc.jsonl`, and `memos/index.json`, each file mode `0444`. Each staged transcript's `sha256` in the index matches `sha256sum` of the original under `state/tickets/<ticket>/`.
+- `thinks`: the dream's transcript shows `thinking` blocks. The `memory` account has its spend rows. The dream's own `ticket:` account has none, and no other Ticket's calls went with thinking on.
+- `same-trap`: two real Tickets that hit the same trap (for example a `cargo test` in a repository whose tests run another way) lead the dream to propose one memo naming the trap. The memo cites a transcript line from each Ticket, with sources of kind `transcript`. The review keeps it, and the next Ticket's first prompt shows it.
+- `corrects`: an active memo the transcripts contradict ends `retired` with `replaced_by` naming the dream's kept correction, whose `supersedes` names it.
+- `digest`: the Watchdog's operator conversation gets exactly one `Memory, <day>: ...` message per dream, with links to the Tickets it read. Restarting the agent the same day sends no second message and starts no second dream.
+
+## How to get to it (user POV)
+
+- The operator's Discord or Slack conversation that `watchdog.operator` names: the daily digest arrives there.
+- An MCP host with `solos-swarm mcp --operator <name>`: `agent_status` lists the dream's Ticket, and `agent_memos` lists the memos it changed.
+- On the box: `solos-swarm agent memo list --all --json --state-dir <state>` shows `supersedes`, `replaced_by` and the reason of each retirement.
+
+## Driving it with bin/mcp.sh
+
+Preconditions: a run launched with an overlay that sets `memory.dream.at` a few minutes ahead (UTC, `HH:MM`) and a
+`watchdog:` section whose operator is a conversation you can read; doctor clean; `serve.log` has `agent: the dream
+comes daily at HH:MM, thinking at max`. Not yet driven live: the recipe below is the plan.
+
+- `same-trap`: before the dream's time, make two requests on the sandbox repository that each need its tests, for example `bin/mcp.sh $RUN request "On <repo>, run its tests and tell me whether they pass."` twice in separate threads, and wait for both results (`replies <thread> result 900`). Look in each transcript for the same failed first attempt (`grep -n 'cargo test' state/tickets/<ticket>/*.rpc.jsonl`).
+- `asked`: after the time passes, `ssh remote-ai "grep 'the dream of' ~/work/verify/$RUN/serve.log"`. Then `bin/evidence.sh $RUN dream` and `jq -c 'select(.type == "ticket_created")' events.jsonl` shows the dream's Ticket, and `sqlite3 state/agent.db "select body from triggers where id like 'dream:%'"` shows one trigger.
+- `staged`: `ssh remote-ai "ls -l ~/work/verify/$RUN/state/tickets/<dream>/work/transcripts/*/"` shows mode `-r--r--r--`. Compare `jq -r '.tickets[].assignments[] | .assignment + " " + .sha256' .../work/tickets/index.json` with `sha256sum state/tickets/<ticket>/<assignment>.rpc.jsonl` for each line.
+- `thinks`: `grep -c '"thinking"' state/tickets/<dream>/<assignment>.rpc.jsonl` is above zero. `sqlite3 state/agent.db "select account, count(*) from spend group by account"` shows `memory` rows and no `ticket:<dream>` row.
+- `corrects` and `same-trap`: `solos-swarm agent memo list --all --json` shows the dream's proposals (author `<dream>/<assignment>`, with `supersedes` on a correction and `replaced_by` on the memo it replaced), and the review's decision on each. `sqlite3 state/agent.db "select json_extract(body, '$.sources') from memos where json_extract(body, '$.author.ticket') = '<dream>'"` shows sources of kind `transcript`. `serve.log` has `agent: the review kept` or `kept in its own words` for each one. Then a new request on the repository: its worker's `memos_shown` names the kept memo.
+- `digest`: the operator conversation shows one `Memory, <day>: the dream read N tickets ...` message with `Kept`, `Retired` or `Rejected` lines and ticket links. Restart the agent (`bin/launch.sh` with the same state, or `systemctl --user restart` on the run's unit), wait two Watchdog intervals, and confirm there is no second message and no second `dream:` trigger.
+
+## Gotchas
+
+- No Ticket ended since the last dream means no dream: the slot is noted in `state/dream-slot` and nothing is asked until the next day. Set `at` after your requests end.
+- A run with `--until-idle` never dreams.
+- The dream may decide nothing needs changing. That is a valid outcome. Check its report (`agent status`) and transcript before calling the feature broken.
+- At `max` effort each of the dream's calls may take minutes. The Watchdog may report it `stalled` if it sends no progress report for 30 minutes.
+- The digest waits up to 30 minutes for the review of the dream's proposals, then lists any proposal still waiting.
+- `memory.daily_microusd` caps the review and the dream together. A cap that is reached stops the dream's calls, and the dream ends failed.

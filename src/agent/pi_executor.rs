@@ -8,6 +8,7 @@
 
 use super::broker::{self, AgentBroker, ModelFailure, WorkerSeat, browser, clip};
 use super::config::{EvidenceConfig, HarnessKind};
+use super::dream;
 use super::earlier;
 use super::environment::{self, Launchable};
 use super::plain_answer::Answer;
@@ -686,6 +687,9 @@ where
         stop: &mut watch::Receiver<bool>,
         run: &mut Run,
     ) -> Result<Option<String>> {
+        if dream::is_dream_trigger(&launch.origin) {
+            return self.dream(launch, facts, inbox, stop, run).await;
+        }
         let parts = &self.parts;
         let dir = self.ticket_dir(&launch.ticket)?;
         let work = dir.join(WORK_DIR);
@@ -810,6 +814,90 @@ where
         .await;
         seat.stop_jobs().await;
         browser::end(&parts.broker, &seat, CloseReason::AssignmentEnded).await;
+        outcome
+    }
+
+    /// The dream's life: the host stages the day's record into its `work`
+    /// once, before any sandbox runs there, and the dream's worker runs on Pi
+    /// with thinking on, its brief as its instructions and its few tools, on
+    /// the `memory` account.
+    async fn dream(
+        &self,
+        launch: &Launch,
+        facts: &FactSink,
+        inbox: &mut mpsc::UnboundedReceiver<Vec<Delivered>>,
+        stop: &mut watch::Receiver<bool>,
+        run: &mut Run,
+    ) -> Result<Option<String>> {
+        let parts = &self.parts;
+        let dir = self.ticket_dir(&launch.ticket)?;
+        let work = dir.join(WORK_DIR);
+        ensure!(
+            parts
+                .broker
+                .environments()
+                .is_local(environment::named(&launch.plan)),
+            "the dream runs on this host only"
+        );
+        let record = parts.broker.dream_record(&launch.ticket).await?;
+        let tickets_dir = parts.tickets_dir.clone();
+        let (staged_in, staged_work) = (dir.clone(), work.clone());
+        let staged = tokio::task::spawn_blocking(move || {
+            dream::stage(&record, &tickets_dir, &staged_in, &staged_work)
+        })
+        .await
+        .context("the dream's staging stopped")??;
+        let token = broker::new_token();
+        let seat = WorkerSeat::new(
+            launch.ticket.clone(),
+            launch.assignment.clone(),
+            work,
+            launch.budget_microusd,
+        )
+        .in_environment(environment::named(&launch.plan).map(str::to_owned))
+        .dreaming(parts.tickets_dir.clone());
+        let grants: Vec<String> = parts
+            .broker
+            .seat_tools(&seat)
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let prompt = dream::system_prompt(&grants);
+        let assignment = dream::assignment_text(&launch.ticket, &staged);
+        let seat = parts.broker.admit_worker(token.clone(), seat, prompt)?;
+        let _revoke = Revoke {
+            broker: &parts.broker,
+            token: token.clone(),
+        };
+        run.seat = Some(seat.clone());
+        let spec = SessionSpec {
+            id: launch.assignment.to_string(),
+            role: Role::TicketWorker,
+            grants,
+            token,
+            model: parts.model.clone(),
+            pi_settings: dir.join("pi-settings.json"),
+            run_dir: dir,
+            broker_socket: parts.broker_socket.clone(),
+            node: parts.node.clone(),
+            pi_root: parts.pi_root.clone(),
+            pstack: None,
+        };
+        let (events_tx, mut events) = mpsc::channel(64);
+        let turns = Turns {
+            launch,
+            facts,
+            seat: &seat,
+            broker: &parts.broker,
+            assignment,
+        };
+        let session = parts
+            .harness
+            .start(&spec, events_tx)
+            .await
+            .context("the dream's session did not start")?;
+        let outcome = turns.drive(session, &mut events, inbox, stop, run).await;
+        seat.stop_jobs().await;
         outcome
     }
 
@@ -1323,6 +1411,7 @@ mod tests {
                 max_output_tokens: 1_024,
                 call_limit: None,
                 temperature: None,
+                thinking: None,
             };
             let parts = BrokerParts {
                 dir: dir.clone(),

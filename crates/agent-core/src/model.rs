@@ -490,6 +490,14 @@ impl Ticket {
         self.latest_assignment()
             .is_some_and(|a| a.state != AssignmentState::Ended)
     }
+    /// The dream's: a Ticket the host accepted from its own daily Trigger,
+    /// asked for by the System actor `dream` on the Source `dream`, which
+    /// no Source but the host's makes.
+    pub fn is_dream(&self) -> bool {
+        self.mandate.source == crate::memo::DREAM
+            && self.mandate.requester.kind == ActorKind::System
+            && self.mandate.requester.id == crate::memo::DREAM
+    }
     pub fn stopped_by_person(&self) -> bool {
         self.ended.as_ref().is_some_and(|e| e.by == EndedBy::Person)
     }
@@ -886,6 +894,9 @@ pub enum DomainEvent {
         author: MemoAuthor,
         text_sha256: Digest,
         active: bool,
+        /// The memo it replaces once active (the dream's corrections).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        supersedes: Option<MemoId>,
     },
     /// The review kept a proposed memo.
     MemoActivated {

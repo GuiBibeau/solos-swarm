@@ -11,21 +11,23 @@
 //! it is asked, so a forgotten memo's text is in no file; `router_read
 //! {kind: memo}` serves the Router the same.
 
-use super::review::ReviewTerms;
+use super::review::{Effort, ReviewTerms};
 use super::{AgentBroker, Refusal, Reply, WorkerSeat, arguments, clip, failed, refuse};
 use crate::agent::ports::{Applied, Fact};
 use crate::agent::pstack::Refused;
+use crate::agent::transcript;
 use crate::agent::utc;
 use axum::Json;
 use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use solos_agent_core::change::RepoName;
+use solos_agent_core::engine::Citing;
 use solos_agent_core::memo::{
-    MAX_MEMO_CHARS, MAX_QUOTE_CHARS, Memo, MemoAuthor, MemoIn, MemoScope, MemoSource, MemoState,
-    MemoTrust,
+    MAX_MEMO_CHARS, MAX_MEMO_REASON_CHARS, MAX_QUOTE_CHARS, Memo, MemoActor, MemoAuthor, MemoIn,
+    MemoScope, MemoSource, MemoState, MemoTrust,
 };
-use solos_agent_core::model::{InputBody, MemoId, MicroUsd, Ms, TriggerId};
+use solos_agent_core::model::{AssignmentId, InputBody, MemoId, MicroUsd, Ms, TriggerId};
 use solos_agent_core::trail::Digest;
 use solos_agent_store::{SqliteStore, StoreError};
 use std::collections::{BTreeSet, VecDeque};
@@ -37,6 +39,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 pub const MEMOS_MOUNT: &str = "/memos";
 /// The memos one Assignment may propose.
 pub const MAX_PROPOSALS: usize = 3;
+/// The memos the dream may propose in one Assignment, and retire.
+pub const DREAM_PROPOSALS: usize = 10;
+pub const DREAM_RETIREMENTS: usize = 10;
 /// The pieces of evidence one proposal may cite.
 pub const MAX_EVIDENCE: usize = 4;
 /// What a seat keeps of its calls' answers for quoting, in bytes; past it
@@ -52,6 +57,16 @@ pub struct MemoryParts {
     pub review: ReviewTerms,
     /// The `memory` account's cap per UTC day, or none.
     pub daily_microusd: Option<MicroUsd>,
+    /// How the dream thinks, where the agent dreams.
+    pub dream: Option<DreamTerms>,
+}
+
+/// The dream's thinking: DeepSeek's thinking mode at `effort`, and what one
+/// call may answer, reasoning included.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DreamTerms {
+    pub effort: Effort,
+    pub max_output_tokens: u64,
 }
 
 /// The broker's memory: its parts, and which proposals this run has already
@@ -77,7 +92,10 @@ impl Memory {
 /// Whether what a call of `tool` answered may be quoted: anything but a
 /// worker's own declarations.
 pub(super) fn citable(tool: &str) -> bool {
-    !matches!(tool, "worker_report" | "worker_handback" | "memo_propose")
+    !matches!(
+        tool,
+        "worker_report" | "worker_handback" | "memo_propose" | "memo_retire"
+    )
 }
 
 /// One call's answer, as the seat received it.
@@ -194,7 +212,7 @@ fn squeezed(text: &str) -> (String, Vec<(usize, usize)>) {
 /// The words of `text` that say `quote`: the quote itself where `text`
 /// holds it, else the span that matches it with every run of whitespace
 /// taken as one space, as the text has it. `None` where it is not there.
-pub(super) fn find_quote<'a>(text: &'a str, quote: &str) -> Option<&'a str> {
+pub(crate) fn find_quote<'a>(text: &'a str, quote: &str) -> Option<&'a str> {
     let quote = quote.trim();
     if quote.is_empty() {
         return None;
@@ -216,6 +234,8 @@ struct ProposeArgs {
     text: String,
     scope: String,
     evidence: Vec<EvidenceArgs>,
+    #[serde(default)]
+    supersedes: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -225,7 +245,24 @@ struct EvidenceArgs {
     trigger: Option<String>,
     #[serde(default)]
     call: Option<String>,
+    #[serde(default)]
+    transcript: Option<String>,
+    #[serde(default)]
+    sha256: Option<String>,
+    #[serde(default)]
+    line: Option<u32>,
     quote: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetireArgs {
+    memo: String,
+    reason: String,
+    #[serde(default)]
+    evidence: Vec<EvidenceArgs>,
+    #[serde(default)]
+    duplicate_of: Option<String>,
 }
 
 fn unprocessable(why: impl std::fmt::Display) -> Refusal {
@@ -241,19 +278,34 @@ pub(super) async fn propose(broker: &AgentBroker, seat: &Arc<WorkerSeat>, args: 
         text,
         scope,
         evidence,
+        supersedes,
     } = arguments(args)?;
+    let most = if seat.is_dream() {
+        DREAM_PROPOSALS
+    } else {
+        MAX_PROPOSALS
+    };
     let full = || {
         refuse(
             StatusCode::CONFLICT,
             format!(
-                "this assignment has proposed {MAX_PROPOSALS} memos, the most one may; go on \
-                 with the ticket"
+                "this assignment has proposed {most} memos, the most one may; go on with the \
+                 ticket"
             ),
         )
     };
-    if seat.proposed.load(Ordering::SeqCst) >= MAX_PROPOSALS {
+    if seat.proposed.load(Ordering::SeqCst) >= most {
         return Err(full());
     }
+    let supersedes = match (supersedes.as_deref().map(str::trim), seat.is_dream()) {
+        (None | Some(""), _) => None,
+        (Some(id), true) => Some(MemoId::new(id)),
+        (Some(_), false) => {
+            return Err(unprocessable(
+                "supersedes is the dream's: propose the memo without it",
+            ));
+        }
+    };
     let text = text.trim().to_owned();
     let chars = text.chars().count();
     if text.is_empty() || chars > MAX_MEMO_CHARS {
@@ -273,16 +325,20 @@ pub(super) async fn propose(broker: &AgentBroker, seat: &Arc<WorkerSeat>, args: 
         .await
         .map_err(failed)?
         .ok_or_else(|| refuse(StatusCode::CONFLICT, format!("there is no {}", seat.ticket)))?;
-    let scopes = match &ticket.mandate.repo {
-        Some(repo) => format!("global or repo:{repo}"),
-        None => "global (this ticket has no repository)".to_owned(),
-    };
-    let scope = match MemoScope::try_from(scope.trim().to_owned()) {
-        Ok(MemoScope::Global) => MemoScope::Global,
-        Ok(MemoScope::Repo(repo)) if ticket.mandate.repo.as_ref() == Some(&repo) => {
-            MemoScope::Repo(repo)
+    let scope = if seat.is_dream() {
+        dream_scope(broker, scope.trim()).await?
+    } else {
+        let scopes = match &ticket.mandate.repo {
+            Some(repo) => format!("global or repo:{repo}"),
+            None => "global (this ticket has no repository)".to_owned(),
+        };
+        match MemoScope::try_from(scope.trim().to_owned()) {
+            Ok(MemoScope::Global) => MemoScope::Global,
+            Ok(MemoScope::Repo(repo)) if ticket.mandate.repo.as_ref() == Some(&repo) => {
+                MemoScope::Repo(repo)
+            }
+            _ => return Err(unprocessable(format!("scope is {scopes}"))),
         }
-        _ => return Err(unprocessable(format!("scope is {scopes}"))),
     };
     // The Triggers the worker was shown: its Ticket's origin and Inputs.
     let mut shown = vec![ticket.origin.clone()];
@@ -290,32 +346,35 @@ pub(super) async fn propose(broker: &AgentBroker, seat: &Arc<WorkerSeat>, args: 
         InputBody::Trigger { trigger } => Some(trigger.clone()),
         _ => None,
     }));
-    let scrubber = match &broker.inner.vault {
-        Some(parts) => Some(parts.vault.scrubber().map_err(failed)?),
-        None => None,
-    };
-    let clean = |text: &str| match &scrubber {
-        Some(scrubber) => scrubber.clean(text),
-        None => text.to_owned(),
-    };
+    let clean = cleaner(broker)?;
     let mut sources: Vec<MemoSource> = Vec::new();
     let mut cited = Vec::new();
     for item in evidence {
-        let quote = item.quote.trim();
+        let quote = item.quote.trim().to_owned();
         if quote.is_empty() {
             return Err(unprocessable("each piece of evidence quotes something"));
         }
-        let (source, named) = match (item.trigger, item.call) {
-            (Some(trigger), None) => {
-                let trigger = TriggerId::new(trigger.trim());
-                quoted_trigger(broker, &shown, trigger, quote, &clean).await?
-            }
-            (None, Some(call)) => quoted_call(seat, call.trim(), quote, &clean)?,
-            _ => {
-                return Err(unprocessable(
-                    "each piece of evidence names a trigger or a call (the tool whose output it \
-                     quotes), and not both",
-                ));
+        let (source, named) = if seat.is_dream() {
+            quoted_line(broker, seat, item, &clean).await?
+        } else {
+            match (item.trigger, item.call, item.transcript) {
+                (Some(trigger), None, None) => {
+                    let trigger = TriggerId::new(trigger.trim());
+                    quoted_trigger(broker, &shown, trigger, &quote, &clean).await?
+                }
+                (None, Some(call), None) => quoted_call(seat, call.trim(), &quote, &clean)?,
+                (None, None, Some(_)) => {
+                    return Err(unprocessable(
+                        "transcript evidence is the dream's: quote a trigger of this ticket or \
+                         one of your calls",
+                    ));
+                }
+                _ => {
+                    return Err(unprocessable(
+                        "each piece of evidence names a trigger or a call (the tool whose output \
+                         it quotes), and not both",
+                    ));
+                }
             }
         };
         if !sources.contains(&source) {
@@ -330,7 +389,7 @@ pub(super) async fn propose(broker: &AgentBroker, seat: &Arc<WorkerSeat>, args: 
              replaced by their names; say it in fewer words"
         )));
     }
-    if seat.proposed.fetch_add(1, Ordering::SeqCst) >= MAX_PROPOSALS {
+    if seat.proposed.fetch_add(1, Ordering::SeqCst) >= most {
         seat.proposed.fetch_sub(1, Ordering::SeqCst);
         return Err(full());
     }
@@ -342,6 +401,7 @@ pub(super) async fn propose(broker: &AgentBroker, seat: &Arc<WorkerSeat>, args: 
             ticket: seat.ticket.clone(),
             assignment: seat.assignment.clone(),
         },
+        supersedes,
     });
     let memo = match broker.inner.facts.ask(fact).await {
         Ok(Ok(Applied::Memo(memo))) => Ok(*memo),
@@ -361,8 +421,8 @@ pub(super) async fn propose(broker: &AgentBroker, seat: &Arc<WorkerSeat>, args: 
         "Active now: it is the words of a person you work for, so later sessions see it. Go on \
          with the ticket."
     };
-    let left = MAX_PROPOSALS.saturating_sub(seat.proposed.load(Ordering::SeqCst));
-    Ok(Json(json!({
+    let left = most.saturating_sub(seat.proposed.load(Ordering::SeqCst));
+    let mut reply = json!({
         "memo": memo.id,
         "state": memo.state.name(),
         "trust": memo.trust,
@@ -370,6 +430,214 @@ pub(super) async fn propose(broker: &AgentBroker, seat: &Arc<WorkerSeat>, args: 
         "evidence": cited,
         "proposals_left": left,
         "next": next,
+    });
+    if let Some(old) = &memo.supersedes {
+        reply["supersedes"] = json!(old);
+    }
+    Ok(Json(reply))
+}
+
+/// What scrubs vault values from a memo's words, where the agent has a vault.
+fn cleaner(broker: &AgentBroker) -> Result<impl Fn(&str) -> String + use<>, Refusal> {
+    let scrubber = match &broker.inner.vault {
+        Some(parts) => Some(parts.vault.scrubber().map_err(failed)?),
+        None => None,
+    };
+    Ok(move |text: &str| match &scrubber {
+        Some(scrubber) => scrubber.clean(text),
+        None => text.to_owned(),
+    })
+}
+
+/// A scope the dream may name: global, or a repository that a Ticket names
+/// or a live memo is about.
+async fn dream_scope(broker: &AgentBroker, scope: &str) -> Result<MemoScope, Refusal> {
+    let wrong = || unprocessable("scope is global or repo:<owner>/<name>");
+    let scope = MemoScope::try_from(scope.to_owned()).map_err(|_| wrong())?;
+    let Some(repo) = scope.repo().cloned() else {
+        return Ok(scope);
+    };
+    let wanted = repo.clone();
+    let known = broker
+        .store(move |store| {
+            let memos = store.memos()?;
+            if memos
+                .iter()
+                .any(|m| m.is_live() && m.scope.repo() == Some(&wanted))
+            {
+                return Ok(true);
+            }
+            Ok(store
+                .tickets()?
+                .iter()
+                .any(|t| t.mandate.repo.as_ref() == Some(&wanted)))
+        })
+        .await
+        .map_err(failed)?;
+    if known {
+        Ok(scope)
+    } else {
+        Err(unprocessable(format!(
+            "no ticket and no memo is about {repo}: scope is global, or a repository the \
+             tickets or memos name"
+        )))
+    }
+}
+
+/// The dream's evidence: a line of an Assignment's original transcript, as
+/// the host keeps it, never the copy staged in /work. The cited sha256 must
+/// be the original's whole digest, and the line must say the quote.
+async fn quoted_line(
+    broker: &AgentBroker,
+    seat: &WorkerSeat,
+    item: EvidenceArgs,
+    clean: &impl Fn(&str) -> String,
+) -> Result<(MemoSource, String), Refusal> {
+    let how = "the dream cites lines of the original transcripts: transcript (an assignment id), \
+               sha256 (from /work/tickets/index.json), line and quote";
+    let EvidenceArgs {
+        trigger: None,
+        call: None,
+        transcript: Some(transcript),
+        sha256: Some(sha256),
+        line: Some(line),
+        quote,
+    } = item
+    else {
+        return Err(unprocessable(how));
+    };
+    let quote = quote.trim().to_owned();
+    let assignment = AssignmentId::new(transcript.trim());
+    let dream = seat
+        .dreaming_in()
+        .ok_or_else(|| unprocessable(how))?
+        .tickets_dir
+        .clone();
+    let id = assignment.clone();
+    let owner = broker
+        .store(move |store| {
+            Ok(store
+                .tickets()?
+                .into_iter()
+                .find(|t| t.assignments.iter().any(|a| a.id == id)))
+        })
+        .await
+        .map_err(failed)?
+        .ok_or_else(|| unprocessable(format!("no ticket has an assignment {assignment}")))?;
+    if owner.is_dream() {
+        return Err(unprocessable(
+            "a dream's own transcript is not evidence: cite the tickets' transcripts",
+        ));
+    }
+    let (path, format) = transcript::original(&dream, &owner.id, &assignment)
+        .ok_or_else(|| unprocessable(format!("the host keeps no transcript of {assignment}")))?;
+    let bytes = tokio::fs::read(&path).await.map_err(failed)?;
+    let digest = Digest::of(&bytes);
+    let cited = sha256.trim();
+    if digest.as_str() != cited && digest.digits() != cited {
+        return Err(unprocessable(format!(
+            "{cited} is not the sha256 of {assignment}'s transcript as the host keeps it: cite \
+             the sha256 /work/tickets/index.json gives, and quote the transcript as the worker's \
+             session wrote it"
+        )));
+    }
+    let (from, words) = transcript::quoted(&bytes, format, line, &quote).map_err(|why| {
+        unprocessable(format!(
+            "{assignment}: {why}. Quote the line's words exactly, as the original says them"
+        ))
+    })?;
+    if words.chars().count() > MAX_QUOTE_CHARS {
+        return Err(unprocessable(format!(
+            "a quote is at most {MAX_QUOTE_CHARS} characters: quote fewer words"
+        )));
+    }
+    let named = format!("{assignment} line {line}");
+    let source = MemoSource::Transcript {
+        assignment,
+        sha256: digest,
+        line,
+        from,
+        quote: clean(&words),
+    };
+    Ok((source, named))
+}
+
+/// `memo_retire`, the dream's only: take a model's or an external memo out
+/// of the index, citing lines of the original transcripts that show it is
+/// wrong or stale, or the active memo that already says it. The Engine
+/// refuses a person's memo.
+pub(super) async fn retire(broker: &AgentBroker, seat: &Arc<WorkerSeat>, args: Value) -> Reply {
+    let RetireArgs {
+        memo,
+        reason,
+        evidence,
+        duplicate_of,
+    } = arguments(args)?;
+    if !seat.is_dream() {
+        return Err(refuse(
+            StatusCode::FORBIDDEN,
+            "only the dream retires a memo",
+        ));
+    }
+    if seat.retired.load(Ordering::SeqCst) >= DREAM_RETIREMENTS {
+        return Err(refuse(
+            StatusCode::CONFLICT,
+            format!("this dream has retired {DREAM_RETIREMENTS} memos, the most one may"),
+        ));
+    }
+    let reason = reason.trim().to_owned();
+    let chars = reason.chars().count();
+    if reason.is_empty() || chars > MAX_MEMO_REASON_CHARS {
+        return Err(unprocessable(format!(
+            "a reason is 1 to {MAX_MEMO_REASON_CHARS} characters and yours has {chars}"
+        )));
+    }
+    let clean = cleaner(broker)?;
+    let citing = match (evidence.is_empty(), duplicate_of) {
+        (true, Some(other)) => Citing::Duplicate(MemoId::new(other.trim())),
+        (false, None) => {
+            if evidence.len() > solos_agent_core::memo::MAX_RETIRE_EVIDENCE {
+                return Err(unprocessable(format!(
+                    "a retirement cites 1 to {} lines",
+                    solos_agent_core::memo::MAX_RETIRE_EVIDENCE
+                )));
+            }
+            let mut sources = Vec::new();
+            for item in evidence {
+                let (source, _) = quoted_line(broker, seat, item, &clean).await?;
+                if !sources.contains(&source) {
+                    sources.push(source);
+                }
+            }
+            Citing::Evidence(sources)
+        }
+        _ => {
+            return Err(unprocessable(
+                "a retirement cites evidence (lines of the transcripts) or duplicate_of (the \
+                 memo that already says it), not both",
+            ));
+        }
+    };
+    let memo = MemoId::new(memo.trim());
+    let fact = Fact::RetireMemo {
+        memo: memo.clone(),
+        by: MemoActor::Dream {
+            ticket: seat.ticket.clone(),
+            assignment: seat.assignment.clone(),
+        },
+        reason: clean(&reason),
+        citing,
+    };
+    match broker.inner.facts.ask(fact).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(why)) => return Err(refuse(StatusCode::CONFLICT, why)),
+        Err(err) => return Err(failed(format!("{err:#}"))),
+    }
+    seat.retired.fetch_add(1, Ordering::SeqCst);
+    Ok(Json(json!({
+        "memo": memo,
+        "state": "retired",
+        "next": "Retired: it is out of the index from now on. Go on with the dream.",
     })))
 }
 
@@ -571,6 +839,19 @@ pub(super) fn page(memos: &[Memo], scope: &MemoScope) -> String {
                     );
                     quote_lines(&mut out, "  ", quote);
                 }
+                MemoSource::Transcript {
+                    assignment,
+                    sha256,
+                    line,
+                    quote,
+                    ..
+                } => {
+                    let _ = writeln!(
+                        out,
+                        "- line {line} of the transcript of {assignment} ({sha256}), which says:"
+                    );
+                    quote_lines(&mut out, "  ", quote);
+                }
             }
         }
     }
@@ -738,6 +1019,14 @@ pub(super) fn recall(store: &SqliteStore, id: &str) -> Result<Option<Value>, Sto
             } => json!({
                 "kind": "call", "assignment": assignment, "call": call, "tool": tool, "quote": quote,
             }),
+            MemoSource::Transcript {
+                assignment,
+                line,
+                quote,
+                ..
+            } => json!({
+                "kind": "transcript", "assignment": assignment, "line": line, "quote": quote,
+            }),
         })
         .collect();
     let decided = match &memo.state {
@@ -857,6 +1146,7 @@ mod tests {
             },
             created_ms: 0,
             verified_ms: 0,
+            supersedes: None,
         };
         let mut proposed = memo.clone();
         proposed.id = MemoId::new("mm_fedcba9876543210");

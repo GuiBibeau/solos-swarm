@@ -501,6 +501,7 @@ fn resolve(w: &World, cmd: &Cmd) -> Op {
                 text: spec.text.clone(),
                 sources,
                 author,
+                supersedes: None,
             })
         }
         Cmd::ActivateMemo(m, review) => Op::ActivateMemo(memo(m), review.clone()),
@@ -2258,6 +2259,7 @@ fn expected_trust(
                 }
             }
             MemoSource::Ticket { .. } => MemoTrust::Model,
+            MemoSource::Transcript { from, .. } => from.trust(),
         };
         least = least.min(one);
     }
