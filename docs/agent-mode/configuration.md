@@ -67,7 +67,7 @@ A list. Each item has a `kind`. At most one source of each of the kinds `slack`,
 | `schedule` | `schedules` | Named slots that fire System Triggers. See [Schedules](#schedules). |
 | `mcp` | none | Requests that operators file with `solos-swarm mcp --state-dir`, from `<state dir>/mcp/inbox.jsonl`. Needs the `mcp` channel. Setup: [Hand the agent work from an MCP host](how-to/mcp.md). |
 
-`api_base` is a test seam. Tests point it at a fake.
+Tests point `api_base` at a fake.
 
 #### Schedules
 
@@ -365,8 +365,8 @@ Required when a `github` source, a `github` channel or `forge: github` is config
 | `poll_secs` | `60` | The `github` source's interval, at least 10. |
 | `reconcile_secs` | `300` | How often every open change is read again, at least 60. Nothing reads it yet. |
 | `writes` | `true` | `false`: no write token is ever minted, so the agent writes nothing on GitHub. A restart applies it. |
-| `api_base` | `https://api.github.com/` | A test seam. GitHub Enterprise Server is `https://HOST/api/v3/`. |
-| `git_base` | `https://github.com/` | A test seam: where the mirrors fetch `<owner>/<name>.git` from. `file://` is accepted. |
+| `api_base` | `https://api.github.com/` | For tests. GitHub Enterprise Server is `https://HOST/api/v3/`. |
+| `git_base` | `https://github.com/` | Where the mirrors fetch `<owner>/<name>.git` from. Tests use a `file://` URL. |
 
 A config that still names the old token fields (`token_file`, `repos`, `api_base` or `poll_secs` on the `github`
 source, or `token_file` or `identity` on `forge: github`) fails to load with a sentence that points at
@@ -386,7 +386,7 @@ source, or `token_file` or `identity` on `forge: github`) fails to load with a s
 | `token_file` | required | A Vercel Blob read-write token (`vercel_blob_rw_...`), a one-use token file. |
 | `every_secs` | `5` | How often the Store is looked at, 1 to 3600. An upload happens only for a snapshot whose content changed. |
 | `heartbeat_secs` | `300` | The index is uploaded again after this long, so the dashboard can tell a quiet agent from a dead publisher. From `every_secs` to 86400. |
-| `api_url` | `https://vercel.com/api/blob` | A test seam. `http` only for a loopback address. |
+| `api_url` | `https://vercel.com/api/blob` | For tests. `http` only for a loopback address. |
 
 `agent serve` ignores the section except for `public_url`. Setup and rotation:
 [production.md](production.md#dashboard).

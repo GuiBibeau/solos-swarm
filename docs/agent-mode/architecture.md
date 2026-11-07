@@ -100,7 +100,7 @@ bearer token.
 
 | Shared piece | Swarm mode uses it for | Agent mode uses it for |
 |---|---|---|
-| Broker and ledger | The Goal cap and per-task envelopes | The Router's daily cap, one account per Ticket, and swarm Goals carved from a Ticket's budget |
+| Broker and ledger | The Goal cap and per-task envelopes | The Router's daily cap, one account per Ticket, and swarm Goals whose budget comes out of a Ticket's budget |
 | Pause, drain, peak refusal and outage pause | Runs | The whole agent. No new Evals while paused. The core still records Triggers, resumes and wakes, and the effect runner holds every Effect until the pause lifts. |
 | `AgentHarness` | N swarm agents | The Router, workers and swarm agents |
 | `ExecutionEnvironment` | `run_code` | Workers' `run_code`, background jobs and remote nodes |
