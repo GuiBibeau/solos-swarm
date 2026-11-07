@@ -5,7 +5,9 @@ use aes_gcm::{
     aead::{Aead, Payload},
 };
 use anyhow::{Context, Result, ensure};
-use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError};
+use openraft::error::{
+    InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError, Unreachable,
+};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
@@ -50,6 +52,11 @@ use crate::{
 pub type NodeId = u64;
 pub const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_STORAGE_RECORD_BYTES: usize = 1024 * 1024 * 1024;
+/// How long `Cluster::shutdown` lets QUIC connections drain after closing the endpoint.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(2);
+/// How long the leader waits on its own quorum for a request made on the leader itself. Requests that arrive from
+/// other nodes are held to 5 s in `Cluster::handle`; this is longer because nothing here has crossed a network.
+const LOCAL_OPERATION_DEADLINE: Duration = Duration::from_secs(30);
 openraft::declare_raft_types!(pub TypeConfig: D = Command, R = TxnResult);
 type Raft = openraft::Raft<TypeConfig>;
 type RpcError<E = openraft::error::Infallible> = RPCError<NodeId, BasicNode, RaftError<NodeId, E>>;
@@ -1548,16 +1555,18 @@ impl Transport {
         let connection = if let Some(connection) = existing {
             connection
         } else {
-            let connection = tokio::time::timeout(
-                Duration::from_secs(3),
-                self.endpoint.connect_with(
+            let connecting = self
+                .endpoint
+                .connect_with(
                     self.client_config.read().await.clone(),
                     node.addr,
                     &node.server_name,
-                )?,
-            )
-            .await
-            .context("QUIC connection deadline")??;
+                )
+                .map_err(|error| PeerUnreachable(error.to_string()))?;
+            let connection = tokio::time::timeout(Duration::from_secs(3), connecting)
+                .await
+                .map_err(|_| PeerUnreachable("QUIC connection deadline".into()))?
+                .map_err(|error| PeerUnreachable(error.to_string()))?;
             self.peer_allowed(node_id, &connection).await?;
             self.connections
                 .lock()
@@ -1599,6 +1608,17 @@ impl Transport {
             .context("QUIC operation deadline")?
     }
 }
+/// No QUIC connection to the peer could be made: it is down, restarting, or refusing. Raft is told so (see
+/// `NetworkPeer::rpc`) because it answers an unreachable peer by backing off, where it answers any other network
+/// error by trying again at once.
+#[derive(Debug)]
+struct PeerUnreachable(String);
+impl std::fmt::Display for PeerUnreachable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+impl std::error::Error for PeerUnreachable {}
 #[derive(Clone)]
 struct Network(Transport);
 struct NetworkPeer {
@@ -1620,7 +1640,12 @@ impl NetworkPeer {
         rpc: Rpc,
     ) -> std::result::Result<Resp, RPCError<NodeId, BasicNode, E>> {
         let value = self.transport.call(self.id, rpc).await.map_err(|error| {
-            RPCError::Network(NetworkError::new(&std::io::Error::other(error.to_string())))
+            let error_io = std::io::Error::other(error.to_string());
+            if error.is::<PeerUnreachable>() {
+                RPCError::Unreachable(Unreachable::new(&error_io))
+            } else {
+                RPCError::Network(NetworkError::new(&error_io))
+            }
         })?;
         let result: std::result::Result<Resp, E> = serde_json::from_value(value)
             .map_err(|error| RPCError::Network(NetworkError::new(&error)))?;
@@ -2555,7 +2580,12 @@ impl Cluster {
             .await
             .context("quorum leader unavailable; admission refused")?;
         if leader == self.node_id {
-            self.process(rpc).await
+            // A request that reaches the leader over QUIC is cut off by `handle`; this one does not cross the wire,
+            // and a leader that has lost its quorum still leads (openraft does not step it down), so the write
+            // would wait for a commit that never comes, and so would the caller.
+            tokio::time::timeout(LOCAL_OPERATION_DEADLINE, self.process(rpc))
+                .await
+                .context("quorum operation deadline")?
         } else {
             self.transport.call(leader, rpc).await
         }
@@ -2673,8 +2703,43 @@ impl Cluster {
         self.raft.shutdown().await?;
         self.transport.connections.lock().await.clear();
         self.transport.incoming_connections.lock().await.clear();
-        self.transport.endpoint.wait_idle().await;
+        // `wait_idle` has no bound of its own. It returns when every connection has drained, and a connection can
+        // outlive the close: quinn-proto leaves a server connection whose first packet was a bare CONNECTION_CLOSE
+        // (an abandoned dial that reached us after its Initial was lost) draining without a close timer, so only
+        // the 30 s idle timeout ends it. Peers have their CONNECTION_CLOSE from `close` above; waiting past
+        // `SHUTDOWN_DRAIN` would only hold shutdown for a connection nobody is using.
+        let _ = tokio::time::timeout(SHUTDOWN_DRAIN, self.transport.endpoint.wait_idle()).await;
+        self.release_address().await;
         Ok(())
+    }
+    /// quinn keeps the listening socket until the last connection has drained, and the callers of `shutdown` (a
+    /// restart in the same process, the tests) bind the same address again as soon as it returns. Moving the
+    /// endpoint onto sockets nobody dials frees the address now, whatever is still draining. It takes two: the
+    /// endpoint keeps the socket it has just replaced until traffic arrives on the new one, and the second move is
+    /// what lets the first go.
+    async fn release_address(&self) {
+        let bind = self.limits.bind_addr;
+        let any = if bind.is_ipv6() {
+            SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))
+        } else {
+            SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0))
+        };
+        for _ in 0..2 {
+            let parked = std::net::UdpSocket::bind(any).and_then(|socket| {
+                socket.set_nonblocking(true)?;
+                Ok(socket)
+            });
+            if let Ok(socket) = parked {
+                let _ = self.transport.endpoint.rebind(socket);
+            }
+        }
+        // The connections drop their reference to the old socket when they next run; wait for that.
+        let _ = tokio::time::timeout(SHUTDOWN_DRAIN, async {
+            while std::net::UdpSocket::bind(bind).is_err() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
     }
     async fn handle(
         &self,
@@ -2885,6 +2950,104 @@ impl Cluster {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A test that waits on a cluster can wait forever, and nextest then reports only that 300 s went by. This runs
+    /// beside such a test: if it is still going after `limit`, it prints the step the test reached and what each
+    /// node's raft thinks, then aborts the process, so the failure says where the test was stuck.
+    struct Watchdog {
+        step: Arc<std::sync::Mutex<&'static str>>,
+        nodes: Arc<std::sync::Mutex<Vec<std::sync::Weak<Cluster>>>>,
+        finished: Arc<AtomicBool>,
+    }
+    impl Watchdog {
+        fn start(limit: Duration) -> Self {
+            let watchdog = Self {
+                step: Arc::default(),
+                nodes: Arc::default(),
+                finished: Arc::default(),
+            };
+            let (step, nodes, finished) = (
+                watchdog.step.clone(),
+                watchdog.nodes.clone(),
+                watchdog.finished.clone(),
+            );
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                while started.elapsed() < limit {
+                    if finished.load(Ordering::Acquire) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                // Not `eprintln!`: the harness captures that per test and the capture dies with the abort.
+                let mut stderr = std::io::stderr();
+                let _ = writeln!(
+                    stderr,
+                    "watchdog: stuck for {limit:?} at step {:?}",
+                    step.lock().unwrap()
+                );
+                for node in nodes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|node| node.upgrade())
+                {
+                    let metrics = node.raft.metrics().borrow().clone();
+                    let _ = writeln!(
+                        stderr,
+                        "watchdog: node {} ready={} raft={:?} term={} leader={:?} applied={:?} quorum_ack_ms={:?} connections={}",
+                        node.node_id,
+                        node.ready.load(Ordering::Acquire),
+                        metrics.state,
+                        metrics.current_term,
+                        metrics.current_leader,
+                        metrics.last_applied,
+                        metrics.millis_since_quorum_ack,
+                        node.transport.endpoint.open_connections(),
+                    );
+                }
+                std::process::abort();
+            });
+            watchdog
+        }
+        fn at(&self, step: &'static str) {
+            *self.step.lock().unwrap() = step;
+        }
+        fn track(&self, node: &Arc<Cluster>) {
+            self.nodes.lock().unwrap().push(Arc::downgrade(node));
+        }
+    }
+    impl Drop for Watchdog {
+        fn drop(&mut self) {
+            self.finished.store(true, Ordering::Release);
+        }
+    }
+    /// Leadership can move while a test talks to the cluster (a pause longer than an election timeout is enough),
+    /// and a call made then fails with "has to forward request to: None" or "quorum leader unavailable". The
+    /// request id makes a repeated transaction harmless, so the test asks again until a leader answers.
+    async fn transact_retrying(node: &Cluster, transaction: Transaction) -> TxnResult {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match node.transact(transaction.clone()).await {
+                    Ok(result) => return result,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+                }
+            }
+        })
+        .await
+        .expect("no leader committed the transaction")
+    }
+    async fn read_retrying(node: &Cluster, key: &str) -> RevisionedValue {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                match node.read(key).await {
+                    Ok(result) => return result,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+                }
+            }
+        })
+        .await
+        .expect("no leader answered the read")
+    }
     /// A leader is known as soon as the election is won, but it can only confirm a read or commit a write once
     /// the first round of heartbeats has come back from a quorum, which on a busy machine is a moment later.
     /// A read has no effect, so this waits for one to be confirmed before a test makes its first quorum call.
@@ -3243,6 +3406,7 @@ mod tests {
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn expired_three_voter_cluster_requires_exact_offline_authority_and_commits_fresh_pins() {
+        let watchdog = Watchdog::start(Duration::from_secs(120));
         let root = std::env::temp_dir().join(format!("solos-offline-{}", uuid::Uuid::new_v4()));
         let authority = crate::identity::IdentityAuthority::generate("test.local").unwrap();
         let signer = crate::audit::CryptoSigner::from_seed([3; 32]);
@@ -3295,7 +3459,9 @@ mod tests {
         for (index, config) in configs.iter().enumerate() {
             drop(sockets[index].take());
             cluster.push(Cluster::open(config.clone()).await.unwrap());
+            watchdog.track(cluster.last().unwrap());
         }
+        watchdog.at("initialize");
         cluster[0].initialize([1, 2, 3].into()).await.unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -3307,19 +3473,22 @@ mod tests {
         })
         .await
         .unwrap();
+        watchdog.at("first quorum");
         until_quorum(&cluster[0]).await;
+        watchdog.at("first write");
         assert!(
-            cluster[0]
-                .transact(Transaction::new(
+            transact_retrying(
+                &cluster[0],
+                Transaction::new(
                     "offline-preserved",
                     vec![Mutation::Put {
                         key: "preserved".into(),
                         value: Value::from(42)
                     }]
-                ))
-                .await
-                .unwrap()
-                .applied
+                )
+            )
+            .await
+            .applied
         );
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -3338,10 +3507,12 @@ mod tests {
         })
         .await
         .unwrap();
+        watchdog.at("first shutdown");
         for node in &cluster {
             node.shutdown().await.unwrap();
         }
         cluster.clear();
+        watchdog.at("wait for the pins to expire");
         tokio::time::sleep(Duration::from_secs(5)).await;
         assert!(
             Cluster::open(configs[0].clone()).await.is_err(),
@@ -3383,7 +3554,9 @@ mod tests {
                     .await
                     .unwrap(),
             );
+            watchdog.track(cluster.last().unwrap());
         }
+        watchdog.at("wait for quorum admission");
         assert!(
             cluster[0]
                 .transact(Transaction::new(
@@ -3399,35 +3572,38 @@ mod tests {
         for node in &cluster {
             node.wait_ready(Duration::from_secs(10)).await.unwrap();
         }
+        watchdog.at("read after admission");
         assert_eq!(
-            cluster[1].read("preserved").await.unwrap().value,
+            read_retrying(&cluster[1], "preserved").await.value,
             Some(Value::from(42))
         );
         assert_eq!(
-            cluster[2]
-                .read("cluster/offline_epoch")
+            read_retrying(&cluster[2], "cluster/offline_epoch")
                 .await
-                .unwrap()
                 .value,
             Some(Value::from(1))
         );
+        watchdog.at("write after admission");
         assert!(
-            cluster[1]
-                .transact(Transaction::new(
+            transact_retrying(
+                &cluster[1],
+                Transaction::new(
                     "after-admission",
                     vec![Mutation::Put {
                         key: "fresh".into(),
                         value: Value::Bool(true)
                     }]
-                ))
-                .await
-                .unwrap()
-                .applied
+                )
+            )
+            .await
+            .applied
         );
+        watchdog.at("second shutdown");
         for node in &cluster {
             node.shutdown().await.unwrap();
         }
         cluster.clear();
+        watchdog.at("restart");
         assert!(
             Cluster::open_with_startup_admission(configs[0].clone(), Some(admission))
                 .await
