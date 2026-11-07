@@ -1,5 +1,14 @@
 # A secrets vault and a verifiable Lightpanda browser for agent mode
 
+> **Status, 2026-11-07.** Designed in #36. The first build, PRs 1 to 8 of [prs.md](prs.md), is done: capabilities in the
+> registry (#38), the vault and `solos-swarm vault` (#43), approvals of vault items (#47), keyed `fetch_url` and
+> `vault_list` (#48), the trail in the core and schema V4 (#39), the `browse` module (#46), the browser tools (#49), and
+> `solos-swarm agent trail` (#51). PRs 9 (browsers on nodes) and 10 (keys in the browser) are not built. Two answers came
+> later: `fetch_url` refuses private, loopback and metadata addresses unless `executor.fetch.allow_private_networks` is
+> set (#81, open question 6), and `agent prune --include-trail` removes the trail blobs of Tickets that ended long ago,
+> by hand only (#74, open question 3 and amendment 10). Setup as built: [Vault and API keys](../README.md#vault-and-api-keys),
+> [Browser](../README.md#browser) and [Check a trail](../README.md#check-a-trail).
+
 This is the design contract for the vault and the browser. It came out of an architect bakeoff between two candidate designs, one by Opus and one by DeepSeek V4.1 Flash, judged against a fixed rubric by a DeepSeek cross-judge. The sketch files in `sketch/` are the base candidate as it was written. **Where they differ from the [Amendments](#amendments) section below, the amendments win.**
 
 Sketch files in `sketch/`, and where each one lives in the repo:
@@ -322,7 +331,7 @@ PRs 1 to 8 of [prs.md](prs.md): the vault, keyed `fetch_url` with first-use appr
 3. **What retention policy should the trail blob store have?** Should `agent trail` gain `prune --before`, given that pruned blobs make those steps' content unverifiable while their signatures still verify? And is 8 GiB a sane default on the shared box?
 4. **The chain can still be cut off at a clean session boundary without detection.** Nothing anchors the head outside `agent.db`. Should `agent trail --json` publish the head to the existing `witness.rs` design, or to a Slack post on a schedule?
 5. **Is `--disable-subframes` the right default** for the sites you expect, such as GitHub, Google SSO, or intranet dashboards?
-6. **`--block-private-networks` blocks intranet sites on a node by design.** Should node.yaml default `allow_private_networks: true`, since browsing the node's own network is the point of a node browser? Also, does Lightpanda's check cover DNS rebinding and IPv6 ULA? `fetch_url` today has no private-network block at all; that risk exists already and this design does not add it.
+6. **`--block-private-networks` blocks intranet sites on a node by design.** Should node.yaml default `allow_private_networks: true`, since browsing the node's own network is the point of a node browser? Also, does Lightpanda's check cover DNS rebinding and IPv6 ULA? `fetch_url` had no private-network block at all when this was written; that risk existed already and this design does not add it. *Since #81, `fetch_url` refuses those addresses on every hop unless `executor.fetch.allow_private_networks` is set.*
 7. **The agent process's own core dump** could hold vault values. We set `--core=0` for the browser, but the repo has no `setrlimit` without adding `libc`. Is relying on the host's `ulimit -c 0` and systemd's `LimitCORE=0` acceptable?
 8. **A secret approval that waits is not a `Stage`**, so the Watchdog's waiting-for-a-person alert misses it. Should it raise `attention`, which is a single slot shared with questions?
 9. **Does Pi run tool calls concurrently?** The seat lock makes the answer irrelevant for correctness, but if it does, steps queue silently behind a slow page load.
@@ -330,4 +339,4 @@ PRs 1 to 8 of [prs.md](prs.md): the vault, keyed `fetch_url` with first-use appr
 
 ## Next implementation step
 
-PR 1: move tool capabilities into the registry (`ToolSpec.needs`) and derive `WORKER_TOOLS`, `worker_tools()` and the handler refusal from it, with every existing tool-list and golden-argv test passing unedited.
+*Done in #38, and the rest of the first build through #51.* The step as planned: PR 1: move tool capabilities into the registry (`ToolSpec.needs`) and derive `WORKER_TOOLS`, `worker_tools()` and the handler refusal from it, with every existing tool-list and golden-argv test passing unedited.

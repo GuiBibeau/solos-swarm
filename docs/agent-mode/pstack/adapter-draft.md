@@ -1,3 +1,8 @@
+> **Status, 2026-11-07.** This is the design-time draft. The adapter that ships is
+> [`docs/harness/solos-swarm.md`](../../harness/solos-swarm.md), compiled into every worker's prompt since #54. It
+> names only the tools workers have, so it has no `delegate`, `delegate_return`, `check` or `pr_*` rows. A test fails if it
+> names one of them.
+
 # pstack in solos-swarm
 
 pstack skills use Cursor names. In solos-swarm this file is part of your instructions, so you never need to open it. Map each Cursor name in a skill with the tables below. Wherever a skill says to read the Claude Code adapter (`../../docs/harness/claude-code.md`), use this file instead. If a Cursor field has no row, drop it and say so in your next report. Never pass a field or value the tool schema rejects.

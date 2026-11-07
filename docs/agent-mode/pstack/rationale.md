@@ -1,5 +1,16 @@
 # pstack as the way solos-swarm codes and operates
 
+> **Status, 2026-11-07.** Designed in #53. PRs 1 and 2 of [prs.md](prs.md) are built. PR 1 (#54) vendors pstack
+> 0.15.36 pinned by its `MANIFEST`, enters every worker into `poteto-mode`, compiles in the adapter
+> ([`docs/harness/solos-swarm.md`](../../harness/solos-swarm.md)), and adds the `read` tool over `/pstack`. PR 2 (#57)
+> gives a Ticket a repository of `forge.repos`, cloned by the host into the Ticket's `work/`. The GitHub App design
+> ([`../github-app/`](../github-app/rationale.md), #62) superseded PRs 3, 4 and 7 and the forge token. The App replaced
+> the token (#63), and a worker's `ready` now delivers a pull request with no `pr_publish` tool (#75). PR 4's `check`
+> tool and proof gate became the host's admission of the commits plus, per repository, an `evidence` command the worker
+> runs (#83). PRs 5 (delegates) and 6 (two model families) are not built. Neither are `/method`, `/children`,
+> `pstack.entries`, `pstack.models`, `pstack.roles` and `pstack.delegates`. The config takes only `pstack.entry`
+> (default `poteto-mode`). A relaunched worker quotes its latest progress report since memory PR 1 (#82).
+
 This is the design contract for making pstack the way solos-swarm does coding work. It came out of an architect bakeoff: two candidate designs (Opus and DeepSeek V4.1 Flash) written against the same task and grounding, scored by a DeepSeek cross-judge against a six-criterion rubric. The sketch files in `sketch/` and `adapter-draft.md` are the base candidate as written. **Where they differ from the [Amendments](#amendments) below, the amendments win.**
 
 The package:
@@ -375,4 +386,4 @@ PRs 1 to 7 of [prs.md](prs.md), with the amendments folded into the PR that owns
 
 ## Next implementation step
 
-Vendor pstack 0.15.36 with `scripts/pstack-sync` and write `src/agent/pstack.rs`'s `Tree::open` and `Tree::enter`, with the test that `enter` matches Pi's own expansion of the vendored poteto-mode byte for byte.
+*Done in #54.* The step as planned: vendor pstack 0.15.36 with `scripts/pstack-sync` and write `src/agent/pstack.rs`'s `Tree::open` and `Tree::enter`, with the test that `enter` matches Pi's own expansion of the vendored poteto-mode byte for byte.

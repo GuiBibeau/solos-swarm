@@ -1,5 +1,8 @@
 # PR sequence
 
+> **Status, 2026-11-07.** PRs 1 to 8 are built: #38, #43, #47, #48, #39, #46, #49 and #51, in the order of the table.
+> PRs 9 and 10 are not.
+
 The [Amendments](rationale.md#amendments) in the rationale apply to every PR below. PRs 1 to 8 are the first build. PRs 9 and 10 come later.
 
 Each PR can be checked by itself, and each leaves `main` shippable. Builds and tests run on the remote box, not on the Mac. "Unedited" means the existing test passes without being changed.

@@ -1,9 +1,27 @@
+# Agent memory for solos-swarm agent mode
+
+> **Status, 2026-11-07.** PRs 1 to 4 of [the plan](#6-plan-five-prs) are built. A relaunched worker is told what it
+> said (#82, with this design). Memos live in the core and in `agent.db`, written by the owner (#84, schema 8). Workers
+> propose memos and a review decides each (#85). The dream runs daily (#86, schema 9). PR 5, forgetting, review and
+> graduation, is not built. The owner decisions below changed what was built:
+>
+> - No person clicks Keep. A separate review call, with DeepSeek's thinking on at `max` effort, keeps, rewrites, merges
+>   or rejects every proposal that is not a person's own words. `Ask::Memo`, the Keep and Discard buttons,
+>   `memory.auto_keep` and `memory.ask: dream` do not exist, and a proposal no review decides is retired after 7 days.
+> - The host, not the Router, asks for the dream and judges it, at `memory.dream.at` (03:30 UTC by default), and only
+>   when a Ticket ended since the last dream. The dream has no budget of its own. Its calls and the review's are held
+>   and settled on the ledger's `memory` account, capped by `memory.daily_microusd`. Its digest tells the owner what was
+>   decided and asks nothing.
+> - `MemoState` is built as `Proposed`, `Active`, `Retired` and `Forgotten`. An active memo records the review that
+>   kept it, and a retired one records the memo that replaced it and the evidence the dream cited.
+>
+> How to run it: [Memory](../README.md#memory), [The dream](../README.md#the-dream) and
+> [Memory and the dream](../production.md#memory-and-the-dream).
+
 > **Owner decisions, 2026-11-07 (these override the text below where they differ).**
 > 1. **Promotion: fully autonomous, at high thinking effort.** No Keep click. Every memo is kept, rewritten, merged, retired or rejected by a separate review pass that runs the model with thinking on at its highest effort (the dream Ticket too). Host-checked quotes, provenance, data-not-instructions handling of external text, chained decisions and owner retire/forget stay. Wherever this document says "until a person clicks Keep", read "until the high-effort reviewer keeps it".
 > 2. **Storage: a core table in agent.db** (as recommended).
 > 3. **Consolidation: a daily dream Ticket** (as recommended), run at high thinking effort.
-
-# Agent memory for solos-swarm agent mode
 
 Applying Anthropic's "The components of agent memory" (Lance Martin, Anthropic Engineering, 2026-11-06,
 https://www.anthropic.com/research/components-of-agent-memory) to `solos-swarm agent serve`, grounded in `main` at

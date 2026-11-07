@@ -1,8 +1,12 @@
 # PR sequence
 
-The [Amendments](rationale.md#amendments) apply to every PR below, each folded into the PR that owns the file it changes.
+> **Status, 2026-11-07.** PR 1 is built (#54), and so is PR 2 (#57). PRs 3, 4 and 7 are superseded by
+> [`../github-app/prs.md`](../github-app/prs.md). A pull request is delivered by `ready` (#75), not by `pr_publish`, and
+> the `check` gate became the host's admission and a repository's `evidence` (#83). PRs 5 and 6 are not built. Since
+> #63 the forge has no token file, because it acts as the GitHub App. PR 1's "a recovery Launch quotes the last
+> progress report" shipped later, in memory PR 1 (#82).
 
-PRs 3, 4 and 7 below are superseded by [`../github-app/prs.md`](../github-app/prs.md) where they conflict.
+The [Amendments](rationale.md#amendments) apply to every PR below, each folded into the PR that owns the file it changes.
 
 Each PR can be checked by itself, leaves `main` shippable, and ends in a behavior test that runs offline: the scripted harness against the real broker, a fake upstream, and `LocalForge` (a bare repository and a JSON file of pull requests on disk). Builds and tests run on the remote box, never on the Mac. "Unedited" means an existing test passes without a change.
 
