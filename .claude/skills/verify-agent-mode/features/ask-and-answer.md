@@ -1,7 +1,7 @@
 # Ask and get real work done
 
 A person asks the agent for a piece of work in their own words. The Router, a real model, accepts it and says so on
-the thread; a sandboxed Pi worker does the work with its tools (here `fetch_url` to a public API) and posts the
+the thread. A sandboxed Pi worker does the work with its tools (here `fetch_url` to a public API) and posts the
 result on the same thread.
 
 ## Sub-features
@@ -19,7 +19,7 @@ result on the same thread.
 
 ## Driving it with bin/mcp.sh
 
-Preconditions: a run launched with no overlay; doctor clean.
+Preconditions: a run launched with no overlay, and a clean doctor.
 
 - `real-work`: `bin/mcp.sh $RUN request "List the open pull requests of the GitHub repository GuiBibeau/solos-swarm, with each one's number and title. Use the GitHub REST API."`, then `bin/mcp.sh $RUN replies <thread> result 540`. The replies hold an `acknowledgement` and a `result`. Check the result against `gh pr list -R GuiBibeau/solos-swarm --state open --json number,title`. An empty list is weak proof on its own: also run `known-answer`.
 - `known-answer`: `bin/mcp.sh $RUN request "In the GitHub repository GuiBibeau/solos-swarm, what is the exact title of pull request #51, and is it merged? Use the GitHub REST API."`. The result names "feat(agent): solos-swarm agent trail" and merged at 2026-11-03T16:31:56Z, as `gh pr view 51 -R GuiBibeau/solos-swarm --json title,state,mergedAt` does.

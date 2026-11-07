@@ -27,21 +27,22 @@ digest of what changed.
 ## Driving it with bin/mcp.sh
 
 Preconditions: a run launched with an overlay that sets `memory.dream.at` a few minutes ahead (UTC, `HH:MM`) and a
-`watchdog:` section whose operator is a conversation you can read; doctor clean; `serve.log` has `agent: the dream
-comes daily at HH:MM, thinking at max`. Not yet driven live: the recipe below is the plan.
+`watchdog:` section whose operator is a conversation you can read, and a clean doctor. `serve.log` has `agent: the dream
+comes daily at HH:MM, thinking at max`. Not yet driven live: the recipe below is the plan. The box has no `sqlite3`
+command: the queries below use the `q` helper in SKILL.md.
 
 - `same-trap`: before the dream's time, make two requests on the sandbox repository that each need its tests, for example `bin/mcp.sh $RUN request "On <repo>, run its tests and tell me whether they pass."` twice in separate threads, and wait for both results (`replies <thread> result 900`). Look in each transcript for the same failed first attempt (`grep -n 'cargo test' state/tickets/<ticket>/*.rpc.jsonl`).
-- `asked`: after the time passes, `ssh remote-ai "grep 'the dream of' ~/work/verify/$RUN/serve.log"`. Then `bin/evidence.sh $RUN dream` and `jq -c 'select(.type == "ticket_created")' events.jsonl` shows the dream's Ticket, and `sqlite3 state/agent.db "select body from triggers where id like 'dream:%'"` shows one trigger.
-- `staged`: `ssh remote-ai "ls -l ~/work/verify/$RUN/state/tickets/<dream>/work/transcripts/*/"` shows mode `-r--r--r--`. Compare `jq -r '.tickets[].assignments[] | .assignment + " " + .sha256' .../work/tickets/index.json` with `sha256sum state/tickets/<ticket>/<assignment>.rpc.jsonl` for each line.
-- `thinks`: `grep -c '"thinking"' state/tickets/<dream>/<assignment>.rpc.jsonl` is above zero. `sqlite3 state/agent.db "select account, count(*) from spend group by account"` shows `memory` rows and no `ticket:<dream>` row.
-- `corrects` and `same-trap`: `solos-swarm agent memo list --all --json` shows the dream's proposals (author `<dream>/<assignment>`, with `supersedes` on a correction and `replaced_by` on the memo it replaced), and the review's decision on each. `sqlite3 state/agent.db "select json_extract(body, '$.sources') from memos where json_extract(body, '$.author.ticket') = '<dream>'"` shows sources of kind `transcript`. `serve.log` has `agent: the review kept` or `kept in its own words` for each one. Then a new request on the repository: its worker's `memos_shown` names the kept memo.
-- `digest`: the operator conversation shows one `Memory, <day>: the dream read N tickets ...` message with `Kept`, `Retired` or `Rejected` lines and ticket links. Restart the agent (`bin/launch.sh` with the same state, or `systemctl --user restart` on the run's unit), wait two Watchdog intervals, and confirm there is no second message and no second `dream:` trigger.
+- `asked`: after the time passes, `ssh remote-ai "grep 'the dream of' ~/work/verify/$RUN/serve.log"`. Then `bin/evidence.sh $RUN dream`, and `jq -c '.[1] | fromjson | select(.type == "ticket_created")' events.jsonl` shows the dream's Ticket. `q "select id from triggers where id like 'dream:%'"` shows one trigger.
+- `staged`: `ssh remote-ai "ls -l ~/work/verify/$RUN/state/tickets/<dream>/work/transcripts/*/"` shows mode `-r--r--r--`. Compare `jq -r '.tickets[].assignments[] | .assignment + " " + .sha256' .../work/tickets/index.json` with `sha256sum state/tickets/<ticket>/<assignment>.rpc.jsonl` for each line. The index writes each digest as `sha256:<hex>`, and leaves `sha256` out for a transcript too large to copy.
+- `thinks`: `grep -c '"thinking"' state/tickets/<dream>/<assignment>.rpc.jsonl` is above zero. `q "select account, count(*) from spend group by account"` shows `memory` rows and no `ticket:<dream>` row.
+- `corrects` and `same-trap`: `solos-swarm agent memo list --all --json` shows the dream's proposals (author `<dream>/<assignment>`, with `supersedes` on a correction and `replaced_by` on the memo it replaced), and the review's decision on each. `q "select json_extract(body, '$.sources') from memos where json_extract(body, '$.author.ticket') = '<dream>'"` shows sources of kind `transcript`. `serve.log` has `agent: the review kept` or `kept in its own words` for each one. Then a new request on the repository: its worker's `memos_shown` names the kept memo.
+- `digest`: the operator conversation shows one `Memory, <day>: the dream read N tickets ...` message with `Kept`, `Retired` or `Rejected` lines and ticket links. Restart the agent on the same state ("Restart a run and keep its state" in SKILL.md: `launch.sh` empties `state/`, and a verify run has no systemd unit), wait two Watchdog intervals, and confirm there is no second message and no second `dream:` trigger.
 
 ## Gotchas
 
 - No Ticket ended since the last dream means no dream: the slot is noted in `state/dream-slot` and nothing is asked until the next day. Set `at` after your requests end.
 - A run with `--until-idle` never dreams.
 - The dream may decide nothing needs changing. That is a valid outcome. Check its report (`agent status`) and transcript before calling the feature broken.
-- At `max` effort each of the dream's calls may take minutes. The Watchdog may report it `stalled` if it sends no progress report for 30 minutes.
+- At `max` effort each of the dream's calls may take minutes. The Watchdog may report it `stalled` ("has gone quiet") if it sends no report for 30 minutes.
 - The digest waits up to 30 minutes for the review of the dream's proposals, then lists any proposal still waiting.
 - `memory.daily_microusd` caps the review and the dream together. A cap that is reached stops the dream's calls, and the dream ends failed.

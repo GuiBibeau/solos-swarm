@@ -21,12 +21,12 @@ Policy allows, and posts the result as a reply in the same chain.
 
 Preconditions: the bot token, written by the operator into a 0600 file on the box (never through chat or a screenshot); an agent.yaml with `kind: discord` source and channel, `policy.people` and `policy.approvers` as `discord:<user id>`, and `budgets.session_microusd` above `policy.auto_approve_microusd` so a request asks for approval. The operator's test server on 2026-11-04 was "zelix" (guild 1567472680515403786, `#general` 1567472681463451711, app 1567474348112216166), with the config in `~/work/zelix/agent.yaml` on the box.
 
-- `gateway`: start `agent serve` with that config; in Chrome (Claude in Chrome), open the channel and show the member list: the bot is online.
+- `gateway`: start `agent serve` with that config. In Chrome (Claude in Chrome), open the channel and show the member list: the bot is online.
 - `mention`, `approval`, `approve`, `result`: the person posts `@bot hello` and clicks Approve. Screenshot the channel; the agent's store shows `trigger_received`, `ticket_created`, `decision_recorded` (`accept`), `ticket_approved` by the person's user id, `assignment_started`, `reported` (`ready`), `ticket_ended`, and every `send` effect done on its first attempt.
 
 ## Gotchas
 
 - Clicks and posts come from a person: never post or click on the operator's behalf without their go-ahead in chat.
 - The Discord check on 2026-11-04 used the scripted Router and executor ("Scripted executor: no work ran."): it proves the chat loop, not real work. For real work on Discord, use the real Router and Pi worker of `agent.verify.yaml` with `kind: discord` added.
-- After an answer the buttons stay on the approval message; a second click is refused with a reply.
-- Discord remembers a post's nonce for a few minutes only; a retry after a long outage can post twice.
+- After an answer, the buttons stay on the approval message. A second click changes nothing and gets the reply "Nothing changed: the ticket does not wait for approval."
+- Discord remembers a post's nonce for a few minutes only, so a retry after a long outage can post twice.

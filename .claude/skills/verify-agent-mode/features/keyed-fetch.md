@@ -1,7 +1,7 @@
 # Use an API key the model never sees
 
-An operator stores an API key in the vault, bound to its host. A worker asks for it by name (`fetch_url` with `key`);
-the broker records `key_used` on the chain, adds the key to requests to that host only, and the model gets the
+An operator stores an API key in the vault, bound to its host. A worker asks for it by name (`fetch_url` with `key`).
+The broker records `key_used` on the chain, adds the key to requests to that host only, and the model gets the
 response without ever seeing the key.
 
 ## Sub-features
@@ -14,11 +14,11 @@ response without ever seeing the key.
 ## How to get to it (user POV)
 
 - The operator: `solos-swarm vault add-key --config agent.yaml --name <name> --host <host> --header authorization --scheme bearer --approval none|first-use --value-file <file>`.
-- A person asking for work that needs the API; the worker discovers keys with `vault_list`.
+- A person asking for work that needs the API. The worker discovers keys with `vault_list`.
 
 ## Driving it with bin/mcp.sh
 
-Preconditions: a run launched with `overlays/vault.yaml` (so `launch.sh` ran `vault init`); doctor clean. A loopback "account API" that returns a random account name only when the bearer token is right:
+Preconditions: a run launched with `overlays/vault.yaml` (so `launch.sh` ran `vault init`), and a clean doctor. A loopback "account API" that returns a random account name only when the bearer token is right:
 
 ```sh
 ssh remote-ai 'bash -s' <<EOF
@@ -35,14 +35,14 @@ bin/solos-swarm vault list --config agent.yaml
 EOF
 ```
 
-- `vault-cli`: `without a key: 401`; `saved probe`; `secrets/probe.value` is gone; `vault list` shows `KEY probe 127.0.0.1:<port> authorization: Bearer …` with no value.
+- `vault-cli`: the output shows `without a key: 401` and `saved probe`, `secrets/probe.value` is gone, and `vault list` shows a row that starts `KEY  probe  127.0.0.1:<port>  authorization: Bearer …`, with no value.
 - `keyed-call`: `bin/mcp.sh $RUN request "Which account does our probe API key belong to? Call our probe API at http://127.0.0.1:<port>/v1/me with fetch_url using the vault key probe, and tell me the account name it returns."`, then `replies <thread> result 540`. The result names the account in `secrets/probe.account`, and `probe.log` has a `200` line with `bearer_token_sent: true`: the probe answers 200 only when the token's sha256 matches.
-- `key-used`: `bin/evidence.sh $RUN keyed-fetch`; `events.jsonl` holds `key_used` with `local/probe` and the URL, before the worker's `reported`.
+- `key-used`: `bin/evidence.sh $RUN keyed-fetch`. `events.jsonl` holds `key_used` with the secret `local/probe` and the URL, before the worker's `reported`.
 - `never-seen`: the probe never echoes a header, so the account name is the proof of the call, and no test value may appear anywhere the model writes or reads: `ssh remote-ai "grep -rl vtest- ~/work/verify/$RUN/state ~/work/verify/$RUN/evidence"` prints nothing (the value lives only in the vault and as a hash in `secrets/`).
 
 ## Gotchas
 
-- Phrase the request as using the key, never as reporting what the server received. On 2026-11-04 the Router twice ignored "tell me exactly what the server reports it received in the authorization header" as a credential-disclosure request, and its session remembered the first refusal; a relaunch gives it a fresh session.
+- Phrase the request as using the key, never as reporting what the server received. On 2026-11-04 the Router twice ignored "tell me exactly what the server reports it received in the authorization header" as a request to disclose a credential, and its session remembered the first refusal. A relaunch gives it a fresh session.
 - MCP cannot click an approval, so the probe key is `--approval none`. First-use approval is driven on Discord (discord-chat.md).
-- The vault admits plain http only on loopback; any other host must be https.
+- The vault admits plain http only on loopback. Any other host must be https.
 - `cleanup.sh` stops the probe by `probe.pid`. A probe started without the pid file exits on its own after 1400 s.

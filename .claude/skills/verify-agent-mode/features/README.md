@@ -1,7 +1,8 @@
 # Agent mode verification map
 
-The maintained source for verifying agent mode's user-facing behavior. Read the index, then use the matching feature
-file as the recipe. The skill's [SKILL.md](../SKILL.md) holds Launch, Doctor, Drive, Evidence and Cleanup.
+This map is the maintained source for verifying agent mode's user-facing behavior. Read the index, then use the
+matching feature file as the recipe. The skill's [SKILL.md](../SKILL.md) holds Launch, Doctor, Drive, Evidence and
+Cleanup, and the `q` helper that reads the live store.
 
 ## Baseline preconditions
 
@@ -15,7 +16,9 @@ file as the recipe. The skill's [SKILL.md](../SKILL.md) holds Launch, Doctor, Dr
 - Act as the person `mcp:verifier` through `bin/mcp.sh`. Treat every command as literal.
 - Phrase each request as the work a person would ask for. The Router judges intent: it ignores a request that reads
   as moving a credential to an unknown place, even when the place is our own test server.
-- One feature per launch when the feature needs an overlay. Snapshot evidence before relaunching.
+- One feature per launch when the feature needs an overlay. Snapshot the evidence before you relaunch.
+- Filter `events.jsonl` with `jq -c '.[1] | fromjson | select(.type == "...")'`: each row is `[seq, "<event JSON>"]`.
+- The box has no `sqlite3` command. Read a store table with the `q` helper in SKILL.md.
 
 ## Proof and skip reporting
 
@@ -33,6 +36,9 @@ harness it uses), and `Gotchas`.
 
 ## Features
 
+A result holds for the revision it names. A feature that has never run live says `not yet` in both columns, and its
+recipe is a plan.
+
 | Feature | Last driven live | Result |
 |---|---|---|
 | [Ask and get real work done](./ask-and-answer.md) | 2026-11-04, v20261104-1032, b04f9f2 | passed: open PRs and PR #51 matched `gh` |
@@ -40,13 +46,14 @@ harness it uses), and `Gotchas`.
 | [Browse a page with a signed trail](./browser-trail.md) | 2026-11-04, v20261104-1815, 04ceeec | passed: `agent trail` 2 steps, 2 signatures ok, 2 blobs ok |
 | [Use an API key the model never sees](./keyed-fetch.md) | 2026-11-04, v20261104-1815, 04ceeec | passed: probe 401 without, 200 with the vault key, `key_used` on the chain, no test value in state |
 | [Chat on Discord with approvals](./discord-chat.md) | 2026-11-04, zelix, b04f9f2, scripted Router | passed: approval buttons, Approve, result |
-| [Follow up on a request](./follow-up.md) | not yet | seeded (`resume` now checks that the new worker's first prompt quotes its earlier replies) |
-| [Work on GitHub as the App's own bot](./github-app-auth.md) | not yet | seeded (needs the App created by hand) |
-| [Ask for a change and get a pull request from the bot](./github-pr.md) | not yet | seeded (needs the App created by hand and `owes: pull_request` on the sandbox) |
-| [The owner's memory shapes later work](./memo-owner.md) | not yet | seeded |
-| [Workers remember, and the review decides](./memo-remember.md) | not yet | seeded |
-| [The daily dream checks memory against the transcripts](./dream.md) | not yet | seeded |
+| [Follow up on a request](./follow-up.md) | not yet | not yet |
+| [Work on GitHub as the App's own bot](./github-app-auth.md) | not yet | not yet: needs the App created by hand |
+| [Ask for a change and get a pull request from the bot](./github-pr.md) | not yet | not yet: needs the App created by hand and `owes: pull_request` on the sandbox |
+| [The owner's memory shapes later work](./memo-owner.md) | not yet | not yet |
+| [Workers remember, and the review decides](./memo-remember.md) | not yet | not yet |
+| [The daily dream checks memory against the transcripts](./dream.md) | not yet | not yet |
 
-Not yet mapped, each a real surface: Swarm Tickets (`executor.swarm`, the Router choosing `Plan::Swarm`), schedules,
-remote nodes, Claude Code workers, the Watchdog's alerts, Slack, `agent bench`, and swarm mode itself (`solos-swarm run`, verified by
-the repo's `skills/verify-solos-swarm`).
+These parts of agent mode have no recipe yet: swarm Tickets (`executor.swarm`, the Router choosing `Plan::Swarm`),
+schedules, remote nodes (`node serve`), Claude Code workers, the Watchdog's alerts, Slack, `agent bench`,
+`agent health`, `agent prune`, `agent stop`, and `agent publish` with the web dashboard. Swarm mode itself
+(`solos-swarm run`) is verified by the repository's `skills/verify-solos-swarm`, not here.

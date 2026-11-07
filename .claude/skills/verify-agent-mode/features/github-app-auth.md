@@ -3,7 +3,7 @@
 A person writes `@solos-bot` on an issue of a repository the operator lists under `forge.repos`. The agent, which holds
 no personal access token and acts as the GitHub App's bot, reads the issue with a token minted for that one repository,
 and answers in a comment whose author is `<slug>[bot]`. Its key is read once and deleted, and no token is ever written
-to disk. PR 1 of `docs/agent-mode/github-app/prs.md`.
+to disk. PR 1 of `docs/agent-mode/github-app/prs.md`, merged as #63.
 
 ## Sub-features
 
@@ -30,7 +30,8 @@ Put the key there before launching: `ssh remote-ai 'umask 077; cat > ~/work/veri
 Gotchas). `bin/doctor.sh $RUN` clean. The operator approved the spend cap.
 
 - `check`: `ssh remote-ai '~/work/verify/$RUN/bin/solos-swarm agent github check --config ~/work/verify/$RUN/agent.yaml
-  --key-file ~/work/verify/$RUN/secrets/github-app.pem --state-dir ~/work/verify/$RUN/state'` prints `ok` and the table.
+  --key-file ~/work/verify/$RUN/secrets/github-app.pem --state-dir ~/work/verify/$RUN/state'` prints the table and ends
+  with `ok`. A miss prints `FAILED` and exits 1.
 - `app-identity`, `answer-from-code`: `gh issue create -R GuiBibeau/solos-swarm-sandbox -t "@solos-bot what is the first
   line of README.md?" -b ""`, then within a minute or two `gh api repos/GuiBibeau/solos-swarm-sandbox/issues/<n>/comments
   --jq '.[] | [.user.login, .body] | @tsv'`. The author is `solos-bot[bot]`, and the text matches `gh api

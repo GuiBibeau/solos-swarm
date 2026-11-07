@@ -5,14 +5,14 @@ pull_request`. The worker commits in its clone and reports `ready`. The host har
 builds, admits them in its own mirror (every commit by the bot, none touching `.github/**`, within the size limit),
 pushes them to a branch it names, `solos/<ticket>/<slug>`, and opens a ready pull request as `solos-bot[bot]`. The Ticket
 ends only once the pull request exists, and its Result carries a line the host built from what it read back: `PR <url> ·
-head <sha> · opened`. The worker has no push, no token and no pull-request tool. PR 2 of
-`docs/agent-mode/github-app/prs.md`.
+head <sha12> · opened`. The worker has no push, no token and no pull-request tool. PR 2 of
+`docs/agent-mode/github-app/prs.md`, merged as #75.
 
 ## Sub-features
 
 - `delivers`: one pull request, ready (not draft), authored by the App's bot, on `solos/<ticket>/<slug>`, whose head is
   the commit the chain's `ProposalAdmitted` names, and whose commits are all by the bot as author and committer.
-- `origin-closes`: asked from a GitHub issue, the pull request's body says `Closes #<issue>`; asked from Discord it does
+- `origin-closes`: asked from a GitHub issue, the pull request's body says `Closes #<issue>`, and asked from Discord it does
   not.
 - `refusal`: a worker that commits as someone else, or into `.github/`, is refused with the remedy, nothing is pushed, and
   its next attempt is admitted.
@@ -43,19 +43,20 @@ approved the spend cap). The sandbox needs a `CONTRIBUTING.md`, or the worker cr
   `<!-- solos-swarm ticket tk_... -->` and holding `Closes #<issue>`, and every commit's `authors` and the committer the
   bot (`gh api repos/GuiBibeau/solos-swarm-sandbox/commits/<headRefOid> --jq '[.author.login, .committer.login]'` is
   `["solos-bot[bot]","solos-bot[bot]"]`). The agent's comment on the issue ends `PR <url> · head <sha12> · opened`.
-  Compare `<sha12>` with `headRefOid` and with the chain: `ssh remote-ai 'grep proposal_admitted
-  ~/work/verify/$RUN/state/events.jsonl'` (or `solos-swarm agent status`) names the same head.
+  Compare `<sha12>` with `headRefOid` and with the chain: `q "select body from events where json_extract(body,
+  '$.type') = 'proposal_admitted'"` (the `q` helper in SKILL.md) names the same head.
   Asked from Discord instead, the body has no `Closes`.
 - `refusal`: ask for a change that must touch a workflow ("add a CI step to .github/workflows/ci.yml") and watch the
   worker's transcript (`state/tickets/<id>/<assignment>.rpc.jsonl`): `worker_report` answers 409 with `which is protected
   (.github/**)` and the `git reset --soft` remedy, no `solos/` branch exists meanwhile
   (`gh api repos/GuiBibeau/solos-swarm-sandbox/branches --jq '.[].name'`), and the retry is accepted or the worker
   reports blocked.
-- `crash`: ask for another small change, poll the chain until `proposal_admitted` appears
-  (`ssh remote-ai 'grep -c proposal_admitted ~/work/verify/$RUN/state/events.jsonl'`), then at once `ssh remote-ai 'pkill -9
-  -f "solos-swarm agent serve.*$RUN"'`, relaunch with `bin/launch.sh`, and wait for idle. `gh pr list -R
-  GuiBibeau/solos-swarm-sandbox --head solos/<ticket>/<slug>` shows exactly one pull request, and `grep -c '"type":"delivered"'
-  ~/work/verify/$RUN/state/events.jsonl` counts one for the Ticket.
+- `crash`: ask for another small change, and poll the chain until `proposal_admitted` appears
+  (`q "select count(*) from events where json_extract(body, '$.type') = 'proposal_admitted'"`). Then at once run
+  `ssh remote-ai "pkill -9 -f 'solos-swarm agent serve.*verify-$RUN-key'"`, start the agent again on the same state
+  ("Restart a run and keep its state" in SKILL.md, not `launch.sh`, which empties `state/`), and wait for idle.
+  `gh pr list -R GuiBibeau/solos-swarm-sandbox --head solos/<ticket>/<slug>` shows exactly one pull request, and
+  `q "select count(*) from events where json_extract(body, '$.type') = 'delivered'"` counts one for the Ticket.
 - `no-token-at-rest`: `ssh remote-ai 'grep -r ghs_ ~/work/verify/$RUN || echo none'` prints `none`.
 - `bin/evidence.sh $RUN github-pr`.
 
@@ -65,7 +66,7 @@ approved the spend cap). The sandbox needs a `CONTRIBUTING.md`, or the worker cr
 - A repository whose `owes` is `answer` (the default) never gets a pull request, whatever the Router asks: `router_decide`
   refuses a deliverable above `owes`. `owes: pull_request` with `github.writes: false` does not load.
 - The pull request is the host's, not the worker's. A worker that is asked to "open a pull request" cannot, and says it
-  reported ready; the host opens it after the worker's `ready` is admitted.
+  reported ready. The host opens it after the worker's `ready` is admitted.
 - A collaborator's push to the bot's branch parks the Ticket (one question, `Withheld`), and the agent never overwrites
   it. A person who closes the pull request is not undone.
 - `merge`, CI repair and review rounds are later PRs of the design: this one stops at an open pull request.
