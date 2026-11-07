@@ -32,6 +32,13 @@ pub const PROPOSAL_TTL_MS: Ms = 7 * 86_400_000;
 /// The name an expired proposal is retired under, where a review's name
 /// would be.
 pub const EXPIRY: &str = "expiry";
+/// The dream: the Source its Triggers name, the System actor that asks for
+/// it, and the Thread its Triggers are on. Only the host makes a Trigger of
+/// this Source, once a day; a Ticket that came from one is the dream's
+/// (see `Ticket::is_dream`).
+pub const DREAM: &str = "dream";
+/// The pieces of evidence a dream's retirement may cite.
+pub const MAX_RETIRE_EVIDENCE: usize = 4;
 
 /// The tools whose results come from the worker's own commands. A memo that
 /// cites a call to any other tool (`read`, `fetch_url`, the browser, or a
@@ -139,13 +146,52 @@ pub enum MemoSource {
     },
     /// A Ticket's outcome: its Reports and Decisions.
     Ticket { ticket: TicketId },
+    /// One line of an Assignment's transcript, as the dream cites it. The
+    /// host found the quote in that line of the original file, whose whole
+    /// digest was `sha256` then, never in the copy the dream read, so the
+    /// quote can be checked again for as long as the file is kept.
+    Transcript {
+        assignment: AssignmentId,
+        sha256: Digest,
+        /// Counted from 1.
+        line: u32,
+        from: LineFrom,
+        quote: String,
+    },
+}
+
+/// Who wrote a transcript line a memo quotes, as the host read the line.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LineFrom {
+    /// The worker's own words: what it said or asked a tool to do.
+    Worker,
+    /// What a call of `tool` answered.
+    Tool { tool: String },
+    /// What the worker was given: its prompt, which quotes people, bots and
+    /// pages, or anything else the line holds.
+    Prompt,
+}
+
+impl LineFrom {
+    /// Its trust: the worker's words and its own commands' output are the
+    /// agent's; any other tool's answer, and a prompt, are outside text.
+    pub fn trust(&self) -> MemoTrust {
+        match self {
+            Self::Worker => MemoTrust::Model,
+            Self::Tool { tool } if own_work(tool) => MemoTrust::Model,
+            Self::Tool { .. } | Self::Prompt => MemoTrust::External,
+        }
+    }
 }
 
 impl MemoSource {
     /// Its quote, erased when the memo is forgotten.
     fn quote_mut(&mut self) -> Option<&mut String> {
         match self {
-            Self::Trigger { quote, .. } | Self::Call { quote, .. } => Some(quote),
+            Self::Trigger { quote, .. }
+            | Self::Call { quote, .. }
+            | Self::Transcript { quote, .. } => Some(quote),
             Self::Operator | Self::Ticket { .. } => None,
         }
     }
@@ -174,6 +220,13 @@ pub enum MemoActor {
     /// The review pass, by the name it gives itself. It may retire a
     /// model's or an external memo, never a person's, and forgets nothing.
     Review { by: String },
+    /// The dream's worker, while its Assignment runs. Like the review, it
+    /// may retire a model's or an external memo, never a person's, citing
+    /// what shows the memo is wrong, stale or held by another memo.
+    Dream {
+        ticket: TicketId,
+        assignment: AssignmentId,
+    },
 }
 
 /// The review's decision to keep a proposed memo.
@@ -202,6 +255,14 @@ pub enum MemoState {
         by: MemoActor,
         reason: String,
         at_ms: Ms,
+        /// The memo that holds what it said now: the review's words for a
+        /// proposal, a merge, the memo that supersedes it, or the memo it
+        /// repeated.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replaced_by: Option<MemoId>,
+        /// What the dream cited to retire it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        evidence: Vec<MemoSource>,
     },
     /// Its text, quotes and reasons are erased; its digest stays.
     Forgotten { by: MemoActor, at_ms: Ms },
@@ -235,6 +296,10 @@ pub struct Memo {
     pub created_ms: Ms,
     /// When a person or the review last vouched for it.
     pub verified_ms: Ms,
+    /// The active memo this one corrects or replaces: once this one is
+    /// active, that one is retired, naming it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<MemoId>,
 }
 
 impl Memo {
@@ -265,6 +330,10 @@ pub struct MemoIn {
     pub text: String,
     pub sources: Vec<MemoSource>,
     pub author: MemoAuthor,
+    /// For the dream only: the active memo this proposal corrects, retired
+    /// once the review keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<MemoId>,
 }
 
 /// Who an index was shown to.
@@ -479,6 +548,18 @@ pub fn source_trust(
             })
         }
         MemoSource::Ticket { .. } => Ok(MemoTrust::Model),
+        MemoSource::Transcript {
+            line, from, quote, ..
+        } => {
+            if *line == 0 {
+                return Err("a transcript's lines count from 1".into());
+            }
+            if let LineFrom::Tool { tool } = from {
+                check_name("a tool", tool)?;
+            }
+            bounded("a quote", quote, MAX_QUOTE_CHARS)?;
+            Ok(from.trust())
+        }
     }
 }
 
@@ -517,6 +598,7 @@ mod tests {
             },
             created_ms: verified_ms,
             verified_ms,
+            supersedes: None,
         }
     }
 

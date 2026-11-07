@@ -144,6 +144,27 @@ impl SqliteStore {
         self.bodies("SELECT body FROM tickets ORDER BY id")
     }
 
+    /// The dream's Tickets, by id: those whose Mandate names the Source
+    /// `dream`, read without parsing every other Ticket.
+    pub fn dream_tickets(&self) -> Result<Vec<Ticket>, StoreError> {
+        let found: Vec<Ticket> = self.bodies(
+            "SELECT body FROM tickets WHERE json_extract(body, '$.mandate.source') = 'dream' \
+             ORDER BY id",
+        )?;
+        Ok(found.into_iter().filter(Ticket::is_dream).collect())
+    }
+
+    /// The Tickets that ended after `since_ms` and have not resumed since,
+    /// by id.
+    pub fn ended_since(&self, since_ms: Ms) -> Result<Vec<Ticket>, StoreError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT body FROM tickets WHERE open = 0 \
+             AND json_extract(body, '$.ended.at_ms') > ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([since_ms], |row| row.get::<_, String>(0))?;
+        rows.map(|body| Ok(serde_json::from_str(&body?)?)).collect()
+    }
+
     /// Every Decision, by id.
     pub fn decisions(&self) -> Result<Vec<Decision>, StoreError> {
         self.bodies("SELECT body FROM decisions ORDER BY id")

@@ -901,6 +901,7 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
                 text,
                 sources,
                 author,
+                supersedes,
             } = proposal;
             let author_key = match &author {
                 MemoAuthor::Operator { source, by } => {
@@ -917,6 +918,9 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
             };
             memo::check_text(&text).map_err(Error::Invalid)?;
             let trust = tx.memo_trust(policy, &sources, &text, &author)?;
+            if let Some(old) = &supersedes {
+                tx.may_supersede(&author, &scope, old)?;
+            }
             if let Some(held) = tx
                 .live_memos()
                 .into_iter()
@@ -948,8 +952,9 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
                 author: author.clone(),
                 text_sha256: text_sha256.clone(),
                 active,
+                supersedes: supersedes.clone(),
             });
-            tx.save_memo(Memo {
+            let memo = Memo {
                 id: id.clone(),
                 scope,
                 text,
@@ -960,7 +965,16 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
                 state,
                 created_ms: tx.now,
                 verified_ms: tx.now,
-            });
+                supersedes,
+            };
+            if active && let MemoAuthor::Worker { ticket, assignment } = &memo.author {
+                let by = MemoActor::Dream {
+                    ticket: ticket.clone(),
+                    assignment: assignment.clone(),
+                };
+                tx.supersede(&memo, &by, None);
+            }
+            tx.save_memo(memo);
             Ok(id)
         })
     }
@@ -980,11 +994,15 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
                 by: review.by.clone(),
                 reason_sha256: Digest::of(review.reason.as_bytes()),
             });
+            let by = MemoActor::Review {
+                by: review.by.clone(),
+            };
             m.state = MemoState::Active {
                 since_ms: tx.now,
                 review: Some(review),
             };
             m.verified_ms = tx.now;
+            tx.supersede(&m, &by, None);
             tx.save_memo(m);
             Ok(())
         })
@@ -1071,17 +1089,19 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
             let by = MemoActor::Review {
                 by: review.by.clone(),
             };
+            let merged_id = merged.as_ref().map(|m| m.id.clone());
             let why = match merged {
                 Some(m) => {
                     let why = format!("merged with {} into {id} by the review", m.id);
                     let other = format!("merged with {} into {id} by the review", proposal.id);
-                    tx.retire(m, &by, other);
+                    tx.retire(m, &by, other, Some(id.clone()));
                     why
                 }
                 None => format!("kept by the review in other words, as {id}"),
             };
             let (scope, author) = (proposal.scope.clone(), proposal.author.clone());
-            tx.retire(proposal, &by, why);
+            let supersedes = proposal.supersedes.clone();
+            tx.retire(proposal, &by, why, Some(id.clone()));
             let text_sha256 = Digest::of(text.as_bytes());
             tx.event(DomainEvent::MemoProposed {
                 memo: id.clone(),
@@ -1090,13 +1110,14 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
                 author: author.clone(),
                 text_sha256: text_sha256.clone(),
                 active: false,
+                supersedes: supersedes.clone(),
             });
             tx.event(DomainEvent::MemoActivated {
                 memo: id.clone(),
                 by: review.by.clone(),
                 reason_sha256: Digest::of(review.reason.as_bytes()),
             });
-            tx.save_memo(Memo {
+            let kept = Memo {
                 id: id.clone(),
                 scope,
                 text,
@@ -1110,7 +1131,10 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
                 },
                 created_ms: tx.now,
                 verified_ms: tx.now,
-            });
+                supersedes,
+            };
+            tx.supersede(&kept, &by, merged_id.as_ref());
+            tx.save_memo(kept);
             Ok(id)
         })
     }
@@ -1139,7 +1163,7 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
             for m in tx.live_memos() {
                 if due(&m, tx.now) {
                     expired.push(m.id.clone());
-                    tx.retire(m, &by, reason.clone());
+                    tx.retire(m, &by, reason.clone(), None);
                 }
             }
             Ok(expired)
@@ -1150,6 +1174,20 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
     /// person may retire any memo; the review only a model's or an external
     /// one, so a person's word stands until a person takes it back.
     pub fn retire_memo(&mut self, memo: &MemoId, by: MemoActor, reason: &str) -> Result<(), Error> {
+        self.retire_memo_citing(memo, by, reason, Citing::Nothing)
+    }
+
+    /// [`retire_memo`](Self::retire_memo), with what the retirement rests
+    /// on. The dream must cite: lines of transcripts that show the memo is
+    /// wrong or stale, or the active memo of the same scope that already
+    /// says it. It acts only while its Assignment runs.
+    pub fn retire_memo_citing(
+        &mut self,
+        memo: &MemoId,
+        by: MemoActor,
+        reason: &str,
+        citing: Citing,
+    ) -> Result<(), Error> {
         self.run(|tx, policy| {
             memo_actor(policy, &by)?;
             memo::check_reason(reason).map_err(Error::Invalid)?;
@@ -1157,12 +1195,51 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
             if !m.is_live() {
                 return Err(Error::Refused(format!("{memo} is {}", m.state.name())));
             }
-            if matches!(by, MemoActor::Review { .. }) && m.trust == MemoTrust::Person {
+            let person = matches!(by, MemoActor::Operator { .. });
+            if !person && m.trust == MemoTrust::Person {
                 return Err(Error::Refused(format!(
                     "{memo} is a person's word, which only a person retires"
                 )));
             }
-            tx.retire(m, &by, reason.to_owned());
+            if let MemoActor::Dream { ticket, assignment } = &by {
+                tx.dreaming(ticket, assignment)?;
+                if matches!(citing, Citing::Nothing) {
+                    return Err(Error::Invalid(
+                        "the dream cites what shows a memo is wrong, stale or a duplicate".into(),
+                    ));
+                }
+            }
+            let (replaced_by, evidence) = match citing {
+                Citing::Nothing => (None, Vec::new()),
+                Citing::Duplicate(other) => {
+                    let held = tx.require_memo(&other)?;
+                    if held.id == m.id || !held.is_active() || held.scope != m.scope {
+                        return Err(Error::Refused(format!(
+                            "{other} is not another active memo of {}",
+                            m.scope
+                        )));
+                    }
+                    (Some(other), Vec::new())
+                }
+                Citing::Evidence(evidence) => {
+                    if !(1..=memo::MAX_RETIRE_EVIDENCE).contains(&evidence.len()) {
+                        return Err(Error::Invalid(format!(
+                            "a retirement cites 1 to {} lines",
+                            memo::MAX_RETIRE_EVIDENCE
+                        )));
+                    }
+                    for source in &evidence {
+                        if !matches!(source, MemoSource::Transcript { .. }) {
+                            return Err(Error::Invalid(
+                                "a retirement cites lines of transcripts".into(),
+                            ));
+                        }
+                        memo::source_trust(source, "", &m.author, None).map_err(Error::Invalid)?;
+                    }
+                    (None, evidence)
+                }
+            };
+            tx.retire_citing(m, &by, reason.to_owned(), replaced_by, evidence);
             Ok(())
         })
     }
@@ -1238,7 +1315,20 @@ fn memo_actor(policy: &impl Policy, by: &MemoActor) -> Result<(), Error> {
     match by {
         MemoActor::Operator { source, by } => may_remember(policy, source, by),
         MemoActor::Review { by } => memo::check_name("a review's name", by).map_err(Error::Invalid),
+        // Checked against its Ticket where it acts.
+        MemoActor::Dream { .. } => Ok(()),
     }
+}
+
+/// What a memo's retirement rests on, beside its reason.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Citing {
+    /// A person's or the review's word.
+    Nothing,
+    /// Lines of transcripts that show the memo is wrong or stale.
+    Evidence(Vec<MemoSource>),
+    /// The active memo of the same scope that already says it.
+    Duplicate(MemoId),
 }
 
 /// Only a person the Policy admits explicitly owns a follow-up: a resume
@@ -1419,6 +1509,45 @@ impl<R: Repositories> Tx<'_, R> {
             id: id.to_string(),
         })
     }
+    /// `ticket` is the dream, open, and `assignment` its running one.
+    fn dreaming(&self, ticket: &TicketId, assignment: &AssignmentId) -> Result<Ticket, Error> {
+        let t = self.open_ticket(ticket)?;
+        if !t.is_dream() {
+            return Err(Error::Refused(format!("{ticket} is not the dream")));
+        }
+        if t.running_assignment().is_none_or(|a| a.id != *assignment) {
+            return Err(Error::Refused(format!("{assignment} is not running")));
+        }
+        Ok(t)
+    }
+    /// Only the dream supersedes a memo, and only an active model's or
+    /// external memo of the proposal's own scope.
+    fn may_supersede(
+        &self,
+        author: &MemoAuthor,
+        scope: &MemoScope,
+        old: &MemoId,
+    ) -> Result<(), Error> {
+        let dream = match author {
+            MemoAuthor::Worker { ticket, .. } => self.ticket(ticket).is_some_and(|t| t.is_dream()),
+            MemoAuthor::Operator { .. } => false,
+        };
+        if !dream {
+            return Err(Error::Refused("only the dream supersedes a memo".into()));
+        }
+        let m = self.require_memo(old)?;
+        if !m.is_active() || m.scope != *scope {
+            return Err(Error::Refused(format!(
+                "{old} is not an active memo of {scope}"
+            )));
+        }
+        if m.trust == MemoTrust::Person {
+            return Err(Error::Refused(format!(
+                "{old} is a person's word, which only a person changes"
+            )));
+        }
+        Ok(())
+    }
     /// Proposed and active memos, this transaction's changes included.
     fn live_memos(&self) -> Vec<Memo> {
         let mut all: BTreeMap<MemoId, Memo> = self
@@ -1434,8 +1563,19 @@ impl<R: Repositories> Tx<'_, R> {
         self.changes.memos.insert(memo.id.clone(), memo);
     }
     /// Retire `memo` for good: its reason in its row, the reason's digest on
-    /// the chain.
-    fn retire(&mut self, mut memo: Memo, by: &MemoActor, reason: String) {
+    /// the chain, and the memo that holds what it said now, if one does.
+    fn retire(&mut self, memo: Memo, by: &MemoActor, reason: String, replaced_by: Option<MemoId>) {
+        self.retire_citing(memo, by, reason, replaced_by, Vec::new());
+    }
+    /// [`retire`](Self::retire), with what the retirement cites.
+    fn retire_citing(
+        &mut self,
+        mut memo: Memo,
+        by: &MemoActor,
+        reason: String,
+        replaced_by: Option<MemoId>,
+        evidence: Vec<MemoSource>,
+    ) {
         self.event(DomainEvent::MemoRetired {
             memo: memo.id.clone(),
             by: by.clone(),
@@ -1445,8 +1585,25 @@ impl<R: Repositories> Tx<'_, R> {
             by: by.clone(),
             reason,
             at_ms: self.now,
+            replaced_by,
+            evidence,
         };
         self.save_memo(memo);
+    }
+    /// `kept` is active now: retire the memo it supersedes, if that one is
+    /// still live, by the same actor and naming `kept`. Nothing else is
+    /// retired here.
+    fn supersede(&mut self, kept: &Memo, by: &MemoActor, skip: Option<&MemoId>) {
+        let Some(old) = &kept.supersedes else {
+            return;
+        };
+        if skip == Some(old) {
+            return;
+        }
+        if let Some(old) = self.memo(old).filter(Memo::is_live) {
+            let why = format!("superseded by {}", kept.id);
+            self.retire(old, by, why, Some(kept.id.clone()));
+        }
     }
     /// What `sources` make a memo that says `text` by `author` worth: the
     /// least of what each gives, each checked as it is cited.
@@ -1471,7 +1628,9 @@ impl<R: Repositories> Tx<'_, R> {
                     self.require_ticket(ticket)?;
                     None
                 }
-                MemoSource::Operator | MemoSource::Call { .. } => None,
+                MemoSource::Operator | MemoSource::Call { .. } | MemoSource::Transcript { .. } => {
+                    None
+                }
             };
             let allowed = trigger.as_ref().map(|t| allowed_person(policy, t));
             let found = trigger.as_ref().zip(allowed);
