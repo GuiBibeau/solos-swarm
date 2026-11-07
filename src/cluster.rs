@@ -2950,6 +2950,13 @@ impl Cluster {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// How long the offline-authority test's node certificates live. The cluster's first phase has to commit its
+    /// data inside this window: once the certificates expire the nodes refuse each other, so a write made after
+    /// that fails and a write in flight at that moment never commits (the leader keeps leading, and waited for it
+    /// for ever: a write started 3 to 6 ms before the expiry hung every time). The window used to be 4 s counted
+    /// from a whole second, 3 to 4 s in practice, and a runner that took 2.7 s to elect a leader left the first
+    /// write well inside the danger zone.
+    const NODE_CERTIFICATE_SECONDS: u64 = 10;
     /// A test that waits on a cluster can wait forever, and nextest then reports only that 300 s went by. This runs
     /// beside such a test: if it is still going after `limit`, it prints the step the test reached and what each
     /// node's raft thinks, then aborts the process, so the failure says where the test was stuck.
@@ -3424,7 +3431,9 @@ mod tests {
                 agent: "cluster".into(),
                 incarnation: "1".into(),
             };
-            let identity = authority.issue(workload, now_ms() / 1000, 4).unwrap();
+            let identity = authority
+                .issue(workload, now_ms() / 1000, NODE_CERTIFICATE_SECONDS)
+                .unwrap();
             nodes.insert(
                 id,
                 NodeAddress {
@@ -3513,7 +3522,17 @@ mod tests {
         }
         cluster.clear();
         watchdog.at("wait for the pins to expire");
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        let expired_at_ms = identities
+            .values()
+            .map(|identity| identity.expires_unix)
+            .max()
+            .unwrap()
+            * 1000
+            + 1000;
+        tokio::time::sleep(Duration::from_millis(
+            expired_at_ms.saturating_sub(now_ms()),
+        ))
+        .await;
         assert!(
             Cluster::open(configs[0].clone()).await.is_err(),
             "expired ordinary pins cannot restart"
@@ -3555,20 +3574,25 @@ mod tests {
                     .unwrap(),
             );
             watchdog.track(cluster.last().unwrap());
+            if cluster.len() == 1 {
+                // One node of three cannot commit the admission, so this is the one moment the refusal cannot race
+                // it: once the second node is open, a pause of the test of a few hundred ms is enough for the
+                // recovery to finish first.
+                assert!(
+                    cluster[0]
+                        .transact(Transaction::new(
+                            "before-admission",
+                            vec![Mutation::Put {
+                                key: "forbidden".into(),
+                                value: Value::Bool(true)
+                            }]
+                        ))
+                        .await
+                        .is_err()
+                );
+            }
         }
         watchdog.at("wait for quorum admission");
-        assert!(
-            cluster[0]
-                .transact(Transaction::new(
-                    "before-admission",
-                    vec![Mutation::Put {
-                        key: "forbidden".into(),
-                        value: Value::Bool(true)
-                    }]
-                ))
-                .await
-                .is_err()
-        );
         for node in &cluster {
             node.wait_ready(Duration::from_secs(10)).await.unwrap();
         }
