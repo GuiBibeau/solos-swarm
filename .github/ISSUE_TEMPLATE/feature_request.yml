@@ -1,0 +1,50 @@
+name: Feature request
+description: Suggest a change to the code, the commands or the docs.
+title: "[feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion. Do not use this form for a security vulnerability. Read [SECURITY.md](https://github.com/GuiBibeau/solos-swarm/blob/main/SECURITY.md) and report it privately.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part would this change?
+      options:
+        - Swarm mode
+        - Agent mode
+        - Both modes
+        - Docs
+        - Build and CI
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Describe the problem and who has it.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like to see?
+      description: Name the command, flag, file or doc if you can.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What do you do today?
+      description: Describe the workaround or the current behavior.
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues for this request.
+          required: true
