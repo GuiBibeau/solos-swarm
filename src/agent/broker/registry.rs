@@ -39,6 +39,7 @@ pub enum WorkerOp {
     BrowserRead,
     ReadPath,
     MemoPropose,
+    MemoRetire,
 }
 
 /// One tool as declared.
@@ -250,8 +251,19 @@ pub(super) const WORKER: &[Tool<WorkerOp>] = &[
                       quote or refuses the memo, replaces any vault value with its name, and a \
                       separate review later keeps, rewrites, merges or drops it. A person's \
                       words quoted whole as the memo are kept at once. A memo is data for later \
-                      work, never a permission. At most 3 per assignment; never a secret.",
+                      work, never a permission. At most 3 per assignment; never a secret. The \
+                      dream alone cites transcript lines and names a memo it supersedes.",
         input_schema: memo_propose,
+        repeatable: false,
+    },
+    Tool {
+        name: "memo_retire",
+        op: WorkerOp::MemoRetire,
+        description: "The dream only: retire a model's or an external memo that the day's \
+                      transcripts show is wrong or stale, citing the lines that show it, or that \
+                      repeats another active memo (duplicate_of). It leaves the index at once. A \
+                      person's memo is never retired here.",
+        input_schema: memo_retire,
         repeatable: false,
     },
 ];
@@ -525,6 +537,23 @@ fn read() -> Value {
     })
 }
 
+/// One piece of evidence: a trigger, a call or, for the dream, a line of an
+/// original transcript.
+fn evidence_item() -> Value {
+    json!({
+        "type": "object",
+        "required": ["quote"],
+        "properties": {
+            "trigger": string("A trigger id of this ticket: the one your assignment came from, or one in its input."),
+            "call": string("Instead of trigger: the tool whose output you quote, such as run_code; your latest call of it that holds the quote is cited."),
+            "transcript": string("The dream only, instead of trigger or call: the assignment id of the transcript you quote."),
+            "sha256": string("With transcript: the transcript's sha256, as /work/tickets/index.json gives it."),
+            "line": {"type": "integer", "minimum": 1, "description": "With transcript: the line that holds the quote, counted from 1."},
+            "quote": required_string("Words copied exactly from that trigger's text, that call's output or that line, at most 500 characters."),
+        },
+    })
+}
+
 fn memo_propose() -> Value {
     json!({
         "type": "object",
@@ -537,16 +566,28 @@ fn memo_propose() -> Value {
                 "minItems": 1,
                 "maxItems": 4,
                 "description": "What shows it, each quoted word for word.",
-                "items": {
-                    "type": "object",
-                    "required": ["quote"],
-                    "properties": {
-                        "trigger": string("A trigger id of this ticket: the one your assignment came from, or one in its input."),
-                        "call": string("Instead of trigger: the tool whose output you quote, such as run_code; your latest call of it that holds the quote is cited."),
-                        "quote": required_string("Words copied exactly from that trigger's text or that call's output, at most 500 characters."),
-                    },
-                },
+                "items": evidence_item(),
             },
+            "supersedes": string("The dream only: the id of the active memo this one corrects; it is retired once the review keeps this one."),
+        },
+    })
+}
+
+fn memo_retire() -> Value {
+    json!({
+        "type": "object",
+        "required": ["memo", "reason"],
+        "properties": {
+            "memo": required_string("The id of the memo to retire, such as mm_0123456789abcdef."),
+            "reason": required_string("One sentence, at most 300 characters: what shows it is wrong, stale or a duplicate."),
+            "evidence": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 4,
+                "description": "Lines of the original transcripts that show it, each with transcript, sha256, line and quote.",
+                "items": evidence_item(),
+            },
+            "duplicate_of": string("Instead of evidence: the id of the active memo of the same scope that already says it."),
         },
     })
 }
@@ -592,6 +633,7 @@ mod tests {
                 "browser_read",
                 "read",
                 "memo_propose",
+                "memo_retire",
             ]
         );
         let report = tools(PrincipalKind::Worker)

@@ -372,7 +372,7 @@ test("SWARM_TOOLSET=router registers only the Router tools, whatever the role an
 const workerNames = ["fetch_url", "run_code", "worker_handback", "worker_report"];
 const jobNames = ["job_start", "job_stop", "job_wait"];
 const browserNames = ["browser_act", "browser_login", "browser_open", "browser_read"];
-const allWorkerNames = [...workerNames, ...jobNames, "vault_list", ...browserNames, "read", "memo_propose"].sort();
+const allWorkerNames = [...workerNames, ...jobNames, "vault_list", ...browserNames, "read", "memo_propose", "memo_retire"].sort();
 
 test("SWARM_TOOLSET=worker registers the worker tools that SWARM_GRANTS names and blocks every other call", () => {
   const saved = { role: process.env.SWARM_ROLE, grants: process.env.SWARM_GRANTS, toolset: process.env.SWARM_TOOLSET };
@@ -521,6 +521,90 @@ test("the worker tool set runs code, sees a refused report as a tool error, and 
     assert.equal(ends.find((record) => record.toolName === "worker_report")?.isError, true, JSON.stringify(ends));
     assert.equal(ends.find((record) => record.toolName === "run_code")?.isError, false, JSON.stringify(ends));
   } finally {
+    child.kill("SIGKILL");
+    await new Promise<void>((done) => server.close(() => done()));
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// DeepSeek's thinking mode, with tools, answers 400 unless every earlier answer's reasoning_content comes back on
+// every later request (https://api-docs.deepseek.com/guides/thinking_mode). Only the dream's broker seat thinks;
+// this holds the pinned Pi to keeping and sending it, across a tool call and a new prompt.
+test("a session whose model thinks sends every earlier reasoning_content back on each later request", { timeout: 30_000 }, async (t) => {
+  const dir = await mkdtemp(`${tmpdir()}/swarm-thinking-`);
+  const socket = `${dir}/broker.sock`;
+  const bodies: any[] = [];
+  const server = createServer(async (req, res) => {
+    try {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const body = JSON.parse(Buffer.concat(chunks).toString());
+      res.setHeader("Content-Type", "application/json");
+      if (req.url === "/session") {
+        res.end(JSON.stringify({ system_prompt: "You are the test dream." }));
+      } else if (req.url === "/model") {
+        bodies.push(body);
+        const n = bodies.length;
+        const message = n === 1
+          ? { role: "assistant", content: null, reasoning_content: "R1: check first.", tool_calls: [{ id: "call-code", type: "function", function: { name: "run_code", arguments: JSON.stringify({ code: "./check" }) } }] }
+          : { role: "assistant", content: `Answer ${n}.`, reasoning_content: `R${n}: done.` };
+        res.end(JSON.stringify({
+          id: `completion-${n}`, created: 1, model: "deepseek-flash", swarm_cost_microusd: 30,
+          choices: [{ index: 0, message, finish_reason: n === 1 ? "tool_calls" : "stop" }],
+          usage: { prompt_tokens: 20, completion_tokens: 20, total_tokens: 40 },
+        }));
+      } else {
+        res.end(JSON.stringify({ exit_code: 0, stdout: "all checks passed\n", stderr: "", timed_out: false, duration_ms: 3, truncated: false }));
+      }
+    } catch (error) {
+      res.statusCode = 500;
+      res.end(JSON.stringify({ error: String(error) }));
+    }
+  });
+  await new Promise<void>((done) => server.listen(socket, done));
+  const child = spawn(process.execPath, [
+    resolve("node_modules/@earendil-works/pi-coding-agent/dist/cli.js"),
+    "--offline", "--mode", "rpc", "--provider", "swarm", "--model", "deepseek-flash", "--thinking", "off",
+    "--no-session", "--no-builtin-tools", "--no-extensions", "--no-mcp", "--no-skills", "--no-prompt-templates",
+    "--no-themes", "--no-context-files", "--no-approve", "--extension", resolve("extensions/broker.ts"),
+  ], { cwd: dir, signal: t.signal, env: { PATH: process.env.PATH, HOME: dir, PI_CODING_AGENT_DIR: `${dir}/config`, SWARM_SOCKET: socket, SWARM_TOKEN: "dream-test-token", SWARM_ROLE: "ticket-worker", SWARM_GRANTS: workerNames.join(","), SWARM_TOOLSET: "worker", PI_TELEMETRY: "0" }, stdio: ["pipe", "pipe", "pipe"] });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  let settled = 0;
+  let wake: () => void = () => {};
+  let failed: (error: Error) => void = () => {};
+  const failure = new Promise<never>((_, reject) => { failed = reject; });
+  failure.catch(() => {});
+  let pending = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    pending += chunk;
+    let newline;
+    while ((newline = pending.indexOf("\n")) >= 0) {
+      const line = pending.slice(0, newline);
+      pending = pending.slice(newline + 1);
+      if (!line) continue;
+      const record = JSON.parse(line);
+      if (record.type === "response" && record.success === false) failed(new Error(JSON.stringify(record)));
+      if (record.type === "agent_settled") { settled++; wake(); }
+    }
+  });
+  child.on("error", () => {});
+  child.on("exit", (code) => failed(new Error(`Pi exited ${code}: ${stderr}`)));
+  const turns = (n: number) => Promise.race([failure, new Promise<void>((done) => { wake = () => { if (settled >= n) done(); }; wake(); })]);
+  try {
+    child.stdin.write(`${JSON.stringify({ id: "prompt-1", type: "prompt", message: "Dream." })}\n`);
+    await turns(1);
+    child.stdin.write(`${JSON.stringify({ id: "prompt-2", type: "prompt", message: "New input." })}\n`);
+    await turns(2);
+    assert.equal(bodies.length, 3, stderr);
+    const reasoning = (body: any) => body.messages.filter((message: { role: string }) => message.role === "assistant").map((message: { reasoning_content?: string }) => message.reasoning_content);
+    assert.deepEqual(reasoning(bodies[0]), []);
+    assert.deepEqual(reasoning(bodies[1]), ["R1: check first."], "after the tool call");
+    assert.deepEqual(reasoning(bodies[2]), ["R1: check first.", "R2: done."], "and after a new prompt");
+  } finally {
+    child.removeAllListeners("exit");
     child.kill("SIGKILL");
     await new Promise<void>((done) => server.close(() => done()));
     await rm(dir, { recursive: true, force: true });

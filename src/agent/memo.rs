@@ -35,6 +35,12 @@ pub struct Listed {
     /// Why it was retired, or the review's reason for keeping it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The memo it corrects, retired once it was kept (the dream's).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<MemoId>,
+    /// The memo that holds what it said, once it was retired for one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replaced_by: Option<MemoId>,
 }
 
 impl Listed {
@@ -60,6 +66,11 @@ impl Listed {
             created_ms: memo.created_ms,
             verified_ms: memo.verified_ms,
             reason,
+            supersedes: memo.supersedes.clone(),
+            replaced_by: match &memo.state {
+                MemoState::Retired { replaced_by, .. } => replaced_by.clone(),
+                _ => None,
+            },
         }
     }
 }
@@ -309,6 +320,7 @@ mod tests {
             },
             created_ms: 0,
             verified_ms: 0,
+            supersedes: None,
         };
         let text = render(&[Listed::of(&memo)]);
         assert!(

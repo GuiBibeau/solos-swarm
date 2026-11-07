@@ -156,6 +156,21 @@ pub struct WorkerSeat {
     calls: Mutex<memory::CallLog>,
     /// The memos it proposed that the Engine took.
     proposed: AtomicUsize,
+    /// The memos it retired, as the dream.
+    retired: AtomicUsize,
+    /// Set for the dream's seat.
+    dream: Option<Dreaming>,
+}
+
+/// What makes a seat the dream's: thinking on, its calls on the `memory`
+/// account, its own few tools, and the original transcripts its evidence is
+/// checked against.
+#[derive(Clone, Debug)]
+pub struct Dreaming {
+    /// `<state>/tickets`, which holds each Assignment's original transcript.
+    pub tickets_dir: PathBuf,
+    /// The `memory` account's cap per UTC day, as `admit_worker` finds it.
+    daily_microusd: Option<MicroUsd>,
 }
 
 impl WorkerSeat {
@@ -184,7 +199,27 @@ impl WorkerSeat {
             held: Toolbox::default(),
             calls: Mutex::default(),
             proposed: AtomicUsize::new(0),
+            retired: AtomicUsize::new(0),
+            dream: None,
         }
+    }
+
+    /// It is the dream's seat: its Ticket's `/work` holds the copies the
+    /// host staged, and the originals are under `tickets_dir`.
+    pub fn dreaming(mut self, tickets_dir: PathBuf) -> Self {
+        self.dream = Some(Dreaming {
+            tickets_dir,
+            daily_microusd: None,
+        });
+        self
+    }
+
+    pub fn is_dream(&self) -> bool {
+        self.dream.is_some()
+    }
+
+    pub(crate) fn dreaming_in(&self) -> Option<&Dreaming> {
+        self.dream.as_ref()
     }
 
     /// Its commands run where its Plan's `environment` names.
@@ -210,10 +245,17 @@ impl WorkerSeat {
         self.host_dir.is_some()
     }
 
+    /// Who pays for its calls: its Ticket, or for the dream the `memory`
+    /// account, whose daily cap the review shares.
     pub fn account(&self) -> Account {
-        Account::Ticket {
-            id: self.ticket.clone(),
-            budget_microusd: self.budget_microusd,
+        match &self.dream {
+            Some(dream) => Account::Memory {
+                daily_microusd: dream.daily_microusd,
+            },
+            None => Account::Ticket {
+                id: self.ticket.clone(),
+                budget_microusd: self.budget_microusd,
+            },
         }
     }
 
@@ -492,8 +534,8 @@ impl Account {
                 format!("{id}'s budget is reached: {committed} of {cap} microusd committed")
             }
             Self::Memory { .. } => format!(
-                "the memory review's daily spend cap is reached: {committed} of {cap} microusd \
-                 committed today"
+                "memory's daily spend cap (the review's and the dream's) is reached: {committed} \
+                 of {cap} microusd committed today"
             ),
         }
     }
@@ -513,6 +555,10 @@ pub struct ModelTerms {
     /// 0, as the Router judges and as swarm mode runs; workers have one, since
     /// a model decoded greedily is the more likely to go round in circles.
     pub temperature: Option<Temperature>,
+    /// DeepSeek's thinking, on at this effort. `None`, as for the Router, every
+    /// worker and swarm mode, sends thinking off; only the dream's seat has
+    /// it on (see [`ModelTerms::body`]).
+    pub thinking: Option<review::Effort>,
 }
 
 impl ModelTerms {
@@ -521,6 +567,24 @@ impl ModelTerms {
         match self.temperature {
             Some(temperature) => gateway::sampled(upstream, temperature),
             None => upstream,
+        }
+    }
+
+    /// What goes upstream for an admitted session request: with thinking
+    /// off, the shared `upstream_body` sampled as these terms say, byte for
+    /// byte what it was before thinking existed; with it on, the thinking
+    /// body at its effort, which passes every earlier reasoning back.
+    pub(crate) fn body(&self, request: &Value) -> Value {
+        let model = &self.upstream.model;
+        match self.thinking {
+            None => self.sample(gateway::upstream_body(
+                model,
+                request,
+                self.max_output_tokens,
+            )),
+            Some(effort) => {
+                gateway::thinking_body(model, request, self.max_output_tokens, effort.as_str())
+            }
         }
     }
 }
@@ -948,13 +1012,25 @@ impl AgentBroker {
         mut seat: WorkerSeat,
         system_prompt: String,
     ) -> Result<Arc<WorkerSeat>> {
-        let terms = self
+        let mut terms = self
             .inner
             .worker_terms
             .clone()
             .context("this broker admits no workers")?;
+        if let Some(dream) = &mut seat.dream {
+            let memory = self
+                .inner
+                .memory
+                .get()
+                .context("this agent keeps no memos")?;
+            let thinking = memory.parts.dream.context("this agent does not dream")?;
+            dream.daily_microusd = memory.parts.daily_microusd;
+            terms.thinking = Some(thinking.effort);
+            terms.max_output_tokens = thinking.max_output_tokens;
+            terms.temperature = None;
+        }
         let reader = self.seat_reader(&seat)?;
-        seat.held = self.worker_toolbox(seat.environment.as_deref(), reader);
+        seat.held = self.worker_toolbox(seat.environment.as_deref(), reader, seat.is_dream());
         let seat = Arc::new(seat);
         let grant = Grant {
             principal: Principal::Worker(seat.clone()),
@@ -1116,13 +1192,19 @@ impl AgentBroker {
     /// lists. It is what [`admit_worker`](Self::admit_worker) binds for such a
     /// seat.
     pub fn worker_tools(&self, environment: Option<&str>, repository: bool) -> Vec<&'static str> {
-        self.worker_toolbox(environment, self.unmounted_reader(repository))
+        self.worker_toolbox(environment, self.unmounted_reader(repository), false)
             .names()
     }
 
     /// What `seat` holds once admitted.
     pub fn seat_tools(&self, seat: &WorkerSeat) -> Vec<&'static str> {
-        self.worker_tools(seat.environment.as_deref(), seat.has_repository())
+        let reads = seat.has_repository() || seat.is_dream();
+        self.worker_toolbox(
+            seat.environment.as_deref(),
+            self.unmounted_reader(reads),
+            seat.is_dream(),
+        )
+        .names()
     }
 
     /// This host's browser, with the vault its logins come from when it has one.
@@ -1166,6 +1248,14 @@ impl AgentBroker {
         let (account, since) = (seat.account().key(), seat.since_ms);
         self.store(move |store| store.committed(&account, since))
             .await
+    }
+
+    /// What the dream `ticket` is to read, from the Store now.
+    pub async fn dream_record(&self, ticket: &TicketId) -> Result<super::dream::Record> {
+        let id = ticket.clone();
+        self.store(move |store| super::dream::record(store, &id))
+            .await?
+            .with_context(|| format!("there is no {ticket}"))
     }
 
     /// What every Assignment of `ticket` has committed on its account.
@@ -1349,11 +1439,7 @@ async fn model(
             grant.principal.tools().contains(&name)
         }),
         max_output_tokens: terms.max_output_tokens,
-        upstream: terms.sample(gateway::upstream_body(
-            &terms.upstream.model,
-            &body,
-            terms.max_output_tokens,
-        )),
+        upstream: terms.body(&body),
     };
     call.send(&broker, &grant).await
 }
@@ -1652,6 +1738,7 @@ impl WorkerCall {
                 read_path(broker, files.as_ref(), *memos, args).await
             }
             Self::MemoPropose => memory::propose(broker, seat, args).await,
+            Self::MemoRetire => memory::retire(broker, seat, args).await,
         };
         if let Some(asked) = asked {
             let answer = match &reply {

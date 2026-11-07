@@ -7,6 +7,7 @@ pub mod bench;
 pub mod broker;
 pub mod config;
 pub mod discord;
+pub mod dream;
 mod earlier;
 pub mod environment;
 pub mod forge;
@@ -35,6 +36,7 @@ pub mod status;
 pub mod stop;
 pub mod swarm_executor;
 pub mod trail;
+pub mod transcript;
 pub mod utc;
 pub mod watchdog;
 
@@ -274,6 +276,12 @@ where
     .with_forge(forge)
     .with_pass_through(config.pass_through)
     .with_global_memo_changes(global_memos)
+    // A run until idle reads what is there and ends: it asks for no dream.
+    .with_dream(
+        config
+            .dream_schedule(state_dir)
+            .filter(|_| !until_idle && pi.as_ref().is_some_and(|pi| pi.executor.is_some())),
+    )
     .with_memo_repos(
         config
             .forge
@@ -416,6 +424,7 @@ where
                     max_output_tokens: *max_output_tokens,
                     call_limit: None,
                     temperature: Some(*temperature),
+                    thinking: None,
                 };
                 let vault = match &config.vault {
                     None => None,
@@ -480,6 +489,15 @@ where
                 "agent: workers propose memos; {} decides each",
                 memory.review.name()
             );
+            if let Some(dream) = &memory.dream {
+                eprintln!(
+                    "agent: the dream comes daily at {}, thinking at {}",
+                    utc::format(config.memory.dream.at.0)
+                        .get(11..16)
+                        .unwrap_or("?"),
+                    dream.effort.as_str()
+                );
+            }
             broker.set_memory(memory);
         }
         let forge = config
@@ -705,6 +723,7 @@ fn router_session(
             max_output_tokens: *max_output_tokens,
             call_limit: Some(half_an_eval),
             temperature: None,
+            thinking: None,
         },
         system_prompt: Some(
             pi_router::system_prompt(

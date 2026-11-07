@@ -15,6 +15,16 @@ use std::sync::Arc;
 
 pub type Env = Arc<dyn ExecutionEnvironment>;
 
+/// What the dream holds, where this host has each: it reports, reads and
+/// greps its staged copies, and proposes and retires memos.
+pub const DREAM_TOOLS: [&str; 5] = [
+    "worker_report",
+    "run_code",
+    "read",
+    "memo_propose",
+    "memo_retire",
+];
+
 /// A host resource a tool can need.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Resource {
@@ -23,6 +33,7 @@ pub enum Resource {
     Vault,
     Read,
     Memory,
+    Dream,
 }
 
 impl Resource {
@@ -34,6 +45,7 @@ impl Resource {
             Self::Vault => "no vault on this host",
             Self::Read => "this ticket has neither pstack nor a repository to read",
             Self::Memory => "this agent keeps no memos from its workers",
+            Self::Dream => "only the dream retires a memo",
         }
     }
 }
@@ -105,6 +117,19 @@ impl<C> Toolbox<C> {
             .any(|bound| bound.spec.name == name && bound.repeatable)
     }
 
+    /// Hold only the tools `keep` names; refuse the rest with `why`.
+    pub fn retain(&mut self, keep: &[&str], why: &str) {
+        let (held, dropped): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held)
+            .into_iter()
+            .partition(|bound| keep.contains(&bound.spec.name));
+        self.held = held;
+        self.refused.extend(
+            dropped
+                .into_iter()
+                .map(|bound| (bound.spec.name, why.to_owned())),
+        );
+    }
+
     pub fn get(&self, name: &str) -> Lookup<'_, C> {
         if let Some(bound) = self.held.iter().find(|bound| bound.spec.name == name) {
             return Lookup::Held(&bound.call);
@@ -144,6 +169,8 @@ struct Resources {
     reader: Option<Arc<Reader>>,
     /// The agent keeps its workers' memos: `memo_propose`, and `/memos`.
     memory: bool,
+    /// The seat is the dream's: `memo_retire`.
+    dream: bool,
 }
 
 impl Resources {
@@ -177,6 +204,11 @@ impl Resources {
     fn memory(&self) -> Result<(), Resource> {
         self.memory.then_some(()).ok_or(Resource::Memory)
     }
+
+    fn dream(&self) -> Result<(), Resource> {
+        self.memory()?;
+        self.dream.then_some(()).ok_or(Resource::Dream)
+    }
 }
 
 /// A worker tool's handler, with the resources it runs on.
@@ -200,6 +232,7 @@ pub enum WorkerCall {
         memos: bool,
     },
     MemoPropose,
+    MemoRetire,
 }
 
 impl WorkerCall {
@@ -234,6 +267,10 @@ impl WorkerCall {
                 host.memory()?;
                 Self::MemoPropose
             }
+            WorkerOp::MemoRetire => {
+                host.dream()?;
+                Self::MemoRetire
+            }
         })
     }
 }
@@ -253,6 +290,9 @@ impl AgentBroker {
                 (HOST_MOUNT, host.as_path()),
             ]);
         }
+        if seat.is_dream() {
+            roots.push((WORK_MOUNT, seat.work_dir.as_path()));
+        }
         let reader = (!roots.is_empty()).then(|| Reader::new(&roots));
         Ok(reader.transpose()?.map(Arc::new))
     }
@@ -269,11 +309,13 @@ impl AgentBroker {
     /// host: run_code and the job tools where that environment offers
     /// run_code, the browser where it is this host, `browser_login` with a
     /// vault too, `fetch_url` wherever its own resource is, and `read` where
-    /// the seat has a `reader`.
+    /// the seat has a `reader`. The dream holds only [`DREAM_TOOLS`]: it
+    /// reads, greps and changes memos, and reaches nothing outside.
     pub(super) fn worker_toolbox(
         &self,
         environment: Option<&str>,
         reader: Option<Arc<Reader>>,
+        dream: bool,
     ) -> Toolbox<WorkerCall> {
         let environments = &self.inner.environments;
         let unknown = environments.get(environment).err();
@@ -287,8 +329,9 @@ impl AgentBroker {
                 .filter(|_| environments.is_local(environment)),
             reader,
             memory: self.inner.memory.get().is_some(),
+            dream,
         };
-        Toolbox::build(
+        let mut toolbox = Toolbox::build(
             WORKER,
             |op| WorkerCall::build(op, &host),
             |resource| {
@@ -296,7 +339,14 @@ impl AgentBroker {
                     .clone()
                     .unwrap_or_else(|| resource.unavailable().to_owned())
             },
-        )
+        );
+        if dream {
+            toolbox.retain(
+                &DREAM_TOOLS,
+                "the dream reads transcripts and memos, and nothing else",
+            );
+        }
+        toolbox
     }
 }
 

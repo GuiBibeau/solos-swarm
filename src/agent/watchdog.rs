@@ -9,6 +9,8 @@
 use super::STORE_FILE;
 use super::broker::Account;
 use super::config::{AgentConfig, WatchdogConfig};
+use super::dream;
+use super::links::TicketLinks;
 use super::ports::{Channel, Fact, FactSink, SendOptions, SendOutcome};
 use crate::broker::now_ms;
 use crate::gateway;
@@ -745,7 +747,12 @@ pub struct Watchdog {
     fresh: HashSet<String>,
     paused: bool,
     unpaused_ms: Option<Ms>,
+    /// Where a Ticket's page is, for the dream's digest.
+    links: TicketLinks,
 }
+
+/// How far back a dream that ended may still be told.
+const DREAM_TOLD_WITHIN_MS: Ms = 7 * 24 * HOUR_MS;
 
 impl Watchdog {
     /// A Watchdog over the Store in `state_dir` that tells `channel`, which
@@ -771,7 +778,59 @@ impl Watchdog {
             fresh: HashSet::new(),
             paused: false,
             unpaused_ms: None,
+            links: TicketLinks::none(),
         })
+    }
+
+    /// Link the dream's digest to Tickets' pages on the dashboard.
+    #[must_use]
+    pub fn with_links(mut self, links: TicketLinks) -> Self {
+        self.links = links;
+        self
+    }
+
+    /// Record the digest of each dream that ended and has not been told,
+    /// once its proposals are decided (see `dream::digest`): one message a
+    /// dream, so one a day, as an alert whose id names the dream, so a
+    /// restart neither repeats it nor loses it.
+    fn dream_digests(&mut self, now: Ms) -> Result<()> {
+        for dream in self.store.dream_tickets()? {
+            let Some(ended) = &dream.ended else {
+                continue;
+            };
+            if now.saturating_sub(ended.at_ms) > DREAM_TOLD_WITHIN_MS {
+                continue;
+            }
+            let id = format!("wd_dream_{}", dream.id);
+            if self.store.has_alert(&id)? {
+                continue;
+            }
+            let Some(text) = dream::digest(&self.store, &dream, &self.links, now)? else {
+                continue;
+            };
+            let row = AlertRow {
+                id: id.clone(),
+                kind: "dream".into(),
+                subject: format!("dream:{}", dream.id),
+                ticket: Some(dream.id.clone()),
+                retry: false,
+                raised_ms: now,
+                message: OutboundMessage {
+                    id: MessageId(id),
+                    channel: self.operator.clone(),
+                    kind: MessageKind::Result,
+                    text,
+                    ticket: Some(dream.id.clone()),
+                    ask: None,
+                },
+                sent_ms: None,
+            };
+            if self.store.record_alert(&row)? {
+                eprintln!("agent: watchdog: the digest of {} is ready", dream.id);
+                self.fresh.insert(row.id);
+            }
+        }
+        Ok(())
     }
 
     /// Assess every `every`, the first time one interval after the start,
@@ -842,6 +901,7 @@ impl Watchdog {
                 retries.extend(retry);
             }
         }
+        self.dream_digests(now)?;
         // Told before acting, so the operator hears of a retry even when the
         // retried work ends the run at once.
         let sent = self.flush(now).await?;
@@ -932,7 +992,12 @@ impl Running {
                 )
             })?;
         let retry = settings.retry_stalled.then(|| facts.clone());
-        let watchdog = Watchdog::open(state_dir, settings, Known::of(config), channel, retry)?;
+        let links = match &config.web {
+            Some(web) => TicketLinks::new(&web.public_url)?,
+            None => TicketLinks::none(),
+        };
+        let watchdog = Watchdog::open(state_dir, settings, Known::of(config), channel, retry)?
+            .with_links(links);
         let (stop, stopped) = oneshot::channel();
         let task = tokio::spawn(watchdog.run(stopped));
         Ok(Some(Self { stop, task }))

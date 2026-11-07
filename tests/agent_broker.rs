@@ -14,7 +14,7 @@ use solos_agent_core::model::{
 use solos_agent_core::{AllowlistPolicy, Engine};
 use solos_agent_store::{SpendState, SqliteStore};
 use solos_swarm::agent::broker::browser::{BrowserParts, LocalBrowser};
-use solos_swarm::agent::broker::memory::MemoryParts;
+use solos_swarm::agent::broker::memory::{DreamTerms, MemoryParts};
 use solos_swarm::agent::broker::registry::{self, PrincipalKind};
 use solos_swarm::agent::broker::review::{Effort, ReviewTerms};
 use solos_swarm::agent::broker::{
@@ -290,6 +290,7 @@ fn terms() -> ModelTerms {
         max_output_tokens: MAX_OUTPUT,
         call_limit: None,
         temperature: None,
+        thinking: None,
     }
 }
 
@@ -747,6 +748,7 @@ async fn a_router_session_starts_with_the_global_memos_and_the_chain_records_it(
                     source: "slack".into(),
                     by: Actor::person("alice"),
                 },
+                supersedes: None,
             })
             .unwrap()
     };
@@ -2541,6 +2543,7 @@ impl ExecutionEnvironment for Laptop {
 
 const HERE: &str = "worker-here";
 const THERE: &str = "worker-there";
+const DREAM: &str = "worker-dream";
 
 fn local_browser(scratch: &Scratch) -> (FakeCdp, BrowserParts) {
     let view = SandboxView::new([]);
@@ -2601,7 +2604,23 @@ fn serve_with_a_node_a_vault_and_a_browser(scratch: &Scratch) -> (Runtime, Serve
             effort: Effort::Max,
         },
         daily_microusd: None,
+        dream: Some(DreamTerms {
+            effort: Effort::Max,
+            max_output_tokens: Effort::Max.max_output_tokens(),
+        }),
     });
+    let dream = WorkerSeat::new(
+        TicketId::new("tk_dream"),
+        AssignmentId::new("as_1"),
+        scratch.state(),
+        None,
+    )
+    .in_environment(Some("local".to_owned()))
+    .dreaming(scratch.state().join("tickets"));
+    served
+        .broker
+        .admit_worker(DREAM.into(), dream, "You are the dream.".into())
+        .unwrap();
     for (token, ticket, environment) in
         [(HERE, "tk_here", None), (THERE, "tk_there", Some("laptop"))]
     {
@@ -2640,6 +2659,7 @@ async fn a_seat_may_call_exactly_the_tools_it_is_offered() {
                 && [
                     Some("run_code is not available on this host"),
                     Some("no browser where this ticket runs"),
+                    Some("only the dream retires a memo"),
                 ]
                 .contains(&reply["error"].as_str());
             assert_eq!(
@@ -2693,6 +2713,7 @@ async fn every_tool_has_a_handler() {
         for tool in registry::tools(kind) {
             let token = match kind {
                 PrincipalKind::Router => TOKEN,
+                PrincipalKind::Worker if tool.name == "memo_retire" => DREAM,
                 PrincipalKind::Worker if there.iter().any(|name| name == tool.name) => THERE,
                 PrincipalKind::Worker => {
                     assert!(

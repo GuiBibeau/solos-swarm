@@ -135,6 +135,7 @@ fn terms() -> ModelTerms {
         max_output_tokens: MAX_OUTPUT,
         call_limit: None,
         temperature: None,
+        thinking: None,
     }
 }
 

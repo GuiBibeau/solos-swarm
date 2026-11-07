@@ -93,6 +93,7 @@ fn terms() -> ModelTerms {
         max_output_tokens: 1_024,
         call_limit: None,
         temperature: None,
+        thinking: None,
     }
 }
 
