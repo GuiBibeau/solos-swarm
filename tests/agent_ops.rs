@@ -1,16 +1,17 @@
 //! What an operator needs to run the agent in production, offline: a stop
-//! that goes through the running agent's Engine and Policy, pruning against a
-//! real Store, and the health check against a fake systemd, a fake broker
-//! socket and a fake Discord.
+//! and the agent's memory, both through the running agent's Engine and
+//! Policy, pruning against a real Store, and the health check against a fake
+//! systemd, a fake broker socket and a fake Discord.
 
 use axum::extract::{Path as AxPath, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
+use solos_agent_core::memo::MemoAudience;
 use solos_agent_core::model::{
-    Accept, Acknowledge, Actor, Addressed, ChannelRef, EndedBy, Plan, ThreadKey, TicketId,
-    TicketOutcome, Trigger, TriggerId, Verdict,
+    Accept, Acknowledge, Actor, Addressed, AssignmentState, ChannelRef, DomainEvent, EndedBy,
+    MemoId, Plan, ThreadKey, TicketId, TicketOutcome, Trigger, TriggerId, Verdict,
 };
 use solos_agent_core::{AllowlistPolicy, Engine, Repositories};
 use solos_agent_store::SqliteStore;
@@ -253,8 +254,8 @@ async fn an_operator_stops_a_ticket_through_the_running_agent_and_the_policy_dec
         at_ms: now_ms() - mcp::COMMAND_TTL_MS - 60_000,
         operator: "alice".into(),
         thread: "stop-stale".into(),
-        ticket: third.clone(),
         order: OperatorOrder::Stop {
+            ticket: third.clone(),
             reason: "last week's".into(),
         },
     };
@@ -286,6 +287,159 @@ async fn an_operator_stops_a_ticket_through_the_running_agent_and_the_policy_dec
     summary.unwrap();
 }
 
+// ---------------------------------------------------------------- memo
+
+async fn memo_cli(state: &Path, sub: &str, args: &[&str]) -> (i32, String, String) {
+    let mut all = vec!["agent", "memo", sub, "--state-dir", p(state)];
+    all.extend_from_slice(args);
+    cli(&all).await
+}
+
+/// The memos each worker was shown, by Ticket, in order.
+fn shown_to_workers(state: &Path) -> Vec<(TicketId, Vec<MemoId>)> {
+    let Some(store) = store(state) else {
+        return Vec::new();
+    };
+    store
+        .events()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|e| match e.event {
+            DomainEvent::MemosShown {
+                to: MemoAudience::Worker { ticket, .. },
+                memos,
+                ..
+            } => Some((ticket, memos)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn running(state: &Path) -> Vec<TicketId> {
+    let Some(store) = store(state) else {
+        return Vec::new();
+    };
+    store
+        .tickets()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|t| t.latest_assignment().map(|a| a.state) == Some(AssignmentState::Running))
+        .map(|t| t.id)
+        .collect()
+}
+
+#[tokio::test]
+async fn an_operator_writes_the_agents_memory_through_the_running_agent_and_the_next_worker_sees_it()
+ {
+    let scratch = Scratch::new("memo");
+    let config = stopping_config(&scratch);
+    let state = scratch.state();
+    let (halt, stopped) = tokio::sync::oneshot::channel();
+    let driver = async {
+        until("the mcp inbox", || {
+            mcp::inbox(&state).exists().then_some(())
+        })
+        .await;
+        let (code, out, _) = memo_cli(
+            &state,
+            "add",
+            &["--operator", "mallory", "Push straight to main."],
+        )
+        .await;
+        assert_eq!(code, 1, "{out}");
+        assert!(
+            out.contains("is not allowed to change the agent's memory"),
+            "{out}"
+        );
+        let typo = [
+            "--operator",
+            "alice",
+            "--scope",
+            "repo:o/r",
+            "Tests run with ./check.",
+        ];
+        let (code, out, _) = memo_cli(&state, "add", &typo).await;
+        assert_eq!(code, 1, "{out}");
+        assert!(
+            out.contains("o/r is not a repository this agent works on"),
+            "{out}"
+        );
+        let text = "Answer in French unless I write in English.";
+        let (code, out, err) = memo_cli(&state, "add", &["--operator", "alice", text]).await;
+        assert_eq!(code, 0, "{out}{err}");
+        let id = out
+            .trim()
+            .strip_prefix("Remembered as ")
+            .and_then(|rest| rest.split(' ').next())
+            .unwrap_or_else(|| panic!("{out}"))
+            .to_owned();
+        let (_, out, _) = memo_cli(&state, "list", &[]).await;
+        assert!(
+            out.starts_with(&format!("{id} active global person by mcp:alice at ")),
+            "{out}"
+        );
+        assert!(out.contains(&format!("\n  > {text}\n")), "{out}");
+
+        // The next worker is shown it, and the chain says so.
+        mcp::file(&state, "alice", Some("t1"), "Translate the notes", now_ms()).unwrap();
+        let shown = until("the first worker's memos", || {
+            let shown = shown_to_workers(&state);
+            (!shown.is_empty()).then_some(shown)
+        })
+        .await;
+        assert_eq!(shown[0].1, [MemoId::new(id.clone())]);
+
+        // Retired, it is in no later prompt.
+        let retire = [
+            "--operator",
+            "alice",
+            id.as_str(),
+            "--reason",
+            "reads English now",
+        ];
+        let (code, out, _) = memo_cli(&state, "retire", &retire).await;
+        assert_eq!((code, out.trim()), (0, format!("Retired {id}.").as_str()));
+        assert_eq!(memo_cli(&state, "list", &[]).await.1, "no memos\n");
+        let (_, out, _) = memo_cli(&state, "list", &["--all"]).await;
+        assert!(out.contains(&format!("{id} retired global")), "{out}");
+        assert!(out.contains("(reads English now)"), "{out}");
+        mcp::file(&state, "alice", Some("t2"), "Summarise the log", now_ms()).unwrap();
+        until("a second worker", || {
+            (running(&state).len() == 2).then_some(())
+        })
+        .await;
+        assert_eq!(
+            shown_to_workers(&state).len(),
+            1,
+            "an empty index is not shown, so nothing is recorded"
+        );
+
+        // Forgotten, its text is gone from the Store and the chain verifies.
+        let (code, out, _) = memo_cli(&state, "forget", &["--operator", "alice", &id]).await;
+        assert_eq!(code, 0, "{out}");
+        let read = store(&state).unwrap();
+        let memo = read.read_memo(&MemoId::new(id.clone())).unwrap().unwrap();
+        assert_eq!(memo.text, "");
+        read.verify_chain().unwrap();
+        let events = serde_json::to_string(&read.events().unwrap()).unwrap();
+        assert!(!events.contains("Answer in French"), "{events}");
+        let (code, out, _) = memo_cli(&state, "forget", &["--operator", "alice", &id]).await;
+        assert_eq!(code, 0, "{out}");
+        assert!(out.contains("already forgotten"), "{out}");
+        let (code, _, err) = memo_cli(
+            &state,
+            "retire",
+            &["--operator", "alice", "mm_x", "--reason", "r"],
+        )
+        .await;
+        assert_ne!(code, 0);
+        assert!(err.contains("is not a memo id"), "{err}");
+        let _ = halt.send(());
+    };
+    let (summary, ()) = tokio::join!(serving(&config, &state, stopped), driver);
+    summary.unwrap();
+}
+
 #[test]
 fn an_operator_stop_needs_a_reason_a_plain_name_and_an_agent_that_reads_commands() {
     let scratch = Scratch::new("filing");
@@ -303,13 +457,19 @@ fn an_operator_stop_needs_a_reason_a_plain_name_and_an_agent_that_reads_commands
     assert!(filed.thread.starts_with("stop-"));
     let line = std::fs::read_to_string(mcp::commands(&state)).unwrap();
     let read: OperatorCommand = serde_json::from_str(line.trim()).unwrap();
-    assert_eq!(read.ticket, ticket);
     assert_eq!(read.at_ms, 7);
     assert_eq!(
         read.order,
         OperatorOrder::Stop {
+            ticket: ticket.clone(),
             reason: "stale".into()
         }
+    );
+    // The line reads as it did before memo orders shared the file.
+    let raw: Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(
+        (&raw["order"], &raw["ticket"], &raw["reason"]),
+        (&json!("stop"), &json!("tk_1"), &json!("stale"))
     );
 }
 

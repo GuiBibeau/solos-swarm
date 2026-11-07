@@ -2,6 +2,9 @@
 # Usage: mcp.sh <run> request "<text>" [<thread>]
 #        mcp.sh <run> replies <thread> [<kind> <timeout_s>]
 #        mcp.sh <run> status
+#        mcp.sh <run> memos [all]
+#        mcp.sh <run> memo-add "<text>" [<scope>]
+#        mcp.sh <run> memo-retire <memo> "<reason>"
 # Talks to the run's agent as the person mcp:verifier through `solos-swarm mcp --operator`, the same stdio MCP
 # server Claude Code or Codex would start. `replies` with a kind (ack, attention, result) waits for it.
 set -euo pipefail

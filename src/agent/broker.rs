@@ -40,6 +40,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use solos_agent_core::change::{CommitSha, Deliverable, Harvest, RepoName};
 use solos_agent_core::delivery::{Admission, NotReady, ready_gate};
+use solos_agent_core::memo::MemoAudience;
 use solos_agent_core::model::{
     Accept, Acknowledge, AssignmentId, EvalId, Method, MicroUsd, Ms, Plan, ReportIn, ReportStatus,
     ThreadKey, Ticket, TicketId, Trigger, TriggerId, Verdict,
@@ -68,6 +69,8 @@ const READ_RECENT: usize = 20;
 pub(crate) const REPORT_TEXT_CHARS: usize = 8_000;
 const QUESTION_CHARS: usize = 1_000;
 const FAILURE_CHARS: usize = 400;
+/// How long a Router session's start waits for the core to pick its memos.
+const ROUTER_MEMOS_WAIT: Duration = Duration::from_secs(5);
 /// What a worker whose turn the broker stopped for looping or for making no
 /// progress reads, in the refusal of every tool call it makes after.
 fn turn_stopped(stopped: Stopped) -> String {
@@ -1249,11 +1252,45 @@ impl AgentBroker {
     }
 }
 
+/// A session's system prompt, fetched once as it starts. A Router's ends
+/// with the global memos the core picks now, which it records as shown.
 async fn session(State(broker): State<AgentBroker>, headers: HeaderMap) -> Reply {
     let grant = broker.authenticate(&headers)?;
-    match &grant.system_prompt {
-        Some(prompt) => Ok(Json(json!({"system_prompt": prompt}))),
-        None => Err(refuse(StatusCode::NOT_FOUND, "no system prompt")),
+    let Some(prompt) = &grant.system_prompt else {
+        return Err(refuse(StatusCode::NOT_FOUND, "no system prompt"));
+    };
+    let memos = match &grant.principal {
+        Principal::Router => broker.router_memos().await,
+        Principal::Worker(_) => None,
+    };
+    let prompt = match memos {
+        Some(memos) => format!("{prompt}\n\n{memos}"),
+        None => prompt.clone(),
+    };
+    Ok(Json(json!({"system_prompt": prompt})))
+}
+
+impl AgentBroker {
+    /// The global memo index for a Router session starting now. A session
+    /// starts without one when the runtime does not answer within
+    /// [`ROUTER_MEMOS_WAIT`], rather than not at all; the runtime may still
+    /// record the index it picks then as shown.
+    async fn router_memos(&self) -> Option<String> {
+        let fact = Fact::ShowMemos {
+            to: MemoAudience::Router,
+        };
+        let asked = tokio::time::timeout(ROUTER_MEMOS_WAIT, self.inner.facts.ask(fact)).await;
+        let why = match asked {
+            Ok(Ok(Ok(Applied::Memos(index)))) => {
+                return (!index.text.is_empty()).then_some(index.text);
+            }
+            Ok(Ok(Ok(other))) => format!("they came back as {other:?}"),
+            Ok(Ok(Err(why))) => format!("they were refused: {why}"),
+            Ok(Err(err)) => format!("{err:#}"),
+            Err(_) => format!("the runtime did not answer in {ROUTER_MEMOS_WAIT:?}"),
+        };
+        eprintln!("agent: a router session starts with no memos: {why}");
+        None
     }
 }
 

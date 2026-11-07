@@ -18,6 +18,7 @@ pub mod jsonl;
 pub mod links;
 mod markdown;
 pub mod mcp;
+pub mod memo;
 pub mod pi_executor;
 pub mod pi_router;
 mod plain_answer;
@@ -210,6 +211,9 @@ where
     private_dir(state_dir)?;
     let store = SqliteStore::open(state_dir.join(STORE_FILE)).context("cannot open the store")?;
     let (facts, inbound) = ports::FactSink::channel();
+    // The runtime moves it when a global memo changes; the Router starts a
+    // new session then, so it reads them again.
+    let (global_memos, memo_changes) = tokio::sync::watch::channel(0u64);
     let nodes = match &config.nodes {
         Some(nodes) => Some(Listener::start(nodes).await?),
         None => None,
@@ -224,6 +228,7 @@ where
             facts.clone(),
             nodes.as_ref(),
             io.github.as_deref(),
+            memo_changes,
         )?),
     };
     let mut router: Arc<dyn Router> = match pi.as_ref().and_then(|pi| pi.router.clone()) {
@@ -267,7 +272,16 @@ where
     )
     .with_control_dir(state_dir)
     .with_forge(forge)
-    .with_pass_through(config.pass_through);
+    .with_pass_through(config.pass_through)
+    .with_global_memo_changes(global_memos)
+    .with_memo_repos(
+        config
+            .forge
+            .as_ref()
+            .map_or_else(Default::default, |forge| {
+                forge.repos().keys().cloned().collect()
+            }),
+    );
     let served = match pi {
         Some(pi) => Some(pi.serve(state_dir)?),
         None => None,
@@ -334,6 +348,7 @@ where
         facts: ports::FactSink,
         nodes: Option<&Listener>,
         github: Option<&GithubApp>,
+        memo_changes: tokio::sync::watch::Receiver<u64>,
     ) -> Result<Self> {
         let PiHost {
             harness,
@@ -498,7 +513,12 @@ where
                 let (spec, grant) = router_session(config, state_dir, &node, &pi_root)?;
                 broker.admit(spec.token.clone(), grant)?;
                 // Its first session starts with the first card, by which time the socket is bound.
-                Some(Arc::new(PiRouter::start(harness.clone(), spec, *max_batch)))
+                Some(Arc::new(PiRouter::start_with_memos(
+                    harness.clone(),
+                    spec,
+                    *max_batch,
+                    memo_changes,
+                )))
             }
         };
         let executor = match (&config.executor, worker_model) {

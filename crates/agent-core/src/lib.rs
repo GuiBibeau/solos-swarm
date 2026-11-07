@@ -9,6 +9,7 @@ pub mod change;
 pub mod delivery;
 pub mod engine;
 pub mod ids;
+pub mod memo;
 pub mod memory;
 pub mod model;
 pub mod policy;

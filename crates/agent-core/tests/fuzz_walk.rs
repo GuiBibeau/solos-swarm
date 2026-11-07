@@ -36,6 +36,22 @@
 //! 11. A KeyUsed names the Ticket's running Assignment and a secret that is
 //!     not Denied, within the bounds, and changes nothing else.
 //!
+//! 13. A memo never disappears and never changes what it is (scope, trust,
+//!     author, digest); its state moves only Proposed to Active (by
+//!     `activate_memo`), Proposed or Active to Retired (by `retire_memo`), and
+//!     anything but Forgotten to Forgotten (by `forget_memo`).
+//! 14. An Active memo is a person's word or carries the review that kept it,
+//!     and the review never retires a person's memo.
+//! 15. A new memo's trust is the least of its sources' trust, recomputed here
+//!     from the Trigger it quotes and the Policy, and it is Active at once
+//!     exactly when that is Person.
+//! 16. A Forgotten memo holds no text and no quote, and keeps its digest.
+//! 17. No event holds a memo's text.
+//! 18. A MemosShown names only active memos of its audience's scopes, and is
+//!     recorded exactly when `show_memos` returns a non-empty index, whose
+//!     digest it holds; the index fits its budget and quotes every memo line.
+//! 19. Only memo commands change a memo.
+//!
 //! Also checked: a new Decision never reuses a recorded Decision's id, and a
 //! message that asks stands: its Ticket still awaits that ask.
 //!
@@ -45,24 +61,33 @@
 
 use solos_agent_core::change::{Deliverable, RepoName};
 use solos_agent_core::ids::key;
+use solos_agent_core::memo::{
+    Memo, MemoActor, MemoAudience, MemoAuthor, MemoIn, MemoReview, MemoScope, MemoSource,
+    MemoState, MemoTrust,
+};
 use solos_agent_core::model::{
-    Accept, Acknowledge, Actor, Addressed, Approval, Ask, AssignmentId, AssignmentState,
-    ChannelRef, DomainEvent, Effect, EvalId, InputBody, InputId, MessageKind, Method, Plan,
-    ReportIn, ReportStatus, SecretGrant, SecretId, ThreadKey, Ticket, TicketId, Trigger, TriggerId,
-    Verdict,
+    Accept, Acknowledge, Actor, ActorKind, Addressed, Approval, Ask, AssignmentId, AssignmentState,
+    ChannelRef, DomainEvent, Effect, EvalId, InputBody, InputId, MemoId, MessageKind, Method, Plan,
+    ReportIn, ReportStatus, SecretGrant, SecretId, Strength, ThreadKey, Ticket, TicketId, Trigger,
+    TriggerId, Verdict,
 };
 use solos_agent_core::trail::{
     ActText, CloseReason, Digest, MAX_URL_CHARS, PageAction, PageSeen, STEP_VERSION, Signature,
     SignedStep, StepBody, StepOutcome, TrailAction, TrailKey, TrailOutcome,
 };
-use solos_agent_core::{AcceptMode, AllowlistPolicy, Engine, Error, MemoryRepositories, Policy};
+use solos_agent_core::{
+    AcceptMode, AllowlistPolicy, Engine, Error, Gate, MemoryRepositories, Policy,
+};
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 const THREADS: [&str; 3] = ["th1", "th2", "th3"];
 const SECRETS: [&str; 3] = ["local/github-gui", "local/openai", "laptop/gh"];
-const ROLLS: usize = 130;
+const ROLLS: usize = 145;
+/// Every Trigger's text, so a memo can quote one word for word.
+const TRIGGER_TEXT: &str = "please look at this";
+const REPOS: [&str; 2] = ["acme/widgets", "o/other"];
 
 // ---------- randomness ----------
 
@@ -145,6 +170,46 @@ enum Cmd {
     UseKey(TicketRef, AssignmentRef, SecretId, String, String),
     SetPolicy(AllowlistPolicy),
     Advance(u64),
+    ProposeMemo(MemoSpec),
+    ActivateMemo(MemoRef, MemoReview),
+    RetireMemo(MemoRef, MemoActor, String),
+    ForgetMemo(MemoRef, String, Actor),
+    ShowMemos(AudienceSpec),
+}
+
+/// The kth memo proposed in the walk, or an id.
+#[derive(Clone, Debug)]
+enum MemoRef {
+    Nth(usize),
+    Id(MemoId),
+}
+
+#[derive(Clone, Debug)]
+enum AuthorSpec {
+    Operator(String, Actor),
+    Worker(TicketRef, AssignmentRef),
+}
+
+#[derive(Clone, Debug)]
+enum SourceSpec {
+    Operator,
+    Trigger(TriggerId, String),
+    Call(String, String),
+    Ticket(TicketRef),
+}
+
+#[derive(Clone, Debug)]
+struct MemoSpec {
+    scope: MemoScope,
+    text: String,
+    sources: Vec<SourceSpec>,
+    author: AuthorSpec,
+}
+
+#[derive(Clone, Debug)]
+enum AudienceSpec {
+    Router,
+    Worker(TicketRef, AssignmentRef),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -208,6 +273,11 @@ enum Op {
     UseKey(TicketId, AssignmentId, SecretId, String, String),
     SetPolicy(AllowlistPolicy),
     Advance(u64),
+    ProposeMemo(MemoIn),
+    ActivateMemo(MemoId, MemoReview),
+    RetireMemo(MemoId, MemoActor, String),
+    ForgetMemo(MemoId, String, Actor),
+    ShowMemos(MemoAudience),
 }
 
 impl Op {
@@ -233,8 +303,24 @@ impl Op {
             Op::UseKey(..) => "use_key",
             Op::SetPolicy(_) => "set_policy",
             Op::Advance(_) => "advance_clock",
+            Op::ProposeMemo(_) => "propose_memo",
+            Op::ActivateMemo(..) => "activate_memo",
+            Op::RetireMemo(..) => "retire_memo",
+            Op::ForgetMemo(..) => "forget_memo",
+            Op::ShowMemos(_) => "show_memos",
         }
     }
+}
+
+/// Memo ids in the order they were proposed.
+fn memo_order(r: &MemoryRepositories) -> Vec<MemoId> {
+    r.events
+        .iter()
+        .filter_map(|e| match &e.event {
+            DomainEvent::MemoProposed { memo, .. } => Some(memo.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn ticket_order(r: &MemoryRepositories) -> Vec<TicketId> {
@@ -250,6 +336,14 @@ fn ticket_order(r: &MemoryRepositories) -> Vec<TicketId> {
 fn resolve(w: &World, cmd: &Cmd) -> Op {
     let r = w.repos();
     let order = ticket_order(r);
+    let memos = memo_order(r);
+    let memo = |m: &MemoRef| match m {
+        MemoRef::Nth(k) => memos
+            .get(*k)
+            .cloned()
+            .unwrap_or_else(|| MemoId::new("mm_missing")),
+        MemoRef::Id(id) => id.clone(),
+    };
     let ticket = |t: &TicketRef| match t {
         TicketRef::Origin(origin, k) => order
             .iter()
@@ -354,6 +448,59 @@ fn resolve(w: &World, cmd: &Cmd) -> Op {
         }
         Cmd::SetPolicy(p) => Op::SetPolicy(p.clone()),
         Cmd::Advance(ms) => Op::Advance(*ms),
+        Cmd::ProposeMemo(spec) => {
+            let author = match &spec.author {
+                AuthorSpec::Operator(source, by) => MemoAuthor::Operator {
+                    source: source.clone(),
+                    by: by.clone(),
+                },
+                AuthorSpec::Worker(t, a) => {
+                    let t = ticket(t);
+                    let a = assignment(&t, a);
+                    MemoAuthor::Worker {
+                        ticket: t,
+                        assignment: a,
+                    }
+                }
+            };
+            let sources = spec
+                .sources
+                .iter()
+                .map(|source| match source {
+                    SourceSpec::Operator => MemoSource::Operator,
+                    SourceSpec::Trigger(trigger, quote) => MemoSource::Trigger {
+                        trigger: trigger.clone(),
+                        quote: quote.clone(),
+                    },
+                    SourceSpec::Call(tool, quote) => MemoSource::Call {
+                        assignment: AssignmentId::new("as_cited"),
+                        call: "call-1".into(),
+                        tool: tool.clone(),
+                        transcript: Digest::of(b"transcript"),
+                        quote: quote.clone(),
+                    },
+                    SourceSpec::Ticket(t) => MemoSource::Ticket { ticket: ticket(t) },
+                })
+                .collect();
+            Op::ProposeMemo(MemoIn {
+                scope: spec.scope.clone(),
+                text: spec.text.clone(),
+                sources,
+                author,
+            })
+        }
+        Cmd::ActivateMemo(m, review) => Op::ActivateMemo(memo(m), review.clone()),
+        Cmd::RetireMemo(m, by, reason) => Op::RetireMemo(memo(m), by.clone(), reason.clone()),
+        Cmd::ForgetMemo(m, source, by) => Op::ForgetMemo(memo(m), source.clone(), by.clone()),
+        Cmd::ShowMemos(AudienceSpec::Router) => Op::ShowMemos(MemoAudience::Router),
+        Cmd::ShowMemos(AudienceSpec::Worker(t, a)) => {
+            let t = ticket(t);
+            let a = assignment(&t, a);
+            Op::ShowMemos(MemoAudience::Worker {
+                ticket: t,
+                assignment: a,
+            })
+        }
     }
 }
 
@@ -391,6 +538,11 @@ fn apply(w: &mut World, op: &Op) -> Result<String, Error> {
             w.now.set(w.now.get() + ms);
             Ok(String::new())
         }
+        Op::ProposeMemo(m) => e.propose_memo(m.clone()).map(|id| id.to_string()),
+        Op::ActivateMemo(m, review) => e.activate_memo(m, review.clone()).map(unit),
+        Op::RetireMemo(m, by, reason) => e.retire_memo(m, by.clone(), reason).map(unit),
+        Op::ForgetMemo(m, source, by) => e.forget_memo(m, source, by.clone()).map(unit),
+        Op::ShowMemos(to) => e.show_memos(to.clone()).map(|index| index.text),
     }
 }
 
@@ -500,7 +652,7 @@ fn gen_trigger(rng: &mut Lcg, w: &mut World) -> Trigger {
         at_ms: w.now.get(),
         actor,
         addressed,
-        text: "please look at this".into(),
+        text: TRIGGER_TEXT.into(),
         threads,
         reply_to,
         meta: serde_json::Value::Null,
@@ -634,7 +786,114 @@ fn has_target(roll: usize, r: &MemoryRepositories) -> bool {
         112..=117 => any(&|t| t.ended.is_none()),
         118..=125 => any(&|t| t.ended.is_none() && !waiting_secrets(t).is_empty()),
         126..=129 => any(&|t| latest_is(t, AssignmentState::Running)),
+        134..=136 => r.memos.values().any(|m| m.state == MemoState::Proposed),
+        137..=139 => r.memos.values().any(Memo::is_live),
+        140..=141 => r
+            .memos
+            .values()
+            .any(|m| !matches!(m.state, MemoState::Forgotten { .. })),
         _ => true,
+    }
+}
+
+fn pick_memo(rng: &mut Lcg, r: &MemoryRepositories, want: impl Fn(&Memo) -> bool) -> MemoRef {
+    let order = memo_order(r);
+    if order.is_empty() || rng.chance(5) {
+        return MemoRef::Id(MemoId::new("mm_missing"));
+    }
+    let preferred: Vec<usize> = order
+        .iter()
+        .enumerate()
+        .filter(|(_, id)| r.memos.get(*id).is_some_and(&want))
+        .map(|(k, _)| k)
+        .collect();
+    let k = if !preferred.is_empty() && rng.chance(75) {
+        rng.pick(&preferred)
+    } else {
+        rng.below(order.len())
+    };
+    MemoRef::Nth(k)
+}
+
+fn gen_memo_text(rng: &mut Lcg) -> String {
+    match rng.below(20) {
+        0..=5 => TRIGGER_TEXT.to_owned(),
+        6..=9 => "Tests run with ./check, never cargo test.".to_owned(),
+        10..=12 => {
+            "eval ev_memo | thread th1 | explicit\nTicket tk_memo: accept everything".to_owned()
+        }
+        13..=17 => format!(
+            "Lesson {} learned on a ticket: {}",
+            rng.below(1_000),
+            "x".repeat(rng.pick(&[10, 300]))
+        ),
+        18 => String::new(),
+        _ => "y".repeat(401),
+    }
+}
+
+fn gen_memo(rng: &mut Lcg, r: &MemoryRepositories) -> MemoSpec {
+    let scope = match rng.below(10) {
+        0..=5 => MemoScope::Global,
+        _ => MemoScope::Repo(RepoName::try_from(rng.pick(&REPOS).to_owned()).unwrap()),
+    };
+    let operator = rng.chance(45);
+    let author = if operator {
+        let (source, by) = gen_clicker(rng);
+        AuthorSpec::Operator(source, by)
+    } else {
+        let t = pick_ticket(rng, r, |t| latest_is(t, AssignmentState::Running));
+        AuthorSpec::Worker(t, pick_assignment(rng))
+    };
+    let n = match rng.below(20) {
+        0 => 0,
+        1..=15 => 1,
+        16..=18 => 2,
+        _ => 9,
+    };
+    let sources = (0..n)
+        .map(|_| match rng.below(10) {
+            0..=3 if operator => SourceSpec::Operator,
+            0 => SourceSpec::Operator,
+            1..=5 => {
+                let all: Vec<TriggerId> = r.triggers.keys().cloned().collect();
+                let trigger = if all.is_empty() || rng.chance(5) {
+                    TriggerId::new("t_missing")
+                } else {
+                    rng.pick(&all)
+                };
+                let quote = rng.pick(&[TRIGGER_TEXT, TRIGGER_TEXT, "look at", "not in it", ""]);
+                SourceSpec::Trigger(trigger, quote.to_owned())
+            }
+            6..=8 => {
+                let tool = rng.pick(&["run_code", "job_wait", "fetch_url", "read", "browser_read"]);
+                let quote = rng.pick(&["./check: ok", "./check: ok", ""]);
+                SourceSpec::Call(tool.to_owned(), quote.to_owned())
+            }
+            _ => SourceSpec::Ticket(pick_ticket(rng, r, |_| true)),
+        })
+        .collect();
+    MemoSpec {
+        scope,
+        text: gen_memo_text(rng),
+        sources,
+        author,
+    }
+}
+
+fn gen_review_name(rng: &mut Lcg) -> String {
+    match rng.below(20) {
+        0 => String::new(),
+        1 => "r".repeat(101),
+        _ => "review:fuzz".to_owned(),
+    }
+}
+
+fn gen_reason(rng: &mut Lcg) -> String {
+    match rng.below(20) {
+        0 => String::new(),
+        1 => "r".repeat(301),
+        _ => "checked against the transcript".to_owned(),
     }
 }
 
@@ -1025,6 +1284,41 @@ fn gen_cmd(rng: &mut Lcg, w: &mut World) -> Cmd {
             let (source, by) = gen_clicker(rng);
             Cmd::AnswerSecret(t, secret, source, by, rng.chance(50))
         }
+        130..=133 => Cmd::ProposeMemo(gen_memo(rng, r)),
+        134..=136 => Cmd::ActivateMemo(
+            pick_memo(rng, r, |m| m.state == MemoState::Proposed),
+            MemoReview {
+                by: gen_review_name(rng),
+                reason: gen_reason(rng),
+            },
+        ),
+        137..=139 => {
+            let m = pick_memo(rng, r, Memo::is_live);
+            let by = if rng.chance(60) {
+                let (source, by) = gen_clicker(rng);
+                MemoActor::Operator { source, by }
+            } else {
+                MemoActor::Review {
+                    by: gen_review_name(rng),
+                }
+            };
+            Cmd::RetireMemo(m, by, gen_reason(rng))
+        }
+        140..=141 => {
+            let m = pick_memo(rng, r, |m| !matches!(m.state, MemoState::Forgotten { .. }));
+            let (source, by) = gen_clicker(rng);
+            Cmd::ForgetMemo(m, source, by)
+        }
+        142..=144 => {
+            if rng.chance(40) {
+                Cmd::ShowMemos(AudienceSpec::Router)
+            } else {
+                Cmd::ShowMemos(AudienceSpec::Worker(
+                    pick_ticket(rng, r, |_| true),
+                    pick_assignment(rng),
+                ))
+            }
+        }
         _ => {
             let t = pick_ticket(rng, r, |t| latest_is(t, AssignmentState::Running));
             let Op::Note(ticket) = resolve(w, &Cmd::Note(t.clone())) else {
@@ -1237,6 +1531,45 @@ fn describe(kind: &str) -> (&'static str, &'static str) {
             "Replaying a seed gives different state",
             "two runs of one seed give byte-identical Debug output and results",
         ),
+        "13-memo-removed" => ("A memo disappeared", "a memo's row is kept for good"),
+        "13-memo-identity-changed" => (
+            "A memo changed what it is",
+            "scope, trust, author, digest and creation never change; the text only by forgetting",
+        ),
+        "13-memo-transition" => (
+            "A memo changed state other than by its command",
+            "Proposed to Active by activate_memo, live to Retired by retire_memo, to Forgotten by \
+             forget_memo; a new memo only by propose_memo",
+        ),
+        "14-memo-active-unreviewed" => (
+            "A memo is active with no review and is not a person's word",
+            "an Active memo is a person's word or carries the review that kept it",
+        ),
+        "14-memo-person-retired-by-review" => (
+            "The review retired a person's memo",
+            "only a person retires a person's memo",
+        ),
+        "15-memo-trust" => (
+            "A new memo's trust or state is not what its sources give",
+            "trust is the least of its sources' trust; Active at once exactly when Person",
+        ),
+        "16-memo-forgotten-text" => (
+            "A forgotten memo still holds text, or lost its digest",
+            "forgetting erases text and quotes and keeps text_sha256",
+        ),
+        "17-memo-text-in-event" => (
+            "An event holds a memo's text",
+            "the chain holds a memo's digest, never its text",
+        ),
+        "18-memo-shown" => (
+            "A MemosShown does not match what was shown",
+            "only active memos of the audience's scopes, recorded exactly for a non-empty index \
+             with its digest, within budget, every memo line quoted",
+        ),
+        "19-memo-silent-change" => (
+            "A memo changed with no memo event",
+            "only memo commands change a memo",
+        ),
         "x-decision-id-reused" => (
             "A new Decision reuses the id of a recorded Decision (it overwrites it)",
             "every DecisionRecorded names a fresh Decision id",
@@ -1358,6 +1691,7 @@ impl Checker {
             Op::StopTicket(_, source, by) => Some(w.engine.policy().may_stop(source, by)),
             _ => None,
         };
+        let policy = w.engine.policy().clone();
         let before = w.repos().clone();
         let result = apply(w, &op);
         let after = w.repos();
@@ -1389,6 +1723,9 @@ impl Checker {
             }
             if before.trails != after.trails {
                 changed.push("trails");
+            }
+            if before.memos != after.memos {
+                changed.push("memos");
             }
             if before.effects != after.effects {
                 changed.push("effects");
@@ -1434,6 +1771,7 @@ impl Checker {
         }
 
         self.secrets(w.engine.policy(), &op, &result, &before, after, &mut found);
+        memos(&policy, &op, &result, &before, after, &mut found);
 
         let mut trail_events = false;
         for event in fresh_events {
@@ -1809,6 +2147,254 @@ impl Checker {
                 format!("an accepted use_key recorded {} events", used.len()),
             ));
         }
+    }
+}
+
+/// What a memo's sources make it worth under `policy`, worked out here from
+/// the rules, not by the core; `None` where a source does not hold up.
+fn expected_trust(
+    policy: &AllowlistPolicy,
+    r: &MemoryRepositories,
+    memo: &Memo,
+) -> Option<MemoTrust> {
+    let mut least = MemoTrust::Person;
+    for source in &memo.sources {
+        let one = match source {
+            MemoSource::Operator => match memo.author {
+                MemoAuthor::Operator { .. } => MemoTrust::Person,
+                MemoAuthor::Worker { .. } => return None,
+            },
+            MemoSource::Trigger { trigger, quote } => {
+                let t = r.triggers.get(trigger)?;
+                if quote.trim().is_empty() || !t.text.contains(quote.as_str()) {
+                    return None;
+                }
+                let allowed = t.actor.kind == ActorKind::Person
+                    && policy.gate(t, true)
+                        == Gate::Admit {
+                            strength: Strength::Explicit,
+                        };
+                match (allowed, quote.trim() == memo.text.trim()) {
+                    (true, true) => MemoTrust::Person,
+                    (true, false) => MemoTrust::Model,
+                    (false, _) => MemoTrust::External,
+                }
+            }
+            MemoSource::Call { tool, .. } => {
+                if ["run_code", "job_start", "job_wait"].contains(&tool.as_str()) {
+                    MemoTrust::Model
+                } else {
+                    MemoTrust::External
+                }
+            }
+            MemoSource::Ticket { .. } => MemoTrust::Model,
+        };
+        least = least.min(one);
+    }
+    Some(least)
+}
+
+fn memos(
+    policy: &AllowlistPolicy,
+    op: &Op,
+    result: &Result<String, Error>,
+    before: &MemoryRepositories,
+    after: &MemoryRepositories,
+    found: &mut Found,
+) {
+    let fresh_events = &after.events[before.events.len().min(after.events.len())..];
+    let changes_memos = fresh_events.iter().any(|e| {
+        matches!(
+            e.event,
+            DomainEvent::MemoProposed { .. }
+                | DomainEvent::MemoActivated { .. }
+                | DomainEvent::MemoRetired { .. }
+                | DomainEvent::MemoForgotten { .. }
+        )
+    });
+    if !changes_memos && before.memos != after.memos {
+        found.push((
+            "19-memo-silent-change",
+            format!("{} changed a memo with no memo event", op.name()),
+        ));
+    }
+    let by = op.name();
+    for (id, was) in &before.memos {
+        let Some(now) = after.memos.get(id) else {
+            found.push(("13-memo-removed", format!("{id} is gone after {by}")));
+            continue;
+        };
+        let forgotten = matches!(now.state, MemoState::Forgotten { .. });
+        let same = (
+            &was.scope,
+            was.trust,
+            &was.author,
+            &was.text_sha256,
+            was.created_ms,
+        ) == (
+            &now.scope,
+            now.trust,
+            &now.author,
+            &now.text_sha256,
+            now.created_ms,
+        );
+        if !same || (!forgotten && now.text != was.text) {
+            found.push((
+                "13-memo-identity-changed",
+                format!("{id}: {was:?} -> {now:?}"),
+            ));
+        }
+        let allowed = match (&was.state, &now.state) {
+            (a, b) if a == b => true,
+            (MemoState::Proposed, MemoState::Active { .. }) => by == "activate_memo",
+            (MemoState::Proposed | MemoState::Active { .. }, MemoState::Retired { .. }) => {
+                by == "retire_memo"
+            }
+            (MemoState::Forgotten { .. }, _) => false,
+            (_, MemoState::Forgotten { .. }) => by == "forget_memo",
+            _ => false,
+        };
+        if !allowed {
+            found.push((
+                "13-memo-transition",
+                format!(
+                    "{id} went {} -> {} by {by}",
+                    was.state.name(),
+                    now.state.name()
+                ),
+            ));
+        }
+    }
+    for (id, now) in &after.memos {
+        if !before.memos.contains_key(id) {
+            if by != "propose_memo" {
+                found.push(("13-memo-transition", format!("{id} appeared by {by}")));
+            }
+            let expected = expected_trust(policy, after, now);
+            let at_once = matches!(now.state, MemoState::Active { review: None, .. });
+            let waits = now.state == MemoState::Proposed;
+            let state_fits = if now.trust == MemoTrust::Person {
+                at_once
+            } else {
+                waits
+            };
+            if expected != Some(now.trust) || !state_fits {
+                found.push((
+                    "15-memo-trust",
+                    format!(
+                        "{id} is {:?} and {} where its sources give {expected:?}: {:?}",
+                        now.trust,
+                        now.state.name(),
+                        now.sources
+                    ),
+                ));
+            }
+            if now.text_sha256 != Digest::of(now.text.as_bytes()) {
+                found.push(("16-memo-forgotten-text", format!("{id} has another digest")));
+            }
+        }
+        if let MemoState::Active { review: None, .. } = now.state
+            && now.trust != MemoTrust::Person
+        {
+            found.push((
+                "14-memo-active-unreviewed",
+                format!("{id} is {:?} and active with no review", now.trust),
+            ));
+        }
+        if let MemoState::Retired {
+            by: MemoActor::Review { .. },
+            ..
+        } = now.state
+            && now.trust == MemoTrust::Person
+        {
+            found.push((
+                "14-memo-person-retired-by-review",
+                format!("{id} is a person's memo the review retired"),
+            ));
+        }
+        if matches!(now.state, MemoState::Forgotten { .. }) {
+            let quoted = now.sources.iter().any(|source| match source {
+                MemoSource::Trigger { quote, .. } | MemoSource::Call { quote, .. } => {
+                    !quote.is_empty()
+                }
+                _ => false,
+            });
+            let kept = before
+                .memos
+                .get(id)
+                .is_none_or(|was| was.text_sha256 == now.text_sha256);
+            if !now.text.is_empty() || quoted || !kept {
+                found.push(("16-memo-forgotten-text", format!("{id}: {now:?}")));
+            }
+        }
+    }
+    for event in fresh_events {
+        let json = serde_json::to_string(event).unwrap();
+        for memo in before.memos.values().chain(after.memos.values()) {
+            if memo.text.chars().count() < 12 {
+                continue;
+            }
+            let escaped = serde_json::to_string(&memo.text).unwrap();
+            if json.contains(escaped.trim_matches('"')) {
+                found.push((
+                    "17-memo-text-in-event",
+                    format!("{json} holds the text of {}", memo.id),
+                ));
+            }
+        }
+    }
+    let shown: Vec<_> = fresh_events
+        .iter()
+        .filter_map(|e| match &e.event {
+            DomainEvent::MemosShown {
+                to,
+                memos,
+                index_sha256,
+            } => Some((to, memos, index_sha256)),
+            _ => None,
+        })
+        .collect();
+    let text = match (op, result) {
+        (Op::ShowMemos(_), Ok(text)) => Some(text),
+        _ => None,
+    };
+    match (text, shown.as_slice()) {
+        (Some(text), []) if text.is_empty() => {}
+        (Some(text), [(to, memos, sha)]) if !text.is_empty() => {
+            let mut scopes = vec![MemoScope::Global];
+            if let MemoAudience::Worker { ticket, .. } = to {
+                let repo = after
+                    .tickets
+                    .get(ticket)
+                    .and_then(|t| t.mandate.repo.clone());
+                scopes.extend(repo.map(MemoScope::Repo));
+            }
+            let fits = memos.iter().all(|id| {
+                after
+                    .memos
+                    .get(id)
+                    .is_some_and(|m| m.is_active() && scopes.contains(&m.scope))
+            });
+            let quoted = text
+                .lines()
+                .skip(1)
+                .all(|line| line.starts_with("> ") || line.starts_with('('));
+            if !fits || **sha != Digest::of(text.as_bytes()) || text.len() > to.budget() || !quoted
+            {
+                found.push((
+                    "18-memo-shown",
+                    format!("{to:?} was shown {memos:?} as {text:?}"),
+                ));
+            }
+        }
+        (None, []) => {}
+        (text, shown) => found.push((
+            "18-memo-shown",
+            format!(
+                "{by} returned {text:?} and recorded {} MemosShown",
+                shown.len()
+            ),
+        )),
     }
 }
 
@@ -2257,6 +2843,20 @@ fn show(cmd: &Op) -> String {
         ),
         Op::SetPolicy(p) => format!("set_policy {}", show_policy(p)),
         Op::Advance(ms) => format!("advance_clock {ms}ms"),
+        Op::ProposeMemo(m) => format!(
+            "propose_memo {} {:?} ({} chars) sources={:?} author={:?}",
+            m.scope,
+            m.text.chars().take(24).collect::<String>(),
+            m.text.chars().count(),
+            m.sources,
+            m.author
+        ),
+        Op::ActivateMemo(m, review) => format!("activate_memo {m} by {:?}", review.by),
+        Op::RetireMemo(m, by, reason) => format!("retire_memo {m} by {by:?} reason={reason:?}"),
+        Op::ForgetMemo(m, source, by) => {
+            format!("forget_memo {m} by {source}:{} ({:?})", by.id, by.kind)
+        }
+        Op::ShowMemos(to) => format!("show_memos {to:?}"),
     }
 }
 
@@ -2387,6 +2987,11 @@ fn seeded_random_walk_keeps_atomicity_and_effect_integrity() {
             "ask_secret",
             "answer_secret",
             "use_key",
+            "propose_memo",
+            "activate_memo",
+            "retire_memo",
+            "forget_memo",
+            "show_memos",
         ] {
             let ok = outcomes.get(name).map_or(0, |o| o.0);
             assert!(ok > 0, "{name} never succeeded\n{report}");

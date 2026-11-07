@@ -9,8 +9,9 @@ use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use solos_agent_core::change::{BranchName, CommitSha, Harvest, RepoName};
 use solos_agent_core::delivery::Observed;
+use solos_agent_core::memo::{MemoAudience, MemoIndex, MemoScope};
 use solos_agent_core::model::{
-    Actor, Ask, AssignmentId, Candidate, ChannelRef, Decision, EvalId, Input, MicroUsd,
+    Actor, Ask, AssignmentId, Candidate, ChannelRef, Decision, EvalId, Input, MemoId, MicroUsd,
     OutboundMessage, Plan, Report, ReportIn, SecretGrant, SecretId, TicketId, Trigger, TriggerId,
     Verdict,
 };
@@ -110,6 +111,10 @@ pub struct Launch {
     /// `blocked` and `failed` Reports and its latest `progress` one (see
     /// `earlier`). Empty for a Ticket's first Assignment.
     pub earlier: Vec<Report>,
+    /// The memo index the worker's first prompt holds, chosen and recorded
+    /// (`MemosShown`) by the core as the Launch is performed. `None` when no
+    /// memo applies, and for a swarm.
+    pub memos: Option<String>,
 }
 
 /// Inputs for a running Assignment, in order.
@@ -456,6 +461,45 @@ pub enum Fact {
         assignment: AssignmentId,
         reports: usize,
     },
+    /// An operator's order about the agent's memory, through a Source's own
+    /// controls, never message text.
+    Memo(MemoCommand),
+    /// A session is about to start: the memo index it is shown, which the
+    /// core records. Asked, so the answer carries the index.
+    ShowMemos {
+        to: MemoAudience,
+    },
+}
+
+/// An operator's order about the agent's memos. The Source vouches for who
+/// gave it; the Policy decides whether they may.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoCommand {
+    /// Stable for one order, so a replayed one names the same reply.
+    pub id: String,
+    pub order: MemoOrder,
+    /// The Source it came through, such as `mcp`.
+    pub source: String,
+    pub by: Actor,
+    /// Where the outcome is told.
+    pub reply_to: ChannelRef,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemoOrder {
+    /// Remember `text`, as the person's own word.
+    Add {
+        scope: MemoScope,
+        text: String,
+    },
+    Retire {
+        memo: MemoId,
+        reason: String,
+    },
+    /// Erase its text; keep its digest.
+    Forget {
+        memo: MemoId,
+    },
 }
 
 /// A person's command through a Source's own controls, such as a Slack
@@ -502,6 +546,8 @@ pub enum Applied {
     },
     /// The grant for a vault item after an ask: waiting, or already answered.
     Secret(SecretGrant),
+    /// The memo index a session is shown.
+    Memos(MemoIndex),
     Done,
 }
 

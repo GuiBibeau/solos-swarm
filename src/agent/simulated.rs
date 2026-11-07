@@ -287,6 +287,7 @@ mod tests {
             recovery: false,
             inputs: Vec::new(),
             earlier: Vec::new(),
+            memos: None,
         }
     }
 

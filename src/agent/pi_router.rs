@@ -9,6 +9,12 @@
 //! A reply that hits the output limit while it asks for the batch's decisions
 //! runs none of them, and Pi asks again with the same context until the
 //! Router's budget runs out.
+//!
+//! A session's system prompt holds the global memos as they were when it
+//! started (the broker asks the core for them). When they change, the session
+//! ends between turns and the next one reads them again, so a retired or
+//! forgotten memo does not live on in a session's context; nothing else is
+//! lost, since the Router's durable context is the Store.
 
 use super::broker::{DecideTerms, clip};
 use super::ports::{BoxFuture, FactSink, Router};
@@ -307,9 +313,24 @@ impl PiRouter {
         H: AgentHarness + Send + Sync + 'static,
         H::Session: Send + 'static,
     {
+        Self::start_with_memos(harness, spec, max_batch, watch::channel(0).1)
+    }
+
+    /// [`Self::start`], ending a session between turns once `memos` moves,
+    /// which the runtime does whenever a global memo changes.
+    pub fn start_with_memos<H>(
+        harness: H,
+        spec: SessionSpec,
+        max_batch: usize,
+        memos: watch::Receiver<u64>,
+    ) -> Self
+    where
+        H: AgentHarness + Send + Sync + 'static,
+        H::Session: Send + 'static,
+    {
         let (cards, queue) = mpsc::unbounded_channel();
         let (stop, stopped) = watch::channel(false);
-        let task = tokio::spawn(drive(harness, spec, max_batch, queue, stopped));
+        let task = tokio::spawn(drive(harness, spec, max_batch, queue, stopped, memos));
         Self {
             cards,
             stop,
@@ -356,6 +377,7 @@ async fn drive<H>(
     max_batch: usize,
     mut cards: mpsc::UnboundedReceiver<String>,
     mut stop: watch::Receiver<bool>,
+    mut memos: watch::Receiver<u64>,
 ) where
     H: AgentHarness + Send + Sync + 'static,
     H::Session: Send + 'static,
@@ -378,6 +400,8 @@ async fn drive<H>(
         incarnation += 1;
         let mut spec = base.clone();
         spec.id = format!("{}-{incarnation}", base.id);
+        // This session's system prompt holds the memos as they are from now.
+        memos.borrow_and_update();
         let (events_tx, mut events) = mpsc::channel(64);
         let mut session = match harness.start(&spec, events_tx).await {
             Ok(session) => session,
@@ -395,6 +419,15 @@ async fn drive<H>(
         let ended = loop {
             while let Ok(card) = cards.try_recv() {
                 queued.push(card);
+            }
+            if !in_turn && !queued.is_empty() && memos.has_changed().unwrap_or(false) {
+                eprintln!(
+                    "agent: router session {} ends: the global memos changed, so the next \
+                     session reads them",
+                    spec.id
+                );
+                close(session).await;
+                continue 'sessions;
             }
             if !in_turn && !queued.is_empty() {
                 let take = queued.len().min(limit);
@@ -481,7 +514,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, watch};
 
     fn trigger(id: &str, text: &str) -> Trigger {
         Trigger {
@@ -742,6 +775,41 @@ mod tests {
 
         router.shutdown().await;
         assert!(router.assess(candidate("ev_e"), facts).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_change_to_the_global_memos_ends_the_session_between_turns_never_inside_one() {
+        let fake = Fake::default();
+        let (changes, memos) = watch::channel(0u64);
+        let router = PiRouter::start_with_memos(fake.clone(), spec(), 6, memos);
+        let (facts, _inbound) = FactSink::channel();
+        router
+            .assess(candidate("ev_a"), facts.clone())
+            .await
+            .unwrap();
+        assert_eq!(fake.prompted(1).await[0].0, "router-7-1");
+
+        // A memo changes while the turn runs: the turn finishes in this session.
+        changes.send_modify(|n| *n += 1);
+        router
+            .assess(candidate("ev_b"), facts.clone())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(fake.prompts.lock().unwrap().len(), 1, "the turn still runs");
+        fake.tell(Ok(SessionEvent::TurnEnded)).await;
+        let second = fake.prompted(2).await;
+        assert_eq!(second[1].0, "router-7-2", "the next turn is a new session");
+        assert!(second[1].1.contains("eval ev_b "));
+
+        // With no change since, the session goes on.
+        fake.tell(Ok(SessionEvent::TurnEnded)).await;
+        router
+            .assess(candidate("ev_c"), facts.clone())
+            .await
+            .unwrap();
+        assert_eq!(fake.prompted(3).await[2].0, "router-7-2");
+        router.shutdown().await;
     }
 
     async fn assess_all(router: &PiRouter, count: usize) {

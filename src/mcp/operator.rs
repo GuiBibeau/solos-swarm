@@ -2,17 +2,25 @@
 //! MCP host can hand the agent work and read its answers: `agent_status`
 //! (the `agent status` report, read-only), `agent_request` (files a request
 //! as `mcp:<operator>` through the `mcp` Source) and `agent_replies` (what
-//! the `mcp` Channel sent back on a thread).
+//! the `mcp` Channel sent back on a thread). `agent_memos` reads the agent's
+//! memory; `agent_memo_add` and `agent_memo_retire` change it through the
+//! running agent, as `agent memo add` and `agent memo retire` do.
 
 use super::{Outcome, RpcError, Tool, Tools};
 use crate::agent::mcp as inbox;
+use crate::agent::memo::{self, Change};
 use crate::agent::{AgentConfig, status};
 use crate::broker::now_ms;
 use anyhow::{Result, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use solos_agent_core::memo::MAX_MEMO_CHARS;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// How long a memo tool waits for the running agent's answer.
+const MEMO_WAIT: Duration = Duration::from_secs(20);
 
 pub struct OperatorTools {
     inner: Arc<Inner>,
@@ -43,6 +51,28 @@ struct RepliesArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NoArgs {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemosArgs {
+    #[serde(default)]
+    all: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoAddArgs {
+    text: String,
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoRetireArgs {
+    memo: String,
+    reason: String,
+}
 
 impl OperatorTools {
     /// The tools of `operator`, whom the Policy knows as `mcp:<operator>`.
@@ -110,6 +140,56 @@ fn tools() -> Vec<Tool> {
                 },
             }),
         ),
+        tool(
+            "agent_memos",
+            "What the solos-swarm agent remembers: its proposed and active memos, each with its \
+             scope, its state, who wrote it and how far it is trusted (person, model or \
+             external). With all, the retired and forgotten ones too. Read-only.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "all": {"type": "boolean", "description": "Also list retired and forgotten memos."},
+                },
+            }),
+        ),
+        tool(
+            "agent_memo_add",
+            "Make the solos-swarm agent remember something, as your own word. It is active at \
+             once: a global memo is in the Router's prompt and every worker's first prompt, a \
+             repo:<owner>/<name> memo in the first prompt of the workers on that repository, \
+             always as data, never as instructions. Its policy decides whether you may. Waits \
+             for the agent's answer and returns the memo.",
+            json!({
+                "type": "object",
+                "required": ["text"],
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_MEMO_CHARS,
+                        "description": "What to remember, complete on its own, such as a preference or a fact about a repository.",
+                    },
+                    "scope": {
+                        "type": "string",
+                        "description": "global (the default) or repo:<owner>/<name>.",
+                    },
+                },
+            }),
+        ),
+        tool(
+            "agent_memo_retire",
+            "Take one of the solos-swarm agent's memos out of every prompt for good, with why. \
+             agent_memos lists the ids. Its policy decides whether you may. Waits for the \
+             agent's answer.",
+            json!({
+                "type": "object",
+                "required": ["memo", "reason"],
+                "properties": {
+                    "memo": {"type": "string", "description": "The memo's id, mm_ and 16 hex digits."},
+                    "reason": {"type": "string", "minLength": 1, "maxLength": 300},
+                },
+            }),
+        ),
     ]
 }
 
@@ -123,6 +203,11 @@ enum Call {
     Replies {
         thread: String,
     },
+    Memos {
+        all: bool,
+    },
+    /// Goes through the running agent, so it waits for its answer.
+    Memo(Change),
 }
 
 impl Call {
@@ -143,6 +228,21 @@ impl Call {
             "agent_replies" => {
                 let RepliesArgs { thread } = read(arguments)?;
                 Self::Replies { thread }
+            }
+            "agent_memos" => {
+                let MemosArgs { all } = read(arguments)?;
+                Self::Memos { all }
+            }
+            "agent_memo_add" => {
+                let MemoAddArgs { text, scope } = read(arguments)?;
+                let scope = memo::scope(scope.as_deref().unwrap_or("global"))
+                    .map_err(|err| format!("{err:#}"))?;
+                Self::Memo(Change::Add { scope, text })
+            }
+            "agent_memo_retire" => {
+                let MemoRetireArgs { memo: id, reason } = read(arguments)?;
+                let memo = memo::memo_id(&id).map_err(|err| format!("{err:#}"))?;
+                Self::Memo(Change::Retire { memo, reason })
             }
             _ => return Err(format!("no tool {name}")),
         })
@@ -180,7 +280,23 @@ impl Inner {
                 let replies = inbox::replies(&self.state_dir, &self.operator, &thread)?;
                 serde_json::to_string(&replies)?
             }
+            Call::Memos { all } => serde_json::to_string(&memo::list(&self.state_dir, all)?)?,
+            Call::Memo(_) => anyhow::bail!("a memo change waits for the agent, off this thread"),
         })
+    }
+
+    /// File a memo change as the operator and wait for the agent's answer.
+    /// A refusal, or no answer, is the tool's error.
+    async fn memo(&self, change: Change) -> Result<String> {
+        let args = memo::Args {
+            state_dir: self.state_dir.clone(),
+            operator: self.operator.clone(),
+            change,
+            wait: MEMO_WAIT,
+        };
+        let outcome = memo::run(&args).await?;
+        anyhow::ensure!(outcome.exit_code() == 0, "{}", outcome.render());
+        Ok(serde_json::to_string(&outcome)?)
     }
 }
 
@@ -189,7 +305,8 @@ impl Tools for OperatorTools {
         "Hand work to a governed solos-swarm agent and read its answers. agent_request files a \
          request in your name; the agent's policy and Router decide what happens to it, and its \
          replies arrive on the request's thread, which agent_replies reads. agent_status shows \
-         what the agent is doing."
+         what the agent is doing. agent_memos, agent_memo_add and agent_memo_retire read and \
+         change what it remembers between tickets."
     }
 
     async fn list(&self) -> Result<Vec<Tool>, RpcError> {
@@ -202,9 +319,12 @@ impl Tools for OperatorTools {
             Err(refused) => return Ok(Outcome::error(refused)),
         };
         let inner = self.inner.clone();
-        let answer = tokio::task::spawn_blocking(move || inner.run(call))
-            .await
-            .map_err(|err| RpcError::internal(format!("the call stopped: {err}")))?;
+        let answer = match call {
+            Call::Memo(change) => inner.memo(change).await,
+            call => tokio::task::spawn_blocking(move || inner.run(call))
+                .await
+                .map_err(|err| RpcError::internal(format!("the call stopped: {err}")))?,
+        };
         Ok(answer.map_or_else(|err| Outcome::error(format!("{err:#}")), Outcome::ok))
     }
 }

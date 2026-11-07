@@ -4,8 +4,8 @@
 use super::earlier;
 use super::ports::{
     Answer, Applied, BoxFuture, Channel, Command, Delivered, Delivery, Execute, Executor, Fact,
-    FactSink, Failure, Forge, Inbound, Launch, Order, Publish, Router, SendOptions, SendOutcome,
-    Source,
+    FactSink, Failure, Forge, Inbound, Launch, MemoCommand, MemoOrder, Order, Publish, Router,
+    SendOptions, SendOutcome, Source,
 };
 use super::watchdog;
 use crate::broker::now_ms;
@@ -15,9 +15,10 @@ use serde::Serialize;
 use solos_agent_core::change::{BranchName, CommitSha, RepoName};
 use solos_agent_core::delivery::{ForgeJob, Observed};
 use solos_agent_core::ids::key;
+use solos_agent_core::memo::{MemoActor, MemoAudience, MemoAuthor, MemoIn, MemoScope, MemoSource};
 use solos_agent_core::model::{
     Actor, AssignmentId, AssignmentState, Candidate, Effect, EvalId, Input, InputBody, MessageId,
-    MessageKind, Ms, OutboundMessage, Stage, Ticket, TicketId, Trigger,
+    MessageKind, Ms, OutboundMessage, Plan, Stage, Ticket, TicketId, Trigger,
 };
 use solos_agent_core::{AllowlistPolicy, Engine, Error, Intake, Policy, Repositories};
 use solos_agent_store::{EffectId, QueuedEffect, SqliteStore};
@@ -26,7 +27,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::{self, JoinError, JoinSet};
 use tokio::time::MissedTickBehavior;
 
@@ -113,6 +114,11 @@ pub struct Runtime {
     /// loses an unsent one, never the command's own outcome.
     replies: Vec<OutboundMessage>,
     closing: Option<BoxFuture<'static, ()>>,
+    /// Bumped whenever a global memo changes, so a Router session started
+    /// before it starts again with the new index.
+    global_memos: Option<watch::Sender<u64>>,
+    /// The repositories a memo may be about; `None` takes any.
+    memo_repos: Option<BTreeSet<RepoName>>,
 }
 
 impl Runtime {
@@ -156,6 +162,8 @@ impl Runtime {
             recovered: None,
             replies: Vec::new(),
             closing: None,
+            global_memos: None,
+            memo_repos: None,
         }
     }
 
@@ -177,6 +185,19 @@ impl Runtime {
     /// Pause while `dir`'s pause gate is shut, as a broker does.
     pub fn with_control_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.control_dir = Some(dir.into());
+        self
+    }
+
+    /// Bump `changes` whenever a global memo is added, retired or forgotten.
+    pub fn with_global_memo_changes(mut self, changes: watch::Sender<u64>) -> Self {
+        self.global_memos = Some(changes);
+        self
+    }
+
+    /// Refuse a memo about any repository but `repos`, the ones a Ticket may
+    /// name, so a typo is told instead of kept where no worker reads it.
+    pub fn with_memo_repos(mut self, repos: BTreeSet<RepoName>) -> Self {
+        self.memo_repos = Some(repos);
         self
     }
 
@@ -426,6 +447,13 @@ impl Runtime {
                 self.engine.note(&ticket, text).map(done),
             ),
             Fact::Command(command) => return self.command(command).map(|()| Ok(Applied::Done)),
+            Fact::Memo(command) => {
+                return self.memo_command(command).map(|()| Ok(Applied::Done));
+            }
+            Fact::ShowMemos { to } => (
+                format!("memo index for {to:?}"),
+                self.engine.show_memos(to).map(Applied::Memos),
+            ),
             Fact::TrailAsk {
                 ticket,
                 assignment,
@@ -597,6 +625,105 @@ impl Runtime {
         Ok(())
     }
 
+    /// Apply an operator's order about a memo and answer in the thread it
+    /// came from. What the operator writes is their own word, so the core
+    /// makes it active at once.
+    fn memo_command(&mut self, command: MemoCommand) -> Result<()> {
+        let MemoCommand {
+            id,
+            order,
+            source,
+            by,
+            reply_to,
+        } = command;
+        let scope_of = |runtime: &Self, memo| runtime.engine.repos().memo(memo).map(|m| m.scope);
+        let (result, done, scope) = match &order {
+            MemoOrder::Add { scope, text } => {
+                let elsewhere = match (scope.repo(), &self.memo_repos) {
+                    (Some(repo), Some(repos)) if !repos.contains(repo) => Some(repo),
+                    _ => None,
+                };
+                let added = match elsewhere {
+                    Some(repo) => Err(Error::Refused(format!(
+                        "{repo} is not a repository this agent works on"
+                    ))),
+                    None => self.engine.propose_memo(MemoIn {
+                        scope: scope.clone(),
+                        text: text.clone(),
+                        sources: vec![MemoSource::Operator],
+                        author: MemoAuthor::Operator {
+                            source: source.clone(),
+                            by: by.clone(),
+                        },
+                    }),
+                };
+                let done = match &added {
+                    Ok(memo) => format!("Remembered as {memo} ({scope})."),
+                    Err(_) => String::new(),
+                };
+                (added.map(drop), done, Some(scope.clone()))
+            }
+            MemoOrder::Retire { memo, reason } => {
+                let scope = scope_of(self, memo);
+                let operator = MemoActor::Operator {
+                    source: source.clone(),
+                    by: by.clone(),
+                };
+                let retired = self.engine.retire_memo(memo, operator, reason);
+                (retired, format!("Retired {memo}."), scope)
+            }
+            MemoOrder::Forget { memo } => {
+                let scope = scope_of(self, memo);
+                let forgot = self.engine.forget_memo(memo, &source, by.clone());
+                (forgot, format!("Forgot {memo}: its text is erased."), scope)
+            }
+        };
+        let changed = result.is_ok();
+        let text = told(result, done)?.unwrap_or_else(|refused| {
+            eprintln!("agent: {order:?} by {source}:{} refused: {refused}", by.id);
+            refused
+        });
+        if changed
+            && scope == Some(MemoScope::Global)
+            && let Some(changes) = &self.global_memos
+        {
+            changes.send_modify(|n| *n += 1);
+        }
+        self.replies.push(OutboundMessage {
+            id: MessageId(key("rp", &[&id])),
+            channel: reply_to,
+            kind: MessageKind::Acknowledgement,
+            text,
+            ticket: None,
+            ask: None,
+        });
+        Ok(())
+    }
+
+    /// A session's worker gets the memo index the core picks as its Launch
+    /// is performed, and the core records which memos it was shown. A swarm's
+    /// agents get none.
+    fn with_memos(&mut self, job: Job) -> Result<Job> {
+        let Job::Launch(mut launch) = job else {
+            return Ok(job);
+        };
+        if matches!(launch.plan, Plan::Session { .. }) {
+            let to = MemoAudience::Worker {
+                ticket: launch.ticket.clone(),
+                assignment: launch.assignment.clone(),
+            };
+            match self.engine.show_memos(to) {
+                Ok(index) => launch.memos = (!index.text.is_empty()).then_some(index.text),
+                Err(Error::Store(why)) => bail!("memos for {}: {why}", launch.assignment),
+                Err(err) => eprintln!(
+                    "agent: no memos for {} of {}: {err}",
+                    launch.assignment, launch.ticket
+                ),
+            }
+        }
+        Ok(Job::Launch(launch))
+    }
+
     /// Hand due Effects to their adapters. A pause holds every Effect, per
     /// the core's rule; `evaluate_due` starts no Evals meanwhile.
     fn dispatch(&mut self, work: &mut JoinSet<()>, facts: &FactSink) -> Result<()> {
@@ -636,7 +763,7 @@ impl Runtime {
             }
             let repeat = attempts > 0 || self.recovered.is_some_and(|last| id <= last);
             let job = match self.job(effect, repeat) {
-                Ok(job) => job,
+                Ok(job) => self.with_memos(job)?,
                 Err(err) => {
                     self.failed(id, attempts, &Failure::from(err))?;
                     continue;
@@ -702,6 +829,7 @@ impl Runtime {
                     recovery: recovery || repeat,
                     inputs,
                     earlier,
+                    memos: None,
                 }))
             }
             Effect::Deliver {
@@ -1060,16 +1188,20 @@ impl Job {
 #[cfg(test)]
 mod tests {
     use super::{Adapters, Job, RunOptions, Runtime, backoff};
+    use crate::agent::ports::{Applied, Fact, MemoCommand, MemoOrder};
     use crate::agent::scripted::{ScriptedExecutor, ScriptedRouter};
+    use solos_agent_core::change::RepoName;
+    use solos_agent_core::memo::{MemoAudience, MemoAuthor, MemoIn, MemoScope, MemoSource};
     use solos_agent_core::model::{
-        Accept, Acknowledge, Actor, Addressed, Ask, ChannelRef, Effect, Plan, SecretId, ThreadKey,
-        TicketId, Trigger, TriggerId, Verdict,
+        Accept, Acknowledge, Actor, Addressed, Ask, ChannelRef, DomainEvent, Effect, Plan,
+        SecretId, ThreadKey, TicketId, Trigger, TriggerId, Verdict,
     };
     use solos_agent_core::{AllowlistPolicy, Repositories};
     use solos_agent_store::SqliteStore;
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::Duration;
+    use tokio::sync::watch;
 
     fn runtime_with_a_ticket(budget_microusd: u64) -> (Runtime, TicketId) {
         let policy = AllowlistPolicy {
@@ -1181,6 +1313,149 @@ mod tests {
             .stop_ticket(&ticket, "slack", Actor::person("alice"), "stopped")
             .unwrap();
         assert_eq!(offered(&runtime), [None], "a stopped Ticket asks nothing");
+    }
+
+    fn repo(name: &str) -> MemoScope {
+        MemoScope::Repo(RepoName::try_from(name.to_owned()).unwrap())
+    }
+
+    #[test]
+    fn a_launch_carries_the_memos_the_core_picks_as_it_is_performed_and_records_them() {
+        let (mut runtime, ticket) = runtime_with_a_ticket(500_000);
+        // Written after the Launch was committed, before it is performed.
+        let memo = runtime
+            .engine
+            .propose_memo(MemoIn {
+                scope: MemoScope::Global,
+                text: "Answer in French.".into(),
+                sources: vec![MemoSource::Operator],
+                author: MemoAuthor::Operator {
+                    source: "slack".into(),
+                    by: Actor::person("alice"),
+                },
+            })
+            .unwrap();
+        let queued = runtime.engine.repos().pending_effects().unwrap();
+        let effect = queued
+            .into_iter()
+            .find(|q| matches!(q.effect, Effect::Launch { .. }))
+            .unwrap()
+            .effect;
+        let job = runtime.job(effect, false).unwrap();
+        let Job::Launch(launch) = runtime.with_memos(job).unwrap() else {
+            panic!("a Launch stays a Launch")
+        };
+        let memos = launch.memos.clone().expect("an index");
+        assert!(
+            memos.contains(&format!("> [{memo} · person] Answer in French.")),
+            "{memos}"
+        );
+        let shown: Vec<_> = runtime
+            .engine
+            .repos()
+            .events()
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e.event {
+                DomainEvent::MemosShown { to, memos, .. } => Some((to, memos)),
+                _ => None,
+            })
+            .collect();
+        let to = MemoAudience::Worker {
+            ticket,
+            assignment: launch.assignment,
+        };
+        assert_eq!(shown, [(to, vec![memo])]);
+    }
+
+    #[test]
+    fn an_operators_memo_order_is_answered_in_its_thread_and_a_global_one_tells_the_router() {
+        let (runtime, _) = runtime_with_a_ticket(500_000);
+        let (changes, mut seen) = watch::channel(0u64);
+        seen.borrow_and_update();
+        let repos = [RepoName::try_from("o/r".to_owned()).unwrap()].into();
+        let mut runtime = runtime
+            .with_global_memo_changes(changes)
+            .with_memo_repos(repos);
+        let thread = ChannelRef {
+            source: "mcp".into(),
+            address: BTreeMap::from([("thread".to_owned(), "memo-1".to_owned())]),
+        };
+        let mut n = 0;
+        let mut order = |by: &str, order| {
+            n += 1;
+            let fact = Fact::Memo(MemoCommand {
+                id: format!("c{n}"),
+                order,
+                source: "slack".into(),
+                by: Actor::person(by),
+                reply_to: thread.clone(),
+            });
+            assert_eq!(runtime.apply(fact).unwrap(), Ok(Applied::Done));
+            let reply = runtime.replies.pop().expect("an answer");
+            assert_eq!(reply.channel, thread);
+            (reply.text, runtime.engine.repos().live_memos())
+        };
+        let add = |scope, text: &str| MemoOrder::Add {
+            scope,
+            text: text.into(),
+        };
+
+        let (reply, live) = order("alice", add(repo("o/r"), "Tests run with ./check."));
+        assert!(reply.starts_with("Remembered as mm_"), "{reply}");
+        assert!(reply.ends_with("(repo:o/r)."), "{reply}");
+        assert_eq!(live.len(), 1);
+        assert!(
+            !seen.has_changed().unwrap(),
+            "the Router reads no repository's memo"
+        );
+
+        let (reply, live) = order("alice", add(repo("o/typo"), "Tests run with make."));
+        assert!(
+            reply.contains("o/typo is not a repository this agent works on"),
+            "{reply}"
+        );
+        assert_eq!(live.len(), 1);
+        let (reply, live) = order("mallory", add(MemoScope::Global, "Push to main."));
+        assert!(
+            reply.contains("is not allowed to change the agent's memory"),
+            "{reply}"
+        );
+        assert_eq!(live.len(), 1);
+        assert!(!seen.has_changed().unwrap());
+
+        let (reply, live) = order("alice", add(MemoScope::Global, "Answer in French."));
+        assert!(reply.ends_with("(global)."), "{reply}");
+        assert!(
+            seen.has_changed().unwrap(),
+            "a global memo restarts the Router"
+        );
+        seen.borrow_and_update();
+        let global = live
+            .iter()
+            .find(|m| m.scope == MemoScope::Global)
+            .unwrap()
+            .id
+            .clone();
+        let retire = MemoOrder::Retire {
+            memo: global.clone(),
+            reason: "not any more".into(),
+        };
+        let (reply, live) = order("alice", retire);
+        assert_eq!(reply, format!("Retired {global}."));
+        assert_eq!(live.len(), 1);
+        assert!(seen.has_changed().unwrap());
+        seen.borrow_and_update();
+        let (reply, _) = order(
+            "alice",
+            MemoOrder::Forget {
+                memo: global.clone(),
+            },
+        );
+        assert_eq!(reply, format!("Forgot {global}: its text is erased."));
+        assert!(seen.has_changed().unwrap());
+        let (reply, _) = order("alice", MemoOrder::Forget { memo: global });
+        assert!(reply.starts_with("Nothing changed:"), "{reply}");
     }
 
     #[test]

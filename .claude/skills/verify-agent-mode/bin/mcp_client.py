@@ -3,6 +3,9 @@
 python3 - <run> request <text> [<thread>]
 python3 - <run> replies <thread> [<kind> <timeout_s>]   # with kind, waits until a reply of that kind arrives
 python3 - <run> status
+python3 - <run> memos [all]
+python3 - <run> memo-add <text> [<scope>]
+python3 - <run> memo-retire <memo> <reason>
 """
 import json
 import os
@@ -67,6 +70,15 @@ elif op == "replies":
         time.sleep(5)
 elif op == "status":
     print(json.dumps(call("agent_status", {}), indent=1))
+elif op == "memos":
+    print(json.dumps(call("agent_memos", {"all": rest[:1] == ["all"]}), indent=1))
+elif op == "memo-add":
+    arguments = {"text": rest[0]}
+    if len(rest) > 1:
+        arguments["scope"] = rest[1]
+    print(json.dumps(call("agent_memo_add", arguments), indent=1))
+elif op == "memo-retire":
+    print(json.dumps(call("agent_memo_retire", {"memo": rest[0], "reason": rest[1]}), indent=1))
 else:
     sys.exit(f"unknown op {op}")
 server.stdin.close()

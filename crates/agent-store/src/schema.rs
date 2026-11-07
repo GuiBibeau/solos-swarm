@@ -1,7 +1,7 @@
 use crate::StoreError;
 use rusqlite::{Connection, TransactionBehavior};
 
-pub(crate) const LATEST: u32 = 7;
+pub(crate) const LATEST: u32 = 8;
 
 /// Aggregates are JSON in `body`; the other columns index the port's queries.
 const V1: &str = "
@@ -129,8 +129,22 @@ const V6: &str = "";
 /// rewrites a Ticket, or failing on an Effect or an event it cannot read.
 const V7: &str = "";
 
+/// Memos, one row each, so writers never overwrite each other's. The text is
+/// in `body`; the events hold only its digest. A file that holds memos, or
+/// memo events, is one an older build refuses to open, instead of failing on
+/// an event it cannot read.
+const V8: &str = "
+CREATE TABLE IF NOT EXISTS memos (
+    id TEXT PRIMARY KEY NOT NULL,
+    scope TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('proposed', 'active', 'retired', 'forgotten')),
+    body TEXT NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS memos_live ON memos (scope, id) WHERE state IN ('proposed', 'active');
+";
+
 /// Migration `n` is `MIGRATIONS[n - 1]`.
-const MIGRATIONS: [&str; LATEST as usize] = [V1, V2, V3, V4, V5, V6, V7];
+const MIGRATIONS: [&str; LATEST as usize] = [V1, V2, V3, V4, V5, V6, V7, V8];
 
 /// Applies the migrations the file lacks. The write lock makes a second
 /// process that opens the file at the same time wait, then find nothing to do.
@@ -167,7 +181,7 @@ pub(crate) fn version(conn: &Connection) -> Result<u32, StoreError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LATEST, V1, V2, V3, V4, V5, V6, V7, migrate, version};
+    use super::{LATEST, V1, V2, V3, V4, V5, V6, V7, V8, migrate, version};
     use rusqlite::Connection;
 
     #[test]
@@ -188,6 +202,7 @@ mod tests {
         conn.execute_batch(V5).unwrap();
         conn.execute_batch(V6).unwrap();
         conn.execute_batch(V7).unwrap();
+        conn.execute_batch(V8).unwrap();
     }
 
     #[test]
@@ -304,6 +319,51 @@ mod tests {
         let table = |sql: &str| -> String { conn.query_row(sql, [], |row| row.get(0)).unwrap() };
         assert_eq!(table("SELECT body FROM tickets WHERE id = 'tk1'"), "{}");
         assert_eq!(table("SELECT ticket FROM trails"), "tk1");
+    }
+
+    #[test]
+    fn a_v7_file_gains_memos_and_keeps_its_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY NOT NULL) STRICT;",
+        )
+        .unwrap();
+        for (version, sql) in (1..).zip([V1, V2, V3, V4, V5, V6, V7]) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_version (version) VALUES (?1)",
+                [version],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO tickets (id, open, body) VALUES ('tk1', 1, '{}')",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.prepare("SELECT 1 FROM memos").is_err(),
+            "a V7 file has no memos table"
+        );
+
+        migrate(&mut conn).unwrap();
+
+        assert_eq!(version(&conn).unwrap(), LATEST);
+        let kept: String = conn
+            .query_row("SELECT body FROM tickets WHERE id = 'tk1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(kept, "{}");
+        let memos: u32 = conn
+            .query_row("SELECT COUNT(*) FROM memos", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(memos, 0);
+        let odd = conn.execute(
+            "INSERT INTO memos (id, scope, state, body) VALUES ('mm1', 'global', 'kept', '{}')",
+            [],
+        );
+        assert!(odd.is_err(), "a state outside the four is refused");
     }
 
     #[test]
