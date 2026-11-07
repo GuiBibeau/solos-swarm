@@ -9,7 +9,8 @@ use solos_agent_core::change::{BranchName, CommitSha, Harvest, RepoName};
 use solos_agent_core::delivery::Observed;
 use solos_agent_core::model::{
     Actor, Ask, AssignmentId, Candidate, ChannelRef, Decision, EvalId, Input, MicroUsd,
-    OutboundMessage, Plan, ReportIn, SecretGrant, SecretId, TicketId, Trigger, TriggerId, Verdict,
+    OutboundMessage, Plan, Report, ReportIn, SecretGrant, SecretId, TicketId, Trigger, TriggerId,
+    Verdict,
 };
 use solos_agent_core::trail::{TrailAction, TrailOutcome};
 use solos_agent_store::EffectId;
@@ -103,6 +104,10 @@ pub struct Launch {
     /// Every Input the Ticket holds so far, in order. Those not yet handed
     /// to an Assignment also come in a Delivery once this one starts.
     pub inputs: Vec<Delivered>,
+    /// What the Ticket's earlier workers said, oldest first: its `ready`,
+    /// `blocked` and `failed` Reports and its latest `progress` one (see
+    /// `earlier`). Empty for a Ticket's first Assignment.
+    pub earlier: Vec<Report>,
 }
 
 /// Inputs for a running Assignment, in order.
