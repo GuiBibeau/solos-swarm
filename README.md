@@ -10,156 +10,178 @@
 [![pi](https://img.shields.io/badge/pi--coding--agent-1.1.0-27272A?labelColor=121215)](package.json)
 [![license](https://img.shields.io/badge/license-Apache--2.0-27272A?labelColor=121215)](LICENSE)
 
-A Rust control plane, scheduler, and capability broker for governed agent swarms across Linux clusters.
+solos-swarm runs AI coding agents on Linux under a governed kernel. A broker makes every model call for the agents,
+so no agent holds a key. It holds each call's cost against a budget in integer microUSD, settles it from the
+provider's reported usage, and refuses calls while the operator pauses. Agents run in bubblewrap sandboxes, and every
+event goes to a hash-chained log. One Rust workspace builds one binary, `solos-swarm`, with two modes on that kernel.
 
-## What is in `main`
+## Two modes
 
-- **`solos-swarm run`**: a single-host run of N sandboxed Pi agents against one Goal, with a model broker that enforces
-  a microUSD budget (conservative holds, cache-aware settlement), per-task envelopes, and a hash-chained event log.
-- **`scripts/remote.py`**: the controller for running on a Linux host over SSH: deploy immutable candidates, start,
-  status, collect and cancel runs, plus candidate channels (`candidates`), drain, pause, resume and doctor.
-- **Pause mode**: model calls can be held in peak-price windows or by an operator; deadlines count unpaused time.
-  [docs/pause-mode.md](docs/pause-mode.md)
-- **Self-update**: `stable`/`canary` candidate channels with a promotion gate, rollback, prune, drain, doctor and
-  smoke. `run --resume` (re-spawning agents of a drained run) is not implemented.
-  [docs/self-update-operations.md](docs/self-update-operations.md)
-- **Dashboard** and a Mac SSH-tunnel script. [docs/dashboard.md](docs/dashboard.md)
-- **Replay-scored policy loop** for the tournament self-review. [replay/README.md](replay/README.md)
-- **Tournament runbook** from the first live run. [docs/running-a-tournament.md](docs/running-a-tournament.md)
-- The original `mvp` cluster path (Raft over QUIC, witness, evaluator), documented in `docs/ARCHITECTURE.md`.
-- **Agent mode (in progress)**: a long-lived agent for Slack, Discord, GitHub and schedules that runs each request on one
-  worker or on a governed swarm, sharing this broker, ledger, harness and sandbox. The pure domain is
-  `crates/agent-core`. Plan: [docs/agent-mode/README.md](docs/agent-mode/README.md).
-- **Vault and verifiable browser**: a secrets vault and a browser whose steps are signed, for agent mode. Workers use
-  vault API keys through `fetch_url`, and browse and sign in with vault logins, without seeing them. Every browser
-  step is on the chain, signed by the host that ran it, and `solos-swarm agent trail` checks it with public keys
-  only. Design: [docs/agent-mode/vault-browser/rationale.md](docs/agent-mode/vault-browser/rationale.md).
+**Swarm mode** (`solos-swarm run`) is a batch run: one Goal, 1 to 30 sandboxed Pi agents, a deadline and one
+artifact. Each agent claims a Task, posts progress to a shared Board and submits a Finding, and a coordinator
+combines the Findings into the artifact. The broker holds each call's worst-case cost against the Goal's budget and
+the Task's envelope, then settles the reported usage, with cache hits at the cache price. `scripts/remote.py` operates
+runs on a Linux host over SSH, with immutable candidates, `stable` and `canary` channels, pause, drain and `doctor`.
 
-See [CHANGELOG.md](CHANGELOG.md) for what changed and when.
+**Agent mode** (`solos-swarm agent serve`) is an always-on agent. It takes requests from Discord, Slack, GitHub,
+schedules and MCP hosts such as Claude Code and Codex. A Router model judges each request, and accepted work becomes
+a Ticket that runs on a sandboxed worker (Pi or Claude Code) or on a governed swarm. A worker's commands can run on
+a remote node of yours. The agent answers in the thread the request came from.
 
-## Architecture
+- On GitHub it acts as the bot of its own GitHub App (`solos-bot` in production). A worker commits in a clone, and
+  its `ready` report becomes a pull request that the host pushes and opens. No token reaches a worker.
+- Workers use vault logins and API keys without seeing their values, and browse with a headless browser that signs
+  every step. `solos-swarm agent trail` checks those steps with public keys only.
+- The agent keeps memos: facts and lessons the owner writes or workers propose, which a separate review call keeps
+  or rejects. A daily dream checks the memos against the day's transcripts.
+- `agent status`, `agent health`, `agent prune`, `agent stop` and a web dashboard of Tickets serve the operator.
 
-<p align="center">
-  <img src="docs/assets/architecture.svg" alt="solos-swarm architecture" width="100%" />
-</p>
+The two modes share the model gateway (`src/gateway/`: prices, providers, the upstream request and the pause gate),
+the harness port (`src/harness.rs`), the sandbox builder (`src/bwrap.rs`) and `run_code` (`src/code.rs`). A swarm is
+also one way agent mode runs a Ticket. Agent mode's domain is the pure crate `crates/agent-core`, and its SQLite
+store is `crates/agent-store`.
 
-## Primitives
+```mermaid
+flowchart LR
+  run["solos-swarm run"] --> swarm["Swarm core: Goal, Task, Board, Finding"]
+  sources["Discord, Slack, GitHub, schedules, MCP"] --> serve["solos-swarm agent serve"]
+  serve --> agent["agent-core Engine and agent-store"]
+  agent -->|"Plan::Swarm"| swarm
+  swarm & agent --> kernel["Shared: model gateway and pause, harness port, bwrap sandbox, run_code"]
+  kernel --> models["DeepSeek, Venice"]
+  kernel --> sessions["Pi and Claude Code sessions"]
+```
 
-| Primitive | Role |
-|---|---|
-| `Goal` | Top-level intent, microUSD budget cap, deadline, and signed operator approval. |
-| `Need` | Verifiable sub-requirement with an acceptance predicate and rubric binding. |
-| `Task` | Fenced work unit carrying a monotonic token, lease, and trace context. |
-| `Board` | Revision-ordered coordination log with bounded reads, cursors, and retractions. |
-| `Capability Lease` | Signed `DispatchPermit` bound to workload SVID, `Goal`, fence, and epoch. |
-| `Finding & Attempt` | Broker-signed worker outputs and scored candidates with provenance lineage. |
-| `Spend Ledger` | Pre-dispatch peak microUSD hold and once-only provider receipt settlement. |
-| `Witness & Evaluator` | Isolated oracle scorer and append-only Merkle `SignedTreeHead` witness. |
-| `Raft over mTLS QUIC` | OpenRaft state machine over Quinn TLS 1.3 with SPIFFE peer validation. |
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) maps the code, and
+[ADR 0001](docs/adr/0001-hexagonal-ports-and-two-modes.md) records why there are two modes on one kernel. The
+repository also holds the frozen `mvp` cluster (`solos-swarm mvp`: Raft over mTLS QUIC, a witness and an isolated
+evaluator), which neither mode runs.
 
-## Runtimes
+## Get started
 
-| Runtime | Isolation |
-|---|---|
-| `Pi Agent Sandbox` | Pinned Pi 1.1.0 inside `bwrap`, Landlock, `seccomp`, and Unix RPC socket. |
-| `WASI Worker` | Separate `wasmtime` process with deterministic fuel and memory caps. |
-| `Firecracker MicroVM` | KVM microVMs with scoped broker SVID over vsock (`gVisor` fallback). |
-| `Model Broker` | Keyless worker gate for DeepSeek and Venice APIs and local Qwen / `llama.cpp`. |
+### Build and test
 
-## Quickstart
+Runs need Linux with `bwrap` (bubblewrap). CI pins Rust 1.96.0 and Node 24.18.0.
 
 ```sh
-# Build and verify contracts
 python3 scripts/bootstrap_tokenizers.py --output work/tokenizers
 cargo build --locked --release
-cargo test --locked -- --test-threads=1   # CI runs the same tests through cargo-nextest (.config/nextest.toml), in parallel
-python3 -m unittest discover -s tests -p 'test_*.py'
+cargo test --locked -- --test-threads=1
 npm ci --ignore-scripts --no-audit --no-fund && npm run test:broker
+python3 -m venv work/dashboard-python && work/dashboard-python/bin/pip install -r scripts/requirements-dashboard.txt
+work/dashboard-python/bin/python -m unittest discover -s tests -p 'test_*.py'
+node --test tests/dashboard-*.test.mjs
+./target/release/solos-swarm smoke --dir work/smoke   # broker, ledger, pause, drain and resume; no key, network or sandbox
 ```
 
+CI (`.github/workflows/ci.yml`) runs the same Rust tests through `cargo-nextest` (`.config/nextest.toml`), in
+parallel, and the agent dashboard's tests in `web/agent-dashboard`. [docs/rust-style.md](docs/rust-style.md) lists
+the lints and gates.
+
+### Run a swarm
+
+`scripts/prepare_case.py` freezes a synthetic reconciliation Goal for 10 agents and a separate evaluator payload.
+`scripts/check_run.py` then checks the run against that payload. The credential file holds a DeepSeek key.
+
 ```sh
-# Run on a Linux host from the controller (needs SSH access, bubblewrap and a provider key in the Pi auth file)
-python3 scripts/remote.py doctor                                    # host and controller health, no spend
-python3 scripts/remote.py deploy                                    # build an immutable candidate; prints its id
-python3 scripts/remote.py candidates promote --candidate ID         # gate (integrity, doctor, smoke, idle probe) then switch
+python3 scripts/prepare_case.py --seed 20260412 --goal /tmp/run-01/case/goal.json --expected /tmp/eval-01/expected.json
+./target/release/solos-swarm run --config /tmp/run-01/case/goal.json --run-dir /tmp/run-01/evidence \
+	--pi-root . --node "$(command -v node)" --credential-file /run/credentials/deepseek.key
+python3 scripts/check_run.py --run-dir /tmp/run-01/evidence --expected /tmp/eval-01/expected.json
+```
+
+To run on a remote Linux host from your machine (SSH access, bubblewrap on the host, and a provider key in the Pi
+auth file):
+
+```sh
+python3 scripts/remote.py doctor                                 # host and controller health, no spend
+python3 scripts/remote.py deploy                                 # build an immutable candidate; prints its id
+python3 scripts/remote.py candidates promote --candidate ID      # gate (integrity, doctor, smoke, idle probe), then switch
 python3 scripts/remote.py start --candidate current --run-id RUN --seed 1 --goal-file goal.json --expected-file expected.json --refuse-peak
 python3 scripts/remote.py status --run-id RUN
-python3 scripts/remote.py collect --run-id RUN --output evidence/RUN    # leaves the code/ scratch dir on the host
+python3 scripts/remote.py collect --run-id RUN --output evidence/RUN   # leaves the code/ scratch directory on the host
+```
+
+Next: [docs/RUNBOOK.md](docs/RUNBOOK.md#6-standalone-and-remote-10-worker-runs) for runs,
+[docs/self-update-operations.md](docs/self-update-operations.md) for channels and drains, and
+[docs/pause-mode.md](docs/pause-mode.md) for peak-hour refusal.
+
+### Run the agent
+
+This `agent.yaml` runs the whole agent with no model and no sandbox. The scripted Router accepts each request as one
+worker session, and the scripted executor reports every Assignment `ready` at once.
+
+```yaml
+policy:
+  people: [mcp:alice]
+sources:
+  - kind: mcp
+channels:
+  - kind: mcp
+router: {kind: scripted}
+executor: {kind: scripted}
+budgets: {session_microusd: 500000}
 ```
 
 ```sh
-# Launch witness, evaluator, runtime, and QA
-solos-swarm mvp witness-serve --config /path/to/witness.json
-solos-swarm mvp evaluator-serve --bundle /path/to/bundle.json --certificate /path/to/eval.der   --private-key /path/to/eval.key --ca /path/to/ca.pem --state /path/to/state.json   --ipc-socket /path/to/evaluator.sock --broker-uid 1001
-solos-swarm mvp serve --config /path/to/runtime.json
-solos-swarm mvp qa --config /path/to/qa.json --profile integration --output /path/to/evidence
+./target/release/solos-swarm agent serve --config agent.yaml --state-dir state     # serves until Ctrl-C
+# in another terminal, once serve has created state/mcp/:
+claude mcp add solos-agent -- "$PWD/target/release/solos-swarm" mcp --state-dir "$PWD/state" --operator alice
 ```
+
+Claude Code then lists `agent_request`, `agent_replies`, `agent_status` and the memo tools. For a real agent, give `router` and
+`executor` the `kind: pi` sections, add a Discord or GitHub Source, and start `agent serve` with `--pi-root`,
+`--node` and `--credential-file`.
+
+Next: [docs/agent-mode/production.md](docs/agent-mode/production.md) for the production config, the systemd units
+and `scripts/agent-deploy`. [docs/agent-mode/README.md](docs/agent-mode/README.md) has the setup of
+[Discord](docs/agent-mode/README.md#discord-app-setup), [the GitHub App](docs/agent-mode/README.md#github-app),
+[MCP hosts](docs/agent-mode/README.md#mcp-hosts), [repositories](docs/agent-mode/README.md#repositories) and
+[memory](docs/agent-mode/README.md#memory).
+
+## Dashboards
+
+The swarm dashboard follows one run's agents, model, budget and receipts from its `state.json`. It is read-only,
+listens on `127.0.0.1` and starts no agents. Orbit, lattice and helix lay out the same recorded workers. `?demo=1`
+loads the bundled example presets, and **Import** opens a saved snapshot.
 
 ```sh
-# Inspect state and verify evidence offline
-solos-swarm mvp inspect --snapshot /path/to/snapshot.json --kind board --id GOAL_ID
-solos-swarm mvp verify --snapshot /path/to/snapshot.json --head /path/to/head.json   --trusted-key /path/to/public-key.json --output /path/to/verification.json
-
-# Follow the latest local Lima swarm (read-only)
-python3 scripts/dashboard_server.py --lima swarm --latest
-
-# Or inspect a retained run from local files
-python3 scripts/dashboard_server.py --state /path/to/run/state.json --config /path/to/run/config.yaml
+python3 scripts/dashboard_server.py --state RUN/state.json --config RUN/config.yaml
 ```
 
-![Swarm dashboard — demo](dashboard/assets/dashboard.png)
+![Swarm dashboard demo](dashboard/assets/dashboard.png)
 
-The dashboard follows the selected run's agents, model, budget, and receipts. It polls every five seconds; `--latest` follows the newest state file. The server binds to `127.0.0.1` and never starts agents or makes model calls.
+[docs/dashboard.md](docs/dashboard.md) covers the local Lima VM and the SSH tunnel to a remote box.
 
-For non-JSON YAML configs, install `scripts/requirements-dashboard.txt` in the reader's Python environment (the Lima guest for `--lima`). For a local virtual environment: `python3 -m venv work/dashboard-python && work/dashboard-python/bin/pip install -r scripts/requirements-dashboard.txt`; then use `work/dashboard-python/bin/python` for the server and Python checks.
-
-`Live` requires both a fresh state file and a confirmed active service. Retained or unavailable sources show `Snapshot`, `Stale`, or `Unavailable`; missing measurements stay `—`. Orbit, lattice, and helix change the layout of the same recorded workers. Use `?demo=1` for the bundled example presets, or Import JSON for a saved snapshot.
-
-### Viewing the dashboard of a run on the remote box
-
-Full notes: [`docs/dashboard.md`](docs/dashboard.md).
-
-The server has no authentication, so it is never bound to a public interface: it listens on `127.0.0.1` on the box and you reach it through an SSH tunnel from your Mac. It has no token option; the Host-header check only admits `127.0.0.1:<its port>` and `localhost:<its port>`, which is why the tunnel uses the same port on both ends.
-
-```sh
-# one-time, on the box: install the template unit (scripts/systemd/solos-dashboard@.service), never enabled
-mkdir -p ~/.config/systemd/user && cp scripts/systemd/solos-dashboard@.service ~/.config/systemd/user/ && systemctl --user daemon-reload
-# on the Mac: start the unit for one run, open the tunnel, open the browser
-scripts/dashboard-tunnel.sh --start RUN_ID            # = ssh -N -L 4173:127.0.0.1:4173 remote-ai, then http://127.0.0.1:4173/?source=runtime
-scripts/dashboard-tunnel.sh --dry-run                 # print the commands only
-```
-
-The unit reads the run's `state.json` and `config.yaml` read-only and starts no agents. The box has no source checkout, so the unit runs `dashboard_server.py` from a deployed candidate (`~/.local/share/solos-swarm/<id>/scripts/`): put `DASHBOARD_CANDIDATE=<id>` in `~/.config/solos-swarm/dashboard.env` on the box before starting it.
-
-### Replay-scored policy loop
-
-`replay/` records run history, scores candidate exploration policies on it without model calls, and gates adoption behind a held-out check; see [`replay/README.md`](replay/README.md). Tests: `python3 -m unittest discover -s tests -p 'test_replay.py'`.
-
-Dashboard checks: `node --test tests/dashboard-spatial.test.mjs tests/dashboard-telemetry.test.mjs` and `python3 -m unittest discover -s tests -p 'test_dashboard_server.py'`.
+The agent's web dashboard is a Next.js app on Vercel, behind Sign in with Vercel. `solos-swarm agent publish` uploads
+a snapshot of each Ticket to a private Vercel Blob store that the app reads. Setup:
+[web/agent-dashboard/README.md](web/agent-dashboard/README.md) and
+[docs/agent-mode/production.md](docs/agent-mode/production.md#dashboard).
 
 ## Documentation
 
-| Document | Scope |
+| Document | What it holds |
 |---|---|
-| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Domain model, Raft over mTLS QUIC, sandbox tiers W, P, G and V, and spend ledger. |
-| [`docs/agent-mode/README.md`](docs/agent-mode/README.md) | Agent mode plan: ports, shared kernel, roadmap P0-P12. |
-| [`docs/adr/0001-hexagonal-ports-and-two-modes.md`](docs/adr/0001-hexagonal-ports-and-two-modes.md) | One hexagon, two modes (swarm and agent). |
-| [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | Identity provisioning, offline startup, cluster recovery, and operations. |
-| [`docs/CAMPAIGNS.md`](docs/CAMPAIGNS.md) | Matched 1-vs-10 worker evaluation design and schemas. |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | The workspace, the ports, the module map of both modes, and the frozen `mvp` cluster's design. |
+| [`docs/adr/0001-hexagonal-ports-and-two-modes.md`](docs/adr/0001-hexagonal-ports-and-two-modes.md) | Why one hexagon serves two modes. |
+| [`docs/agent-mode/README.md`](docs/agent-mode/README.md) | Agent mode: concepts, the status of each phase (P0 to P15), budgets, memory, and the setup of each Source, worker, node, vault and browser. |
+| [`docs/agent-mode/production.md`](docs/agent-mode/production.md) | Agent mode in production: `scripts/agent-deploy`, the config, the dashboard, health checks, pruning. |
+| `docs/agent-mode/{vault-browser,pstack,github-app,memory}/` | Design records for the vault and browser, pstack in workers, the GitHub App and memory. |
+| [`web/agent-dashboard/README.md`](web/agent-dashboard/README.md) | The agent's web dashboard: Vercel setup, environment, sign-in. |
+| [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | Build, stage, run and qualify: host UIDs, tokenizers, offline bundles, the `mvp` daemons, 10-worker runs. |
 | [`docs/pause-mode.md`](docs/pause-mode.md) | `control.json`, `PAUSE`, `SWARM_REFUSE_PEAK`, the 503 reply, unpaused deadlines. |
-| [`docs/self-update-operations.md`](docs/self-update-operations.md) | Channels, promote/rollback/prune, drain, doctor, smoke, outage pause. |
-| [`docs/self-update-and-graceful-restart.md`](docs/self-update-and-graceful-restart.md) | Design and failure modes behind the above. |
-| [`docs/dashboard.md`](docs/dashboard.md) | Dashboard server and the Mac tunnel script. |
-| [`docs/agent-mode/production.md`](docs/agent-mode/production.md#dashboard) | Agent mode in production, and its web dashboard: `agent publish`, the Vercel app, tokens and rotation. |
-| [`web/agent-dashboard/README.md`](web/agent-dashboard/README.md) | The agent's web dashboard (Next.js on Vercel, Sign in with Vercel): setup, environment, sign-in. |
+| [`docs/self-update-operations.md`](docs/self-update-operations.md) | Swarm channels, promote, rollback, prune, drain, doctor, smoke, outage pause. |
+| [`docs/self-update-and-graceful-restart.md`](docs/self-update-and-graceful-restart.md) | The design and failure modes behind self-update. |
 | [`docs/running-a-tournament.md`](docs/running-a-tournament.md) | Runbook from the first live tournament. |
-| [`replay/README.md`](replay/README.md) | Replay-scored policy loop. |
+| [`docs/dashboard.md`](docs/dashboard.md) | The swarm dashboard server and the Mac tunnel script. |
+| [`replay/README.md`](replay/README.md) | The replay-scored policy loop for the tournament self-review. |
+| [`docs/CAMPAIGNS.md`](docs/CAMPAIGNS.md) | Matched 1-vs-10 worker evaluation design and schemas. |
+| [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | Live 10-agent DeepSeek results, microbenchmarks and acceptance SLOs. |
 | [`docs/rust-style.md`](docs/rust-style.md) | Rust style, lints and the gates CI runs. |
-| [`CHANGELOG.md`](CHANGELOG.md) | Unreleased agent-mode work, and what PRs #6-#14 added. |
-| [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | Live 10-agent DeepSeek results, microbenchmarks, and acceptance SLOs. |
-| [`dashboard/index.html`](dashboard/index.html) | Spatial dashboard for runtime telemetry and saved snapshots. |
-| [`skills/verify-solos-swarm/SKILL.md`](skills/verify-solos-swarm/SKILL.md) | Release qualification workflow for immutable candidates. |
+| [`skills/verify-solos-swarm/SKILL.md`](skills/verify-solos-swarm/SKILL.md) | Release qualification for immutable candidates and 10-worker runs. |
+| [`.claude/skills/verify-agent-mode/SKILL.md`](.claude/skills/verify-agent-mode/SKILL.md) | Live verification of agent mode on the remote box, one recipe per feature. |
+| [`CHANGELOG.md`](CHANGELOG.md) | Every merged pull request since #6. |
 
 ## License
 
-Apache-2.0. Copyright 2026 Gui Bibeau.
+Apache-2.0. Copyright 2026 Gui Bibeau. [NOTICE](NOTICE) lists vendored third-party code.
