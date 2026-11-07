@@ -5,34 +5,34 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
 ## Unreleased
 
 ### Added
-- Agent mode, P0: workspace crate `crates/agent-core` (pure domain, ports and Engine for Triggers, Threads, Evals,
+- Agent mode, P0 (#18): workspace crate `crates/agent-core` (pure domain, ports and Engine for Triggers, Threads, Evals,
   Tickets and Assignments, with `Plan::Session` or `Plan::Swarm`), ADR 0001 and the plan in `docs/agent-mode/`.
   Root lints move to `[workspace.lints]`; `cargo test`/`clippy` cover both crates. Swarm mode is unchanged.
-- Agent mode, P1: the `AgentHarness` port in `src/harness.rs` (`SessionSpec`, `SessionEvent`, `Session`). `PiHarness`
+- Agent mode, P1 (#19): the `AgentHarness` port in `src/harness.rs` (`SessionSpec`, `SessionEvent`, `Session`). `PiHarness`
   is the Pi launch moved out of `main.rs` unchanged: same argv and env (pinned by a golden test), transcript and stderr
   files, caps, messages, Store events and shutdown accounting. `harness::scripted::ScriptedHarness` plays scripted
   tool calls against the real broker, and a new end-to-end test runs `work()` with three scripted agents and
   `smoke::Scripted`.
-- Agent mode, P2a: `swarm::run_goal(GoalRun, harness, provider) -> GoalOutcome` in `src/swarm.rs`, so agent mode can
+- Agent mode, P2a (#20): `swarm::run_goal(GoalRun, harness, provider) -> GoalOutcome` in `src/swarm.rs`, so agent mode can
   run a swarm as a library call. The run machinery moved out of `main.rs` unchanged (spawn loop, `work`, nudges,
   deadline, broker socket, shutdown); `solos-swarm run` is a thin wrapper with the same run-dir files, Store events,
   stdout line and exit code. The end-to-end test drives `run_goal` with `ScriptedHarness` and also checks the spawn
   loop, shutdown, `cleanup.json`, `runtime-report.json` and a deadline stop.
-- Agent mode, P3a: workspace crate `crates/agent-store` (`solos-agent-store`), the SQLite Store for agent-core
+- Agent mode, P3a (#21): workspace crate `crates/agent-store` (`solos-agent-store`), the SQLite Store for agent-core
   (`rusqlite` 0.41.1, bundled SQLite, WAL). It implements `Repositories` with one transaction per commit, and adds a
   durable Effect queue (due oldest first, done, failed with an attempt count and a retry time, Sends kept in commit
   order per Channel address and Launch, Deliver and Stop per Ticket, every call safe to repeat after a crash) and an event log hash-chained like
   `events.jsonl`, with `verify_chain()`. A seeded differential walk checks it against `MemoryRepositories`.
-- Agent mode, P3b: `solos-swarm agent serve --config agent.yaml --state-dir DIR [--until-idle]` (`src/agent/`): the
+- Agent mode, P3b (#22): `solos-swarm agent serve --config agent.yaml --state-dir DIR [--until-idle]` (`src/agent/`): the
   `Source`, `Channel`, `Router` and `Executor` ports, a single-writer runtime over the Engine and the SQLite Store
   (Effects retried with exponential backoff, all held while paused), and the jsonl and scripted adapters, so the
   agent runs with no model, Slack or sandbox.
-- Agent mode, P4: Slack (`src/agent/slack/`, `kind: slack` source and channel). A Socket Mode Source (outbound
+- Agent mode, P4 (#23): Slack (`src/agent/slack/`, `kind: slack` source and channel). A Socket Mode Source (outbound
   WebSocket, every envelope acknowledged, reconnect with backoff) and a Web API Channel that replies in the thread,
   never posts a message twice after a crash, and offers Approve and Stop buttons that the runtime applies as
   `approve` and `stop_ticket`; `tokio-tungstenite` 0.29.0 on the existing rustls.
-- Agent mode, P11: Discord (`src/agent/discord/`, `kind: discord` source and channel). A Gateway v10 Source (outbound WebSocket, heartbeats with zombie detection, resume after a drop, op 7 or a resumable invalid session, fresh identify when the session is gone, fatal close codes that name the fix such as Message Content Intent) and a REST Channel that replies to the message, never posts a message twice within Discord's nonce window, and offers Approve and Stop buttons that feed the same commands Slack's do. A thread is one id, a message or a Discord thread. No new dependencies.
-- Agent mode, P3c: a Pi Router. `router: {kind: pi, ...}` in `agent.yaml` and `agent serve --pi-root --node
+- Agent mode, P11 (#35): Discord (`src/agent/discord/`, `kind: discord` source and channel). A Gateway v10 Source (outbound WebSocket, heartbeats with zombie detection, resume after a drop, op 7 or a resumable invalid session, fresh identify when the session is gone, fatal close codes that name the fix such as Message Content Intent) and a REST Channel that replies to the message, never posts a message twice within Discord's nonce window, and offers Approve and Stop buttons that feed the same commands Slack's do. A thread is one id, a message or a Discord thread. No new dependencies.
+- Agent mode, P3c (#24): a Pi Router. `router: {kind: pi, ...}` in `agent.yaml` and `agent serve --pi-root --node
   --credential-file` run the Router as one long-lived, keyless, bwrap-sandboxed Pi session that judges batched
   Candidate cards through `router_decide` and `router_read` on a new agent broker (`src/agent/broker.rs`). The
   broker holds and settles every Router model call against `budgets.router_daily_microusd` in a `spend` table
@@ -41,72 +41,82 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   channel and a `slack:` approver can take the approval its Ticket then waits for; otherwise it is refused.
   `SWARM_TOOLSET=router` selects the Router's tools in `extensions/broker.ts`; unset keeps the swarm set. Pricing,
   the upstream request, the providers and the pause gate moved to `src/gateway/` and swarm mode calls them unchanged.
-- Agent mode, P8: GitHub and schedules (`kind: github` source and channel, `kind: schedule` source). The GitHub Source
+- Agent mode, P8 (#25): GitHub and schedules (`kind: github` source and channel, `kind: schedule` source). The GitHub Source
   polls the listed repositories' issues, pull requests, comments, review comments and failed workflow runs (CI as bot
   Triggers on the pull request's Thread) with ETags, rate-limit waits and an atomic cursor in the state directory; the
   Channel comments with a hidden marker, so a crash never posts twice. Schedules fire named slots (`every`, `daily_at`
   UTC) as System Triggers a restart cannot repeat, with an optional `reply_to`. No new dependencies.
-- Agent mode, P3d: Pi workers. `executor: {kind: pi, ...}` runs each session Ticket on a keyless, bwrap-sandboxed Pi
+- Agent mode, P3d (#26): Pi workers. `executor: {kind: pi, ...}` runs each session Ticket on a keyless, bwrap-sandboxed Pi
   worker in its own directory under the state dir (optional prepare command, `max_workers` at once), admitted by the
   agent broker as a Worker on the Ticket's account with `worker_report`, `worker_handback`, `run_code` and
   `fetch_url` (`SWARM_TOOLSET=worker`); a start relaunches the work the last run left running with `recovery` set
   (new `Engine::restart`). `run_code` takes configured mounts and a caller-owned scratch directory; swarm runs keep
   their exact sandbox command.
-- Agent mode, P6: the Watchdog (`src/agent/watchdog.rs`, `watchdog:` in agent.yaml). A pure assessment of the Store
+- Agent mode, P6 (#27): the Watchdog (`src/agent/watchdog.rs`, `watchdog:` in agent.yaml). A pure assessment of the Store
   (Tickets waiting for a person, stalled Assignments, failing Effects, `unavailable` Decisions, spend near a cap,
   long pauses) runs inside `agent serve` and tells the operator's conversation each new alert once, recorded in a
   `watchdog_alerts` table (agent store schema v3) so a restart repeats none; `retry_stalled` retries a stalled
   Assignment once per Ticket through the runtime. `solos-swarm agent status` reports what is running and why from a
   read-only Store, as text or `--json`.
-- Agent mode, P5: swarm Tickets. `executor.swarm` runs each `Plan::Swarm` Assignment as one governed swarm through
+- Agent mode, P5 (#28): swarm Tickets. `executor.swarm` runs each `Plan::Swarm` Assignment as one governed swarm through
   the new `swarm::run_goal_until` (a cancel input beside the signals `run_goal` keeps), with a Goal rendered from a
   YAML template under what the Ticket has left to spend and checked by `Goal::validate`, at most `max_runs` at once,
   its spend charged on the Ticket's account, a Stop that cancels it cleanly, and a restart that relaunches it in a
   new run directory; the Router learns when a swarm pays for itself. `solos-swarm run` is unchanged.
-- Agent mode, P3e: background jobs for workers (`src/agent/jobs.rs`). `job_start`, `job_wait` and `job_stop` run a
+- Agent mode, P3e (#29): background jobs for workers (`src/agent/jobs.rs`). `job_start`, `job_wait` and `job_stop` run a
   command in the Ticket's sandbox without blocking the turn, and a `run_code` still running after 5 s moves to the
   background; a job's end reaches the worker once, in its turn or as a Note that wakes it, and the job dies with its
   Assignment. Limits under `executor.run_code` (`background_after_secs`, `max_jobs`, `job_max_secs`,
   `job_output_bytes`); swarm `run_code` is unchanged.
-- Agent mode, P2b, which closes P2: one bwrap builder (`src/bwrap.rs`) for the Pi launch, `run_code`'s sandbox and
+- Agent mode, P2b (#30), which closes P2: one bwrap builder (`src/bwrap.rs`) for the Pi launch, `run_code`'s sandbox and
   `doctor`'s probe, with the same argument vectors (the golden tests pass unedited; the frozen mvp sandboxes keep
   their own lines). The research words in the swarm runtime are now optional Goal fields: `nudges`, one template
   per escalation stage, and `record_fields`, the Task fields a host-filed record reads. `Goal::validate` checks
   them, a Goal template can set them, and a Goal without them runs exactly as before.
-- Agent mode, P7a: `solos-swarm mcp`, a hand-written stdio MCP server. `--socket --token-file` offers one principal's
+- Agent mode, P7a (#31): `solos-swarm mcp`, a hand-written stdio MCP server. `--socket --token-file` offers one principal's
   broker tools (the broker's new `GET /tools`, from a Rust tool registry the Pi extension's schemas are tested
   against), with refusals as `isError` results and pauses waited out; `--state-dir --operator` offers `agent_status`,
   `agent_request` (a Trigger from `mcp:<operator>` through the new `kind: mcp` Source) and `agent_replies` (the
   `kind: mcp` Channel's outbox).
-- Agent mode, P7b: Claude Code workers. `executor.harness: claude-code` (or a Plan naming it) runs a session Ticket
+- Agent mode, P7b (#32): Claude Code workers. `executor.harness: claude-code` (or a Plan naming it) runs a session Ticket
   on the installed `claude`, headless in bwrap with no network and no key, its only tools the broker's through
   `solos-swarm mcp`, and its model the agent broker's new Anthropic Messages facade (`POST /v1/messages`, SSE too,
   translated in `src/gateway/anthropic.rs`), held and settled on the Ticket's account and refused while paused,
   through a loopback port that the hidden `solos-swarm bridge` pipes to the broker socket.
-- Agent mode, P9: remote nodes (`src/remote/`, `src/agent/environment.rs`). `solos-swarm node serve` dials the
+- Agent mode, P9 (#33): remote nodes (`src/remote/`, `src/agent/environment.rs`). `solos-swarm node serve` dials the
   agent over TLS where each side pins the other's certificate (`node init`, `agent init-nodes`), and runs the
   `run_code` and background jobs of the Tickets bound to it in its own bwrap sandbox, with its own mounts and
   secrets that never leave it; `Plan::Session` gains an optional `environment` (stored Plans read as before), an
   offline node holds its Tickets' launches until it connects, and swarm mode is unchanged.
-- Agent mode, P10: `solos-swarm agent bench` reproduces the super-agent article's ablation on a seeded stream of chat
+- Agent mode, P10 (#34): `solos-swarm agent bench` reproduces the super-agent article's ablation on a seeded stream of chat
   and CI Triggers with work requests (`agent workload` writes one), simulated work (`executor: {kind: simulated}`)
   and three designs (`super-agent`, `no-pass-through` through the new `pass_through: false` and
   `Engine::set_pass_through`, and `serial`), writing `report.json` and `report.md`; `--router pi` refuses to start
   without `--max-spend-usd` and caps each run's Router account.
-- Agent mode, vault and browser, PR 1 of the design in #36: capabilities live in the tool registry
+- Agent mode, vault and browser, PR 1 of the design in #36 (#38): capabilities live in the tool registry
   (`src/agent/broker/registry.rs`). `ToolSpec.needs` is a set of capabilities (`run_code`, `browser`, `vault`), a tool
   is offered and callable only when its seat has all of them, and `ROUTER_TOOLS`, `WORKER_TOOLS`, a worker's grants,
   `GET /tools` and the refusal in `/tool` all read the registry, which replaces `job_host`'s own check. The three
   sandbox builders bind `bwrap::SYSTEM_BINDS`. No change in behavior: every tool-list test and golden argv test
   passes unedited.
-- Agent mode, the trail (first step of the verifiable browser, PR #36's design): `agent-core` gains `trail`
+- Agent mode, the vault (#43, PR 2 of PR #36's design): `src/vault.rs` and `src/vault/` keep one sealed file of logins
+  and API keys per machine, in the AES-256-GCM envelope that moved from `src/artifacts.rs` to `src/sealed.rs` with
+  its bytes unchanged. A value leaves the vault only inside an allowed admission, as a login fill or a key header.
+  `solos-swarm vault init | add-login | add-key | list | remove` reads `vault: {path, key_file}` from agent.yaml or
+  node.yaml and prints no value. Nothing in agent mode used the vault yet.
+- Agent mode, the trail (#39, first step of the verifiable browser, PR #36's design): `agent-core` gains `trail`
   (`TrailAction`, `StepBody`, `SignedStep` and the `Digest`, `TrailKey` and `Signature` hex newtypes, with no crypto
   type) and `Engine::{trail_ask, trail_done}`, which write `TrailAsked` before a browser acts and `TrailDone` after,
   one pending step per Assignment, numbered by the core; a `Close` is admitted after its Assignment or Ticket ends. The
   store's schema is v4 (a `trails` table, one row per Assignment), so an older build refuses the file instead of
   failing on an event it cannot read, and `Fact::{TrailAsk, TrailDone}` reach the Engine through the runtime. Nothing
   writes a step yet.
-- Agent mode, approvals of vault items (PR #36's design): a Ticket holds a grant per item (`SecretId`, `local/github-gui`;
+- Agent mode, the browser module (#46, PR 6 of PR #36's design): `src/browse/` runs one Lightpanda per Assignment in a
+  bwrap sandbox, the only caller of the new `Bwrap::share_net`, and drives it over CDP on a Unix socket. Each answer
+  is scrubbed of vault values, digested and signed with this machine's Ed25519 trail key, and `verify_step` checks it.
+  A login fills only a password input in the main document of one of its sites, after an origin check.
+  `solos-swarm browser init-key` writes the trail key. No broker tool called it yet.
+- Agent mode, approvals of vault items (#47, PR #36's design): a Ticket holds a grant per item (`SecretId`, `local/github-gui`;
   `SecretGrant` Waiting, Granted or Denied), and `Engine::{ask_secret, answer_secret, use_key}` ask a person once per
   Ticket, take only a click from the person the item names (or a Policy approver when it names none), and record a keyed
   use before it leaves (`SecretAsked`, `SecretAnswered`, `KeyUsed`). The answer reaches the worker as
@@ -116,7 +126,7 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   Approve and Stop, and `Fact::{SecretAsk, KeyUsed}` reach the Engine through the runtime. The store's schema is v5 (no
   new table), so an older build refuses a file that can hold grants; stored Tickets and messages read back unchanged.
   Nothing asks yet.
-- Agent mode, keyed `fetch_url` and `vault_list` (PR #36's design): with `vault:` in agent.yaml, `agent serve` opens
+- Agent mode, keyed `fetch_url` and `vault_list` (#48, PR #36's design): with `vault:` in agent.yaml, `agent serve` opens
   the vault, and refuses to start when it or its key sits under the Tickets' directory, `--pi-root` or `--node`'s
   install. A worker's `fetch_url` takes `key`: the broker writes `KeyUsed` to the chain first, then sends the key as
   its header only on hops whose own URL is one of the key's hosts (`broker::fetch_with`), over a client that ignores
@@ -124,7 +134,7 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   asks once in the thread and answers 409 until the click comes back as an Input. `vault_list` (only with a vault)
   lists the keys and logins a Ticket may use, without values, and where the Ticket stands with each. Swarm mode's
   `fetch_url` is unchanged.
-- Agent mode, the browser tools (PR #36's design): with `browser:` in agent.yaml, `agent serve` pins this host's trail
+- Agent mode, the browser tools (#49, PR #36's design): with `browser:` in agent.yaml, `agent serve` pins this host's trail
   key, opens `Browsers` and a trail blob store under the state directory, and refuses to start when the key, the
   blobs or the browser sockets sit where a sandbox can read them. Workers get `browser_open`, `browser_act`,
   `browser_read` and, with a vault, `browser_login`. Each step is `TrailAsked` on the chain before the browser acts
@@ -135,7 +145,7 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   the agent stops, before the runtime does. A first use of a login or key is refused at once on a Ticket whose
   channels cannot show the Allow and Deny buttons. The worker's system prompt and the Router's environment note tell
   of the browser.
-- Agent mode, `solos-swarm agent trail` (PR #36's design, the last PR of its first build): it opens the Store
+- Agent mode, `solos-swarm agent trail` (#51, PR #36's design, the last PR of its first build): it opens the Store
   read-only, checks the event chain, then walks each Ticket's browser steps from the events, so a schema 3 or 4 file
   reads too. Each signed step must verify under the key trusted for its environment (the public half of
   `browser.audit_key`, or `--trust <environment>=ed25519:<hex>`, so a verifier elsewhere needs no secret), answer the
@@ -145,6 +155,14 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   `--step N --show view` prints the exact bytes the model got, and `--json` prints the report. It exits 1 on any
   problem. An Assignment's last step asked and never answered, and a lost answer, are warnings that `--strict`
   counts too. `browse::verify_signature` is the signature half of `verify_step`, which now calls it.
+- `verify-agent-mode` (#52): `.claude/skills/verify-agent-mode/`, a skill that ships the checkout to the remote box,
+  starts `agent serve` with a real DeepSeek Router and Pi workers, drives it through `solos-swarm mcp --operator`,
+  and keeps the evidence (chain, effects, spend, replies, `agent trail`). Its `features/` hold one recipe per feature.
+- Agent mode, pstack PR 1 (#54, design in #53): with `pstack:` in agent.yaml, every worker starts in poteto-mode.
+  `vendor/pstack/` holds pstack 0.15.36 verbatim, pinned by a `MANIFEST` that `scripts/pstack-sync` writes, and
+  `agent serve` refuses to start when one byte differs. The system prompt gains the solos-swarm adapter
+  (`docs/harness/solos-swarm.md`), and a new worker tool, `read`, reads files under `/pstack`, confined by the kernel
+  (`openat2` with `RESOLVE_BENEATH`). Off by default.
 - Agent mode, pstack PR 2 (#57): repository workspaces. `forge:` in agent.yaml lists repositories (`kind: github`
   with a token file read once, or `kind: local` bare repositories for dry runs). The Router names a repository when it
   accepts work on it; the host keeps a mirror per repository and clones each repository Ticket's `work/` from it
@@ -158,10 +176,149 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   to the host resource it needs and held per seat, and `extensions/broker.ts` reads its tool table from
   `extensions/agent-tools.json`, generated from the registry and recorded in the run manifest as
   `agent_tools_sha256` (#58).
-- `verify-agent-mode`: `overlays/pstack.yaml` and `overlays/forge.yaml` (a local forge seeded from the shipped
+- `verify-agent-mode` (#59): `overlays/pstack.yaml` and `overlays/forge.yaml` (a local forge seeded from the shipped
   checkout), `run_code` in the base config, and the `pstack-repo` feature, driven live.
-- `collect` leaves the per-run `code/` scratch directory on the host and writes `collect-manifest.json`; `--include-code` opts back in.
-- Docs: pause mode, self-update operations, dashboard tunnel, tournament runbook, replay status.
+- Agent mode in production (#60): `scripts/systemd/solos-agent.service` runs `agent serve` as a systemd user unit
+  whose `ExecStartPre` copies `~/agent/tokens/` into its tmpfs runtime directory before every start.
+  `scripts/agent-deploy`, run from the Mac, builds an immutable release on the box, backs up `agent.db`, switches
+  `current`, restarts and waits until healthy. On a failure it switches back and restores `agent.db`. It also has
+  `rollback`, `status`, `logs`, `token NAME`, `start`, `stop`, `restart` and `releases`. How-to:
+  `docs/agent-mode/production.md`.
+- Agent mode, the GitHub App, App PR 1 (#63, design in #62): one App key replaces both personal access tokens. A
+  top-level `github:` section (`app_id`, `key_file`, `poll_secs`, `reconcile_secs`, `writes`, `api_base`,
+  `git_base`), and the github Source reads its repositories from `forge.repos`. The old `token_file`, `identity` and
+  per-Source fields fail config load with a sentence that names the migration. `src/agent/github/app.rs` signs an
+  RS256 JWT and mints installation tokens per repository and per read or write (a `GET` is a read), never with
+  `workflows` or `administration`, cached until 15 minutes before expiry. A suspended or missing installation is a
+  5-minute wait, not a crash. `github/identities.rs` pins each listed `github:<login>` to its account id. The agent
+  comments and commits as `<slug>[bot]`, and `solos-swarm agent github check` prints each repository's installation,
+  permissions and pins. An accept from a source with no Approve button is capped at `auto_approve_microusd`. New
+  direct dependency: `rsa`, already in `Cargo.lock`.
+- Agent mode, every budget optional (#68): `budgets.session_microusd`, `budgets.router_daily_microusd` and the whole
+  `budgets:` section may be left out. An uncapped account still holds and settles every model call, so spend is
+  recorded, but nothing is refused for spend. A session Ticket with no budget needs no approval. A swarm still needs
+  one: the Router's, else the new `executor.swarm.default_budget_microusd`, else `session_microusd`. `agent status`
+  prints `no cap`, and the Watchdog's spend alert covers capped accounts only. Swarm-mode Goals are unchanged.
+- Agent mode, replies for each medium (#69): with `web.public_url`, the host adds a link to the Ticket's dashboard page
+  after a Result and an Attention (`src/agent/links.rs`). On Discord a table becomes an aligned monospace block or one
+  line per row, a heading becomes a bold line, and a long result is split into up to three messages, each with its
+  own nonce (`src/agent/markdown.rs`, `src/agent/discord/format.rs`). Slack gets mrkdwn (`src/agent/slack/mrkdwn.rs`).
+  GitHub and MCP get only the link.
+- Agent mode, the web dashboard (#70): `solos-swarm agent publish` is a sidecar that opens `agent.db` read-only and
+  uploads a JSON snapshot of each open and recently ended Ticket, and an index, to a private Vercel Blob store
+  (`web.publish` in agent.yaml), only when a snapshot's SHA-256 changed. `web/agent-dashboard/` is a Next.js app on
+  Vercel that reads those blobs behind Sign in with Vercel and an email allowlist.
+  `scripts/systemd/solos-agent-publish.service` runs the sidecar, and `scripts/agent-deploy` installs and stops it
+  with the agent. `agent-store` gains `events_after`, `effects_after` and `data_version`. CI gains a `web` job.
+- Swarm mode, a Goal's fetch policy (#73): the broker enforces an optional `fetch` section of the Goal (`hosts`,
+  `methods`, `per_agent_rps`, `follow_redirects_off_list`, `allow_private_networks`) on the URL and on every redirect
+  hop before it is requested (`src/broker_fetch.rs`). A refusal is a tool result and a `fetch_refused` event, and
+  `scripts/check_run.py` gains a `fetch-scope` check. Every swarm `fetch_url`, with or without a policy, now refuses
+  loopback, private, link-local, CGNAT and other non-public addresses unless the policy allows them, and pins the
+  connection to the addresses it checked. `authorized-audit:zelix` joins the audit scopes, and its Goals need a
+  `fetch` policy to grant `fetch_url`. `scripts/prepare_platform_case.py` writes the policy.
+- Agent mode, operations (#74): `solos-swarm agent health` checks the agent from outside it (the unit, restart loops,
+  the broker socket, free disk, the bot's access to the Watchdog's Discord channel, whether `agent.yaml` loads) and
+  posts once per incident to that channel. `solos-agent-health.timer` runs it every 3 minutes, and the agent unit's
+  `OnFailure=` runs it too. Below `health.min_free_gb` (default 5) it writes `state/PAUSE`, and it lifts only a pause
+  it wrote. `solos-swarm agent prune` removes the clones and transcripts of Tickets that ended more than
+  `--keep-days` ago, idle forge mirrors and old Router transcripts. `solos-agent-prune.timer` runs it daily with 14
+  days. `solos-swarm agent stop` files an operator's stop as `mcp:<operator>`, which the Engine judges under the
+  Policy. `scripts/agent-deploy` pauses the agent and waits up to 90 s for running Assignments to report before it
+  stops the unit (`--drain SECONDS`, `--no-drain`).
+- Agent mode, `ready` delivers a pull request, App PR 2 (#75): on a Ticket that owes a pull request, the host admits
+  a worker's `worker_report ready` only after it harvests the commits as a sandbox-made `git bundle`, fetches them
+  into its own mirror and checks ancestry, the bot as every commit's author and committer, protected paths (default
+  `.github/**`), size and file count. An admitted `ready` commits `Effect::Forge(Publish)`. The host then pushes
+  `solos/<ticket>/<slug>` with `--force-with-lease` and opens or updates a ready pull request with `Closes #n`, each
+  step safe to repeat after a crash, while the Ticket waits in `Stage::Delivering`. No new worker tool. Store schema
+  7. `src/agent/forge.rs` becomes `src/agent/forge/`. New per-repository keys: `owes`, `protected`, `max_pushes`,
+  `max_change_bytes`, `merge`, `ci` and `max_repairs`. Nothing acted on the last three yet.
+- Agent mode, memory PR 1 (#82, design in `docs/agent-mode/memory/`): a relaunched worker's first prompt quotes the
+  Ticket's earlier `ready`, `blocked` and `failed` Reports and its latest `progress`, oldest first, in at most 6,000
+  characters (`src/agent/earlier.rs`). No core or schema change.
+- Agent mode, a repository's dependencies and evidence (#83): `forge.repos.<repo>.deps: {kind: bun}` installs a
+  repository's dependencies on the host once per lockfile, with `bun install --frozen-lockfile --ignore-scripts` in a
+  bwrap sandbox that shares the network and nothing else of the host. The key is a digest of the lockfile and
+  manifests at the clone's base commit in the host's mirror. Each Ticket's `run_code` mounts the result read-only. A
+  failed build is told to the worker and never fails the Ticket. `forge.repos.<repo>.evidence: {command, heading}`
+  makes `ready` require that command's JSON (`ok: true`, not `dirty: true`) under the heading in the pull request
+  description. `agent prune` removes caches nobody mounted.
+- Agent mode, memory PR 2 (#84): memos are a core aggregate (`crates/agent-core/src/memo.rs`) in a `memos` table of
+  `agent.db` (schema 8), with trust (`person`, `model` or `external`) that the core derives from their sources. An
+  operator's memo is active at once, and any other waits as `Proposed`. Events carry digests only, and a forgotten
+  memo's text is erased from the database and its WAL (`secure_delete=ON`, a WAL checkpoint). The Router's system
+  prompt and each worker's first prompt end with a quoted index of memos, recorded as `MemosShown`. New:
+  `solos-swarm agent memo list | add | retire | forget` and the MCP tools `agent_memos`, `agent_memo_add` and
+  `agent_memo_retire`.
+- Agent mode, memory PR 3 (#85): workers propose memos with `memo_propose {text, scope, evidence}`. The broker finds
+  each quote in the Ticket's Triggers or in an earlier tool answer, and refuses one it cannot find. A separate model
+  call at DeepSeek's highest thinking effort (`reasoning_effort: max`) reviews each proposal the core does not
+  activate and keeps, rewrites, merges or rejects it (`src/agent/broker/review.rs`). Its spend goes on a new `memory`
+  ledger account (`memory.daily_microusd`, no cap by default). A proposal no review decided expires after 7 days.
+  `read` serves `/memos/global.md` and `/memos/repo/<owner>/<name>.md`, and `router_read {kind: memo}` reads memos.
+  `memory:` in agent.yaml is on by default where workers run on Pi.
+- Agent mode, memory PR 4 (#86): the dream (`src/agent/dream.rs`). Each day at `memory.dream.at` (03:30 UTC by
+  default), when a Ticket ended since the last dream, the host asks for one dream Ticket and judges it in the Router's
+  place. The dream reads the ended Tickets' digests, their transcripts and the live memos, staged read-only in its
+  `/work`, with thinking on at max effort on the `memory` account. It proposes corrections (`supersedes`) and new
+  memos, and retires memos with `memo_retire`, citing transcript lines whose digest and text the broker checks
+  against the original transcripts. The review decides its proposals, and the Watchdog sends the operator one digest
+  of what changed. Store schema 9.
+- `collect` (#15) leaves the per-run `code/` scratch directory on the host and writes `collect-manifest.json`; `--include-code` opts back in.
+- `work/tournament-20261028/` (#17): the record of the 2026-10-28 discovery tournament (frozen Goals, driver, dataset
+  builder, gate, systemd units and evidence summaries), without raw logs.
+- Docs (#16): pause mode, self-update operations, dashboard tunnel, tournament runbook, replay status.
+- Design records: the vault and verifiable browser (#36, `docs/agent-mode/vault-browser/`), pstack as the coding method
+  (#53, `docs/agent-mode/pstack/`) and the agent's GitHub App (#62, `docs/agent-mode/github-app/`). Docs matched to
+  the code in #40, #41, #42, #44 and #50 (the live P10 run with a DeepSeek Router).
+
+### Changed
+
+- CI (#66): the `ci` workflow runs `lint`, `scripts`, `tokenizers`, `build` (one `cargo nextest archive`), four `test`
+  shards and four `test-isolated` jobs, then a `check` job that passes only when every job before it passed. `check`
+  is the status to require. CI builds without debug info, and small crypto, SQLite and JSON crates build optimized in
+  the dev profile (`[profile.dev.package.*]` in `Cargo.toml`). The warm median run went from 17.6 minutes to 3.5.
+  The flaky tests it exposed were fixed in the tests.
+- Agent mode, how the agent talks (#67): the Router writes the first reply in its own words, and the Engine's default
+  is `Looking into it.` (`STANDARD_ACKNOWLEDGEMENT`) instead of `On it: <title>.`. A worker's `ready` text is a chat
+  message that leads with the answer, in about 1,500 characters at most. `docs/harness/solos-swarm.md` gains
+  "Talking to people", which maps each pstack reply rule it overrides. Host-written text, such as a failed worker's
+  reply and the Watchdog's alerts, is in the first person.
+
+### Fixed
+
+- Agent mode, the bench (#37): the workload has 24 distinct tasks, and `WorkloadSpec::validate` refuses more requests
+  than tasks, so no two requests ask for the same work.
+- Agent mode, the Pi Router (#45): a prompt holds at most `router.max_batch` cards (6). A reply cut off at the output
+  limit ends the session, and the cut cards return in prompts of half the size. A Router model call is dropped after
+  half of `policy.eval_timeout_ms`. A decision on a closed Eval is refused with the open Evals listed.
+- Agent mode, a looping worker and a silent end (#65): a repetition guard (`src/agent/broker/repeat.rs`) refuses a
+  worker's call that repeats a cycle of one to three identical calls for the third time, with HTTP 429 and a reason
+  the model reads. Tools marked `repeatable` (`job_wait`, `browser_act`, `browser_read`, `worker_report`,
+  `worker_handback`) are never refused. When a turn ends on a failed model call with no report, the host files
+  `blocked` (no budget left) or `failed` in the worker's place, so the person hears once.
+- Agent mode, a worker's plain-text answer (#72): when a Pi worker ends its turn with text and no `worker_report`, the
+  host files that text as the Report (`src/agent/plain_answer.rs`): `blocked` for a short question, `ready` otherwise.
+  Empty text, reasoning and a tool call written as text stay `waiting`. Claude Code workers keep the old behavior.
+- Agent mode, a worker that ignores the repeat guard (#77): 3 refused calls in a row, or 10 in one turn, stop the turn
+  (`ModelFailure::Stuck`). The seat's next model call is refused before any hold, and the host files one `failed`
+  Report. Each refusal quotes what the call answered before. The worker's prompt now says that `run_code` has no
+  `/host`.
+- Agent mode, a worker that makes no progress (#78): cycles of up to 10 calls, 30 calls in a row that bring nothing
+  new, and ceilings of 200 tool calls and 250 model calls per turn all end in #77's stop, with a sentence that names
+  what the worker repeated (`src/agent/broker/repeat/gist.rs`). Workers sample at `executor.temperature` (default
+  0.6). The Router stays at 0, and swarm mode's request is unchanged.
+- Agent dashboard (#71): a failed sign-in logs the OAuth `error` and `error_description`.
+- Agent mode, systemd units (#76, #80): the health check, prune and publish units set `TOKIO_WORKER_THREADS=2`, and
+  the health and publish units set `TasksMax=256`. One async worker thread per core (128 on the box) had used up
+  their task limit.
+- `src/cluster.rs` (#79): a raft test hung when its first write was in flight as the certificates expired.
+  `Cluster::authoritative` gives a request on the leader a 30 s deadline, `Cluster::shutdown` bounds its drain to 2 s
+  and frees the UDP address, and replication to an unreachable peer backs off.
+- Agent mode, `fetch_url` (#81): keyed and unkeyed, it goes through swarm mode's guard (`FetchGuard::open`), so
+  loopback, private, link-local (cloud metadata) and CGNAT addresses are refused on every hop.
+  `executor.fetch.allow_private_networks` turns the check off. The unkeyed fetch no longer uses proxy variables.
 
 ## 2026-10-28
 
