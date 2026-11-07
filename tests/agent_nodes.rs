@@ -25,7 +25,7 @@ use solos_swarm::agent::scripted::{ScriptedExecutor, ScriptedRouter};
 use solos_swarm::agent::{
     Adapters, AgentConfig, PiHost, RunOptions, Runtime, STORE_FILE, TICKETS_DIR, serve_with,
 };
-use solos_swarm::code::{CodeConfig, CodeExecutor, MAX_FILES_BYTES};
+use solos_swarm::code::{CodeConfig, CodeExecutor, Extras, MAX_FILES_BYTES};
 use solos_swarm::gateway::{Dispatch, PriceTable, Provider, Upstream};
 use solos_swarm::harness::scripted::{Call, ScriptedHarness};
 use solos_swarm::remote::daemon::{AgentEndpoint, SandboxConfig, SecretsConfig};
@@ -923,6 +923,7 @@ async fn oversized_frames_are_refused_on_either_side() {
     let work = Work {
         ticket: &ticket,
         dir: &root,
+        extras: &Extras::default(),
     };
     let controls: String = "\u{1}".repeat(MAX_FILES_BYTES);
     let big = json!({"code": "true", "files": {"blob.txt": controls}});

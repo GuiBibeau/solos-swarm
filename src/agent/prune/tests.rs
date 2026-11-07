@@ -355,6 +355,54 @@ fn mirrors_go_when_nothing_has_fetched_into_them_for_the_window() {
 }
 
 #[test]
+fn a_dependency_cache_goes_when_no_ticket_has_used_it_for_the_window_and_a_dead_build_with_it() {
+    let scratch = Scratch::new("deps");
+    let repo = scratch.state().join("deps/acme/widgets");
+    let (stale, fresh) = ("a".repeat(64), "b".repeat(64));
+    for key in [&stale, &fresh] {
+        write(&repo.join(key).join("node_modules/.bun/x/index.js"), 50_000);
+        write(&repo.join(key).join("manifest.json"), 10);
+    }
+    write(&repo.join("tmp-dead/s/src/node_modules/y"), 20_000);
+    write(&repo.join("tmp-live/s/src/node_modules/y"), 20_000);
+    let not_ours = repo.join("notes");
+    write(&not_ours.join("x"), 10);
+    for path in [
+        repo.join(&stale).join("manifest.json"),
+        repo.join(&stale),
+        repo.join("tmp-dead"),
+        not_ours.clone(),
+    ] {
+        age(&path, 30);
+    }
+    // Built long ago and mounted just now: a Ticket's start touches the manifest.
+    age(&repo.join(&fresh), 30);
+
+    let ledger = Fake::default();
+    let found = plan(&options(&scratch), &ledger, now_ms()).unwrap();
+    let mut paths: Vec<_> = found
+        .items
+        .iter()
+        .map(|item| (item.kind, item.paths[0].clone()))
+        .collect();
+    paths.sort_by(|a, b| a.1.cmp(&b.1));
+    assert_eq!(
+        paths,
+        [
+            (Kind::DepsCache, repo.join(&stale)),
+            (Kind::DepsCache, repo.join("tmp-dead"))
+        ],
+        "{found:?}"
+    );
+    let report = apply(&options(&scratch), &ledger, found);
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert!(!repo.join(&stale).exists() && !repo.join("tmp-dead").exists());
+    assert!(repo.join(&fresh).exists() && repo.join("tmp-live").exists() && not_ours.exists());
+    assert!(report.freed_bytes >= 70_000);
+    assert!(render(&report).contains(&format!("removed {}", repo.join(&stale).display())));
+}
+
+#[test]
 fn the_routers_old_transcripts_go_but_never_its_newest() {
     let scratch = Scratch::new("router");
     let router = scratch.state().join("router");

@@ -7,12 +7,13 @@
 //! and a launch past that waits for a slot.
 
 use super::broker::{self, AgentBroker, ModelFailure, WorkerSeat, browser, clip};
-use super::config::HarnessKind;
+use super::config::{EvidenceConfig, HarnessKind};
 use super::earlier;
 use super::environment::{self, Launchable};
 use super::plain_answer::Answer;
 use super::ports::{
-    BoxFuture, Delivered, Delivery, Executor, Fact, FactSink, Forge, Launch, TicketDirs, Workspace,
+    BoxFuture, Delivered, Delivery, Dependencies, Executor, Fact, FactSink, Forge, Launch,
+    TicketDirs, Workspace,
 };
 use super::swarm_executor::SwarmExecutor;
 use crate::broker::write_json;
@@ -251,12 +252,13 @@ pub fn assignment_text(launch: &Launch, run_code: bool) -> String {
     text
 }
 
-fn repository_text(workspace: &Workspace, owes: Deliverable) -> String {
+fn repository_text(workspace: &Workspace, owes: Deliverable, deps: &Dependencies) -> String {
     let Workspace {
         repo,
         base,
         base_commit,
         notes,
+        evidence,
     } = workspace;
     let short = base_commit.get(..7).unwrap_or(base_commit);
     let mut text = format!(
@@ -272,7 +274,47 @@ fn repository_text(workspace: &Workspace, owes: Deliverable) -> String {
         text.push_str("\n\n");
         text.push_str(owed);
     }
+    if let Some(installed) = dependencies_text(deps) {
+        text.push_str("\n\n");
+        text.push_str(&installed);
+    }
+    if let (Some(evidence), Deliverable::PullRequest) = (evidence, owes) {
+        let EvidenceConfig { command, heading } = evidence;
+        let _ = write!(
+            text,
+            "\n\nThis repository's pull requests must carry evidence. When your commits are final \
+             and the tree is clean (`git status` shows nothing), run `{command}` in /work and put \
+             its JSON output, unedited, in a ```json fence under a `{heading}` heading in your \
+             ready report. That report is the pull request's description, so for a pull request \
+             this outranks the advice above to keep a reply short. The host refuses a ready \
+             report without the block, or whose JSON does not say `\"ok\": true`. Commit again \
+             and you must run it again. If you cannot run it, report blocked and say why."
+        );
+    }
     text
+}
+
+/// What a worker is told about the dependencies the host installed for its
+/// repository, if the repository asks for any.
+fn dependencies_text(deps: &Dependencies) -> Option<String> {
+    match deps {
+        Dependencies::None => None,
+        Dependencies::Ready { .. } => Some(
+            "Dependencies: the repository's are installed, read-only, in /work/node_modules and in \
+             each workspace's node_modules (the host built them from the lockfile at the base \
+             commit). `bun` and `node` are on PATH, and both are the host's bun, so the \
+             repository's own scripts run in /work with run_code. The sandbox is offline: \
+             `bun install` and `bun add` cannot run, so a dependency you add, or a lockfile \
+             change, is not installed here. HOME is a temporary directory that is gone when the \
+             command ends."
+                .to_owned(),
+        ),
+        Dependencies::Unavailable { why } => Some(format!(
+            "Dependencies: the host could not install the repository's ({why}). The sandbox is \
+             offline, so scripts that need node_modules cannot run here: do not claim checks you \
+             could not run, and say so when you report."
+        )),
+    }
 }
 
 /// What a worker is told about the forge, for a Ticket that owes a change or a
@@ -653,7 +695,10 @@ where
                     host: &host,
                 };
                 let cloned = forge.prepare(repo, dirs).await;
-                Some(cloned.with_context(|| format!("{repo} was not cloned"))?)
+                let cloned = cloned.with_context(|| format!("{repo} was not cloned"))?;
+                // Never a failure of the Ticket: without them the worker is told why.
+                let installed = forge.dependencies(&cloned).await;
+                Some((cloned, installed))
             }
         };
         // A node's /work is its own, so this host's prepare has nothing to set up there.
@@ -668,8 +713,11 @@ where
             launch.budget_microusd,
         )
         .in_environment(named.map(str::to_owned));
-        if workspace.is_some() {
+        if let Some((_, installed)) = &workspace {
             seat = seat.on_repository(host);
+            if let Dependencies::Ready { extras, .. } = installed {
+                seat = seat.with_extras(extras.clone());
+            }
         }
         let grants: Vec<String> = parts
             .broker
@@ -679,10 +727,10 @@ where
             .collect();
         let run_code = grants.iter().any(|tool| tool == "run_code");
         let mut prompt = system_prompt(launch.budget_microusd, &grants);
-        if let Some(workspace) = &workspace {
+        if let Some((workspace, installed)) = &workspace {
             prompt = format!(
                 "{prompt}\n\n{}",
-                repository_text(workspace, deliverable(&launch.plan))
+                repository_text(workspace, deliverable(&launch.plan), installed)
             );
         }
         let mut assignment = assignment_text(launch, run_code);
@@ -982,7 +1030,7 @@ impl Turns<'_> {
         // same admission as the `worker_report` tool.
         let mut harvest = None;
         if status == ReportStatus::Ready {
-            match self.broker.admit_ready(self.seat).await {
+            match self.broker.admit_ready(self.seat, &text).await {
                 Ok(admitted) => harvest = admitted.harvest,
                 Err(refused) => {
                     eprintln!(
@@ -1067,18 +1115,21 @@ async fn failed(
 mod tests {
     use super::{
         PREPARED, PiExecutor, PiExecutorParts, QUIET_TURN, WORK_DIR, assignment_text,
-        delivery_text, system_prompt,
+        delivery_text, repository_text, system_prompt,
     };
     use crate::agent::broker::{AgentBroker, BrokerParts, DecideTerms, ModelTerms, WorkerParts};
-    use crate::agent::config::HarnessKind;
+    use crate::agent::config::{EvidenceConfig, HarnessKind};
     use crate::agent::environment::{ExecutionEnvironment, Nodes, Offline, Work};
     use crate::agent::jobs::JobLimits;
-    use crate::agent::ports::{Delivered, Delivery, Executor, Fact, FactSink, Inbound, Launch};
+    use crate::agent::ports::{
+        Delivered, Delivery, Dependencies, Executor, Fact, FactSink, Inbound, Launch, Workspace,
+    };
     use crate::agent::pstack::Pstack;
     use crate::code::{OutputBounds, Started};
     use crate::gateway::{Dispatch, PriceTable, Provider, Upstream};
     use crate::harness::{AgentHarness, Observation, Session, SessionEvent, SessionSpec};
     use serde_json::Value;
+    use solos_agent_core::change::Deliverable;
     use solos_agent_core::model::{
         Actor, Addressed, AssignmentId, Input, InputBody, InputId, Plan, Report, ReportStatus,
         SecretId, ThreadKey, TicketId, Trigger, TriggerId,
@@ -1499,6 +1550,16 @@ mod tests {
         }
     }
 
+    fn widgets(evidence: Option<EvidenceConfig>) -> Workspace {
+        Workspace {
+            repo: solos_agent_core::change::RepoName::try_from("acme/widgets".to_owned()).unwrap(),
+            base: "main".into(),
+            base_commit: "0123456789abcdef".into(),
+            notes: Some("Tests run with bun.".into()),
+            evidence,
+        }
+    }
+
     #[test]
     fn a_relaunch_quotes_what_the_worker_said_once_after_the_inputs_and_before_how_to_report() {
         let mut again = launch("tk_1", "as_2");
@@ -1585,6 +1646,79 @@ mod tests {
         waiting.earlier = Vec::new();
         assert!(!assignment_text(&waiting, true).contains("earlier replies"));
         assert!(!assignment_text(&launch("tk_1", "as_1"), true).contains("earlier replies"));
+    }
+
+    #[test]
+    fn a_worker_is_told_what_is_installed_and_what_could_not_be_and_the_evidence_a_pull_request_needs()
+     {
+        let command = "bun run solos dev verify --scope unit --json";
+        let evidence = Some(EvidenceConfig {
+            command: command.into(),
+            heading: "## Evidence".into(),
+        });
+        let ready = Dependencies::Ready {
+            key: "k".repeat(64),
+            extras: crate::code::Extras::default(),
+        };
+        let down = Dependencies::Unavailable {
+            why: "the install failed (exit status: 1): no space left".into(),
+        };
+
+        let plain = repository_text(
+            &widgets(None),
+            Deliverable::PullRequest,
+            &Dependencies::None,
+        );
+        assert!(
+            !plain.contains("Dependencies") && !plain.contains("evidence"),
+            "a repository that asks for neither is told of neither: {plain}"
+        );
+        let installed = repository_text(&widgets(None), Deliverable::PullRequest, &ready);
+        assert!(
+            installed.starts_with(&plain),
+            "what it was told before comes first, unchanged"
+        );
+        for told in [
+            "installed, read-only, in /work/node_modules and in each workspace's node_modules",
+            "`bun` and `node` are on PATH",
+            "`bun install` and `bun add` cannot run",
+        ] {
+            assert!(installed.contains(told), "{told}: {installed}");
+        }
+        assert!(!installed.contains("must carry evidence"));
+
+        let failed = repository_text(&widgets(None), Deliverable::PullRequest, &down);
+        assert!(
+            failed.contains(
+                "the host could not install the repository's (the install failed (exit status: 1): \
+                 no space left)"
+            ) && failed.contains("do not claim checks you could not run"),
+            "{failed}"
+        );
+
+        let asked = repository_text(&widgets(evidence.clone()), Deliverable::PullRequest, &ready);
+        for told in [
+            "This repository's pull requests must carry evidence.",
+            "run `bun run solos dev verify --scope unit --json` in /work",
+            "in a ```json fence under a `## Evidence` heading in your ready report",
+            "That report is the pull request's description",
+            "The host refuses a ready report without the block",
+            "If you cannot run it, report blocked and say why.",
+        ] {
+            assert!(asked.contains(told), "{told}: {asked}");
+        }
+        for owes in [Deliverable::Answer, Deliverable::Change] {
+            let kept = repository_text(&widgets(evidence.clone()), owes, &ready);
+            assert!(
+                !kept.contains("must carry evidence"),
+                "evidence is for a pull request's description, not for {owes:?}"
+            );
+        }
+        let told_twice = repository_text(&widgets(evidence), Deliverable::PullRequest, &down);
+        assert!(
+            told_twice.contains("could not install") && told_twice.contains("must carry evidence"),
+            "the evidence rule stands when the install failed, and the worker reports blocked"
+        );
     }
 
     #[test]

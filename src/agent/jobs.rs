@@ -13,7 +13,7 @@
 
 use super::environment::{ExecutionEnvironment, Offline, Work};
 use super::ports::{Fact, FactSink};
-use crate::code::{Ended, MAX_TIMEOUT_SECONDS, OutputBounds, Started};
+use crate::code::{Ended, Extras, MAX_TIMEOUT_SECONDS, OutputBounds, Started};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use solos_agent_core::ids::key;
@@ -91,6 +91,8 @@ pub struct Host<'a> {
     pub ticket: &'a TicketId,
     pub assignment: &'a AssignmentId,
     pub work_dir: &'a Path,
+    /// What this host adds to the Ticket's sandbox.
+    pub extras: &'a Extras,
 }
 
 /// One Assignment's jobs whose end has not reached the worker, and
@@ -178,6 +180,7 @@ impl Host<'_> {
         Work {
             ticket: self.ticket,
             dir: self.work_dir,
+            extras: self.extras,
         }
     }
 }

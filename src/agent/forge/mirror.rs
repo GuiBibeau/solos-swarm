@@ -13,10 +13,11 @@
 //! The push to the forge runs from the mirror, with a token that exists only
 //! in that git's environment.
 
+use super::deps::{self, Cache};
 use super::paths;
-use crate::agent::config::{Identity, RepoConfig};
+use crate::agent::config::{DepsKind, Identity, RepoConfig};
 use crate::agent::pi_executor::private_dir;
-use crate::agent::ports::{Proposal, Refusal, TicketDirs, Workspace};
+use crate::agent::ports::{Dependencies, Proposal, Refusal, TicketDirs, Workspace};
 use crate::broker::write_json;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use solos_agent_core::change::{BranchName, CommitSha, Harvest, RepoName};
@@ -60,6 +61,12 @@ pub(super) struct Mirrors {
     /// `<state>/forge-stage`: admitted bundles, outside the mirrors.
     stage: PathBuf,
     repos: BTreeMap<RepoName, (RepoConfig, Mutex<()>)>,
+    /// The repositories' dependency builds, one at a time each. A build can
+    /// take minutes, so it has a lock apart from the one that serializes git
+    /// on the mirror, which a Ticket's clone and a publish wait on.
+    builds: BTreeMap<RepoName, Mutex<()>>,
+    /// `<state>/deps`.
+    deps: Cache,
 }
 
 /// What pushing a head to the Ticket's branch came to.
@@ -80,6 +87,7 @@ pub(super) enum Branch {
 impl Mirrors {
     pub(super) fn new(dir: PathBuf, repos: &BTreeMap<RepoName, RepoConfig>) -> Self {
         let stage = dir.with_file_name(super::STAGE_DIR);
+        let deps = Cache::new(dir.with_file_name(super::DEPS_DIR));
         Self {
             dir,
             stage,
@@ -87,7 +95,52 @@ impl Mirrors {
                 .iter()
                 .map(|(repo, terms)| (repo.clone(), (terms.clone(), Mutex::new(()))))
                 .collect(),
+            builds: repos
+                .keys()
+                .map(|repo| (repo.clone(), Mutex::new(())))
+                .collect(),
+            deps,
         }
+    }
+
+    /// The repository's dependencies at the commit `workspace`'s clone
+    /// started from (see [`Forge::dependencies`]). The files an install reads
+    /// are taken from the mirror under its lock, which is brief; the build
+    /// runs after it, under the repository's build lock alone.
+    ///
+    /// [`Forge::dependencies`]: crate::agent::ports::Forge::dependencies
+    pub(super) async fn dependencies(&self, workspace: &Workspace) -> Dependencies {
+        let repo = &workspace.repo;
+        let (Some((terms, lock)), Some(build)) = (self.repos.get(repo), self.builds.get(repo))
+        else {
+            return Dependencies::None;
+        };
+        let Some(config) = &terms.deps else {
+            return Dependencies::None;
+        };
+        let unavailable = |why: String| Dependencies::Unavailable { why };
+        let read = {
+            let _one_command_at_a_time = lock.lock().await;
+            let mirror = self.mirror_of(repo);
+            if mirror.is_dir() {
+                deps::read_inputs(&mirror, &workspace.base_commit, config.kind).await
+            } else {
+                Err(anyhow!("the host's mirror of {repo} is not there"))
+            }
+        };
+        let inputs = match read {
+            Ok(inputs) => inputs,
+            Err(err) => {
+                let why = format!("{err:#}");
+                eprintln!(
+                    "agent: deps: {repo} {} are unavailable: {why}",
+                    config.kind.as_str()
+                );
+                return unavailable(why);
+            }
+        };
+        let _one_build_at_a_time = build.lock().await;
+        self.deps.ensure(repo, &inputs, config).await
     }
 
     #[cfg(test)]
@@ -182,11 +235,15 @@ impl Mirrors {
             "remote set-url",
         )
         .await?;
+        if let Some(deps) = &terms.deps {
+            exclude_installed(dirs.work, deps.kind)?;
+        }
         let workspace = Workspace {
             repo: repo.clone(),
             base: terms.base.clone(),
             base_commit,
             notes: terms.notes.clone(),
+            evidence: terms.evidence.clone(),
         };
         // The marker says the clone is whole, so it must not reach the disk
         // before the clone does.
@@ -694,6 +751,22 @@ fn open_without_links(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::File::open(path)
 }
 
+/// Keep what the dependency cache puts in the clone out of its commits and
+/// its `git status`: `node_modules` is mounted over the clone, and a tool the
+/// package manager runs may leave its own directory in `/work` (a dirty tree
+/// fails a repository's evidence check, and `git add -A` would commit it). The
+/// host writes this before any sandbox has touched the clone.
+fn exclude_installed(work: &Path, kind: DepsKind) -> Result<()> {
+    let info = work.join(".git/info");
+    std::fs::create_dir_all(&info).with_context(|| format!("cannot make {}", info.display()))?;
+    let own = match kind {
+        DepsKind::Bun => "/.bun/\n",
+    };
+    let text = format!("# solos-swarm: the host's dependency cache\nnode_modules/\n{own}");
+    std::fs::write(info.join("exclude"), text)
+        .with_context(|| format!("cannot write {}", info.join("exclude").display()))
+}
+
 /// What `repo.json` says, or `None` before the clone is done.
 pub(super) fn prepared(marker: &Path) -> Result<Option<Workspace>> {
     match std::fs::read(marker) {
@@ -818,7 +891,7 @@ fn git_range<'a>(dir: &Path, args: impl IntoIterator<Item = &'a str>, range: &[S
 }
 
 /// [`git`] on the mirror at `dir`, which only the host writes.
-fn git_in<'a>(dir: &Path, args: impl IntoIterator<Item = &'a str>) -> Command {
+pub(super) fn git_in<'a>(dir: &Path, args: impl IntoIterator<Item = &'a str>) -> Command {
     let mut command = git(["-C".as_ref(), dir.as_os_str()]);
     command.args(args);
     command
@@ -854,7 +927,7 @@ async fn run_for(git: Command, what: &str, wait: Duration) -> Result<String> {
 
 /// A git command on the mirror alone: its raw output, with `stdin` written to
 /// it.
-async fn run_bytes(git: Command, what: &str, stdin: Option<Vec<u8>>) -> Result<Vec<u8>> {
+pub(super) async fn run_bytes(git: Command, what: &str, stdin: Option<Vec<u8>>) -> Result<Vec<u8>> {
     run_for_bytes(git, what, LOCAL_WAIT, stdin).await
 }
 

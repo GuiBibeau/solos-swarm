@@ -8,7 +8,7 @@ switches releases from the Mac. Everything on the box is under `~/agent`:
 | `releases/<sha>/` | One immutable build of a commit: `bin/solos-swarm`, `node_modules`, `extensions`, `vendor/pstack`. Read-only. The newest five are kept, plus current and previous. |
 | `current`, `previous` | Links to the release that serves and the one before it. `--pi-root` is `current`. |
 | `agent.yaml` | The production config. It is not in git. |
-| `state/` | `agent.db`, `tickets/`, `router/`, `forge/`, `trail/`, `mcp/`, the broker socket, and the operator's files: `health-state.json`, `health-hold`, `PAUSE`, `control.json`. Kept across releases; finished work is pruned daily ([Pruning state](#pruning-state-and-the-disk-floor)). |
+| `state/` | `agent.db`, `tickets/`, `router/`, `forge/`, `deps/`, `trail/`, `mcp/`, the broker socket, and the operator's files: `health-state.json`, `health-hold`, `PAUSE`, `control.json`. Kept across releases; finished work is pruned daily ([Pruning state](#pruning-state-and-the-disk-floor)). |
 | `tokens/` | One file per one-use credential, mode 0600: `model.key` (the DeepSeek key), `discord-token`, `github-app.pem` (the GitHub App's private key), and `vercel-blob-token` (the dashboard publisher's, see [Dashboard](#dashboard)). |
 | `backups/` | `agent.db` copied before every deploy and rollback, while the agent is stopped. The newest twenty are kept. |
 | `target/` | The cargo build cache. |
@@ -181,6 +181,37 @@ A config that still has `token_file` on the github Source or on `forge: github`,
 load with a sentence that points at [Moving from token files](README.md#moving-from-token-files). The `forge-token` file is no
 longer read; delete it from `~/agent/tokens`.
 
+### A repository whose pull requests need its own checks (`GuiBibeau/solos`)
+
+A JavaScript repository's checks cannot run in a worker's sandbox, which has no network and a clone with no
+`node_modules`, and a pull request that lacks the checks' proof fails CI. `GuiBibeau/solos` wants the JSON of
+`bun run solos dev verify --scope unit --json` under `## Evidence` in every pull request (its `AGENTS.md`, "Evidence").
+Two keys on its repository fix both:
+
+```yaml
+# ~/agent/agent.yaml
+forge:
+  repos:
+    GuiBibeau/solos:
+      about: ...
+      base: main
+      owes: pull_request
+      deps: {kind: bun, binary: /home/debian/.bun/bin/bun}       # the box's bun; the default is $HOME/.bun/bin/bun
+      evidence: {command: "bun run solos dev verify --scope unit --json"}
+```
+
+`deps.memory_bytes` is 16 GiB of address space (a cap, not memory used) for the `run_code` of Tickets on this repository
+alone: bun aborts under 4 or 6 GiB, and its lint step under 8. `executor.run_code.memory_bytes` stays as it is for every
+other Ticket.
+
+The host installs the dependencies from `bun.lock` at the base commit the first time a Ticket on the repository starts
+(about four seconds, 2.2 GiB and 234,000 files, links and directories on the box), under `state/deps/GuiBibeau/solos/<key>/`, and a later Ticket
+mounts the same cache; a new lockfile on `main` is a new cache. The worker runs `verify` itself, offline, and the host refuses
+its `ready` without the JSON in its report. The whole mechanism, what it trusts and what it leaves to CI is in
+[Installed dependencies and evidence](README.md#installed-dependencies-and-evidence). Needs: `bun`, `bwrap` and `prlimit` on the
+box, and the network from the host (the build sandbox is the one place besides the browser that has it). `agent prune`
+removes a cache no Ticket has used for its `--keep-days`. Keep `state/` off a tmpfs: a cache has many files.
+
 ## Dashboard
 
 A web page of the agent's tickets at `https://agent.guibibeau.com`, behind Sign in with Vercel, for one person. The box
@@ -352,6 +383,7 @@ scripts/agent-deploy prune-logs        # what the daily runs freed
 | `tickets/<id>/work`, plus `host/repo.json` and `prepared` | the Ticket ended more than N days ago (its end time is in the Store) | an open Ticket; a directory the Store has no Ticket for; `pi-settings.json`; a swarm's `swarm/` books |
 | `tickets/<id>/*.rpc.jsonl`, `*.stderr` | the same | |
 | `forge/<owner>/<name>.git` | nothing has fetched into it for N days (`FETCH_HEAD`, `HEAD`, `config`, `packed-refs`) | a mirror used since. The next Ticket on that repository makes it again; clones are independent, so no clone needs it |
+| `deps/<owner>/<name>/<key>` | no Ticket has mounted it for N days (a Ticket's start marks `manifest.json` used), and a `tmp-*` directory of a build that died, by its age | a cache used since. The next Ticket on that repository builds it again |
 | `router/*.rpc.jsonl`, `*.stderr` | not written for N days | the newest of each kind, which a live session may be writing |
 | `trail/<id>/` | **only with `--include-trail`**, for Tickets that ended more than N days ago. `agent trail` then reports their blobs missing | by default |
 | `agent.db` and its WAL, `tokens/`, `backups/`, `releases/`, the vault, `browser/` | | always |
@@ -421,4 +453,7 @@ ssh <box> 'for t in tk_aaa tk_bbb; do ~/agent/current/bin/solos-swarm agent stop
 - The disk floor is checked by `agent health` every three minutes, not by `agent serve`, and it pauses; it does not free
   space. `~/agent/target`, old releases and backups are not part of the prune.
 - The health check runs on the box it watches. Nothing alerts if the box or the user's systemd is gone.
+- The host does not run a repository's `evidence` command itself: the worker does, and the host checks the shape of its
+  block. A pull request's description is made once, so a later head pushed for a repair keeps the first head's evidence.
+  See [Installed dependencies and evidence](README.md#installed-dependencies-and-evidence).
 - A drain narrows what a deploy interrupts; a worker in the middle of a long tool call is still stopped.

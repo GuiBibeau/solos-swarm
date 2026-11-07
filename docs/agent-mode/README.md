@@ -1744,7 +1744,11 @@ what its `ready` means: an answer, a change committed in the clone, or a pull re
          # merge: ask                         # off, ask or auto: recorded in the Ticket's terms; merging itself is later work
          # ci: expected                       # expected or none: whether a merge waits for CI
          # max_repairs: 2                     # CI failures that may resume a delivered Ticket (later work)
+         # deps: {kind: bun}                  # install the base's dependencies for every Ticket's run_code
+         # evidence: {command: "bun run solos dev verify --scope unit --json"}   # what a pull request's description carries
    ```
+
+   `deps` and `evidence` are described under [Installed dependencies and evidence](#installed-dependencies-and-evidence).
 
    `kind: local` takes `remote: <dir>` and `identity: {name, email}` (who its clone's commits are by) instead of the
    `github:` section. Each repository is then the bare repository `<dir>/<owner>/<name>.git` on this disk, so tests and
@@ -1838,6 +1842,95 @@ Publish ─ push the branch (lease) ─ find or open the pull request ─ read i
 - **`change`.** A Ticket that owes a change ends when the host admits the worker's commits (the same checks), and says
   `Committed <sha> (n files) in the ticket's clone; not published.` A `ready` with no commits is refused.
 - **Existing work.** A Ticket accepted before this build, with no terms in its Mandate, ends on `ready` as it did.
+
+### Installed dependencies and evidence
+
+A worker's sandbox has no network and its clone has no `node_modules`, so a JavaScript repository's own scripts (its
+tests, its type check, its `verify` command) cannot run in it. `deps` has the host install the dependencies once, and
+every Ticket's `run_code` mounts them read-only. `evidence` makes the worker's report carry what the repository's CI
+asks of a pull request. Each is per repository:
+
+```yaml
+forge:
+  repos:
+    GuiBibeau/solos:
+      about: ...
+      base: main
+      owes: pull_request
+      # binary: $HOME/.bun/bin/bun; timeout_secs: 600; max_bytes: 8 GiB (disk); memory_bytes: 16 GiB (address space)
+      deps: {kind: bun}
+      evidence: {command: "bun run solos dev verify --scope unit --json"}   # heading: "## Evidence" by default
+```
+
+`deps.memory_bytes` raises the address-space cap of the `run_code` of Tickets on this repository only, never lowers it:
+bun (JavaScriptCore) reserves a great deal of address space, and aborts under about 8 GiB, which is a cap and not memory used.
+
+**What is built from.** Only the host's mirror at the commit the Ticket's clone started from (`base_commit` in
+`repo.json`): the lockfile (`bun.lock`, and `bun.lockb` if there is one), the root `package.json`, the `package.json`
+of each workspace the root names, and the files `patchedDependencies` names. Never a worker's branch and never `/work`,
+which a worker writes. `bunfig.toml` and `.npmrc` are not read: the install uses no registry, scope, token or
+linker setting the repository chose, and fetches from `https://registry.npmjs.org/` only. A text lockfile that names
+any other host (a tarball, a git dependency, a private registry) is refused, and the reason is what the worker is told.
+The key is the SHA-256 of those files and where they are, so a change to the lockfile or a manifest at the base is a
+new cache, and a commit that changes neither is the same one. Caches are never changed once written. A bun upgrade does
+not change the key.
+
+**The build.** `bun install --frozen-lockfile --ignore-scripts`, in a bwrap sandbox of its own that is the one place on
+the host's behalf (beside the browser) that shares the host's network. It holds nothing else of the host's: no home, no
+token, no vault, no agent state, an empty environment but a few variables, `/usr` and the TLS and DNS files read-only, the
+package manager read-only, and a scratch directory. No lifecycle script runs, so no code of the repository runs. It is
+killed at `timeout_secs` or when its scratch passes `max_bytes`. A directory with its `manifest.json` is a complete
+cache: the build writes into a `tmp-*` directory and renames it to `<state>/deps/<owner>/<name>/<key>`, so a crash
+leaves nothing a Ticket would mount. Builds of one repository run one at a time, under a lock of their own, so a
+slow install does not hold up the mirror; a failed one is not tried again for the same lockfile for five minutes.
+`agent prune` removes a cache no Ticket has mounted for `--keep-days`, and the scratch of a build that died.
+
+**When.** Lazily, as each Ticket on the repository starts and its clone is made, before the worker: the first Ticket
+builds, the rest find the cache (a lookup is a read of the mirror). A build that cannot run (no `bun.lock`, a refused
+lockfile, a network that is down, a full disk, a missing `bun`) never fails the Ticket. The worker's prompt says
+dependencies are unavailable and why, and to say so when it reports.
+
+**What a Ticket's `run_code` sees.** Bun links each workspace's `node_modules` into one store, `node_modules/.bun`, with
+relative links (`apps/web/node_modules/zod -> ../../../node_modules/.bun/zod@4.6.6/node_modules/zod`). The directories
+that hold real files, the store, are mounted read-only at their paths under `/work`. A directory of nothing but links
+is made again in each sandbox as a fresh tmpfs, because tools write there (Vite makes `node_modules/.vite-temp`, which a
+read-only mount refuses and which fails a repository's own tests), and what they write is gone when the command ends.
+The shared cache is never writable, so no Ticket can plant a file another will run. The package manager is mounted
+read-only as `bun` and as `node` in `/runtime/bun`, first on `PATH`: bun runs `#!/usr/bin/env node` scripts (ESLint, for one),
+which the host's own node may be too old for. `HOME` is a throwaway `/tmp/home`, because a tool that writes a cache
+under `$HOME` would put it in the clone, and a dirty tree fails an evidence check. The clone gets `node_modules/` and
+`/.bun/` in its `.git/info/exclude` (written before any sandbox ran), so `git add -A` and `git status` ignore them. The
+sandbox is still offline: `bun install` and `bun add` cannot run, so a dependency a worker adds is not installed,
+and a change to a manifest or the lockfile is not reflected in the cache.
+
+The Pi session's own sandbox holds none of this. Its `/work` is a tmpfs for Pi's settings, not the clone, and nothing in
+it runs repository code: every command goes through `run_code`, and `read` is the broker's. The Claude Code harness is the
+same, with its tools off.
+
+**Evidence.** The worker is told to run `command` in `/work` once its commits are final and its tree is clean, and to paste
+the JSON it prints, unedited, in a ```json fence under the `heading` in its ready report, which is the pull request's
+description. A fence is left as written by the description's mention quieting. The host reads the report before it opens a
+pull request (and so before a branch is pushed) and refuses a `ready` that CI would fail at once: no heading followed by a
+`json` fence, JSON that is not an object (a long report is cut at 8,000 characters, so its block may be cut), an object
+whose `ok` is not `true`, or one whose `dirty` is `true`. The refusal says what to run and what to do, including to report
+`blocked` when the command cannot run (for example, dependencies are unavailable). A `ready` that is only a reply on a head
+already delivered is not a description and is not checked. The host does not judge the proof itself: which commit the
+object names (`sha`), and every other rule, stay the repository's CI.
+
+**Why the worker runs the command and the host does not.** The host could run it itself after `admit`, on a fresh checkout
+of the admitted head, and append the JSON, which cannot be mangled or made up by a worker. It is the more trustworthy
+design and not this one, for now: `verify` takes about a minute on `GuiBibeau/solos` and more on a bigger repository, which
+is too long to hold a `worker_report` call (the Pi extension's broker call times out at 11 minutes) or the mirror's lock, and
+the result must cross from `admit` to `Publish` and be put in a description the host builds from the worker's text. The gate
+above catches a missing, malformed, failed or dirty block at once, and CI judges the rest. The sandbox and the cache this
+section adds are what a host-run `verify` would use.
+
+**Not covered.** A pull request's description is made once: a later head the host pushes for a review or CI repair keeps the
+first head's evidence, and a CI that requires it for every head asks the worker to run it again. A build of a very large
+dependency tree uses many inodes (about 234,000 for `GuiBibeau/solos`), so keep `<state>` off a tmpfs. A lockfile
+that needs a private registry or a scope token is not supported. A binary `bun.lockb` is read as a lockfile like any
+other, but cannot be checked for the hosts it names (the install still reads no registry setting, so a registry
+package comes from npmjs); prefer the text `bun.lock`. `kind` is a variant for npm or pnpm to be added to.
 
 ## Security model
 

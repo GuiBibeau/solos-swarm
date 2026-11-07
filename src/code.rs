@@ -106,6 +106,44 @@ impl Mount {
     }
 }
 
+/// What one Ticket's commands see beyond the executor's own mounts. The
+/// host builds it for a Ticket (see `Forge::dependencies`), never a worker:
+/// every source is a path the host chose, and every value is plain text, since
+/// they are `bwrap` arguments that any local user can read.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Extras {
+    pub binds: Vec<Bind>,
+    /// Sandbox directories that come first on `PATH`.
+    pub path: Vec<PathBuf>,
+    /// Variables set last, over the sandbox's own.
+    pub env: Vec<(String, String)>,
+    /// An address-space cap for these commands where it is higher than the
+    /// executor's: a program (bun) that reserves more than the usual cap
+    /// allows gets what it needs, only for the Tickets that run it.
+    pub memory_bytes: Option<u64>,
+}
+
+/// One extra mount of a command's sandbox, made after `/work`, so what it
+/// covers in the Ticket's tree is shadowed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Bind {
+    /// The host's `source`, a file or a directory, read-only at `target`.
+    ReadOnly { source: PathBuf, target: PathBuf },
+    /// A fresh writable tmpfs at `dir` that holds these links and is gone
+    /// when the command ends: for a directory a tool must be able to write
+    /// into (Vite makes `node_modules/.vite-temp`) whose entries are only
+    /// links into a read-only tree mounted elsewhere.
+    Links { dir: PathBuf, links: Vec<Link> },
+}
+
+/// A symbolic link in a [`Bind::Links`] directory: `path`, relative to it,
+/// points at `target`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Link {
+    pub path: PathBuf,
+    pub target: PathBuf,
+}
+
 #[derive(Clone, Debug)]
 pub struct CodeConfig {
     /// Read-only binds, in this order.
@@ -247,6 +285,7 @@ struct CodeRequest {
     files: Vec<(String, String)>,
     timeout: Duration,
     stdin: Option<String>,
+    extras: Extras,
 }
 impl CodeRequest {
     fn parse(args: &Value) -> Result<Self> {
@@ -323,6 +362,7 @@ impl CodeRequest {
             files,
             timeout: Duration::from_secs(timeout_seconds),
             stdin,
+            extras: Extras::default(),
         })
     }
 }
@@ -400,7 +440,18 @@ impl CodeExecutor {
     /// [`run_in`](Self::run_in) on its own task: it returns at once, and
     /// the request ends with the same receipt or error.
     pub fn start_in(self: &Arc<Self>, scratch: &Path, args: &Value) -> Result<Started> {
-        let request = CodeRequest::parse(args)?;
+        self.start_in_with(scratch, &Extras::default(), args)
+    }
+    /// [`start_in`](Self::start_in) with the `extras` of the Ticket the
+    /// directory is.
+    pub fn start_in_with(
+        self: &Arc<Self>,
+        scratch: &Path,
+        extras: &Extras,
+        args: &Value,
+    ) -> Result<Started> {
+        let mut request = CodeRequest::parse(args)?;
+        request.extras = extras.clone();
         let scratch = self.owned_scratch(scratch)?;
         Ok(self.start(scratch, request, OutputBounds::RUN_CODE))
     }
@@ -409,6 +460,17 @@ impl CodeExecutor {
     pub fn start_job_in(
         self: &Arc<Self>,
         scratch: &Path,
+        code: &str,
+        timeout: Duration,
+        bounds: OutputBounds,
+    ) -> Result<Started> {
+        self.start_job_in_with(scratch, &Extras::default(), code, timeout, bounds)
+    }
+    /// [`start_job_in`](Self::start_job_in) with the Ticket's `extras`.
+    pub fn start_job_in_with(
+        self: &Arc<Self>,
+        scratch: &Path,
+        extras: &Extras,
         code: &str,
         timeout: Duration,
         bounds: OutputBounds,
@@ -424,6 +486,7 @@ impl CodeExecutor {
             files: Vec::new(),
             timeout,
             stdin: None,
+            extras: extras.clone(),
         };
         Ok(self.start(scratch, request, bounds))
     }
@@ -559,7 +622,7 @@ impl CodeExecutor {
             .context("run_code scheduler closed")?;
         let queue_wait_ms = queued.elapsed().as_millis() as u64;
         write_files(scratch, &request.files)?;
-        let command = self.command(scratch, &request.code);
+        let command = self.command_with(scratch, &request.code, &request.extras);
         let mut receipt = execute(command, request.stdin, request.timeout).await?;
         // `duration_ms` is sandbox time only; queue_wait_ms is the time spent
         // waiting for one of `concurrency` slots (78% of run_code wall time in
@@ -579,7 +642,11 @@ impl CodeExecutor {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
         Ok(path)
     }
+    #[cfg(test)]
     fn command(&self, scratch: &Path, code: &str) -> Command {
+        self.command_with(scratch, code, &Extras::default())
+    }
+    fn command_with(&self, scratch: &Path, code: &str, extras: &Extras) -> Command {
         let mut command = Command::new(&self.config.prlimit);
         command.env_clear();
         command.envs(
@@ -588,19 +655,28 @@ impl CodeExecutor {
                 .iter()
                 .map(|(name, value)| (name, value.expose())),
         );
+        let memory = extras
+            .memory_bytes
+            .map_or(self.config.memory_bytes, |more| {
+                more.max(self.config.memory_bytes)
+            });
         command
-            .arg(format!("--as={}", self.config.memory_bytes))
+            .arg(format!("--as={memory}"))
             .arg(format!("--fsize={FILE_SIZE_BYTES}"))
             .arg(format!("--cpu={MAX_TIMEOUT_SECONDS}"))
             .arg(format!("--nofile={MAX_OPEN_FILES}"))
             .arg("--")
             .arg(&self.config.bwrap)
-            .args(self.bwrap_args(scratch, code));
+            .args(self.bwrap_args_with(scratch, code, extras));
         command
     }
     /// The bwrap argument vector is separated from the process launch so the
     /// isolation contract can be asserted without a Linux host.
+    #[cfg(test)]
     fn bwrap_args(&self, scratch: &Path, code: &str) -> Vec<OsString> {
+        self.bwrap_args_with(scratch, code, &Extras::default())
+    }
+    fn bwrap_args_with(&self, scratch: &Path, code: &str, extras: &Extras) -> Vec<OsString> {
         let mut sandbox = Bwrap::new()
             .unshare_all()
             .die_with_parent()
@@ -626,14 +702,27 @@ impl CodeExecutor {
         for file in &self.config.files {
             sandbox = parent_dirs(sandbox, &file.target).ro_bind(&file.source, &file.target);
         }
+        for bind in &extras.binds {
+            sandbox = match bind {
+                Bind::ReadOnly { source, target } => sandbox.ro_bind(source, target),
+                Bind::Links { dir, links } => links_dir(sandbox, dir, links),
+            };
+        }
         sandbox = sandbox.chdir("/work");
         // `command` cleared the environment bwrap inherits and put only
         // `env` in it, so bwrap passes those on when it does not clear them.
         if self.config.env.is_empty() {
             sandbox = sandbox.clearenv();
         }
-        sandbox
-            .setenv("PATH", "/venv/bin:/usr/local/bin:/usr/bin:/bin")
+        let path = extras
+            .path
+            .iter()
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .chain(["/venv/bin:/usr/local/bin:/usr/bin:/bin".to_owned()])
+            .collect::<Vec<_>>()
+            .join(":");
+        let mut sandbox = sandbox
+            .setenv("PATH", path)
             .setenv("HOME", "/work")
             .setenv("TMPDIR", "/tmp")
             .setenv("LANG", "C.UTF-8")
@@ -655,9 +744,33 @@ impl CodeExecutor {
             .setenv("RAYON_NUM_THREADS", "4")
             // CPU-only deployment: even if a library probes for a device,
             // this sandbox never exposes one.
-            .setenv("CUDA_VISIBLE_DEVICES", "")
-            .exec("/usr/bin/bash", ["-c", code])
+            .setenv("CUDA_VISIBLE_DEVICES", "");
+        for (name, value) in &extras.env {
+            sandbox = sandbox.setenv(name, value);
+        }
+        sandbox.exec("/usr/bin/bash", ["-c", code])
     }
+}
+/// A tmpfs at `dir` holding `links`, each under the directories it needs.
+fn links_dir(sandbox: Bwrap, dir: &Path, links: &[Link]) -> Bwrap {
+    let mut sandbox = sandbox.tmpfs(dir);
+    let mut made = std::collections::BTreeSet::new();
+    for link in links {
+        let at = dir.join(&link.path);
+        let mut parents: Vec<&Path> = at
+            .ancestors()
+            .skip(1)
+            .take_while(|parent| parent.starts_with(dir) && *parent != dir)
+            .collect();
+        parents.reverse();
+        for parent in parents {
+            if made.insert(parent.to_owned()) {
+                sandbox = sandbox.dir(parent);
+            }
+        }
+        sandbox = sandbox.symlink(&link.target, &at);
+    }
+    sandbox
 }
 /// `--dir` for each directory above `path` but the root, outermost first.
 fn parent_dirs(mut sandbox: Bwrap, path: &Path) -> Bwrap {
@@ -1134,7 +1247,7 @@ async fn attend(
     let queue_wait_ms = queued.elapsed().as_millis() as u64;
     progress.running.store(true, Ordering::SeqCst);
     write_files(scratch, &request.files)?;
-    let command = executor.command(scratch, &request.code);
+    let command = executor.command_with(scratch, &request.code, &request.extras);
     let (mut receipt, was_stopped) =
         execute_watched(command, request.stdin, request.timeout, progress, stop).await?;
     receipt["queue_wait_ms"] = json!(queue_wait_ms);
@@ -1485,6 +1598,143 @@ mod tests {
             ["--dir", "/data", "--ro-bind", "/usr/share", "/data"]
         );
         assert!(!worker.iter().any(|arg| arg == "/dataset" || arg == "/venv"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn a_tickets_extras_are_mounted_after_its_directory_read_only_and_change_nothing_else() {
+        let dir = scratch_dir();
+        let work = Path::new("/tickets/tk_1/work");
+        let executor = executor(worker_config(&dir));
+        let extras = Extras {
+            binds: vec![
+                Bind::ReadOnly {
+                    source: "/opt/bun".into(),
+                    target: "/runtime/bun/bun".into(),
+                },
+                Bind::ReadOnly {
+                    source: "/opt/bun".into(),
+                    target: "/runtime/bun/node".into(),
+                },
+                Bind::Links {
+                    dir: "/tmp/home".into(),
+                    links: Vec::new(),
+                },
+                Bind::Links {
+                    dir: "/work/apps/web/node_modules".into(),
+                    links: vec![
+                        Link {
+                            path: "@acme/lib".into(),
+                            target: "../../../../packages/lib".into(),
+                        },
+                        Link {
+                            path: "@acme/ui".into(),
+                            target: "../../../../packages/ui".into(),
+                        },
+                        Link {
+                            path: "zod".into(),
+                            target: "../../../node_modules/.bun/zod/node_modules/zod".into(),
+                        },
+                    ],
+                },
+                Bind::ReadOnly {
+                    source: "/state/deps/acme/widgets/k/node_modules".into(),
+                    target: "/work/node_modules".into(),
+                },
+            ],
+            path: vec![PathBuf::from("/runtime/bun")],
+            env: vec![("HOME".into(), "/tmp/home".into())],
+            memory_bytes: Some(17_179_869_184),
+        };
+
+        let plain = executor.bwrap_args(work, "true");
+        assert_eq!(
+            plain,
+            executor.bwrap_args_with(work, "true", &Extras::default()),
+            "no extras, the same sandbox as ever"
+        );
+        let with = executor.bwrap_args_with(work, "true", &extras);
+        let words: Vec<String> = with
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let text = words.join("\n");
+
+        let at = |needle: &str| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("{needle} in {text}"))
+        };
+        assert!(
+            at("--bind\n/tickets/tk_1/work\n/work")
+                < at("--ro-bind\n/state/deps/acme/widgets/k/node_modules\n/work/node_modules"),
+            "/work first, so the cache covers what is in it"
+        );
+        assert_eq!(
+            text.matches("\n--bind\n").count(),
+            1,
+            "still one writable mount"
+        );
+        assert!(text.contains("--ro-bind\n/opt/bun\n/runtime/bun/bun\n"));
+        assert!(text.contains("--ro-bind\n/opt/bun\n/runtime/bun/node\n"));
+        assert!(
+            text.contains(
+                "--tmpfs\n/work/apps/web/node_modules\n\
+                 --dir\n/work/apps/web/node_modules/@acme\n\
+                 --symlink\n../../../../packages/lib\n/work/apps/web/node_modules/@acme/lib\n\
+                 --symlink\n../../../../packages/ui\n/work/apps/web/node_modules/@acme/ui\n\
+                 --symlink\n../../../node_modules/.bun/zod/node_modules/zod\n/work/apps/web/node_modules/zod\n"
+            ),
+            "a directory of links is a tmpfs holding them, each parent made once: {text}"
+        );
+        assert!(text.contains("--tmpfs\n/tmp/home\n"));
+        assert!(
+            text.contains("--setenv\nPATH\n/runtime/bun:/venv/bin:/usr/local/bin:/usr/bin:/bin\n"),
+            "the manager's directory first on PATH"
+        );
+        let homes: Vec<usize> = words
+            .windows(2)
+            .enumerate()
+            .filter(|(_, pair)| pair[0] == "HOME")
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(homes.len(), 2, "{text}");
+        assert_eq!(words[homes[0] + 1], "/work");
+        assert_eq!(
+            words[homes[1] + 1],
+            "/tmp/home",
+            "the extra one is set last, so it wins"
+        );
+        assert!(
+            !text.contains("--share-net"),
+            "the ticket's sandbox stays offline"
+        );
+        assert!(
+            !text.contains("--ro-bind\n/work"),
+            "nothing makes /work read-only"
+        );
+
+        let limit = |extras: &Extras| -> String {
+            let command = executor.command_with(work, "true", extras);
+            let args: Vec<String> = command
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            args.into_iter()
+                .find(|arg| arg.starts_with("--as="))
+                .unwrap()
+        };
+        let usual = format!("--as={DEFAULT_MEMORY_BYTES}");
+        assert_eq!(limit(&Extras::default()), usual);
+        assert_eq!(limit(&extras), "--as=17179869184", "raised for this ticket");
+        let lower = Extras {
+            memory_bytes: Some(1 << 20),
+            ..Extras::default()
+        };
+        assert_eq!(
+            limit(&lower),
+            usual,
+            "extras never lower the executor's cap"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
     /// The whole command a swarm run's `run_code` starts, as it was before
