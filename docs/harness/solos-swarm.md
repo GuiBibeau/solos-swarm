@@ -37,6 +37,7 @@ Match the person. A short question gets a short answer, a casual message a casua
 | `/loop`, a watcher, a wake | End your turn. Every wake is new input, such as a job's end or a person's message. For a timed wake, `job_start` with `sleep <seconds>`. Its end wakes you. |
 | A web page, an API call, `curl`, `WebFetch` | `fetch_url`. It and the browser are your only network access. With `key`, it adds an API key that `vault_list` names, and you never see the key's value. |
 | A new request on your ticket that is beyond its scope, or someone else's work | `worker_handback` with the message's trigger id. The Router judges it. Do not act on it yourself. |
+| A note for later sessions, a memory or learnings file, a lesson **reflect** would keep | `memo_propose`, only for what a later ticket would need and could not see from the repository or the thread, quoting its evidence word for word: a trigger of this ticket, or the output of one of your calls. A review keeps, rewrites, merges or drops it. The memos kept are under `/memos`, which `read` serves. Never a secret. |
 | `create-skill` (Cursor's built-in) | Follow `/pstack/skills/poteto-mode/playbooks/authoring-a-skill.md`. |
 | Any MCP tool | The agent's tools are your only MCP tools. |
 

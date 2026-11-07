@@ -14,7 +14,9 @@ use solos_agent_core::model::{
 use solos_agent_core::{AllowlistPolicy, Engine};
 use solos_agent_store::{SpendState, SqliteStore};
 use solos_swarm::agent::broker::browser::{BrowserParts, LocalBrowser};
+use solos_swarm::agent::broker::memory::MemoryParts;
 use solos_swarm::agent::broker::registry::{self, PrincipalKind};
+use solos_swarm::agent::broker::review::{Effort, ReviewTerms};
 use solos_swarm::agent::broker::{
     self, Account, AgentBroker, BrokerParts, DecideTerms, Grant, ModelFailure, ModelTerms,
     Principal, ROUTER_TOOLS, SwarmTerms, VaultParts, WORKER_TOOLS, WorkerParts, WorkerSeat,
@@ -2593,6 +2595,13 @@ fn serve_with_a_node_a_vault_and_a_browser(scratch: &Scratch) -> (Runtime, Serve
         workers(Some(vault), Some(browser)),
         Some(Arc::new(pstack)),
     );
+    served.broker.set_memory(MemoryParts {
+        review: ReviewTerms {
+            terms: terms(),
+            effort: Effort::Max,
+        },
+        daily_microusd: None,
+    });
     for (token, ticket, environment) in
         [(HERE, "tk_here", None), (THERE, "tk_there", Some("laptop"))]
     {
@@ -2651,7 +2660,8 @@ async fn a_seat_may_call_exactly_the_tools_it_is_offered() {
             "job_stop",
             "fetch_url",
             "vault_list",
-            "read"
+            "read",
+            "memo_propose"
         ],
         "a node's worker has run_code there and no browser"
     );
@@ -2666,7 +2676,8 @@ async fn a_seat_may_call_exactly_the_tools_it_is_offered() {
             "browser_act",
             "browser_login",
             "browser_read",
-            "read"
+            "read",
+            "memo_propose"
         ],
         "this host has a browser and no run_code"
     );

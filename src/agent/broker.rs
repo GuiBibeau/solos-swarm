@@ -6,8 +6,10 @@
 //! settled against the principal's account in the agent Store.
 
 pub mod browser;
+pub mod memory;
 pub mod registry;
 mod repeat;
+pub mod review;
 mod secrets;
 mod toolbox;
 
@@ -50,7 +52,7 @@ use solos_agent_store::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
 use std::time::Duration;
 use tokio::net::UnixListener;
@@ -150,6 +152,10 @@ pub struct WorkerSeat {
     /// The worker tools this seat holds. `admit_worker` builds it from the
     /// seat's environment and the host.
     held: Toolbox<WorkerCall>,
+    /// What its calls answered, so a memo can quote one.
+    calls: Mutex<memory::CallLog>,
+    /// The memos it proposed that the Engine took.
+    proposed: AtomicUsize,
 }
 
 impl WorkerSeat {
@@ -176,6 +182,8 @@ impl WorkerSeat {
             jobs: Arc::default(),
             browser: browser::SeatBrowser::default(),
             held: Toolbox::default(),
+            calls: Mutex::default(),
+            proposed: AtomicUsize::new(0),
         }
     }
 
@@ -437,6 +445,9 @@ pub enum Account {
         id: TicketId,
         budget_microusd: Option<MicroUsd>,
     },
+    /// The memory review's calls, capped per UTC day, or not capped where
+    /// `memory.daily_microusd` is absent; held and settled either way.
+    Memory { daily_microusd: Option<MicroUsd> },
 }
 
 impl Account {
@@ -446,6 +457,7 @@ impl Account {
         match self {
             Self::Router { .. } => "router".into(),
             Self::Ticket { id, .. } => Self::ticket_key(id),
+            Self::Memory { .. } => "memory".into(),
         }
     }
 
@@ -457,7 +469,9 @@ impl Account {
     /// Spend from the first time on counts against the cap, if there is one.
     pub fn allowance(&self, now_ms: Ms) -> (Ms, Option<MicroUsd>) {
         match self {
-            Self::Router { daily_microusd } => (now_ms - now_ms % DAY_MS, *daily_microusd),
+            Self::Router { daily_microusd } | Self::Memory { daily_microusd } => {
+                (now_ms - now_ms % DAY_MS, *daily_microusd)
+            }
             Self::Ticket {
                 budget_microusd, ..
             } => (0, *budget_microusd),
@@ -477,6 +491,10 @@ impl Account {
             Self::Ticket { id, .. } => {
                 format!("{id}'s budget is reached: {committed} of {cap} microusd committed")
             }
+            Self::Memory { .. } => format!(
+                "the memory review's daily spend cap is reached: {committed} of {cap} microusd \
+                 committed today"
+            ),
         }
     }
 }
@@ -701,6 +719,9 @@ struct Inner {
     browser: Option<Arc<browser::BrowserParts>>,
     /// Judges what a worker proposes on `ready`; set once, before workers run.
     forge: OnceLock<Arc<dyn Forge>>,
+    /// Workers' memory: `memo_propose`, `/memos` and the review of what
+    /// they propose; set once, before workers run.
+    memory: OnceLock<Arc<memory::Memory>>,
     /// The Router's tools, which need no host resource.
     router: Toolbox<RouterOp>,
 }
@@ -904,6 +925,7 @@ impl AgentBroker {
                 vault,
                 browser,
                 forge: OnceLock::new(),
+                memory: OnceLock::new(),
                 router: toolbox::router(),
             }),
         })
@@ -958,6 +980,14 @@ impl AgentBroker {
     /// worker runs; a second call changes nothing.
     pub fn set_forge(&self, forge: Arc<dyn Forge>) {
         let _ = self.inner.forge.set(forge);
+    }
+
+    /// Give workers memory: `memo_propose`, the memos under `/memos` in
+    /// `read`, and the review of each proposal on `memory`'s model and
+    /// account. Set once, before any worker is admitted; a second call
+    /// changes nothing.
+    pub fn set_memory(&self, memory: memory::MemoryParts) {
+        let _ = self.inner.memory.set(Arc::new(memory::Memory::new(memory)));
     }
 
     /// What `ready` means for `seat`'s Ticket, before the Engine records it:
@@ -1381,23 +1411,64 @@ impl Call {
             ));
         }
         self.admitted.map_err(forbidden)?;
+        let spent = broker
+            .spend(
+                &grant.account,
+                terms,
+                self.input_bytes,
+                self.max_output_tokens,
+                self.upstream,
+            )
+            .await?;
+        match spent {
+            Spent::Answered(reply) => reply,
+            Spent::CapReached { committed, cap } => {
+                *named = Some(ModelFailure::BudgetReached {
+                    committed,
+                    budget: cap,
+                });
+                Err(forbidden(grant.account.cap_reached(committed, cap)))
+            }
+        }
+    }
+}
+
+/// What holding a model call on an account came to.
+enum Spent {
+    /// It went upstream, and its hold is closed: the answer, or why it
+    /// failed.
+    Answered(Reply),
+    /// The account's cap has no room for its hold; nothing was sent.
+    CapReached { committed: MicroUsd, cap: MicroUsd },
+}
+
+impl AgentBroker {
+    /// Hold a call of `input_bytes` that may answer `max_output_tokens` on
+    /// `account`, send `body` upstream and close the hold. An account with a
+    /// cap is refused after an overrun, since only a hold bounds its spend.
+    async fn spend(
+        &self,
+        account: &Account,
+        terms: &ModelTerms,
+        input_bytes: usize,
+        max_output_tokens: u64,
+        body: Value,
+    ) -> std::result::Result<Spent, Refusal> {
         // An account with no cap relies on no hold to bound its spend, so
         // an overrun stops only the accounts that have one.
-        if grant.account.capped() && broker.inner.overrun.load(Ordering::SeqCst) {
+        if account.capped() && self.inner.overrun.load(Ordering::SeqCst) {
             return Err(forbidden(
                 "an earlier call cost more than its hold, so model calls are stopped",
             ));
         }
-        let hold = terms
-            .prices
-            .request_hold(self.input_bytes, self.max_output_tokens);
+        let hold = terms.prices.request_hold(input_bytes, max_output_tokens);
         let now = now_ms();
-        let (since_ms, cap) = grant.account.allowance(now);
-        let (account, provider) = (grant.account.key(), terms.upstream.provider.clone());
-        let reservation = broker
+        let (since_ms, cap) = account.allowance(now);
+        let (key, provider) = (account.key(), terms.upstream.provider.clone());
+        let reservation = self
             .store(move |store| {
                 store.reserve(&HoldRequest {
-                    account: &account,
+                    account: &key,
                     provider: &provider,
                     since_ms,
                     cap_microusd: cap,
@@ -1409,40 +1480,39 @@ impl Call {
             .map_err(failed)?;
         let id = match reservation {
             Reservation::Held(id) => id,
+            // Only an account with a cap is refused for spend.
             Reservation::Refused { committed } => {
-                // Only an account with a cap is refused for spend.
-                let cap = cap.unwrap_or_default();
-                *named = Some(ModelFailure::BudgetReached {
+                return Ok(Spent::CapReached {
                     committed,
-                    budget: cap,
+                    cap: cap.unwrap_or_default(),
                 });
-                return Err(forbidden(grant.account.cap_reached(committed, cap)));
             }
         };
         // Its own task, so a session that hangs up mid-call still gets its hold closed.
         let call = tokio::spawn(dispatch(
-            broker.clone(),
-            grant.clone(),
+            self.clone(),
+            account.clone(),
+            terms.clone(),
             id,
             hold,
-            self.upstream,
+            body,
         ));
-        call.await.map_err(failed)?
+        Ok(Spent::Answered(call.await.map_err(failed)?))
     }
 }
 
 /// Send one held call upstream and close its hold: settled at the receipt's
 /// cost, released if the provider failed, or charged at the hold if it
 /// answered with a receipt that cannot be read or did not answer within the
-/// grant's call limit, since the provider may still bill a request it got.
+/// terms' call limit, since the provider may still bill a request it got.
 async fn dispatch(
     broker: AgentBroker,
-    grant: Arc<Grant>,
+    account: Account,
+    terms: ModelTerms,
     id: HoldId,
     hold: u64,
     body: Value,
 ) -> Reply {
-    let terms = &grant.terms;
     let sent = broker.inner.provider.dispatch(body);
     let sent = match terms.call_limit {
         None => sent.await,
@@ -1490,7 +1560,7 @@ async fn dispatch(
         .await
         .map_err(failed)?;
     if cost > hold {
-        if grant.account.capped() {
+        if account.capped() {
             broker.inner.overrun.store(true, Ordering::SeqCst);
             return Err(forbidden(
                 "provider exceeded reservation; admission stopped",
@@ -1501,7 +1571,7 @@ async fn dispatch(
         eprintln!(
             "agent: a call on {} cost {cost} microusd, above its {hold} hold; it has no cap, so \
              the cost is recorded and the call stands",
-            grant.account.key()
+            account.key()
         );
     }
     response["swarm_cost_microusd"] = json!(cost);
@@ -1564,7 +1634,8 @@ impl WorkerCall {
         let asked = (!seat.held.repeatable(name)).then(|| args.clone());
         let reply = match self {
             Self::Browser(tool, browse) => {
-                return browser::call(broker, seat, *tool, browse.clone(), args).await;
+                let page = browser::call(broker, seat, *tool, browse.clone(), args).await?;
+                return Ok(seat.recorded(name, page).await);
             }
             Self::Report => report(broker, seat, args).await,
             Self::Handback => handback(broker, seat, args).await,
@@ -1577,7 +1648,10 @@ impl WorkerCall {
             Self::JobStop => seat.jobs.stop(args).await.map(Json).map_err(refused),
             Self::FetchUrl(vault) => fetch_url(broker, seat, vault.as_deref(), args).await,
             Self::VaultList(vault) => secrets::vault_list(broker, seat, vault).await,
-            Self::ReadPath(reader) => read_path(reader, args).await,
+            Self::ReadPath { files, memos } => {
+                read_path(broker, files.as_ref(), *memos, args).await
+            }
+            Self::MemoPropose => memory::propose(broker, seat, args).await,
         };
         if let Some(asked) = asked {
             let answer = match &reply {
@@ -1586,7 +1660,33 @@ impl WorkerCall {
             };
             seat.answered(name, &asked, answer);
         }
+        if let Ok(Json(answer)) = &reply
+            && memory::citable(name)
+        {
+            seat.record(name, answer);
+        }
         reply.map(IntoResponse::into_response)
+    }
+}
+
+impl WorkerSeat {
+    /// Keep what a call of `tool` answered, so a memo can quote it.
+    fn record(&self, tool: &str, answer: &Value) {
+        let mut calls = self.calls.lock().unwrap_or_else(PoisonError::into_inner);
+        calls.record(tool, answer);
+    }
+
+    /// A browser call's page, kept as [`record`](Self::record) keeps an
+    /// answer, and served as it came.
+    async fn recorded(&self, tool: &str, page: Response) -> Response {
+        let (parts, body) = page.into_parts();
+        let Ok(bytes) = axum::body::to_bytes(body, usize::MAX).await else {
+            return failed("the browser's page could not be read").into_response();
+        };
+        if let Ok(answer) = serde_json::from_slice::<Value>(&bytes) {
+            self.record(tool, &answer);
+        }
+        Response::from_parts(parts, axum::body::Body::from(bytes))
     }
 }
 
@@ -2097,25 +2197,43 @@ struct ReadPathArgs {
     limit: Option<usize>,
 }
 
-async fn read_path(reader: &Arc<Reader>, args: Value) -> Reply {
+/// `read`: the memos under `/memos` where the seat has memory, else a file
+/// or directory under the roots of `files`.
+async fn read_path(
+    broker: &AgentBroker,
+    files: Option<&Arc<Reader>>,
+    memos: bool,
+    args: Value,
+) -> Reply {
     let ReadPathArgs {
         path,
         offset,
         limit,
     } = arguments(args)?;
-    let reader = reader.clone();
-    tokio::task::spawn_blocking(move || reader.read(&path, offset, limit))
-        .await
-        .map_err(failed)?
-        .map(Json)
-        .map_err(|refusal| match refusal {
-            pstack::Refused::Invalid(why) | pstack::Refused::NotText(why) => {
-                refuse(StatusCode::UNPROCESSABLE_ENTITY, why)
-            }
-            pstack::Refused::Leaves(why) => forbidden(why),
-            pstack::Refused::Missing(why) => refuse(StatusCode::NOT_FOUND, why),
-            pstack::Refused::Host(why) => failed(why),
-        })
+    let read = if memos && memory::under_memos(&path) {
+        broker
+            .store(move |store| Ok(memory::read(store, &path, offset, limit)))
+            .await
+            .map_err(failed)?
+    } else if let Some(reader) = files {
+        let reader = reader.clone();
+        tokio::task::spawn_blocking(move || reader.read(&path, offset, limit))
+            .await
+            .map_err(failed)?
+    } else {
+        Err(pstack::Refused::Invalid(format!(
+            "{path} is not under {}: read takes an absolute path there",
+            memory::MEMOS_MOUNT
+        )))
+    };
+    read.map(Json).map_err(|refusal| match refusal {
+        pstack::Refused::Invalid(why) | pstack::Refused::NotText(why) => {
+            refuse(StatusCode::UNPROCESSABLE_ENTITY, why)
+        }
+        pstack::Refused::Leaves(why) => forbidden(why),
+        pstack::Refused::Missing(why) => refuse(StatusCode::NOT_FOUND, why),
+        pstack::Refused::Host(why) => failed(why),
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -2124,6 +2242,8 @@ enum Kind {
     Ticket,
     Trigger,
     Thread,
+    /// A memo by its id, or the active memos of a scope.
+    Memo,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2147,10 +2267,11 @@ async fn read(broker: &AgentBroker, args: Value) -> Reply {
         .await
         .map_err(failed)?;
     found.map(Json).ok_or_else(|| {
-        refuse(
-            StatusCode::NOT_FOUND,
-            format!("no trigger, thread or ticket {shown}"),
-        )
+        let what = match kind {
+            Some(Kind::Memo) => "memo",
+            _ => "trigger, thread or ticket",
+        };
+        refuse(StatusCode::NOT_FOUND, format!("no {what} {shown}"))
     })
 }
 
@@ -2169,6 +2290,9 @@ fn recall(
         && let Some(trigger) = store.read_trigger(&TriggerId::new(id))?
     {
         return trigger_summary(store, &trigger).map(Some);
+    }
+    if kind == Some(Kind::Memo) || (kind.is_none() && id.starts_with("mm_")) {
+        return memory::recall(store, id);
     }
     if wants(Kind::Thread) {
         return thread_summary(store, &ThreadKey::new(id));

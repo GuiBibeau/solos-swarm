@@ -4,8 +4,8 @@
 use super::earlier;
 use super::ports::{
     Answer, Applied, BoxFuture, Channel, Command, Delivered, Delivery, Execute, Executor, Fact,
-    FactSink, Failure, Forge, Inbound, Launch, MemoCommand, MemoOrder, Order, Publish, Router,
-    SendOptions, SendOutcome, Source,
+    FactSink, Failure, Forge, Inbound, Launch, MemoCommand, MemoDecision, MemoOrder, Order,
+    Publish, Router, SendOptions, SendOutcome, Source,
 };
 use super::watchdog;
 use crate::broker::now_ms;
@@ -15,10 +15,12 @@ use serde::Serialize;
 use solos_agent_core::change::{BranchName, CommitSha, RepoName};
 use solos_agent_core::delivery::{ForgeJob, Observed};
 use solos_agent_core::ids::key;
-use solos_agent_core::memo::{MemoActor, MemoAudience, MemoAuthor, MemoIn, MemoScope, MemoSource};
+use solos_agent_core::memo::{
+    MemoActor, MemoAudience, MemoAuthor, MemoIn, MemoReview, MemoScope, MemoSource,
+};
 use solos_agent_core::model::{
-    Actor, AssignmentId, AssignmentState, Candidate, Effect, EvalId, Input, InputBody, MessageId,
-    MessageKind, Ms, OutboundMessage, Plan, Stage, Ticket, TicketId, Trigger,
+    Actor, AssignmentId, AssignmentState, Candidate, Effect, EvalId, Input, InputBody, MemoId,
+    MessageId, MessageKind, Ms, OutboundMessage, Plan, Stage, Ticket, TicketId, Trigger,
 };
 use solos_agent_core::{AllowlistPolicy, Engine, Error, Intake, Policy, Repositories};
 use solos_agent_store::{EffectId, QueuedEffect, SqliteStore};
@@ -34,6 +36,8 @@ use tokio::time::MissedTickBehavior;
 pub type AgentEngine = Engine<SqliteStore, AllowlistPolicy, fn() -> Ms>;
 
 const MAX_IN_FLIGHT: usize = 64;
+/// How often proposals no review decided are looked at for expiry.
+const EXPIRY_CHECK: Duration = Duration::from_secs(60);
 /// Why a start ends the Assignments the last run left without a worker.
 pub const HOST_RESTARTED: &str = "host restarted";
 
@@ -119,6 +123,8 @@ pub struct Runtime {
     global_memos: Option<watch::Sender<u64>>,
     /// The repositories a memo may be about; `None` takes any.
     memo_repos: Option<BTreeSet<RepoName>>,
+    /// When unreviewed proposals were last expired.
+    memos_expired: Option<Instant>,
 }
 
 impl Runtime {
@@ -164,6 +170,7 @@ impl Runtime {
             closing: None,
             global_memos: None,
             memo_repos: None,
+            memos_expired: None,
         }
     }
 
@@ -236,6 +243,7 @@ impl Runtime {
         loop {
             self.gate();
             self.evaluate()?;
+            self.expire_memos()?;
             self.dispatch(&mut work, &facts)?;
             let drained =
                 !sources_open && sources.is_empty() && inbound.is_empty() && work.is_empty();
@@ -453,6 +461,25 @@ impl Runtime {
             Fact::ShowMemos { to } => (
                 format!("memo index for {to:?}"),
                 self.engine.show_memos(to).map(Applied::Memos),
+            ),
+            Fact::ProposeMemo(proposal) => {
+                let what = match &proposal.author {
+                    MemoAuthor::Worker { assignment, .. } => {
+                        format!("memo proposed by {assignment}")
+                    }
+                    MemoAuthor::Operator { source, by } => {
+                        format!("memo proposed by {source}:{}", by.id)
+                    }
+                };
+                (what, self.propose_memo(proposal))
+            }
+            Fact::ReviewMemo {
+                memo,
+                review,
+                decision,
+            } => (
+                format!("review of {memo}"),
+                self.review_memo(&memo, review, decision),
             ),
             Fact::TrailAsk {
                 ticket,
@@ -683,11 +710,8 @@ impl Runtime {
             eprintln!("agent: {order:?} by {source}:{} refused: {refused}", by.id);
             refused
         });
-        if changed
-            && scope == Some(MemoScope::Global)
-            && let Some(changes) = &self.global_memos
-        {
-            changes.send_modify(|n| *n += 1);
+        if changed && scope == Some(MemoScope::Global) {
+            self.global_memos_changed();
         }
         self.replies.push(OutboundMessage {
             id: MessageId(key("rp", &[&id])),
@@ -698,6 +722,90 @@ impl Runtime {
             ask: None,
         });
         Ok(())
+    }
+
+    /// The global index moved, so a Router session started before starts
+    /// again with the new one.
+    fn global_memos_changed(&self) {
+        if let Some(changes) = &self.global_memos {
+            changes.send_modify(|n| *n += 1);
+        }
+    }
+
+    /// A worker's memo, as the core keeps it. One that is active at once
+    /// (a person's words, quoted whole) and global moves the Router's index.
+    fn propose_memo(&mut self, proposal: MemoIn) -> Result<Applied, Error> {
+        let id = self.engine.propose_memo(proposal)?;
+        let memo = self.engine.repos().memo(&id).ok_or(Error::Missing {
+            kind: "memo",
+            id: id.to_string(),
+        })?;
+        if memo.is_active() && memo.scope == MemoScope::Global {
+            self.global_memos_changed();
+        }
+        Ok(Applied::Memo(Box::new(memo)))
+    }
+
+    /// Apply the review's decision through the Engine, which takes it only
+    /// for a memo still proposed: keep it, keep it in other words (and in
+    /// place of the memo it merges), or retire it.
+    fn review_memo(
+        &mut self,
+        memo: &MemoId,
+        review: MemoReview,
+        decision: MemoDecision,
+    ) -> Result<Applied, Error> {
+        let scope = self.engine.repos().memo(memo).map(|m| m.scope);
+        let kept = match decision {
+            MemoDecision::Keep => self
+                .engine
+                .activate_memo(memo, review)
+                .map(|()| Some(memo.clone())),
+            MemoDecision::Rewrite { text } => {
+                self.engine.revise_memo(memo, review, text, None).map(Some)
+            }
+            MemoDecision::Merge { into, text } => self
+                .engine
+                .revise_memo(memo, review, text, Some(&into))
+                .map(Some),
+            MemoDecision::Reject => {
+                let by = MemoActor::Review {
+                    by: review.by.clone(),
+                };
+                self.engine
+                    .retire_memo(memo, by, &review.reason)
+                    .map(|()| None)
+            }
+        }?;
+        if kept.is_some() && scope == Some(MemoScope::Global) {
+            self.global_memos_changed();
+        }
+        Ok(Applied::Reviewed(kept))
+    }
+
+    /// Retire the proposals no review decided within a week, at most once
+    /// a minute. A Store error stops the runtime.
+    fn expire_memos(&mut self) -> Result<()> {
+        if self
+            .memos_expired
+            .is_some_and(|at| at.elapsed() < EXPIRY_CHECK)
+        {
+            return Ok(());
+        }
+        self.memos_expired = Some(Instant::now());
+        match self.engine.expire_memos() {
+            Ok(expired) => {
+                for memo in expired {
+                    eprintln!("agent: {memo} expired: no review decided it within a week");
+                }
+                Ok(())
+            }
+            Err(Error::Store(why)) => bail!("memo expiry: {why}"),
+            Err(err) => {
+                eprintln!("agent: memo expiry: {err}");
+                Ok(())
+            }
+        }
     }
 
     /// A session's worker gets the memo index the core picks as its Launch
@@ -1191,16 +1299,21 @@ mod tests {
     use crate::agent::ports::{Applied, Fact, MemoCommand, MemoOrder};
     use crate::agent::scripted::{ScriptedExecutor, ScriptedRouter};
     use solos_agent_core::change::RepoName;
-    use solos_agent_core::memo::{MemoAudience, MemoAuthor, MemoIn, MemoScope, MemoSource};
-    use solos_agent_core::model::{
-        Accept, Acknowledge, Actor, Addressed, Ask, ChannelRef, DomainEvent, Effect, Plan,
-        SecretId, ThreadKey, TicketId, Trigger, TriggerId, Verdict,
+    use solos_agent_core::memo::{
+        Memo, MemoAudience, MemoAuthor, MemoIn, MemoScope, MemoSource, MemoState, MemoTrust,
+        PROPOSAL_TTL_MS,
     };
+    use solos_agent_core::model::{
+        Accept, Acknowledge, Actor, Addressed, Ask, AssignmentId, ChangeSet, ChannelRef,
+        DomainEvent, Effect, MemoId, Plan, SecretId, ThreadKey, TicketId, Trigger, TriggerId,
+        Verdict,
+    };
+    use solos_agent_core::trail::Digest;
     use solos_agent_core::{AllowlistPolicy, Repositories};
     use solos_agent_store::SqliteStore;
     use std::collections::BTreeMap;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tokio::sync::watch;
 
     fn runtime_with_a_ticket(budget_microusd: u64) -> (Runtime, TicketId) {
@@ -1456,6 +1569,59 @@ mod tests {
         assert!(seen.has_changed().unwrap());
         let (reply, _) = order("alice", MemoOrder::Forget { memo: global });
         assert!(reply.starts_with("Nothing changed:"), "{reply}");
+    }
+
+    #[test]
+    fn a_proposal_no_review_decided_for_a_week_expires_as_the_runtime_looks_once_a_minute() {
+        let (mut runtime, ticket) = runtime_with_a_ticket(100_000);
+        let old = |id: &str| {
+            let text = format!("Proposal {id}.");
+            let at = crate::broker::now_ms() - PROPOSAL_TTL_MS - 1;
+            Memo {
+                id: MemoId::new(id),
+                scope: MemoScope::Global,
+                text_sha256: Digest::of(text.as_bytes()),
+                text,
+                sources: vec![MemoSource::Ticket {
+                    ticket: ticket.clone(),
+                }],
+                trust: MemoTrust::Model,
+                author: MemoAuthor::Worker {
+                    ticket: ticket.clone(),
+                    assignment: AssignmentId::new("as_gone"),
+                },
+                state: MemoState::Proposed,
+                created_ms: at,
+                verified_ms: at,
+            }
+        };
+        let save = |runtime: &mut Runtime, memo: Memo| {
+            let memos = BTreeMap::from([(memo.id.clone(), memo)]);
+            let changes = ChangeSet {
+                memos,
+                ..ChangeSet::default()
+            };
+            runtime.engine.repos_mut().commit(changes).unwrap();
+        };
+        let state = |runtime: &Runtime, id: &str| {
+            let memo = runtime.engine.repos().memo(&MemoId::new(id)).unwrap();
+            memo.state.name()
+        };
+        save(&mut runtime, old("mm_0000000000000001"));
+
+        runtime.expire_memos().unwrap();
+        assert_eq!(state(&runtime, "mm_0000000000000001"), "retired");
+
+        save(&mut runtime, old("mm_0000000000000002"));
+        runtime.expire_memos().unwrap();
+        assert_eq!(
+            state(&runtime, "mm_0000000000000002"),
+            "proposed",
+            "looked for once a minute"
+        );
+        runtime.memos_expired = Some(Instant::now() - super::EXPIRY_CHECK);
+        runtime.expire_memos().unwrap();
+        assert_eq!(state(&runtime, "mm_0000000000000002"), "retired");
     }
 
     #[test]

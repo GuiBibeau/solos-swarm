@@ -22,6 +22,7 @@ pub enum Resource {
     Browser,
     Vault,
     Read,
+    Memory,
 }
 
 impl Resource {
@@ -32,6 +33,7 @@ impl Resource {
             Self::Browser => "no browser where this ticket runs",
             Self::Vault => "no vault on this host",
             Self::Read => "this ticket has neither pstack nor a repository to read",
+            Self::Memory => "this agent keeps no memos from its workers",
         }
     }
 }
@@ -140,6 +142,8 @@ struct Resources {
     vault: Option<Arc<VaultParts>>,
     browser: Option<Arc<BrowserParts>>,
     reader: Option<Arc<Reader>>,
+    /// The agent keeps its workers' memos: `memo_propose`, and `/memos`.
+    memory: bool,
 }
 
 impl Resources {
@@ -158,8 +162,20 @@ impl Resources {
         })
     }
 
-    fn reader(&self) -> Result<Arc<Reader>, Resource> {
-        self.reader.clone().ok_or(Resource::Read)
+    /// What `read` reaches: the seat's files, and the memos where the agent
+    /// keeps them. One of the two at least.
+    fn read(&self) -> Result<WorkerCall, Resource> {
+        if self.reader.is_none() && !self.memory {
+            return Err(Resource::Read);
+        }
+        Ok(WorkerCall::ReadPath {
+            files: self.reader.clone(),
+            memos: self.memory,
+        })
+    }
+
+    fn memory(&self) -> Result<(), Resource> {
+        self.memory.then_some(()).ok_or(Resource::Memory)
     }
 }
 
@@ -177,7 +193,13 @@ pub enum WorkerCall {
     FetchUrl(Option<Arc<VaultParts>>),
     VaultList(Arc<VaultParts>),
     Browser(BrowserTool, Browse),
-    ReadPath(Arc<Reader>),
+    /// The seat's files where it has a pstack or a repository, and the
+    /// memos at `/memos` where the agent keeps them.
+    ReadPath {
+        files: Option<Arc<Reader>>,
+        memos: bool,
+    },
+    MemoPropose,
 }
 
 impl WorkerCall {
@@ -207,7 +229,11 @@ impl WorkerCall {
                 Self::Browser(BrowserTool::Login, browse)
             }
             WorkerOp::BrowserRead => Self::Browser(BrowserTool::Read, host.browse()?),
-            WorkerOp::ReadPath => Self::ReadPath(host.reader()?),
+            WorkerOp::ReadPath => host.read()?,
+            WorkerOp::MemoPropose => {
+                host.memory()?;
+                Self::MemoPropose
+            }
         })
     }
 }
@@ -260,6 +286,7 @@ impl AgentBroker {
                 .clone()
                 .filter(|_| environments.is_local(environment)),
             reader,
+            memory: self.inner.memory.get().is_some(),
         };
         Toolbox::build(
             WORKER,

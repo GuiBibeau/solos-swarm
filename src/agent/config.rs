@@ -13,6 +13,9 @@ pub use sources::{Interval, ReplyTo, ScheduleConfig, TimeOfDay};
 pub use watchdog::{OperatorConfig, ThresholdsConfig, WatchdogConfig};
 pub use web::{DEFAULT_API_URL, PublishConfig, WebConfig};
 
+use super::broker::ModelTerms;
+use super::broker::memory::MemoryParts;
+use super::broker::review::{Effort, ReviewTerms};
 use super::goal_template::GoalTemplates;
 use super::jobs::{self, JobLimits};
 use super::links::TicketLinks;
@@ -82,10 +85,73 @@ pub struct AgentConfig {
     /// as trouble. Without it, its defaults apply.
     #[serde(default)]
     pub health: Option<HealthConfig>,
+    /// Workers' memory: whether they propose memos, and the review that
+    /// decides each. On by default where workers run on Pi.
+    #[serde(default)]
+    pub memory: MemoryConfig,
 }
 
 fn pass_through() -> bool {
     true
+}
+
+/// How long one review call may take: the transport's own limit.
+const REVIEW_CALL_LIMIT: Duration = Duration::from_secs(600);
+
+/// `memory:` in agent.yaml.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryConfig {
+    /// Workers may propose memos (`memo_propose`, and `/memos` in `read`),
+    /// each decided by the review. `false`: only the owner writes memos.
+    #[serde(default = "proposals")]
+    pub proposals: bool,
+    /// The review's model and thinking; each field the workers' unless set.
+    #[serde(default)]
+    pub review: ReviewConfig,
+    /// What the review may commit per UTC day on the `memory` account.
+    /// Absent: no cap, and every call is still held and settled there.
+    #[serde(default)]
+    pub daily_microusd: Option<MicroUsd>,
+}
+
+fn proposals() -> bool {
+    true
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            proposals: proposals(),
+            review: ReviewConfig::default(),
+            daily_microusd: None,
+        }
+    }
+}
+
+/// `memory.review`: the separate model call that decides each proposal.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewConfig {
+    /// The workers' provider, which is the only one allowed: one credential
+    /// serves both.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// The workers' model unless set.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// The workers' prices unless set.
+    #[serde(default)]
+    pub prices: Option<PriceTable>,
+    /// DeepSeek's `reasoning_effort` with thinking on: `low`, `high` or
+    /// `max`, the default.
+    #[serde(default)]
+    pub thinking: Effort,
+    /// What one review may answer, reasoning included. By default what
+    /// DeepSeek allows in thinking mode at that effort: 65536, or 131072 at
+    /// `max`.
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
 }
 
 /// Where the setup is written down, for the sentences that tell an owner of
@@ -1187,7 +1253,81 @@ impl AgentConfig {
         }
         self.validate_pstack()?;
         self.validate_forge()?;
+        self.validate_memory()?;
         self.validate_executor()
+    }
+
+    fn validate_memory(&self) -> Result<()> {
+        let memory = &self.memory;
+        ensure!(
+            memory.daily_microusd != Some(0),
+            "memory.daily_microusd must be above zero, or absent for no cap"
+        );
+        let ExecutorConfig::Pi {
+            provider, model, ..
+        } = &self.executor
+        else {
+            ensure!(
+                memory.review == ReviewConfig::default() && memory.daily_microusd.is_none(),
+                "memory.review and memory.daily_microusd are for workers on executor: pi"
+            );
+            return Ok(());
+        };
+        let review = &memory.review;
+        if let Some(named) = &review.provider {
+            ensure!(
+                named == provider,
+                "memory.review.provider must be the workers' provider, {provider}: one credential \
+                 serves both"
+            );
+        }
+        let model = review.model.as_deref().unwrap_or(model);
+        upstream_profile(provider, model).context("memory.review")?;
+        if let Some(prices) = &review.prices {
+            prices.validate().context("memory.review.prices")?;
+        }
+        ensure!(
+            review
+                .max_output_tokens
+                .is_none_or(|max| (1..=393_216).contains(&max)),
+            "memory.review.max_output_tokens must be 1..=393216"
+        );
+        Ok(())
+    }
+
+    /// The review of workers' memos and its account, where workers run on
+    /// Pi and propose memos: each of the review's fields the workers' unless
+    /// `memory.review` sets it, with thinking on at `memory.review.thinking`.
+    pub fn memory_parts(&self) -> Result<Option<MemoryParts>> {
+        let ExecutorConfig::Pi {
+            provider,
+            model,
+            prices,
+            max_input_bytes,
+            ..
+        } = &self.executor
+        else {
+            return Ok(None);
+        };
+        if !self.memory.proposals {
+            return Ok(None);
+        }
+        let review = &self.memory.review;
+        let effort = review.thinking;
+        let terms = ModelTerms {
+            upstream: upstream_profile(provider, review.model.as_deref().unwrap_or(model))?,
+            prices: review.prices.unwrap_or(*prices),
+            max_input_bytes: *max_input_bytes,
+            max_output_tokens: review
+                .max_output_tokens
+                .unwrap_or(effort.max_output_tokens()),
+            call_limit: Some(REVIEW_CALL_LIMIT),
+            temperature: None,
+        };
+        Ok(Some(MemoryParts {
+            review: ReviewTerms { terms, effort },
+            daily_microusd: self.memory.daily_microusd,
+        }))
     }
 
     fn validate_forge(&self) -> Result<()> {

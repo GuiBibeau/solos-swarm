@@ -358,10 +358,16 @@ async fn without_the_pstack_section_a_worker_starts_on_its_ticket_and_cannot_rea
         "{}",
         seen.first_prompt
     );
-    assert!(
-        !seen.grants.iter().any(|tool| tool == "read"),
-        "{:?}",
-        seen.grants
+    assert_eq!(
+        seen.grants,
+        [
+            "worker_report",
+            "worker_handback",
+            "fetch_url",
+            "read",
+            "memo_propose"
+        ],
+        "with no pstack and no repository, read reaches only the memos at /memos"
     );
     assert!(
         !seen.system_prompt.contains("pstack"),
