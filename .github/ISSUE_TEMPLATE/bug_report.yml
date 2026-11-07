@@ -1,0 +1,69 @@
+name: Bug report
+description: Report a problem with a build, a run or the agent.
+title: "[bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Do not use this form for a security vulnerability. Read [SECURITY.md](https://github.com/GuiBibeau/solos-swarm/blob/main/SECURITY.md) and report it privately.
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      description: Which mode does the problem affect?
+      options:
+        - Swarm mode (`solos-swarm run`)
+        - Agent mode (`solos-swarm agent serve`)
+        - Both
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Commit or version
+      description: The commit on `main` or the version you tested.
+      placeholder: main at abc1234
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+      description: Describe the result you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened?
+      description: Describe the result you saw.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Give the exact commands, config and inputs. Remove keys, tokens and private data.
+      placeholder: |
+        1. Run ...
+        2. Open ...
+        3. See ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Paste the relevant output. Remove keys, tokens and private data.
+      render: shell
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues for this problem.
+        - label: I removed secrets and private data from this report.
+          required: true
