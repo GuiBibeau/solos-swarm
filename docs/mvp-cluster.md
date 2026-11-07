@@ -11,9 +11,9 @@ The paths under `/var/lib/solos-swarm` and `/etc/solos-swarm` below are examples
 
 | Requirement | Target |
 |---|---|
-| Kernel | Linux `6.1+` (Landlock v3+, seccomp-BPF, cgroups v2, user namespaces) |
+| Kernel | Linux with Landlock ABI 6 to 9 (Linux 6.12 or later), seccomp-BPF, cgroups v2 and user namespaces. Tier P refuses another Landlock ABI unless the sandbox policy sets `allow_degraded_landlock` (`src/sandbox.rs`). |
 | Toolchains | Rust `1.96.0`, Node `v24.18.0`, Python `3.11+` |
-| Packages | `bubblewrap`, `systemd`, `squashfs-tools`, `openssl` |
+| Packages | `bubblewrap`, `systemd`, `e2fsprogs` (`mkfs.ext4 -d`), `openssl` |
 
 Each daemon runs as its own user and owns one directory:
 
@@ -53,10 +53,10 @@ python3 scripts/probe_tokenizer.py \
 	--output /tmp/probe-report.json \
 	--verify-usage
 
-# The read-only SquashFS root file system for workers
+# The pinned read-only ext4 guest image for microVM workers, with its manifest
 python3 scripts/bootstrap_sandbox.py \
 	--userland /path/to/staged-userland \
-	--output /var/lib/solos-swarm/rootfs \
+	--output /var/lib/solos-swarm/rootfs.ext4 \
 	--size-mib 512
 ```
 
