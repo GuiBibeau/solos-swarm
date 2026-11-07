@@ -1,7 +1,7 @@
 # solos-swarm
 
 <p align="center">
-  <img src="docs/assets/banner.svg" alt="solos-swarm: Governed control plane for multi-node agent swarms" width="100%" />
+  <img src="docs/assets/banner.svg" alt="solos-swarm: sandboxed AI coding agents under a budget, in swarm mode and agent mode" width="100%" />
 </p>
 
 [![ci](https://img.shields.io/github/actions/workflow/status/GuiBibeau/solos-swarm/ci.yml?branch=main&label=ci&color=27272A&labelColor=121215)](https://github.com/GuiBibeau/solos-swarm/actions/workflows/ci.yml)
