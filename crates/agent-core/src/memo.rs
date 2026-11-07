@@ -26,11 +26,23 @@ pub const MAX_MEMO_NAME_CHARS: usize = 100;
 pub const ROUTER_INDEX_BYTES: usize = 1_024;
 /// A worker's index of global memos and its repository's, in bytes.
 pub const WORKER_INDEX_BYTES: usize = 3_072;
+/// How long a proposal waits for the review's decision before it expires:
+/// seven days.
+pub const PROPOSAL_TTL_MS: Ms = 7 * 86_400_000;
+/// The name an expired proposal is retired under, where a review's name
+/// would be.
+pub const EXPIRY: &str = "expiry";
 
 /// The tools whose results come from the worker's own commands. A memo that
 /// cites a call to any other tool (`read`, `fetch_url`, the browser, or a
 /// tool this list does not know) quotes outside text, so it is external.
 const OWN_WORK_TOOLS: [&str; 3] = ["run_code", "job_start", "job_wait"];
+
+/// Whether what a call of `tool` answered is the worker's own command's
+/// output, rather than outside text.
+pub fn own_work(tool: &str) -> bool {
+    OWN_WORK_TOOLS.contains(&tool)
+}
 
 /// Where a memo applies: every session, or work on one repository.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -115,7 +127,9 @@ pub enum MemoSource {
     /// A Trigger's words. The core checks that the quote is in its text.
     Trigger { trigger: TriggerId, quote: String },
     /// A tool call in an Assignment's transcript. The host checks the quote
-    /// against the transcript whose digest this names.
+    /// against what the call answered before it is cited. `transcript` is
+    /// the digest of that answer, its compact JSON as the transcript holds
+    /// it for the call's result, so the quote can be checked again later.
     Call {
         assignment: AssignmentId,
         call: String,
@@ -310,25 +324,40 @@ fn lines(memo: &Memo) -> String {
     out
 }
 
-fn overflow(scope: &MemoScope, hidden: usize) -> String {
-    let (many, verb) = if hidden == 1 {
-        ("memo", "is")
-    } else {
-        ("memos", "are")
-    };
+/// Where a worker reads every active memo of `scope` in full, with its
+/// sources: the page `read` serves under `/memos`.
+pub fn memos_page(scope: &MemoScope) -> String {
     match scope {
-        MemoScope::Global => format!("\n({hidden} more global {many} {verb} not shown here.)"),
-        MemoScope::Repo(repo) => {
-            format!("\n({hidden} more {many} about {repo} {verb} not shown here.)")
-        }
+        MemoScope::Global => "/memos/global.md".to_owned(),
+        MemoScope::Repo(repo) => format!("/memos/repo/{repo}.md"),
     }
 }
 
-/// The active memos of `scopes` as one block of at most `budget` bytes: a
-/// person's memos first, then the most recently vouched for. Whatever does
-/// not fit is counted per scope in a line of its own. Pure: the same memos
-/// give the same text.
-pub fn memo_index(memos: &[Memo], scopes: &[MemoScope], budget: usize) -> MemoIndex {
+/// The line that counts what an index leaves out of `scope`, and says how
+/// `to` reads the rest: a worker with `read`, the Router with `router_read`.
+fn overflow(scope: &MemoScope, hidden: usize, to: &MemoAudience) -> String {
+    let many = if hidden == 1 { "memo" } else { "memos" };
+    let what = match scope {
+        MemoScope::Global => format!("{hidden} more global {many}"),
+        MemoScope::Repo(repo) => format!("{hidden} more {many} about {repo}"),
+    };
+    let reach = match to {
+        MemoAudience::Router => format!(r#"router_read {{"kind": "memo", "id": "{scope}"}}"#),
+        MemoAudience::Worker { .. } => format!("read {}", memos_page(scope)),
+    };
+    format!("\n({what}: {reach})")
+}
+
+/// The active memos of `scopes` as one block of at most `budget` bytes for
+/// `to`: a person's memos first, then the most recently vouched for.
+/// Whatever does not fit is counted per scope in a line of its own, which
+/// says how `to` reads the rest. Pure: the same memos give the same text.
+pub fn memo_index(
+    memos: &[Memo],
+    scopes: &[MemoScope],
+    budget: usize,
+    to: &MemoAudience,
+) -> MemoIndex {
     let mut applies: Vec<&Memo> = memos
         .iter()
         .filter(|memo| memo.is_active() && scopes.contains(&memo.scope))
@@ -350,7 +379,7 @@ pub fn memo_index(memos: &[Memo], scopes: &[MemoScope], budget: usize) -> MemoIn
     let overflows = |hidden: &BTreeMap<&MemoScope, usize>| -> usize {
         hidden
             .iter()
-            .map(|(scope, n)| overflow(scope, *n).len())
+            .map(|(scope, n)| overflow(scope, *n, to).len())
             .sum()
     };
     // Drop memos from the end until the lines left and the overflow lines fit.
@@ -367,7 +396,7 @@ pub fn memo_index(memos: &[Memo], scopes: &[MemoScope], budget: usize) -> MemoIn
         text.push_str(block);
     }
     for (scope, n) in &hidden {
-        text.push_str(&overflow(scope, *n));
+        text.push_str(&overflow(scope, *n, to));
     }
     MemoIndex {
         sha256: Digest::of(text.as_bytes()),
@@ -443,7 +472,7 @@ pub fn source_trust(
             check_name("a call", call)?;
             check_name("a tool", tool)?;
             bounded("a quote", quote, MAX_QUOTE_CHARS)?;
-            Ok(if OWN_WORK_TOOLS.contains(&tool.as_str()) {
+            Ok(if own_work(tool) {
                 MemoTrust::Model
             } else {
                 MemoTrust::External
@@ -456,11 +485,19 @@ pub fn source_trust(
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_MEMO_CHARS, Memo, MemoAuthor, MemoScope, MemoState, MemoTrust, check_text, memo_index,
+        MAX_MEMO_CHARS, Memo, MemoAudience, MemoAuthor, MemoScope, MemoState, MemoTrust,
+        check_text, memo_index,
     };
     use crate::change::RepoName;
-    use crate::model::{Actor, MemoId};
+    use crate::model::{Actor, AssignmentId, MemoId, TicketId};
     use crate::trail::Digest;
+
+    fn worker() -> MemoAudience {
+        MemoAudience::Worker {
+            ticket: TicketId::new("tk_1"),
+            assignment: AssignmentId::new("as_1"),
+        }
+    }
 
     fn memo(id: &str, scope: MemoScope, trust: MemoTrust, text: &str, verified_ms: u64) -> Memo {
         Memo {
@@ -514,10 +551,10 @@ mod tests {
             memo("mm_c", MemoScope::Global, MemoTrust::Model, "old model", 2),
             memo("mm_d", repo(), MemoTrust::Person, "repo only", 5),
         ];
-        let global = memo_index(&memos, &[MemoScope::Global], 3_072);
+        let global = memo_index(&memos, &[MemoScope::Global], 3_072, &worker());
         assert_eq!(global.shown, ["mm_a", "mm_b", "mm_c"].map(MemoId::new));
         assert!(!global.text.contains("repo only"));
-        let both = memo_index(&memos, &[MemoScope::Global, repo()], 3_072);
+        let both = memo_index(&memos, &[MemoScope::Global, repo()], 3_072, &worker());
         assert_eq!(both.shown.len(), 4);
         assert!(both.text.contains("> [mm_d · person · o/r] repo only"));
         assert_eq!(both.sha256, Digest::of(both.text.as_bytes()));
@@ -527,7 +564,7 @@ mod tests {
     fn nothing_applies_nothing_is_shown() {
         let mut proposed = memo("mm_a", MemoScope::Global, MemoTrust::Person, "waits", 1);
         proposed.state = MemoState::Proposed;
-        let index = memo_index(&[proposed], &[MemoScope::Global], 1_024);
+        let index = memo_index(&[proposed], &[MemoScope::Global], 1_024, &worker());
         assert_eq!((index.text.as_str(), index.shown.len()), ("", 0));
     }
 
@@ -544,21 +581,47 @@ mod tests {
                 memo(&format!("mm_{n:02}"), scope, MemoTrust::Person, &long, n)
             })
             .collect();
-        for budget in [0, 300, 1_024, 3_072] {
-            let index = memo_index(&memos, &[MemoScope::Global, repo()], budget);
-            assert!(index.shown.len() < memos.len());
-            let hidden = memos.len() - index.shown.len();
-            if budget >= 1_024 {
-                assert!(index.text.len() <= budget, "{budget}: {}", index.text.len());
+        for to in [MemoAudience::Router, worker()] {
+            for budget in [0, 300, 1_024, 3_072] {
+                let index = memo_index(&memos, &[MemoScope::Global, repo()], budget, &to);
+                assert!(index.shown.len() < memos.len());
+                let hidden = memos.len() - index.shown.len();
+                if budget >= 1_024 {
+                    assert!(index.text.len() <= budget, "{budget}: {}", index.text.len());
+                }
+                let overflow: Vec<&str> = index
+                    .text
+                    .lines()
+                    .filter_map(|line| line.strip_prefix('('))
+                    .collect();
+                let counted: usize = overflow
+                    .iter()
+                    .map(|line| line.split(' ').next().unwrap().parse::<usize>().unwrap())
+                    .sum();
+                assert_eq!(counted, hidden, "{budget}:\n{}", index.text);
+                let reach = match to {
+                    MemoAudience::Router => r#": router_read {"kind": "memo", "id": "#,
+                    MemoAudience::Worker { .. } => ": read /memos/",
+                };
+                assert!(
+                    overflow.iter().all(|line| line.contains(reach)),
+                    "{overflow:?}"
+                );
             }
-            let counted: usize = index
-                .text
-                .lines()
-                .filter_map(|line| line.strip_prefix('('))
-                .map(|line| line.split(' ').next().unwrap().parse::<usize>().unwrap())
-                .sum();
-            assert_eq!(counted, hidden, "{budget}:\n{}", index.text);
         }
+        let index = memo_index(&memos, &[MemoScope::Global, repo()], 3_072, &worker());
+        assert!(
+            index
+                .text
+                .contains("more global memos: read /memos/global.md)")
+        );
+        assert!(
+            index
+                .text
+                .contains("more memos about o/r: read /memos/repo/o/r.md)"),
+            "{}",
+            index.text
+        );
     }
 
     #[test]
@@ -568,6 +631,7 @@ mod tests {
             &[memo("mm_a", MemoScope::Global, MemoTrust::Model, text, 1)],
             &[MemoScope::Global],
             1_024,
+            &MemoAudience::Router,
         );
         let body: Vec<&str> = index.text.lines().skip(1).collect();
         assert_eq!(body.len(), 2);
