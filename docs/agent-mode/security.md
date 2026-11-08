@@ -31,6 +31,23 @@ open. The open items are marked **Open**.
 - `fetch_url` reaches the public internet only, unless `executor.fetch.allow_private_networks` is on
   ([What fetch_url can reach](runtime.md#what-fetch_url-can-reach)).
 
+## Model policy
+
+A repository's text reaches a model only on a provider its `forge.repos.<repo>.models` allows, in the role that would
+read it. The allowlist is required on every repository, so a repository added to `forge.repos` reaches no provider by
+default, and a config without it does not load. `agent serve` logs each repository's allowed providers per role and
+the upstream its workers run on. The rule, the roles and the providers are in
+[Repository models](configuration.md#repository-models).
+
+**Open.** This release records the allowlist. The paths that read a repository's text — the Router's cards and reads,
+a worker's prompt, the memory review and the dream — are filtered by it in the changes that follow
+([the design](repo-models/design.md)). Until then an allowlist says which providers are approved; it does not yet
+withhold a read.
+
+**Open.** Shared mounts and vault items are not scoped by repository: `executor.run_code.mounts` binds into every
+worker's sandbox, and a vault item is scoped by requester. Do not mount a private repository's data globally, and do
+not set `approval: none` on a vault item that can read one.
+
 ## The host's own user
 
 A worker that escapes its sandbox, and anything the host runs on a repository's behalf (`git`, the dependency install),

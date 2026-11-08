@@ -76,7 +76,7 @@ github:
 forge:
   kind: github                         # no token_file, no identity: the clone's commits are by the App's bot
   repos:                               # the one list of repositories: the source, the channel and the forge use it
-    acme/widgets: {about: The widget service, base: main, owes: pull_request}
+    acme/widgets: {about: The widget service, base: main, owes: pull_request, models: {allow: [deepseek]}}
 sources:
   - kind: github                       # no fields: it reads forge.repos
   - kind: schedule

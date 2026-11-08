@@ -287,8 +287,8 @@ budgets: {session_microusd: 500000}
   remote: /srv/remote
   identity: {name: bot, email: bot@example.com}
   repos:
-    acme/widgets: {about: Widgets., base: main, deps: {kind: bun, binary: /opt/bun/bin/bun}}
-    acme/docs: {about: Docs., base: main}
+    acme/widgets: {about: Widgets., base: main, models: {allow: [deepseek]}, deps: {kind: bun, binary: /opt/bun/bin/bun}}
+    acme/docs: {about: Docs., base: main, models: {allow: [deepseek]}}
 ";
 
     #[test]

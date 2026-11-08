@@ -22,6 +22,7 @@ use super::dream::{self, DreamSchedule};
 use super::goal_template::GoalTemplates;
 use super::jobs::{self, JobLimits};
 use super::links::TicketLinks;
+use super::models::{ModelPolicy, ModelsConfig, Provider, UpstreamName};
 use super::simulated::TimeFactor;
 use super::trail::TrailStoreConfig;
 use super::{discord, github, mcp, pstack, slack};
@@ -352,6 +353,11 @@ pub struct RepoConfig {
     /// checked for it.
     #[serde(default)]
     pub evidence: Option<EvidenceConfig>,
+    /// The providers this repository's text may reach, by role. Required:
+    /// no repository reaches any provider by default. `None` is a config
+    /// that does not name it, which fails to load.
+    #[serde(default)]
+    pub models: Option<ModelsConfig>,
 }
 
 impl Default for RepoConfig {
@@ -370,6 +376,7 @@ impl Default for RepoConfig {
             max_change_bytes: max_change_bytes(),
             deps: None,
             evidence: None,
+            models: None,
         }
     }
 }
@@ -823,6 +830,8 @@ fn default_max_batch() -> usize {
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+// Read once at start; each variant's fields are the config schema it takes.
+#[allow(clippy::large_enum_variant)]
 pub enum ExecutorConfig {
     Scripted {},
     /// Work that only takes time, for `agent bench`: each Assignment starts
@@ -896,7 +905,39 @@ pub enum ExecutorConfig {
         /// node in `nodes.allow`, or `local` (the default).
         #[serde(default)]
         environment: Option<String>,
+        /// Other upstreams a Ticket may run on, by name. Each has its own
+        /// provider, model, wire, harness and key file; `default` is this
+        /// section's own provider and model.
+        #[serde(default)]
+        upstreams: BTreeMap<UpstreamName, UpstreamConfig>,
     },
+}
+
+/// `executor.upstreams.<name>`: another upstream a Ticket may run on.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamConfig {
+    /// Who receives the text and bills for it: `deepseek` or `venice` in
+    /// this build. `anthropic` is a valid entry in a repository's `allow`,
+    /// but an upstream runs on it only once its transport lands.
+    pub provider: Provider,
+    pub model: String,
+    /// How the broker reaches the provider: `chat` translates Claude Code's
+    /// Messages calls onto chat completions, `anthropic` forwards them to the
+    /// provider's own Messages endpoint.
+    pub wire: Wire,
+    /// What its sessions run on: `pi` needs `wire: chat`, `claude-code`
+    /// takes either, and `wire: anthropic` needs `claude-code`.
+    pub harness: HarnessKind,
+    /// Its key, a one-use token file like `github.key_file`: read once and
+    /// deleted, and refused under any path a sandbox can read.
+    pub key_file: PathBuf,
+    pub prices: PriceTable,
+    /// What one of its calls may send or answer. Defaults as `executor`'s.
+    #[serde(default)]
+    pub max_input_bytes: Option<usize>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
 }
 
 /// The harness a worker session runs on.
@@ -1192,6 +1233,11 @@ impl AgentConfig {
         if let Some(github) = &mut config.github {
             github.key_file = base.join(&github.key_file);
         }
+        if let ExecutorConfig::Pi { upstreams, .. } = &mut config.executor {
+            for upstream in upstreams.values_mut() {
+                upstream.key_file = base.join(&upstream.key_file);
+            }
+        }
         if let Some(publish) = config.web.as_mut().and_then(|web| web.publish.as_mut()) {
             publish.token_file = base.join(&publish.token_file);
         }
@@ -1357,7 +1403,11 @@ impl AgentConfig {
         self.validate_pstack()?;
         self.validate_forge()?;
         self.validate_memory()?;
-        self.validate_executor()
+        self.validate_executor()?;
+        // Every repository names its models, and each worker upstream
+        // resolves; a config that does not is refused here.
+        ModelPolicy::from_config(self)?;
+        Ok(())
     }
 
     fn validate_memory(&self) -> Result<()> {
@@ -1850,10 +1900,11 @@ mod tests {
     use super::{
         AgentConfig, Budgets, ChannelConfig, ClaudeConfig, DepsConfig, DepsKind, EvidenceConfig,
         ExecutorConfig, ForgeConfig, GithubConfig, HarnessKind, JobLimits, RepoConfig,
-        RouterConfig, SourceConfig,
+        RouterConfig, SourceConfig, UpstreamConfig,
     };
-    use crate::gateway::Wire;
+    use crate::agent::models::{Allow, ModelPolicy, ModelsConfig, Provider};
     use crate::gateway::forward::WebSearch;
+    use crate::gateway::{PriceTable, Wire};
     use solos_agent_core::change::{Deliverable, RepoName};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -2302,7 +2353,11 @@ forge:
       budget_microusd: 1500000
       notes: Tests run with ./check.
       owes: pull_request
-    acme/docs: {about: The handbook., base: release/2026}
+      models: {allow: [deepseek]}
+    acme/docs:
+      about: The handbook.
+      base: release/2026
+      models: {allow: [deepseek]}
 ";
     const WORKTREE: &str = "  prepare: git -C /srv/repo worktree add \"$SOLOS_WORK_DIR\"\n";
 
@@ -2319,6 +2374,211 @@ forge:
             "github: {app_id: 7, key_file: secrets/github-app.pem}\nforge:\n  kind: github",
             "forge:\n  kind: local\n  remote: remotes\n  identity: {name: solos-bot, email: bot@example.com}",
         )
+    }
+
+    fn models() -> ModelsConfig {
+        ModelsConfig {
+            allow: Allow::Every([Provider::Deepseek].into()),
+            worker: None,
+        }
+    }
+
+    /// The forged config with `executor.upstreams` added, before `prepare`.
+    fn with_upstreams(upstreams: &str) -> String {
+        let workers = workers(|yaml| {
+            yaml.replace(WORKTREE, "").replace(
+                "  max_workers: 3\n",
+                &format!("  max_workers: 3\n  upstreams:\n{upstreams}"),
+            )
+        });
+        format!("{workers}{FORGE}")
+    }
+
+    fn venice() -> String {
+        "    venice:
+      provider: venice
+      model: zai-org-glm-5
+      wire: chat
+      harness: pi
+      key_file: keys/venice.key
+      prices: {input_microusd_per_million: 300000, output_microusd_per_million: 1200000}
+"
+        .to_owned()
+    }
+
+    #[test]
+    fn every_repository_names_its_models_and_its_worker_upstream_resolves() {
+        let refused = |yaml: String, said: &str, also: &str| {
+            let err = format!("{:#}", parse(&yaml).unwrap_err());
+            assert!(err.contains(said), "{said}: {err}");
+            assert!(err.contains(also), "{also}: {err}");
+        };
+        let upstream = |provider: &str, wire: &str, harness: &str| {
+            format!(
+                "    claude:
+      provider: {provider}
+      model: deepseek-flash
+      wire: {wire}
+      harness: {harness}
+      key_file: keys/claude.key
+      prices: {{input_microusd_per_million: 300000, output_microusd_per_million: 1200000}}
+"
+            )
+        };
+
+        // Every repository names models; a config that leaves one out says so.
+        refused(
+            forged(|yaml| {
+                yaml.replace(
+                    "    acme/docs:\n      about: The handbook.\n      base: release/2026\n      models: {allow: [deepseek]}\n",
+                    "    acme/docs: {about: The handbook., base: release/2026}\n",
+                )
+            }),
+            "acme/docs names no models",
+            "none reaches any by default",
+        );
+        // An unknown provider in an allow list, or in an upstream.
+        refused(
+            forged(|yaml| yaml.replace("[deepseek]", "[openai]")),
+            "unknown variant `openai`",
+            "deepseek",
+        );
+        refused(
+            with_upstreams(&upstream("openai", "chat", "pi")),
+            "unknown variant `openai`",
+            "deepseek",
+        );
+        // A role map names all three roles, and nothing else.
+        refused(
+            forged(|yaml| {
+                yaml.replace(
+                    "models: {allow: [deepseek]}",
+                    "models: {allow: {router: [deepseek], worker: [deepseek]}}",
+                )
+            }),
+            "missing field `memory`",
+            "missing field",
+        );
+        refused(
+            forged(|yaml| {
+                yaml.replace(
+                    "models: {allow: [deepseek]}",
+                    "models: {allow: {router: [deepseek], worker: [deepseek], memory: [deepseek], dream: [deepseek]}}",
+                )
+            }),
+            "unknown field `dream`",
+            "memory",
+        );
+        // An upstream's harness and wire fit, and claude-code has an install.
+        refused(
+            with_upstreams(&upstream("deepseek", "anthropic", "pi")),
+            "harness pi needs wire: chat",
+            "wire: anthropic needs harness: claude-code",
+        );
+        refused(
+            with_upstreams(&upstream("deepseek", "chat", "claude-code")),
+            "harness claude-code needs executor.claude",
+            "executor.upstreams.claude",
+        );
+        // This build runs an upstream on deepseek or venice.
+        refused(
+            with_upstreams(&upstream("anthropic", "anthropic", "claude-code")),
+            "provider anthropic is not admitted yet",
+            "deepseek or venice",
+        );
+        refused(
+            with_upstreams(
+                "    default: {provider: deepseek, model: deepseek-flash, wire: chat, harness: pi, \
+                 key_file: keys/default.key, prices: {input_microusd_per_million: 300000, \
+                 output_microusd_per_million: 1200000}}\n",
+            ),
+            "executor.upstreams names `default`",
+            "executor's own upstream",
+        );
+        // Two allowed upstreams and no worker ask for one.
+        refused(
+            with_upstreams(&venice()).replace(
+                "models: {allow: [deepseek]}",
+                "models: {allow: [deepseek, venice]}",
+            ),
+            "models.worker is absent",
+            "name one with models.worker",
+        );
+        // A worker names a configured upstream whose provider it allows.
+        refused(
+            with_upstreams(&venice()).replace(
+                "models: {allow: [deepseek]}",
+                "models: {allow: [deepseek], worker: venice}",
+            ),
+            "runs on venice",
+            "worker role allows only deepseek",
+        );
+        refused(
+            forged(|yaml| {
+                yaml.replace(
+                    "models: {allow: [deepseek]}",
+                    "models: {allow: [deepseek], worker: claude}",
+                )
+            }),
+            "models.worker names claude",
+            "not a key of executor.upstreams",
+        );
+
+        // A repository whose allow list no upstream here serves still loads.
+        let anthropic = parse(&forged(|yaml| yaml.replace("[deepseek]", "[anthropic]"))).unwrap();
+        let policy = ModelPolicy::from_config(&anthropic).unwrap();
+        let widgets = RepoName::try_from("acme/widgets".to_owned()).unwrap();
+        assert_eq!(policy.worker_upstream(&widgets), None);
+        // The default is the one allowed upstream, and may be named.
+        assert!(
+            parse(&forged(|yaml| yaml.replace(
+                "models: {allow: [deepseek]}",
+                "models: {allow: [deepseek], worker: default}"
+            )))
+            .is_ok()
+        );
+
+        // A named upstream parses with its provider, model, wire and harness.
+        let config = parse(&with_upstreams(&venice())).unwrap();
+        let ExecutorConfig::Pi { upstreams, .. } = &config.executor else {
+            panic!("{:?}", config.executor)
+        };
+        let found = upstreams.values().next().unwrap();
+        assert_eq!(
+            *found,
+            UpstreamConfig {
+                provider: Provider::Venice,
+                model: "zai-org-glm-5".into(),
+                wire: Wire::Chat,
+                harness: HarnessKind::Pi,
+                key_file: PathBuf::from("keys/venice.key"),
+                prices: PriceTable {
+                    input_microusd_per_million: 300_000,
+                    output_microusd_per_million: 1_200_000,
+                    cache_hit_microusd_per_million: None,
+                },
+                max_input_bytes: None,
+                max_output_tokens: None,
+            }
+        );
+    }
+
+    #[test]
+    fn an_upstreams_key_file_resolves_beside_the_config() {
+        let dir =
+            std::env::temp_dir().join(format!("agent-config-upstream-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.yaml");
+        std::fs::write(&path, with_upstreams(&venice())).unwrap();
+        let config = AgentConfig::load(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let ExecutorConfig::Pi { upstreams, .. } = &config.executor else {
+            panic!("{:?}", config.executor)
+        };
+        assert_eq!(
+            upstreams.values().next().unwrap().key_file,
+            dir.join("keys/venice.key")
+        );
     }
 
     #[test]
@@ -2368,6 +2628,7 @@ forge:
                         budget_microusd: None,
                         notes: None,
                         owes: Deliverable::Answer,
+                        models: Some(models()),
                         ..RepoConfig::default()
                     }
                 ),
@@ -2379,6 +2640,7 @@ forge:
                         budget_microusd: Some(1_500_000),
                         notes: Some("Tests run with ./check.".into()),
                         owes: Deliverable::PullRequest,
+                        models: Some(models()),
                         ..RepoConfig::default()
                     }
                 ),
@@ -2638,8 +2900,8 @@ forge:
             (
                 forged(|yaml| {
                     yaml.replace(
-                        "acme/docs: {about: The handbook., base: release/2026}",
-                        "acme/docs: {about: The handbook., base: release/2026, evidence: {command: x}}",
+                        "    acme/docs:\n      about: The handbook.\n      base: release/2026\n      models: {allow: [deepseek]}\n",
+                        "    acme/docs:\n      about: The handbook.\n      base: release/2026\n      models: {allow: [deepseek]}\n      evidence: {command: x}\n",
                     )
                 }),
                 "forge.repos.acme/docs.evidence is for a pull request's description, and owes is \

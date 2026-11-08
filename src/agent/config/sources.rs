@@ -426,7 +426,7 @@ executor: {kind: pi, provider: deepseek, model: deepseek-flash, prices: {input_m
 forge:
   kind: github
   repos:
-    acme/widgets: {about: \"Widgets.\", base: main}
+    acme/widgets: {about: \"Widgets.\", base: main, models: {allow: [deepseek]}}
 budgets: {session_microusd: 500000}
 ";
 
@@ -537,7 +537,7 @@ budgets: {session_microusd: 500000}
             (
                 "no repository",
                 GITHUB.replace(
-                    "  repos:\n    acme/widgets: {about: \"Widgets.\", base: main}\n",
+                    "  repos:\n    acme/widgets: {about: \"Widgets.\", base: main, models: {allow: [deepseek]}}\n",
                     "  repos: {}\n",
                 ),
             ),
@@ -563,7 +563,7 @@ budgets: {session_microusd: 500000}
             (
                 "a github source without the forge whose repos it reads",
                 GITHUB.replace(
-                    "forge:\n  kind: github\n  repos:\n    acme/widgets: {about: \"Widgets.\", base: main}\n",
+                    "forge:\n  kind: github\n  repos:\n    acme/widgets: {about: \"Widgets.\", base: main, models: {allow: [deepseek]}}\n",
                     "",
                 ),
             ),

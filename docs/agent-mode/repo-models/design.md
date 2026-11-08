@@ -1,7 +1,9 @@
 # A model policy per repository
 
-> **Status, 2026-11-08.** Design only, for [#103](https://github.com/GuiBibeau/solos-swarm/issues/103). Nothing here is
-> built. Grounded in `main` at `7ea26d2`. The [sketch](sketch/) holds types and signatures, not compiled.
+> **Status, 2026-11-08.** PR 1 of [the plan](#5-pr-plan) is built: `forge.repos.<repo>.models` and
+> `executor.upstreams` load and are checked, and `src/agent/models.rs` holds the policy. The rest is design only, for
+> [#103](https://github.com/GuiBibeau/solos-swarm/issues/103). Grounded in `main` at `7ea26d2`. The [sketch](sketch/)
+> holds types and signatures, not compiled.
 
 ## 0. In one paragraph
 
