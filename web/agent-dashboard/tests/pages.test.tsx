@@ -4,12 +4,14 @@
 import { readFileSync } from "node:fs";
 import { renderToStaticMarkup } from "react-dom/server";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { Index, TicketSnapshot } from "@/lib/types";
+import type { Index, Jobs, TicketSnapshot } from "@/lib/types";
 
 const fixture = <T,>(name: string): T =>
   JSON.parse(readFileSync(new URL(`./fixtures/${name}.json`, import.meta.url), "utf8")) as T;
 
 const index = fixture<Index>("mix-index");
+// Written by the_jobs_blob_has_the_shape_the_dashboard_reads_and_feeds_its_fixtures in tests/agent_publish.rs.
+const jobs = fixture<Jobs>("jobs");
 const tickets = [0, 1, 2].map((n) => fixture<TicketSnapshot>(`mix-${n}`));
 const byTitle = (title: string) => {
   const found = tickets.find((ticket) => ticket.title === title);
@@ -21,6 +23,7 @@ const NOW = Date.parse(index.generated_at ?? "") + 5 * 60 * 1000;
 
 const readIndex = vi.fn();
 const readTicket = vi.fn();
+const readJobs = vi.fn();
 vi.mock("@/lib/viewer", () => ({
   requireViewer: async () => ({ email: "g.bibeaulaviolette@gmail.com" }),
   currentViewer: async () => null,
@@ -31,6 +34,7 @@ vi.mock("@/lib/blob", async () => ({
   ...(await vi.importActual<typeof import("@/lib/blob")>("@/lib/blob")),
   readIndex,
   readTicket,
+  readJobs,
 }));
 vi.mock("next/navigation", () => ({
   redirect: (to: string) => {
@@ -48,6 +52,8 @@ const { default: Login } = await import("@/app/login/page");
 beforeEach(() => {
   readIndex.mockReset();
   readTicket.mockReset();
+  readJobs.mockReset();
+  readJobs.mockResolvedValue(null);
   vi.spyOn(console, "error").mockImplementation(() => {});
 });
 
@@ -82,6 +88,64 @@ describe("the ticket list", () => {
     const out = await html(Tickets());
     expect(out).toContain("could not be read from storage");
     expect(out).not.toContain("vercel_blob_rw_secret");
+  });
+});
+
+describe("the external jobs", () => {
+  it("lists every job with how it is checked, the ones in trouble first with what was found, above the tickets", async () => {
+    readIndex.mockResolvedValue(index);
+    readJobs.mockResolvedValue(jobs);
+    const out = await html(Tickets());
+    expect(readJobs).toHaveBeenCalledWith(expect.anything());
+    expect(out).toContain("<h2>External jobs</h2>");
+    expect(out).toContain("1 of 4 up");
+    for (const job of jobs.jobs) {
+      expect(out, job.name).toContain(`<span>${job.name}</span>`);
+      expect(out, job.check).toContain(job.check);
+    }
+    const at = (name: string) => out.indexOf(`<span>${name}</span>`);
+    expect(at("data-build")).toBeLessThan(at("modal-wave-3"));
+    expect(at("modal-wave-3")).toBeLessThan(at("l2book-archive"));
+    expect(at("l2book-archive")).toBeLessThan(at("l2book"));
+    for (const label of ["down", "stalled", "low on disk", "up"]) expect(out).toContain(`>${label}</span>`);
+    expect(out).toContain("can&#x27;t find session: data-build");
+    expect(out).toContain("no new shard for 40m");
+    expect(out).toContain("11.2 GB free on /data/l2book (floor 50.0 GB)");
+    expect(out).toContain("active (running)");
+    expect(out.indexOf("External jobs")).toBeLessThan(out.indexOf("<h2>Open</h2>"));
+    expect(out).not.toContain("has not looked");
+  });
+
+  it("says so when the Watchdog has not looked for a long time", async () => {
+    readIndex.mockResolvedValue(index);
+    readJobs.mockResolvedValue({ ...jobs, checked_ms: NOW - 40 * 60 * 1000 });
+    const out = await html(Tickets());
+    expect(out).toContain("The Watchdog has not looked at these jobs for 40m");
+  });
+
+  it("shows nothing for jobs when none are published or none are registered", async () => {
+    readIndex.mockResolvedValue(index);
+    expect(await html(Tickets())).not.toContain("External jobs");
+    readJobs.mockResolvedValue({ ...jobs, jobs: [] });
+    expect(await html(Tickets())).not.toContain("External jobs");
+  });
+
+  it("does not let a failed read of the jobs hide the tickets, or show what storage said", async () => {
+    readIndex.mockResolvedValue(index);
+    readJobs.mockRejectedValue(new Error("token vercel_blob_rw_secret leaked"));
+    const out = await html(Tickets());
+    expect(out).toContain("The external jobs could not be read from storage.");
+    expect(out).not.toContain("vercel_blob_rw_secret");
+    expect(out).toContain("Rotate the staging keys");
+  });
+
+  it("shows what a job's command printed as text, never as markup", async () => {
+    readIndex.mockResolvedValue(index);
+    const hostile = { ...jobs.jobs[1], detail: '<script>alert(1)</script><img src=x onerror="y">' };
+    readJobs.mockResolvedValue({ ...jobs, jobs: [hostile] });
+    const out = await html(Tickets());
+    expect(out).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
+    for (const bad of ["<script", "<img"]) expect(out, bad).not.toContain(bad);
   });
 });
 

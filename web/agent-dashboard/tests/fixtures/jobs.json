@@ -1,0 +1,34 @@
+{
+  "checked_ms": 1793973600000,
+  "jobs": [
+    {
+      "check": "systemd unit l2book-download.service",
+      "detail": "active (running)",
+      "name": "l2book",
+      "since_ms": 1793966400000,
+      "status": "up"
+    },
+    {
+      "check": "tmux session data-build",
+      "detail": "can't find session: data-build",
+      "name": "data-build",
+      "since_ms": 1793970000000,
+      "status": "down"
+    },
+    {
+      "check": "status command /home/agent/bin/wave-status",
+      "detail": "no new shard for 40m",
+      "name": "modal-wave-3",
+      "since_ms": 1793971200000,
+      "status": "stalled"
+    },
+    {
+      "check": "pid file /data/l2book/archive.pid",
+      "detail": "11.2 GB free on /data/l2book (floor 50.0 GB)",
+      "name": "l2book-archive",
+      "since_ms": 1793972400000,
+      "status": "low_disk"
+    }
+  ],
+  "v": 1
+}

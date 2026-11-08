@@ -45,6 +45,20 @@ export const STAGE_LABEL: Record<string, string> = {
   ended: "ended",
 };
 
+export const JOB_LABEL: Record<string, string> = {
+  up: "up",
+  down: "down",
+  stalled: "stalled",
+  low_disk: "low on disk",
+};
+
+/** A job that runs is quiet; one that is not asks for a look. */
+export function jobTone(status: string): "bad" | "attention" | "good" {
+  if (status === "up") return "good";
+  if (status === "down") return "bad";
+  return "attention";
+}
+
 /** What a stage asks of the person reading, as a tone for the badge. */
 export function stageTone(stage: string, outcome?: string): "attention" | "bad" | "live" | "quiet" | "good" {
   if (stage === "approval" || stage === "answer") return "attention";

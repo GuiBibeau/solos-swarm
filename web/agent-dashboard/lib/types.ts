@@ -52,6 +52,30 @@ export type Index = {
   tickets: IndexRow[];
 };
 
+/** The version of `jobs/index.json`, which is `src/agent/external_jobs.rs`'s `FORMAT`. */
+export const JOBS_FORMAT = 1;
+
+export type JobStatus = "up" | "down" | "stalled" | "low_disk";
+
+/** One external job: work outside agent mode that the Watchdog checks. */
+export type JobRow = {
+  name: string;
+  /** How it is checked: `systemd unit x.service`, `tmux session x`, `pid file /p`, `status command /bin/x`. */
+  check: string;
+  status: JobStatus;
+  /** One line of what the last look found. */
+  detail: string;
+  /** When the job began to have this status, as the Watchdog saw it. */
+  since_ms: number;
+};
+
+export type Jobs = {
+  v: number;
+  /** When the Watchdog last looked. */
+  checked_ms: number;
+  jobs: JobRow[];
+};
+
 export type Delivery = {
   delivered: boolean;
   attempts: number;
