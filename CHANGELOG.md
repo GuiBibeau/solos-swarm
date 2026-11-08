@@ -285,6 +285,13 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   message that leads with the answer, in about 1,500 characters at most. `docs/harness/solos-swarm.md` gains
   "Talking to people", which maps each pstack reply rule it overrides. Host-written text, such as a failed worker's
   reply and the Watchdog's alerts, is in the first person.
+- Agent mode in production, hardened units and a dedicated user (#117): the five systemd user units take
+  `NoNewPrivileges`, a read-only file system except `~/agent/state`, a `SystemCallFilter` deny-list, restricted socket
+  families and namespaces, and the other options that work in a user unit with `bwrap` (`RestrictSUIDSGID` and
+  `ProtectKernelTunables` break it, so `solos-agent.service` leaves them out). `scripts/agent-deploy` takes
+  `AGENT_USER`, makes the unit and state directories a user's first deploy needs, and refuses a config that names
+  another uid's `/run/user` directory. `docs/agent-mode/production.md` gains "Hardening the units" and "Run the agent
+  as its own user", a migration with rollback.
 
 ### Fixed
 
