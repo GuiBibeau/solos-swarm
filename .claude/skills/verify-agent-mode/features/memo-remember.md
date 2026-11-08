@@ -27,8 +27,8 @@ the owner to add it with `agent memo add`. The memos kept are readable at `/memo
 ## Driving it with bin/mcp.sh
 
 Preconditions: a run launched with no overlay (`memory` is on by default with `executor: pi`), and a clean doctor.
-`serve.log` has `agent: workers propose memos; review:deepseek-flash@max decides each`. Not yet driven live: the
-recipe below is the plan.
+`serve.log` has `agent: workers propose memos; review:deepseek-flash@max decides each that is not outside text`. Not
+yet driven live: the recipe below is the plan.
 
 - `person-remember`: `bin/mcp.sh $RUN request "Remember that answers to me end with the word Over."`, then `replies <thread> result 540`. `bin/mcp.sh $RUN memos` lists a memo whose text is the whole request (`Remember that answers to me end with the word Over.`), trust `person`, author `<ticket>/<assignment>`, and `serve.log` has no `the review` line for that memo. If the worker quoted only part of the request, the memo is `model` and goes to the review: record that, and check `lesson-reviewed` on it.
 - `shapes-next`: `bin/mcp.sh $RUN request "What is the capital of Canada? One sentence."`, then `replies <thread> result 540`: the result ends with "Over.". `bin/evidence.sh $RUN memo-remember`, then `jq -c '.[1] | fromjson | select(.type == "memos_shown")' events.jsonl` has a `"to":{"kind":"worker",...}` line naming the memo.

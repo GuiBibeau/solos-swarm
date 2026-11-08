@@ -431,7 +431,7 @@ On by default where workers run on Pi. How memos work: [Memory](runtime.md#memor
 |---|---|---|
 | `proposals` | `true` | Workers may propose memos with `memo_propose` and read `/memos`. `false`: only the owner writes memos, and there is no dream. |
 | `daily_microusd` | none | What the review and the dream may commit per UTC day on the `memory` account. Absent: no cap. Not `0`. |
-| `review` | see below | The model call that decides each proposal. |
+| `review` | see below | The model call that decides each proposal that is not outside text. |
 | `dream` | see below | The daily dream. |
 
 `review`, each field the workers' unless set:

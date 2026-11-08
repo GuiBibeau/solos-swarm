@@ -1,7 +1,8 @@
 # Manage the agent's memory
 
 Memos are what the agent learned on one Ticket that a later, different Ticket should know. You write them and take
-them back. Workers on Pi propose them too, and a review decides each one with no click. How proposals, the review and
+them back. Workers on Pi propose them too: a review decides each proposal that rests on a person's message or the
+agent's own reading, with no click, while one that quotes outside text waits for you. How proposals, the review and
 the daily dream work is in [Memory](../runtime.md#memory), and the design is [memory/design.md](../memory/design.md).
 
 The commands below that change memory go through the running agent as `mcp:<operator>`, as `agent stop` does. So the
@@ -29,9 +30,10 @@ solos-swarm agent memo list --state-dir DIR [--all] [--json]
 trusted. `--all` adds the retired and forgotten ones.
 
 A proposal whose trust is `external` rests on outside text: a stranger's or a bot's words, a page, a file, or a tool's
-output, `run_code`'s included. No review makes it active. If it is right, write it as your own with `agent memo add`,
-and it is active at once. While the proposal is live, a memo with the same words and scope is refused, so use your own
-words or retire the proposal first. A proposal no one adds is retired as `expiry` after 7 days.
+output, `run_code`'s included. No review makes it active, so it never reaches a prompt. If it is right, write it
+yourself with `agent memo add`, in your own words: while the proposal is live, a memo with the same words and scope is
+refused, so use different words or retire the proposal first. A proposal no one adds is retired as `expiry` after 7
+days.
 
 ## Retire a memo
 

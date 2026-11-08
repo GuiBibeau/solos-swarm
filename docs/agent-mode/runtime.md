@@ -581,8 +581,9 @@ Spend per job is not watched here. The design for long-running work (#101, #102)
 
 Memos are what the agent learned on one Ticket that a later, different Ticket should know. The owner writes them with
 `solos-swarm agent memo add` or the MCP tool `agent_memo_add`, and they are active at once. Workers on Pi propose them
-too, and a review decides each one with no click. The design is [memory/design.md](memory/design.md). To manage memos,
-see [Manage the agent's memory](how-to/memory.md).
+too: a review decides each proposal that is not outside text, with no click, and one that rests on outside text waits
+for the owner. The design is [memory/design.md](memory/design.md). To manage memos, see [Manage the agent's
+memory](how-to/memory.md).
 
 **Where memos are shown.** Memos are quoted as data in the Router's system prompt (the global ones, within 1 KB) and in
 each worker's first prompt (the global ones and its repository's, within 3 KB). When the index in a prompt leaves memos

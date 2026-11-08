@@ -101,7 +101,7 @@ forge:
       about: solos-swarm, the agent's own code (Rust and TypeScript).
       base: main                           # no owes: it defaults to answer, so the agent only reads here
 memory:                                    # optional; these are the defaults
-  proposals: true                          # workers propose memos, and a review decides each
+  proposals: true                          # workers propose memos, and a review decides each that is not outside text
   review: {thinking: max}
   dream: {enabled: true, at: "03:30", thinking: max}   # UTC, before the 04:30 prune
   # daily_microusd: 500000                 # the review's and the dream's cap per UTC day; absent: no cap

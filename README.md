@@ -56,7 +56,8 @@ a remote node of yours. The agent answers in the thread the request came from.
 - Workers use vault logins and API keys without seeing their values, and browse with a headless browser that signs
   every step. `solos-swarm agent trail` checks those steps with public keys only.
 - The agent keeps memos: facts and lessons the owner writes or workers propose, which a separate review call keeps
-  or rejects. A daily dream checks the memos against the day's transcripts.
+  or rejects. A proposal that quotes outside text is never reviewed: it waits for the owner. A daily dream checks the
+  memos against the day's transcripts.
 - `agent status`, `agent health`, `agent prune`, `agent stop` and a web dashboard of Tickets serve the operator.
 
 The two modes share the model gateway (`src/gateway/`: prices, providers, the upstream request and the pause gate),

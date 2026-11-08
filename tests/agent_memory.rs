@@ -1061,6 +1061,56 @@ async fn a_vault_value_is_scrubbed_from_a_memo_and_its_quotes_and_never_reaches_
 }
 
 #[tokio::test]
+async fn the_review_sees_the_whole_message_a_quote_came_from_with_its_vault_values_scrubbed() {
+    let w = World::new("whole-message");
+    let asked = format!("Why do deploys from forks fail? The log showed token={CANARY} rejected.");
+    w.append(&github("gh-ask", "alice", "issue-1", &asked));
+    let runtime = w.runtime();
+    let served = w.serve(runtime.facts(), Some(w.vault()));
+    w.provider.answer(says(json!({
+        "decision": "reject",
+        "reason": "the message names a token, which a memo holds no secret of",
+    })));
+
+    with_runtime(runtime, async {
+        w.worker(&served, "gh-ask", WORKER).await;
+        let (status, reply) = served
+            .propose(
+                WORKER,
+                json!({"text": "Fork deploys are rejected by CI.", "scope": "global",
+                       "evidence": [{"trigger": "gh-ask", "quote": "deploys from forks fail"}]}),
+            )
+            .await;
+        assert_eq!(status, 200, "{reply}");
+        assert_eq!(reply["trust"], "model", "a span of her message: {reply}");
+        let memo = proposed(&reply);
+        w.until("the review decided", |store| {
+            let found = store.read_memo(&MemoId::new(&memo)).ok()??;
+            matches!(found.state, MemoState::Retired { .. }).then_some(())
+        })
+        .await;
+        let reviews = w.provider.reviews();
+        let [review] = &reviews[..] else {
+            panic!("{reviews:?}")
+        };
+        let case: Value =
+            serde_json::from_str(review["messages"][1]["content"].as_str().unwrap()).unwrap();
+        let said = case["evidence"][0]["message"].as_str().unwrap();
+        assert!(
+            said.starts_with("Why do deploys from forks fail?"),
+            "the whole message the quote was cut from: {said}"
+        );
+        assert!(
+            said.contains("[vault:deploy]"),
+            "its vault value is named, not quoted: {said}"
+        );
+        assert!(!said.contains(CANARY), "{said}");
+        assert!(!serde_json::to_string(&reviews).unwrap().contains(CANARY));
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn an_assignment_proposes_at_most_three_memos() {
     let w = World::new("three");
     w.append(&github("gh-ask", "alice", "issue-1", "Tidy the build"));

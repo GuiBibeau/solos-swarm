@@ -487,7 +487,7 @@ where
         let broker = AgentBroker::with_pstack(parts, job_limits, remote, pstack)?;
         if let Some(memory) = config.memory_parts()? {
             eprintln!(
-                "agent: workers propose memos; {} decides each",
+                "agent: workers propose memos; {} decides each that is not outside text",
                 memory.review.name()
             );
             if let Some(dream) = &memory.dream {

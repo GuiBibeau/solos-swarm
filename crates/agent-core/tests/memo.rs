@@ -329,6 +329,49 @@ fn a_bot_trigger_or_a_fetched_page_makes_a_memo_external_and_no_review_makes_it_
 }
 
 #[test]
+fn a_review_cannot_activate_a_model_memo_whose_person_the_policy_no_longer_admits() {
+    let mut w = World::new();
+    let (ticket, assignment) = w.running("th1", Some("o/r"));
+    let said = "PR descriptions stay under five lines";
+    let asked = format!("remember that {said}");
+    w.engine
+        .receive(slack("t-alice", Actor::person("alice"), "th1", &asked))
+        .unwrap();
+    let span = w
+        .engine
+        .propose_memo(MemoIn {
+            scope: repo("o/r"),
+            text: said.into(),
+            sources: vec![MemoSource::Trigger {
+                trigger: TriggerId::new("t-alice"),
+                quote: said.into(),
+            }],
+            author: MemoAuthor::Worker {
+                ticket: ticket.clone(),
+                assignment: assignment.clone(),
+            },
+            supersedes: None,
+        })
+        .unwrap();
+    assert_eq!(w.memo(&span).trust, MemoTrust::Model);
+    assert_eq!(w.memo(&span).state, MemoState::Proposed);
+
+    // She is no longer a person the Policy admits, so quoting her message is
+    // outside text now: the review's keep is refused, not applied.
+    let mut lapsed = policy();
+    lapsed.people.remove("slack:alice");
+    w.engine.set_policy(lapsed);
+    let events = w.engine.repos().events.len();
+    let kept = w.engine.activate_memo(&span, review("looks useful"));
+    assert!(
+        matches!(&kept, Err(Error::Refused(why)) if why.contains("outside text")),
+        "{kept:?}"
+    );
+    assert_eq!(w.memo(&span).state, MemoState::Proposed);
+    assert_eq!(w.engine.repos().events.len(), events, "nothing changed");
+}
+
+#[test]
 fn trust_is_derived_from_the_sources_and_never_claimed() {
     let mut w = World::new();
     let (ticket, assignment) = w.running("th1", None);
