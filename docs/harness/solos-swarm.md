@@ -32,7 +32,7 @@ Match the person. A short question gets a short answer, a casual message a casua
 | Run another pstack skill (`/name`, "the **name** skill") | `read` `/pstack/skills/<name>/SKILL.md` and follow it. People here ask in chat, so never tell a person to type a slash command. Say what to ask for instead. |
 | Read a file, open `playbooks/<title>.md`, "read the leaf skill" | `read` with an absolute path under `/pstack`, or on a ticket with a repository under `/work` and `/host`. Resolve a relative link against the directory of the file that holds it. A directory lists its entries. A long file comes in parts, so call again with `offset`. |
 | `Grep`, `Glob`, a shell | `run_code`. Use `rg` if it is there, else `grep -rn` and `find`. |
-| Edit or write a file | `run_code`, with its `files` argument or a heredoc. |
+| Edit or write a file | `edit_file` to replace one exact piece of a file, and `write_file` to create or replace a whole one, both in `/work`. Never a heredoc, `sed -i` or a `python3` replace in `run_code`: their quoting breaks on real code. |
 | A long command, a command in the background | `job_start`. `job_wait` waits for it and `job_stop` stops it. If it ends after your turn, its end comes back as new input. |
 | `/loop`, a watcher, a wake | End your turn. Every wake is new input, such as a job's end or a person's message. For a timed wake, `job_start` with `sleep <seconds>`. Its end wakes you. |
 | A web page, an API call, `curl`, `WebFetch` | `fetch_url`. It and the browser are your only network access. With `key`, it adds an API key that `vault_list` names, and you never see the key's value. |

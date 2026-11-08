@@ -146,7 +146,7 @@ its Ticket's budget:
 | `temperature` | `0.6` | What workers' model calls are sampled at, 0 to 2. The Router and swarm mode use 0 whatever this is. |
 | `max_workers` | `2` | Worker sessions at once, 1 to 64. A launch past it waits for a slot. |
 | `prepare` | none | A shell command run once per Ticket in its directory before its first worker, with `SOLOS_TICKET` and `SOLOS_WORK_DIR` (the worker's `/work`) set. Not empty. With `forge`, it must not run `git worktree add` into `$SOLOS_WORK_DIR`. |
-| `run_code` | none | The workers' `run_code` sandbox. Without it, workers have no `run_code` and no job tools. See [executor.run_code](#executorrun_code). |
+| `run_code` | none | The workers' `run_code` sandbox. Without it, workers have no `run_code`, no job tools, and no `write_file` or `edit_file`. See [executor.run_code](#executorrun_code). |
 | `fetch` | `{}` | What workers' `fetch_url` may reach. See [executor.fetch](#executorfetch). |
 | `swarm` | none | How `Plan::Swarm` Tickets run. Without it, they fail. See [executor.swarm](#executorswarm). |
 | `harness` | `pi` | The harness of a session Ticket whose Plan names none: `pi` or `claude-code`. `claude-code` needs `claude`. |

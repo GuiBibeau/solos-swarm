@@ -17,11 +17,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 // Through the crate's name, not `crate::`: the broker's HTTP tests compile
 // this file as a module of their own.
+use solos_swarm::beneath::Beneath;
 use solos_swarm::bwrap::Bwrap;
 use std::{
     ffi::OsString,
-    fs::{self, OpenOptions},
-    io::{self, Write},
+    fs, io,
     os::unix::fs::PermissionsExt,
     path::{Component, Path, PathBuf},
     process::Stdio,
@@ -784,63 +784,17 @@ fn parent_dirs(mut sandbox: Bwrap, path: &Path) -> Bwrap {
     }
     sandbox
 }
+/// Write `files` into `scratch` through [`Beneath`], so a link the sandbox
+/// left there never takes a write outside it.
 fn write_files(scratch: &Path, files: &[(String, String)]) -> Result<()> {
-    for (name, content) in files {
-        let path = scratch.join(name);
-        ensure!(
-            path.starts_with(scratch),
-            "run_code file escaped the scratch directory"
-        );
-        if let Some(parent) = path.parent() {
-            create_dirs(scratch, parent)?;
-        }
-        if let Ok(metadata) = fs::symlink_metadata(&path) {
-            ensure!(
-                metadata.file_type().is_file() || metadata.file_type().is_symlink(),
-                "run_code file path is a directory"
-            );
-            fs::remove_file(&path)?;
-        }
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .with_context(|| format!("run_code could not create {name}"))?;
-        file.write_all(content.as_bytes())?;
+    if files.is_empty() {
+        return Ok(());
     }
-    Ok(())
-}
-fn create_dirs(scratch: &Path, directory: &Path) -> Result<()> {
-    ensure!(
-        directory.starts_with(scratch),
-        "run_code directory escaped the scratch directory"
-    );
-    let relative = directory
-        .strip_prefix(scratch)
-        .context("run_code directory prefix")?;
-    let mut current = scratch.to_path_buf();
-    for component in relative.components() {
-        let Component::Normal(name) = component else {
-            bail!("run_code directory has an invalid component");
-        };
-        current.push(name);
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) => {
-                ensure!(
-                    !metadata.file_type().is_symlink(),
-                    "run_code scratch directory contains a symlink"
-                );
-                ensure!(
-                    metadata.is_dir(),
-                    "run_code scratch path is not a directory"
-                );
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                fs::create_dir(&current)?;
-                fs::set_permissions(&current, fs::Permissions::from_mode(0o700))?;
-            }
-            Err(error) => return Err(error.into()),
-        }
+    let work = Beneath::open(scratch, "/work")
+        .with_context(|| format!("run_code cannot open {}", scratch.display()))?;
+    for (name, content) in files {
+        work.write(name, content.as_bytes())
+            .with_context(|| format!("run_code could not write {name}"))?;
     }
     Ok(())
 }
@@ -1502,12 +1456,11 @@ mod tests {
         }
     }
     #[test]
-    fn files_stay_inside_scratch_and_replace_old_links() {
+    fn files_are_written_beneath_scratch_and_replace_a_file_there() {
         let dir = scratch_dir();
-        let outside = dir.join("outside");
-        fs::write(&outside, "secret").unwrap();
         let scratch = dir.join("work");
         fs::create_dir_all(&scratch).unwrap();
+        fs::write(scratch.join("replace.txt"), "old").unwrap();
         write_files(
             &scratch,
             &[
@@ -1524,6 +1477,35 @@ mod tests {
             fs::read_to_string(scratch.join("replace.txt")).unwrap(),
             "new"
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+    /// The sandbox can leave a link in its scratch; a file through it, or onto
+    /// it, is refused before any sandbox starts, and nothing outside changes.
+    #[tokio::test]
+    async fn a_file_through_or_onto_a_link_in_scratch_is_refused_and_nothing_is_written_outside() {
+        let dir = scratch_dir();
+        let outside = dir.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret"), "keep").unwrap();
+        let scratch = dir.join("work");
+        fs::create_dir_all(&scratch).unwrap();
+        std::os::unix::fs::symlink(&outside, scratch.join("escape")).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret"), scratch.join("secret")).unwrap();
+        let executor = executor(worker_config(&dir));
+        for (name, link) in [
+            ("escape/secret", "/work/escape"),
+            ("escape/new/file", "/work/escape"),
+            ("secret", "/work/secret"),
+        ] {
+            let args = json!({"code": "true", "files": {name: "pwned"}});
+            let refused = executor.run_in(&scratch, &args).await.unwrap_err();
+            assert!(
+                format!("{refused:#}").contains(&format!("{link} is a link")),
+                "{name}: {refused:#}"
+            );
+        }
+        assert_eq!(fs::read_to_string(outside.join("secret")).unwrap(), "keep");
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
         fs::remove_dir_all(&dir).unwrap();
     }
     #[test]

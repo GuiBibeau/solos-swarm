@@ -1,10 +1,10 @@
 # How repository Tickets work
 
 A repository Ticket is a Ticket whose Mandate names one of `forge.repos`. Its worker reads the repository's real code
-in a clone of its own, runs git and the code there with `run_code`, and commits there. What the Ticket owes decides
-what its `ready` means: an answer, a change committed in the clone, or a pull request the host opens as the bot. This
-page explains what the host does at each step and why. To set it up, see
-[Let workers work in a repository](how-to/repositories.md).
+in a clone of its own, changes its files with `edit_file` and `write_file`, runs git and the code there with
+`run_code`, and commits there. What the Ticket owes decides what its `ready` means: an answer, a change committed in
+the clone, or a pull request the host opens as the bot. This page explains what the host does at each step and why. To
+set it up, see [Let workers work in a repository](how-to/repositories.md).
 
 A question about how or why a repository works counts as work on it, so the Router names the repository for it too.
 
@@ -184,8 +184,8 @@ The sandbox is still offline. `bun install` and `bun add` cannot run, so a depen
 and a change to a manifest or the lockfile is not reflected in the cache.
 
 The Pi session's own sandbox holds none of this. Its `/work` is a tmpfs for Pi's settings, not the clone, and nothing
-in it runs repository code: every command goes through `run_code`, and `read` is the broker's. The Claude Code harness
-is the same, with its tools off.
+in it runs repository code: every command goes through `run_code`, and `read`, `write_file` and `edit_file` are the
+broker's. The Claude Code harness is the same, with its tools off.
 
 `kind` is `bun` or `cargo`. npm or pnpm would be new variants.
 

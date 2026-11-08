@@ -2208,13 +2208,17 @@ async fn a_real_pi_worker_runs_code_in_its_ticket_directory_and_reports_ready() 
     assert_eq!(
         tools,
         [
+            "edit_file",
             "fetch_url",
             "job_start",
             "job_stop",
             "job_wait",
+            "memo_propose",
+            "read",
             "run_code",
             "worker_handback",
-            "worker_report"
+            "worker_report",
+            "write_file"
         ]
     );
     assert_eq!(bodies[0]["messages"][0]["role"], "system");

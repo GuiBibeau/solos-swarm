@@ -22,6 +22,9 @@ open. The open items are marked **Open**.
   reaches it only as escaped values, and its budget is what the Ticket has left.
 - The event-driven surface is larger than a batch run's. The Router and workers keep the `bwrap` sandbox, workers get no
   network except through broker tools, and the Router gets no `run_code`.
+- The broker writes in a worker's `/work` as the host, for `write_file`, `edit_file` and `run_code`'s `files`. It
+  walks each path one name at a time from the directory opened once, and follows no link (`src/beneath.rs`), so a
+  link the worker made there cannot take a write outside ([Files](runtime.md#files)).
 - A Claude Code worker holds its broker token, as a Pi worker does, and no provider key. Its built-in tools are off,
   only its grants are allowed, project and local settings are not read, and its loopback bridge adds nothing to what
   the broker checks.

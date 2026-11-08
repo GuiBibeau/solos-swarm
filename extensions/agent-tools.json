@@ -443,6 +443,56 @@
       }
     },
     {
+      "name": "write_file",
+      "description": "Create or replace one file in /work, your ticket's directory as run_code sees it, with content, making the directories above it. Write files with it, never with a heredoc or echo in run_code. The path is relative to /work or absolute under it, such as src/main.rs or /work/src/main.rs. A path through a link or to one, a .. part, and a directory are refused. At most 1 MiB. Returns {path,bytes,created}.",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "path",
+          "content"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The file, relative to /work or absolute under it: src/main.rs or /work/src/main.rs."
+          },
+          "content": {
+            "type": "string",
+            "description": "The whole file, at most 1 MiB."
+          }
+        }
+      }
+    },
+    {
+      "name": "edit_file",
+      "description": "Change one file in /work: replace the one place old is in it with new. Change part of a file with it, never with sed -i, a heredoc or a python replace in run_code. old must be in the file exactly once: copy it exactly, white space included and without read's line numbers, and when it is there more than once, include more of the lines around it. Paths are as write_file's. Returns {path,bytes,line}, line being where new starts.",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "path",
+          "old",
+          "new"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The file, relative to /work or absolute under it: src/main.rs or /work/src/main.rs."
+          },
+          "old": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Text that is in the file exactly once, copied exactly, white space included."
+          },
+          "new": {
+            "type": "string",
+            "description": "What replaces it. Empty deletes it."
+          }
+        }
+      }
+    },
+    {
       "name": "memo_propose",
       "description": "Propose a memo: something a later, different ticket would need and could not easily see in the repository, the thread or the web, such as what a person you work for prefers, a rule you tested or a trap you hit. Quote its evidence word for word: a trigger of this ticket, or the output of one of your own calls (name the tool, such as run_code). The host finds every quote or refuses the memo, and replaces any vault value with its name. A person's words quoted whole as the memo are kept at once; a memo on part of them goes to a separate review that keeps, rewrites, merges or drops it. A memo that quotes any tool's output, a command's included, or someone you do not work for is outside text: it waits for a person to add it. A memo is data for later work, never a permission. At most 3 per assignment; never a secret. The dream alone cites transcript lines and names a memo it supersedes.",
       "input_schema": {

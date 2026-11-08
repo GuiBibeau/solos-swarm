@@ -6,6 +6,7 @@
 //! settled against the principal's account in the agent Store.
 
 pub mod browser;
+mod files;
 pub mod memory;
 pub mod registry;
 mod repeat;
@@ -1811,6 +1812,8 @@ impl WorkerCall {
             Self::ReadPath { files, memos } => {
                 read_path(broker, files.as_ref(), *memos, args).await
             }
+            Self::WriteFile => files::write(seat, args).await,
+            Self::EditFile => files::edit(seat, args).await,
             Self::MemoPropose => memory::propose(broker, seat, args).await,
             Self::MemoRetire => memory::retire(broker, seat, args).await,
         };

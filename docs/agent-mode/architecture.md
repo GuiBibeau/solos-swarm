@@ -155,10 +155,12 @@ tool's name, handler, description and JSON Schema, keyed by principal kind, and 
 `POST /tool/{name}`, and a model call is `/model` or `/v1/messages`.
 
 A seat's tools are bound once, when it is admitted (`src/agent/broker/toolbox.rs`). Each tool is built from the host
-resources its handler runs on: an environment's `run_code`, the vault, the browser, the seat's `read` reader. A tool
-whose resource is missing is never held, and `/tool` refuses it with the reason. `ROUTER_TOOLS` and `WORKER_TOOLS` are
-the registry's names. A worker's tools are the ones it holds (`AgentBroker::worker_tools`, and `seat_tools` for a
-seat).
+resources its handler runs on: an environment's `run_code`, the vault, the browser, the seat's `read` reader, and for
+`write_file` and `edit_file` the seat's `/work` where its `run_code` runs on this host. A tool whose resource is missing
+is never held, and `/tool` refuses it with the reason. Every write the broker makes in a worker's `/work`
+(`write_file`, `edit_file` and `run_code`'s `files`) goes through `src/beneath.rs`, which follows no link the worker
+made there ([Files](runtime.md#files)). `ROUTER_TOOLS` and `WORKER_TOOLS` are the registry's names. A worker's tools
+are the ones it holds (`AgentBroker::worker_tools`, and `seat_tools` for a seat).
 
 The Pi extension builds its tools from `extensions/agent-tools.json`, a generated copy of the registry. A Rust test
 holds it equal to the registry, and a Node test holds the extension to it, so neither can drift. To rewrite it:

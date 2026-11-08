@@ -4,6 +4,7 @@ extern crate self as solos_swarm;
 pub mod agent;
 pub mod artifacts;
 pub mod audit;
+pub mod beneath;
 pub mod bridge;
 pub mod broker;
 pub mod browse;
