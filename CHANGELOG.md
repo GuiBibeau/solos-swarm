@@ -301,6 +301,14 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
 - Verify skill (#120): `bin/launch.sh` takes `--keep-state`, which skips the `rm -rf` of a run's `state/`, so a crash
   restart or a second start on the same day keeps its tickets, threads, memos and dream slot. `SKILL.md`'s restart
   recipe uses it, and the feature docs that said a relaunch always empties `state/` say how to keep it.
+- Deploy and CI speed (#119): a deploy pushes the commit to a bare repository on the box (`~/agent/src.git`) and
+  builds it in one tree updated in place (`~/agent/src`) against the shared cache, one build at a time
+  (`~/agent/build.lock`), instead of sending a `git archive` and extracting a tree per release. `agent-deploy
+  prebuild` builds a revision without switching, so `scripts/ship` can build a pull request's head while CI runs,
+  merge on green, and deploy the merge in one command. CI runs the jobs a change needs (`scripts/ci-changes.sh`):
+  documentation-only and dashboard-only pull requests skip the Rust jobs, one with no dashboard file skips `web`.
+  Five test shards replace four, the tokenizers are fetched inside `build`, and doc tests run only when a doc
+  comment holds one rustdoc would run (`scripts/has-doc-tests.sh`).
 
 ### Fixed
 

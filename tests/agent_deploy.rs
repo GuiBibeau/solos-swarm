@@ -159,6 +159,16 @@ struct Host {
     _socket: Option<UnixListener>,
 }
 
+impl Drop for Host {
+    /// A built release is read-only, and the scratch directory cannot be removed until it is not.
+    fn drop(&mut self) {
+        let _ = Command::new("chmod")
+            .args(["-R", "u+w"])
+            .arg(&self.home)
+            .status();
+    }
+}
+
 impl Host {
     /// A box with an agent that is running its release `old`.
     fn new(name: &str) -> Self {
@@ -757,6 +767,7 @@ fn the_flags_are_read_on_the_mac_and_reach_the_box_as_its_drain_time() {
         "health-logs",
         "prune-logs",
         "solos-agent-health.timer",
+        "prebuild",
     ] {
         assert!(text.contains(word), "the usage text lacks {word}: {text}");
     }
@@ -1100,5 +1111,615 @@ fn status_says_which_user_it_is_looking_at() {
         out(&output).starts_with(&format!("user: {} (uid {})\n", me.trim(), uid())),
         "{}",
         out(&output)
+    );
+}
+
+/// Run git in `dir` with an identity and, when given, a date for the commit.
+fn git(dir: &Path, args: &[&str], date: Option<&str>) -> String {
+    let mut command = Command::new("git");
+    command
+        .current_dir(dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+        .args(["-c", "commit.gpgsign=false"])
+        .args(args);
+    if let Some(date) = date {
+        command
+            .env("GIT_COMMITTER_DATE", date)
+            .env("GIT_AUTHOR_DATE", date);
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+/// The repository on the Mac that a deploy sends from.
+struct Source {
+    dir: PathBuf,
+}
+
+impl Source {
+    fn new(root: &Path) -> Self {
+        let dir = root.join("source");
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"], None);
+        Self { dir }
+    }
+
+    /// Commit these files, as of `date`; the commit's id.
+    fn commit(&self, files: &[(&str, &str)], date: &str) -> String {
+        for (name, text) in files {
+            let path = self.dir.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        git(&self.dir, &["add", "-A"], None);
+        git(&self.dir, &["commit", "-qm", "a change"], Some(date));
+        git(&self.dir, &["rev-parse", "HEAD"], None)
+    }
+}
+
+/// Cargo as far as a deploy depends on it: it builds `src/lib.rs` into the binary, and, as cargo does, it builds
+/// nothing when no source file is newer than the binary it made last time.
+const FAKE_CARGO: &str = "#!/bin/sh
+echo \"cargo $* in $(pwd) into $CARGO_TARGET_DIR\" >> \"$HOME/fake/cargo.log\"
+bin=\"$CARGO_TARGET_DIR/release/solos-swarm\"
+mkdir -p \"$CARGO_TARGET_DIR/release\"
+if [ -f \"$bin\" ] && [ -z \"$(find . -type f -newer \"$bin\" -print -quit)\" ]; then exit 0; fi
+printf '#!/bin/sh\\n[ \"$1\" = doctor ] && exit 0\\n# built from: %s\\n' \"$(cat src/lib.rs)\" > \"$bin\"
+chmod +x \"$bin\"
+";
+
+const FAKE_NPM: &str = "#!/bin/sh
+echo \"npm $*\" >> \"$HOME/fake/npm.log\"
+mkdir -p node_modules && echo ok > node_modules/.package-lock.json
+";
+
+impl Host {
+    fn build_tools(&self) {
+        executable(&self.home.join(".cargo/bin/cargo"), FAKE_CARGO);
+        executable(
+            &self.home.join(".local/opt/node-v24.18.0-linux-x64/bin/npm"),
+            FAKE_NPM,
+        );
+    }
+
+    /// What the Mac's push does: the commit goes into the bare repository as `refs/deploy/<first 12>`.
+    fn receive(&self, source: &Source, commit: &str) -> String {
+        let short = commit[..12].to_owned();
+        let bare = self.agent().join("src.git");
+        if !bare.exists() {
+            git(&self.agent(), &["init", "-q", "--bare", "src.git"], None);
+        }
+        let refspec = format!("{commit}:refs/deploy/{short}");
+        git(
+            &source.dir,
+            &["push", "-q", "--force", bare.to_str().unwrap(), &refspec],
+            None,
+        );
+        short
+    }
+
+    fn log(&self, name: &str) -> Vec<String> {
+        std::fs::read_to_string(self.home.join("fake").join(name))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn release_binary(&self, name: &str) -> String {
+        std::fs::read_to_string(
+            self.agent()
+                .join("releases")
+                .join(name)
+                .join("bin/solos-swarm"),
+        )
+        .unwrap()
+    }
+}
+
+fn mtime(path: &Path) -> SystemTime {
+    std::fs::metadata(path).unwrap().modified().unwrap()
+}
+
+#[test]
+fn a_build_compiles_in_one_tree_with_one_cache_and_never_ships_a_binary_older_than_its_source() {
+    let boxed = Host::new("build");
+    boxed.build_tools();
+    let source = Source::new(boxed.home.parent().unwrap());
+    let manifest = [
+        ("Cargo.toml", "[package]\n"),
+        ("package.json", "{}\n"),
+        ("scripts/systemd/solos-agent.service", "# unit\n"),
+        ("src/other.rs", "never changes\n"),
+    ];
+    let tree_at = |lib: &'static str| {
+        let mut files = manifest.to_vec();
+        files.push(("src/lib.rs", lib));
+        files
+    };
+    let a = source.commit(&tree_at("one"), "2026-01-01T00:00:00Z");
+    let b = source.commit(&tree_at("two"), "2026-01-02T00:00:00Z");
+    // Older than everything built before it, as a deploy of an old commit is: a rollback by hand, or a merge
+    // commit made before the previous deploy finished building.
+    let c = source.commit(&tree_at("one"), "2025-01-01T00:00:00Z");
+    let (a, b, c) = (
+        boxed.receive(&source, &a),
+        boxed.receive(&source, &b),
+        boxed.receive(&source, &c),
+    );
+
+    let (output, _) = boxed.on_host(&["build", &a], None);
+    assert!(output.status.success(), "{}{}", out(&output), err(&output));
+    let release = boxed.agent().join("releases").join(&a);
+    assert!(release.join(".complete").exists());
+    assert_eq!(
+        std::fs::read_to_string(release.join("REVISION"))
+            .unwrap()
+            .trim(),
+        a
+    );
+    assert!(release.join("node_modules/.package-lock.json").exists());
+    assert!(
+        release.join("src/other.rs").exists(),
+        "the release holds the commit's files"
+    );
+    assert_eq!(
+        boxed.log("npm.log"),
+        ["npm ci --ignore-scripts --no-audit --no-fund"],
+        "no install script runs on the box"
+    );
+    assert!(boxed.release_binary(&a).contains("built from: one"));
+    let tree = boxed.agent().join("src");
+    let cargo = boxed.log("cargo.log");
+    assert_eq!(cargo.len(), 1, "{cargo:?}");
+    assert!(
+        cargo[0].starts_with("cargo build --locked --release --bin solos-swarm in ")
+            && cargo[0].contains(&format!(
+                "in {} into {}",
+                tree.display(),
+                boxed.agent().join("target").display()
+            )),
+        "cargo builds in the one tree, into the one cache: {cargo:?}"
+    );
+    assert!(out(&output).contains("built release"), "{}", out(&output));
+    let untouched = mtime(&tree.join("src/other.rs"));
+
+    std::thread::sleep(Duration::from_millis(50));
+    let (output, _) = boxed.on_host(&["build", &b], None);
+    assert!(output.status.success(), "{}{}", out(&output), err(&output));
+    assert!(boxed.release_binary(&b).contains("built from: two"));
+    assert_eq!(
+        mtime(&tree.join("src/other.rs")),
+        untouched,
+        "a file the next commit does not change keeps its time, so cargo does not rebuild for it"
+    );
+    assert_eq!(boxed.log("cargo.log").len(), 2);
+
+    std::thread::sleep(Duration::from_millis(50));
+    let (output, _) = boxed.on_host(&["build", &c], None);
+    assert!(output.status.success(), "{}{}", out(&output), err(&output));
+    assert!(
+        boxed.release_binary(&c).contains("built from: one"),
+        "the commit is older than the last build, and its release must still hold its own code, not the binary of {b}: {}",
+        boxed.release_binary(&c)
+    );
+    assert_eq!(boxed.log("cargo.log").len(), 3);
+
+    let (output, _) = boxed.on_host(&["build", &a], None);
+    assert!(output.status.success(), "{}{}", out(&output), err(&output));
+    assert!(
+        out(&output).contains("is already built"),
+        "{}",
+        out(&output)
+    );
+    assert_eq!(
+        (boxed.log("cargo.log").len(), boxed.log("npm.log").len()),
+        (3, 3),
+        "a release that is built is not built again"
+    );
+}
+
+#[test]
+fn a_build_of_a_commit_the_box_was_not_sent_says_so_and_builds_nothing() {
+    let boxed = Host::new("nocommit");
+    boxed.build_tools();
+    git(&boxed.agent(), &["init", "-q", "--bare", "src.git"], None);
+    let (output, _) = boxed.on_host(&["build", "0123456789ab"], None);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        err(&output).contains("the box has no commit"),
+        "{}",
+        err(&output)
+    );
+    assert!(boxed.log("cargo.log").is_empty());
+    assert!(!boxed.agent().join("releases/0123456789ab").exists());
+}
+
+#[test]
+fn a_failed_compile_shows_cargos_own_words_and_leaves_no_release() {
+    let boxed = Host::new("brokenbuild");
+    boxed.build_tools();
+    executable(
+        &boxed.home.join(".cargo/bin/cargo"),
+        "#!/bin/sh\necho 'error[E0425]: cannot find value `x`' ; echo 'error: could not compile' ; exit 101\n",
+    );
+    let source = Source::new(boxed.home.parent().unwrap());
+    let a = source.commit(
+        &[("src/lib.rs", "one"), ("Cargo.toml", "[package]\n")],
+        "2026-01-01T00:00:00Z",
+    );
+    let a = boxed.receive(&source, &a);
+    let (output, _) = boxed.on_host(&["build", &a], None);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(err(&output).contains("error[E0425]"), "{}", err(&output));
+    assert!(!boxed.agent().join("releases").join(&a).exists());
+}
+
+/// The Mac's side of `deploy` and `prebuild`, with a `git` and an `ssh` that log what they are asked.
+fn mac(command: &[&str]) -> (Output, Vec<String>) {
+    let scratch = Scratch::new("mac-deploy");
+    let bin = scratch.root.join("bin");
+    let log = scratch.root.join("calls.log");
+    let full = "0123456789abcdef0123456789abcdef01234567";
+    executable(
+        &bin.join("ssh"),
+        &format!(
+            "#!/bin/sh\necho \"ssh $*\" >> {}\ncat > /dev/null\n",
+            log.display()
+        ),
+    );
+    executable(
+        &bin.join("git"),
+        &format!(
+            "#!/bin/sh\necho \"git $*\" >> {log}
+case \"$*\" in
+*\"rev-parse --show-toplevel\") echo /fake/repo ;;
+*\"^{{commit}}\") echo {full} ;;
+*\" log \"*) echo a one-line fix ;;
+esac
+",
+            log = log.display()
+        ),
+    );
+    let output = Command::new("bash")
+        .arg(SCRIPT)
+        .args(command)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("AGENT_HOST", "testbox")
+        .env_remove("AGENT_DRAIN_SECS")
+        .output()
+        .unwrap();
+    let calls = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    (output, calls)
+}
+
+fn position(calls: &[String], part: &str) -> usize {
+    calls
+        .iter()
+        .position(|call| call.contains(part))
+        .unwrap_or_else(|| panic!("no call has {part:?}: {calls:#?}"))
+}
+
+#[test]
+fn a_deploy_pushes_only_what_the_box_lacks_then_builds_then_switches() {
+    let (output, calls) = mac(&["deploy", "origin/main", "--drain", "7"]);
+    assert!(output.status.success(), "{}{}", out(&output), err(&output));
+    let init = position(&calls, "git init -q --bare ~/agent/src.git");
+    let push = position(
+        &calls,
+        "git -C /fake/repo push -q --force testbox:agent/src.git 0123456789abcdef0123456789abcdef01234567:refs/deploy/0123456789ab",
+    );
+    let build = position(&calls, "--on-host build 0123456789ab");
+    let switch = position(&calls, "--on-host switch 0123456789ab");
+    assert!(init < push && push < build && build < switch, "{calls:#?}");
+    assert!(
+        calls[build].contains("AGENT_DRAIN_SECS=7") && calls[switch].contains("AGENT_DRAIN_SECS=7"),
+        "{calls:#?}"
+    );
+    assert!(
+        !calls.iter().any(|call| call.contains("receive")),
+        "the archive of the whole tree is no longer sent: {calls:#?}"
+    );
+    let said = out(&output);
+    assert!(
+        said.contains("deploy 0123456789ab to testbox: a one-line fix"),
+        "{said}"
+    );
+    assert!(said.contains("sent 0123456789ab"), "{said}");
+    assert!(said.contains("deployed 0123456789ab in "), "{said}");
+}
+
+#[test]
+fn a_prebuild_builds_and_does_not_touch_the_running_agent() {
+    let (output, calls) = mac(&["prebuild", "feature"]);
+    assert!(output.status.success(), "{}{}", out(&output), err(&output));
+    position(&calls, "--on-host build 0123456789ab");
+    for call in &calls {
+        assert!(
+            !call.contains("switch") && !call.contains("drain") && !call.contains("restart"),
+            "a prebuild only builds: {call}"
+        );
+    }
+    assert!(
+        out(&output).contains("prebuilt 0123456789ab in "),
+        "{}",
+        out(&output)
+    );
+}
+
+const SHIP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/ship");
+const HEAD: &str = "1111111111111111111111111111111111111111";
+const MERGED: &str = "2222222222222222222222222222222222222222";
+
+/// `scripts/ship` with a `gh`, a `git` and an `agent-deploy` that log what they are asked to one file and answer from
+/// files the test writes. `polls` are what the poll of the PR's `check` job says, one per call, the last repeated.
+struct Ship {
+    scratch: Scratch,
+}
+
+impl Ship {
+    fn new(polls: &[String]) -> Self {
+        let scratch = Scratch::new("ship");
+        let fake = scratch.root.join("fake");
+        std::fs::create_dir_all(&fake).unwrap();
+        std::fs::write(fake.join("info"), format!("OPEN {HEAD} main false false\n")).unwrap();
+        std::fs::write(fake.join("fetch_head"), format!("{HEAD}\n")).unwrap();
+        std::fs::write(fake.join("merged"), format!("{MERGED}\n")).unwrap();
+        for (n, poll) in polls.iter().enumerate() {
+            std::fs::write(fake.join(format!("poll.{}", n + 1)), format!("{poll}\n")).unwrap();
+        }
+        std::fs::write(
+            fake.join("poll.last"),
+            format!("{}\n", polls.last().unwrap()),
+        )
+        .unwrap();
+        let scripts = scratch.root.join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::copy(SHIP, scripts.join("ship")).unwrap();
+        executable(
+            &scripts.join("agent-deploy"),
+            "#!/bin/sh
+echo \"agent-deploy $*\" >> \"$FAKE/log\"
+if [ \"$1\" = prebuild ]; then
+  sleep 0.3
+  [ -f \"$FAKE/prebuild.fail\" ] && { echo 'error: could not compile'; exit 1; }
+  echo \"prebuilt $2 in 1s\"
+  echo \"agent-deploy prebuild done\" >> \"$FAKE/log\"
+fi
+",
+        );
+        executable(
+            &scratch.root.join("bin/gh"),
+            "#!/bin/sh
+echo \"gh $*\" >> \"$FAKE/log\"
+case \"$*\" in
+*state,headRefOid,baseRefName,isDraft*) cat \"$FAKE/info\" ;;
+*headRefOid,statusCheckRollup*)
+  n=$(cat \"$FAKE/polls\" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > \"$FAKE/polls\"
+  f=\"$FAKE/poll.$n\"; [ -f \"$f\" ] || f=\"$FAKE/poll.last\"
+  [ \"$(cat \"$f\")\" = FAIL ] && exit 1
+  cat \"$f\" ;;
+\"pr merge\"*) [ -f \"$FAKE/merge.fail\" ] && { echo 'not mergeable' >&2; exit 1; }; echo merged ;;
+*mergeCommit*) cat \"$FAKE/merged\" ;;
+*) echo \"unexpected: gh $*\" >&2; exit 2 ;;
+esac
+",
+        );
+        executable(
+            &scratch.root.join("bin/git"),
+            "#!/bin/sh
+echo \"git $*\" >> \"$FAKE/log\"
+case \"$*\" in
+\"rev-parse FETCH_HEAD\") cat \"$FAKE/fetch_head\" ;;
+esac
+exit 0
+",
+        );
+        Self { scratch }
+    }
+
+    fn fake(&self, file: &str) -> PathBuf {
+        self.scratch.root.join("fake").join(file)
+    }
+
+    fn run(&self, args: &[&str]) -> (Output, Vec<String>) {
+        let fake = self.scratch.root.join("fake");
+        let output = Command::new("bash")
+            .arg(self.scratch.root.join("scripts/ship"))
+            .args(args)
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", self.scratch.root.join("bin").display()),
+            )
+            .env("FAKE", &fake)
+            .env("SHIP_POLL", "0.2")
+            .env("TMPDIR", &self.scratch.root)
+            .output()
+            .unwrap();
+        let calls = std::fs::read_to_string(fake.join("log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        (output, calls)
+    }
+}
+
+fn poll(ci: &str) -> String {
+    format!("{HEAD} {ci}")
+}
+
+#[test]
+fn ship_builds_on_the_box_while_ci_runs_then_merges_on_green_and_deploys_the_merge() {
+    let ship = Ship::new(&[
+        poll("NONE"),
+        poll("IN_PROGRESS/"),
+        poll("IN_PROGRESS/"),
+        poll("COMPLETED/SUCCESS"),
+    ]);
+    let (output, calls) = ship.run(&["7"]);
+    assert!(output.status.success(), "{}{}", out(&output), err(&output));
+    let fetch = position(&calls, "git fetch -q origin pull/7/head");
+    let prebuild = position(&calls, &format!("agent-deploy prebuild {HEAD}"));
+    let first_poll = position(&calls, "headRefOid,statusCheckRollup");
+    let merge = position(
+        &calls,
+        &format!("gh pr merge 7 --merge --match-head-commit {HEAD}"),
+    );
+    let prebuilt = position(&calls, "agent-deploy prebuild done");
+    let deploy = position(&calls, &format!("agent-deploy deploy {MERGED}"));
+    assert!(
+        fetch < prebuild,
+        "the head is fetched, then built: {calls:#?}"
+    );
+    assert!(
+        prebuild < merge && first_poll < merge,
+        "the box builds while CI is polled, and the merge comes last: {calls:#?}"
+    );
+    assert!(
+        prebuilt < deploy && merge < deploy,
+        "the deploy waits for the prebuild and follows the merge: {calls:#?}"
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.contains("headRefOid,statusCheckRollup"))
+            .count(),
+        4,
+        "it polled until the check job was green: {calls:#?}"
+    );
+    let said = out(&output);
+    for line in ["CI is green", "merged as 222222222222", "#7 is live"] {
+        assert!(said.contains(line), "{line}: {said}");
+    }
+}
+
+#[test]
+fn ship_merges_nothing_when_ci_is_red_cancelled_or_the_head_moved() {
+    for (ci, wanted) in [
+        (poll("COMPLETED/FAILURE"), "CI is COMPLETED/FAILURE"),
+        (poll("COMPLETED/CANCELLED"), "CI is COMPLETED/CANCELLED"),
+        (
+            format!("{} IN_PROGRESS/", "3".repeat(40)),
+            "the head of #7 moved",
+        ),
+    ] {
+        let ship = Ship::new(&[poll("IN_PROGRESS/"), ci]);
+        let (output, calls) = ship.run(&["7"]);
+        assert_eq!(output.status.code(), Some(1), "{wanted}");
+        assert!(err(&output).contains(wanted), "{wanted}: {}", err(&output));
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.contains("pr merge") || call.contains("agent-deploy deploy")),
+            "{wanted}: nothing is merged or deployed: {calls:#?}"
+        );
+    }
+}
+
+#[test]
+fn ship_refuses_a_pull_request_that_is_closed_a_draft_from_a_fork_or_not_against_main_before_it_builds_anything()
+ {
+    for info in [
+        format!("MERGED {HEAD} main false false"),
+        format!("OPEN {HEAD} release false false"),
+        format!("OPEN {HEAD} main true false"),
+        format!("OPEN {HEAD} main false true"),
+    ] {
+        let ship = Ship::new(&[poll("COMPLETED/SUCCESS")]);
+        std::fs::write(ship.fake("info"), format!("{info}\n")).unwrap();
+        let (output, calls) = ship.run(&["7"]);
+        assert_eq!(output.status.code(), Some(1), "{info}");
+        assert!(
+            !calls.iter().any(|call| call.contains("agent-deploy")),
+            "{info}: {calls:#?}"
+        );
+    }
+}
+
+#[test]
+fn ship_passes_the_drain_to_the_deploy_and_can_skip_the_prebuild() {
+    for (args, wanted) in [
+        (
+            vec!["7", "--drain", "30"],
+            format!("agent-deploy deploy {MERGED} --drain 30"),
+        ),
+        (
+            vec!["--no-drain", "7"],
+            format!("agent-deploy deploy {MERGED} --no-drain"),
+        ),
+        (vec!["7"], format!("agent-deploy deploy {MERGED}")),
+    ] {
+        let ship = Ship::new(&[poll("COMPLETED/SUCCESS")]);
+        let (output, calls) = ship.run(&args);
+        assert!(
+            output.status.success(),
+            "{args:?}: {}{}",
+            out(&output),
+            err(&output)
+        );
+        assert_eq!(calls.last().unwrap(), &wanted, "{args:?}: {calls:#?}");
+    }
+    let ship = Ship::new(&[poll("COMPLETED/SUCCESS")]);
+    let (output, calls) = ship.run(&["7", "--no-prebuild"]);
+    assert!(output.status.success(), "{}{}", out(&output), err(&output));
+    assert!(
+        !calls.iter().any(|call| call.contains("prebuild")),
+        "{calls:#?}"
+    );
+    for args in [
+        vec!["--drain", "soon", "7"],
+        vec!["seven"],
+        vec![],
+        vec!["7", "8"],
+        vec!["--nope", "7"],
+    ] {
+        let (output, _) = Ship::new(&[poll("COMPLETED/SUCCESS")]).run(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+    }
+}
+
+#[test]
+fn a_failed_prebuild_does_not_stop_the_ship_and_neither_does_a_github_that_does_not_answer_once() {
+    let ship = Ship::new(&["FAIL".into(), poll("COMPLETED/SUCCESS")]);
+    std::fs::write(ship.fake("prebuild.fail"), b"").unwrap();
+    let (output, calls) = ship.run(&["7"]);
+    assert!(output.status.success(), "{}{}", out(&output), err(&output));
+    assert!(
+        out(&output).contains("GitHub did not answer; trying again"),
+        "{}",
+        out(&output)
+    );
+    assert!(
+        out(&output).contains("the prebuild failed, so the deploy builds it again")
+            || err(&output).contains("could not compile"),
+        "{}{}",
+        out(&output),
+        err(&output)
+    );
+    position(&calls, &format!("agent-deploy deploy {MERGED}"));
+}
+
+#[test]
+fn a_merge_that_github_refuses_is_not_deployed() {
+    let ship = Ship::new(&[poll("COMPLETED/SUCCESS")]);
+    std::fs::write(ship.fake("merge.fail"), b"").unwrap();
+    let (output, calls) = ship.run(&["7"]);
+    assert!(!output.status.success());
+    assert!(err(&output).contains("not mergeable"), "{}", err(&output));
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.contains("agent-deploy deploy")),
+        "{calls:#?}"
     );
 }

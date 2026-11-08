@@ -143,15 +143,23 @@ The sections below say how to set up GitHub, dependencies, memory and the dashbo
 ```sh
 scripts/agent-deploy deploy            # origin/main
 scripts/agent-deploy deploy <rev>      # any commit, branch or tag
+scripts/agent-deploy prebuild <rev>    # steps 1 to 3 only: build the release, change nothing that runs
 ```
+
+To merge a pull request and deploy it in one command, see [Ship a fix](#ship-a-fix).
 
 A deploy does these steps, in order:
 
-1. It fetches `origin`, resolves the revision to a 12-digit sha, and sends `git archive` of it to the box. The box skips
-   the build when that release is already built.
+1. It fetches `origin`, resolves the revision to a 12-digit sha, and pushes that commit to a bare repository on the box,
+   `~/agent/src.git`, as `refs/deploy/<sha>`. A push sends only the objects the box lacks: a one-line change is a few
+   kilobytes, and the first push sends the history, about 9 MB. The box skips the build when that release is already
+   built.
 2. It refuses to build with less than 30 GB free.
-3. It builds on the box: `npm ci --ignore-scripts`, then `cargo build --locked --release` with toolchain 1.96.0 and
-   the build cache `~/agent/target`. It runs `doctor` on the new release and makes the release read-only.
+3. It builds on the box, one build at a time (`~/agent/build.lock`). It checks the commit out into one persistent tree,
+   `~/agent/src`, and runs `cargo build --locked --release` there with toolchain 1.96.0 and the build cache
+   `~/agent/target`. The checkout rewrites only the files that differ, so cargo recompiles what changed and nothing else.
+   It then unpacks the commit into `releases/<sha>`, runs `npm ci --ignore-scripts`, copies in the binary, runs `doctor`
+   and makes the release read-only. A failed compile prints the end of cargo's log.
 4. It [drains](#drain-running-work) the agent, stops the publisher and the agent, and copies `agent.db*` into
    `backups/`.
 5. It points `current` at the new release (the old one becomes `previous`), installs and enables the units from the
@@ -165,13 +173,18 @@ A deploy does these steps, in order:
 If the new release does not become healthy, the deploy switches back to the previous release, restores the
 `agent.db` it copied (the new release may have migrated it), starts that, and exits 1.
 
-A deploy that went well ends like this:
+Every command prints how long its parts took. A deploy that went well ends like this:
 
 ```text
+sent 53f30cbf570b (3s)
+compiled in 71s
+built release 53f30cbf570b in 77s
 backed up agent.db to /home/debian/agent/backups/20261107T142301Z-ebb9f39ae70a
 release 53f30cbf570b is serving (pid 812345)
+switch took 24s: drain 0s, stop 2s, backup 0s, units and start 1s, health wait 21s
 unpaused
 publisher: active
+deployed 53f30cbf570b in 105s
 ```
 
 ## Roll back
@@ -612,7 +625,8 @@ health:
 To free space when the floor trips:
 
 1. Run the prune by hand with a shorter `--keep-days`, after a `--dry-run`.
-2. Run `cargo clean` in `~/agent/target`, the build cache. The prune never touches it, and the next deploy rebuilds it.
+2. Run `cargo clean` in `~/agent/target`, the build cache. The prune never touches it, and the next deploy rebuilds it
+   (measured: 114 s from an empty cache, 70 s after a one-line change).
 3. Delete old releases or backups only by hand. A deploy keeps five releases and twenty backups.
 
 ## Hardening the units
@@ -851,7 +865,10 @@ back only if you must, with the agent stopped, and only to the same release: an 
 | `state/` | The agent's state, kept across releases ([below](#state-directory)). |
 | `tokens/` | One file per one-use credential, mode 0600 ([Tokens](#tokens)). |
 | `backups/<time>-<sha>/` | `agent.db*`, copied before every deploy and rollback while the agent is stopped. The newest twenty are kept. |
-| `target/` | The cargo build cache. Not pruned. |
+| `src.git/` | A bare repository. Each deploy pushes its commit here as `refs/deploy/<sha>`; the newest twenty refs are kept. |
+| `src/` | The one tree every build compiles in, updated in place by `git checkout`. Not pruned. |
+| `target/` | The cargo build cache, shared by every build and kept between deploys. Not pruned, and not under `~/work/ci/target-*`, which the box's CI sweep removes. |
+| `build.lock`, `build.log` | The lock that makes builds take turns, and the last build's cargo output. |
 | `.agent-deploy` | The copy of `scripts/agent-deploy` that each command installs and runs on the box. |
 
 ### State directory
@@ -893,6 +910,7 @@ thread per core filled the publisher's `TasksMax` and hung its uploads.
 | Command | What it does |
 |---|---|
 | `deploy [REV]` | Builds `REV` (default `origin/main`) as a release, then switches to it ([Deploy a release](#deploy-a-release)). |
+| `prebuild [REV]` | The build of a deploy and nothing else: nothing is drained, stopped or switched. A later `deploy` of the same commit, or of one with the same files, finds the release built. |
 | `rollback` | Switches to `previous`. |
 | `start`, `stop`, `restart` | The agent's unit, with the publisher and the timers. `stop` and `restart` drain. |
 | `status` | The user, the release, the unit, `agent status`, the publisher, the timers, any health incident, and `agent health --dry-run`. |
