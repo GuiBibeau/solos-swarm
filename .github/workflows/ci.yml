@@ -87,18 +87,10 @@ jobs:
           else
             echo "no doc comment has a code block rustdoc runs: no doc tests"
           fi
-
-  # The pinned tokenizer assets come from huggingface.co. This job fetches them, once per change of the pin; the
-  # shards restore them from the cache, so no shard depends on huggingface being up.
-  tokenizers:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          fetch-depth: 2
-      - id: changes
-        run: scripts/ci-changes.sh >> "$GITHUB_OUTPUT"
+      # The pinned tokenizer assets come from huggingface.co. They are fetched here, once per change of the pin, and
+      # the shards restore them from the cache, so no shard depends on huggingface being up. They had a job of their
+      # own, which the shards waited for: when other runs fill GitHub's 20 concurrent jobs, that job queued, and
+      # every test queued behind it. In `build` they cost a second (the cache is restored, and saved when the pin changed).
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: steps.changes.outputs.rust == 'true'
         with:
@@ -109,7 +101,7 @@ jobs:
         run: python3 scripts/bootstrap_tokenizers.py --output work/tokenizers
 
   test:
-    needs: [build, tokenizers]
+    needs: [build]
     if: ${{ needs.build.outputs.rust == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -153,7 +145,7 @@ jobs:
   # that fails when called), so these jobs skip setting it up: part 4, the archive test, is the slowest job in the
   # run after `build`, and setting up Node was 5 s of it.
   test-isolated:
-    needs: [build, tokenizers]
+    needs: [build]
     if: ${{ needs.build.outputs.rust == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -261,7 +253,7 @@ jobs:
   # dashboard changed. If `build` did not say so (it failed, or its output is missing), skipped tests do not pass.
   check:
     if: ${{ always() }}
-    needs: [lint, build, tokenizers, test, test-isolated, scripts, web]
+    needs: [lint, build, test, test-isolated, scripts, web]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
