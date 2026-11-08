@@ -1,0 +1,69 @@
+# Sketch: /etc/systemd/system/solos-hostops.service, root-owned, installed by the owner with sudo (the
+# `agent-deploy hostops-install` step, PR 8). The helper runs as the user that owns the resources (debian), not root,
+# and not as the agent's user (solos-agent).
+#
+# Every /home/debian path below is an example. `solos-hostops check-unit` compares this unit's BindPaths= entries with
+# the roots and ops-file directories in /etc/solos-hostops/hostops.yaml, and refuses to start on a difference.
+[Unit]
+Description=solos-swarm host operations helper (typed, allowlisted host actions for agent mode)
+Requires=solos-hostops.socket
+After=solos-hostops.socket dbus.socket
+
+[Service]
+Type=simple
+User=debian
+Group=debian
+ExecStart=/usr/local/libexec/solos-hostops serve --config /etc/solos-hostops/hostops.yaml
+StateDirectory=solos-hostops
+StateDirectoryMode=0700
+UMask=0077
+TimeoutStopSec=10
+
+# No sudo, no capabilities, for the helper and everything it starts. It talks to systemctl over the system bus only,
+# and never to a user manager.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+
+# Everything is read-only except the BindPaths= mounts below and the state directory.
+ProtectSystem=strict
+
+# The home is an allowlist, not a deny list: ProtectHome=tmpfs gives the helper an empty /home and /run/user, and
+# BindPaths= puts back only the roots it works on, read-write (systemd resolves the source in the host namespace).
+# ~/.ssh, ~/.pi, ~/.config/gh, ~/.config/solana, ~/.kube, shell history, ~/agent/tokens and every other home file are
+# not in its namespace at all.
+ProtectHome=tmpfs
+BindPaths=/home/debian/work/repos /home/debian/work/ci
+# BindPaths=/home/debian/work/regimes/ops     # only once an ops file is listed
+
+# The system and root files that hold privileges are absent too, on top of ProtectSystem=strict.
+InaccessiblePaths=-/etc/sudoers -/etc/sudoers.d -/etc/shadow -/root
+
+# No network: it talks only over the socket systemd hands it, and to the system bus over AF_UNIX.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+LimitCORE=0
+
+# The box runs other production services: stay below them.
+Nice=10
+IOSchedulingClass=idle
+CPUWeight=20
+IOWeight=20
+MemoryMax=2G
+TasksMax=64

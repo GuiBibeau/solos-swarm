@@ -1,0 +1,38 @@
+# Sketch: /etc/solos-hostops/hostops.yaml, owned by root, group debian, mode 0640. The helper refuses a config that
+# the agent's user, or anyone but root, can write. This file is the allowlist; agent.yaml cannot widen it.
+#
+# Three things must agree, and `solos-hostops check-unit` refuses to start if they do not:
+#   - this file's roots and ops files are the unit's BindPaths= entries;
+#   - this file's restart units are the polkit rule's exact names;
+#   - this file's max_plan_ttl_mins is at least agent.yaml's host_ops.plan_ttl_mins.
+
+agent_uid: 1001                    # `id -u solos-agent`; the only uid that may connect
+max_plan_ttl_mins: 30              # agent.yaml's host_ops.plan_ttl_mins may be lower, never higher
+
+roots:                             # where deletes may happen, by name; a plan names a root, never a path.
+  repos:                           # Roots must not overlap: `ci` is not inside `repos`.
+    path: /home/debian/work/repos
+    kinds: [cargo_target]          # the only kind in the first build
+    idle_days: 7
+    max_depth: 6
+  ci:                              # the shared CARGO_TARGET_DIR slots
+    path: /home/debian/work/ci
+    kinds: [cargo_target]
+    idle_days: 2
+    max_depth: 2
+
+units:                             # system units with User=debian; not user units
+  status:                          # read-only; exact names or * patterns
+    - l2book-download.service
+    - "regimes-*.service"
+    - "regimes-*.timer"
+  restart:                         # exact names only; a template instance is never chosen by a worker
+    - l2book-download.service
+  require_no_new_privileges: true  # refuse to restart a unit without NoNewPrivileges=yes
+  journal_lines: 0                 # journal lines can carry secrets and outside text
+
+ops_files: []                      # exact paths, once wanted, for example:
+#  - /home/debian/work/regimes/ops/download.sh
+
+deny: []                           # added to the built-in list (~/.ssh, ~/.pi, ~/.config/gh, ~/agent, ...)
+backups_keep_days: 90
