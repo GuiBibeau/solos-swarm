@@ -1,0 +1,20 @@
+# Sketch: /etc/systemd/system/solos-hostops.socket, root-owned, installed by the owner with sudo (PR 8).
+# Root creates the socket, so neither the helper nor the agent chooses its owner or mode. Only the agent's group can
+# open it, and the helper also checks SO_PEERCRED against `agent_uid` in /etc/solos-hostops/hostops.yaml.
+#
+# `solos-agent` below is the user production.md creates; if your agent user has another name, use its primary group.
+[Unit]
+Description=solos-swarm host operations helper socket
+
+[Socket]
+ListenStream=/run/solos-hostops/hostops.sock
+SocketUser=debian
+SocketGroup=solos-agent
+SocketMode=0660
+# The directory is root's, so no other process can place a socket here; the agent checks that before it trusts it.
+DirectoryMode=0755
+Accept=no
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

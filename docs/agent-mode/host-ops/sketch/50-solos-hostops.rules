@@ -1,0 +1,20 @@
+// Sketch: /etc/polkit-1/rules.d/50-solos-hostops.rules, root-owned, mode 0644, installed by the owner with sudo (PR 8).
+//
+// systemd's manage-units action asks polkit when a non-root process calls `systemctl restart`. The helper runs as
+// `debian`, so this rule is what lets it restart exactly the units in its config and nothing else. It is per user, not
+// per program: any process of debian may restart these names. On this box that adds nothing to debian's passwordless
+// sudo, and it grants nothing to the agent's user (solos-agent), who is not matched.
+//
+// `solos-hostops check-unit` reads the `restart_units` array and compares it with the config's `units.restart` list, so
+// the two cannot drift without the helper refusing to start. Keep the array on one line, in this exact form.
+
+var restart_units = ["l2book-download.service"];
+
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("verb") == "restart" &&
+        restart_units.indexOf(action.lookup("unit")) !== -1 &&
+        subject.user == "debian") {
+        return polkit.Result.YES;
+    }
+});
