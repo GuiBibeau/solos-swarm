@@ -339,6 +339,10 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   with each worker's reports in the middle, recent web conversations on the left, and what the swarm is doing on the
   right — polled every two seconds, with the thread kept in the address and a server-side message write to a private
   Blob inbox. Discord and GitHub stay their own sources; the full field moved to `/command`.
+- Agent dashboard, design review (#136): the sign-in, 404 and error screens are composed (a split sign-in with the
+  beacon field), the empty chat leads with what waits on the person and one-line commands instead of suggestion cards,
+  the activity rail shows the active ticket's last worker report instead of a miniature field, and the field labels its
+  rings and tickets; the Swarm field is sized so the workers land on the first screen.
 
 ### Fixed
 
