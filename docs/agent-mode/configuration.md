@@ -155,6 +155,27 @@ its Ticket's budget:
 | `wire` | `chat` | How a Claude Code session's Messages calls reach `provider`: `chat` translates them onto its chat completions, or `anthropic` forwards them to its own Messages endpoint with the broker's key. `anthropic` needs `claude`, and only `deepseek` serves it. See [executor.wire](#executorwire). |
 | `web_search` | none | The provider's own web search, which the broker adds to every call it forwards. Needs `wire: anthropic`. See [executor.web_search](#executorweb_search). |
 | `environment` | `local` | Where a session's commands run when its Plan names nowhere: `local` or a node in `nodes.allow`. |
+| `upstreams` | empty | Other upstreams a Ticket may run on, by name. Each has its own provider, model, wire, harness and key file. See [executor.upstreams](#executorupstreams). |
+
+#### executor.upstreams
+
+Other upstreams a Ticket may run on, by name. `default` is this section's own `provider`, `model`, `prices`,
+`max_input_bytes`, `max_output_tokens`, `wire` and `harness`; a name here is one more, and a repository's
+`models.worker` picks one. Each entry takes:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `provider` | required | Who receives the text and bills for it: `deepseek` or `venice`. `anthropic` is not admitted for an upstream in this release. |
+| `model` | required | The model, as the provider's catalog names it. |
+| `wire` | required | `chat` or `anthropic`. A `pi` session needs `chat`; `anthropic` needs `harness: claude-code`, and only `deepseek` serves it. |
+| `harness` | required | `pi` or `claude-code`. `claude-code` needs `executor.claude`. |
+| `key_file` | required | The upstream's key, a one-use token file read once and deleted. `serve` refuses it under any path a sandbox can read. A relative path resolves beside this file. |
+| `prices` | required | The same table as `executor.prices`. |
+| `max_input_bytes` | `executor.max_input_bytes` | 1 to 16777216. |
+| `max_output_tokens` | `executor.max_output_tokens` | 1 to 393216. |
+
+`executor.upstreams.default` is refused: `default` always names this section's own upstream, whose key is
+`--credential-file`, not `key_file`.
 
 #### executor.run_code
 
@@ -399,6 +420,7 @@ Each entry of `forge.repos`, keyed `<owner>/<name>`:
 |---|---|---|
 | `about` | required | What the Router reads to tell which repository a request is about. Not empty. |
 | `base` | required | The branch each Ticket's clone starts from. |
+| `models` | required | The providers this repository's text may reach, by role, and the upstream its workers run on. A config without it does not load. See [Repository models](#repository-models). |
 | `budget_microusd` | none | What an accept that names this repository and no budget gets. Above `policy.auto_approve_microusd`, it needs someone who can approve. |
 | `notes` | none | What the worker's prompt says about working in it, such as where its toolchain is. |
 | `owes` | `answer` | `answer`, `change` or `pull_request`: what a Ticket owes when the Router names nothing, and the most it may owe. `pull_request` needs `forge: github` and `github.writes: true`. |
@@ -410,6 +432,33 @@ Each entry of `forge.repos`, keyed `<owner>/<name>`:
 | `max_repairs` | `2` | CI failures that may resume a delivered Ticket. Recorded in the Ticket's terms. Repair is not built yet. |
 | `deps` | none | Dependencies the host installs for the base commit. See below. |
 | `evidence` | none | What a pull request's description must carry. Needs `owes: pull_request`. See below. |
+
+#### Repository models
+
+`models` is required on every repository: no repository reaches any provider by default, so one added to
+`forge.repos` stays unreachable until its owner writes the providers it may reach. A config without it does not load.
+
+```yaml
+      models: {allow: [deepseek]}                 # every role
+      models:
+        allow: {router: [deepseek], worker: [anthropic], memory: [anthropic]}
+        worker: claude                            # the upstream its workers run on
+```
+
+`allow` is a list of providers, which applies to every role, or a map that names all three:
+
+- `router`: the Router's cards, its `router_read` and its system prompt.
+- `worker`: the repository's Tickets' workers, and any worker shown a memo that carries it.
+- `memory`: the memory review and the dream.
+
+A provider is `deepseek`, `venice` or `anthropic`. `anthropic` may be allowed before an upstream runs on it: a
+repository that no upstream here serves still loads, and `agent serve` logs it at start.
+
+`worker` names `default` or a key of `executor.upstreams`, and that upstream's provider must be one the `worker` role
+allows. Without it: `default` when its provider is allowed, else the one upstream here whose provider is allowed. Two
+upstreams here whose providers are allowed, and no `worker`, is an error that asks for one.
+
+`agent serve` logs each repository's allowed providers per role and the upstream its workers run on.
 
 `deps`:
 

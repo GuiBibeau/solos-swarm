@@ -41,6 +41,7 @@ const FORGE: &str = "forge:
       budget_microusd: 400000
       notes: Tests run with ./check.
       owes: change
+      models: {allow: [deepseek]}
 ";
 const ANSWER: &str = "acme/widgets tests its widgets with ./check.";
 const COMMIT: &str = "git log --format=%s && echo checked >> README.md && \

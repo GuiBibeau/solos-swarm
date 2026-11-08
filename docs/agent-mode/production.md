@@ -97,11 +97,13 @@ forge:
       about: solos, one binary agents call to trade across venues (JavaScript).
       base: main
       owes: pull_request                   # the most the agent does here
+      models: {allow: [deepseek]}          # the only provider its text may reach
       deps: {kind: bun}                    # the host installs bun.lock's dependencies
       evidence: {command: "bun run solos dev verify --scope unit --json"}
     GuiBibeau/solos-swarm:
       about: solos-swarm, the agent's own code (Rust and TypeScript).
       base: main                           # no owes: it defaults to answer, so the agent only reads here
+      models: {allow: [deepseek, anthropic]}
 memory:                                    # optional; these are the defaults
   proposals: true                          # workers propose memos, and a review decides each that is not outside text
   review: {thinking: max}
@@ -123,6 +125,10 @@ Read these before you change it:
 
 - Every `token_file` and `github.key_file` names the unit's runtime copy, as [Store a token](#store-a-token) says.
   `serve` refuses a `key_file` under any path a sandbox can read.
+- Every repository names `models`, the providers its text may reach, and a config without one does not load. Before
+  deploying a release that includes the model policy, add a `models:` line to each repository in the live config, or
+  the agent will refuse to start. A repository whose allowed providers no upstream here serves still loads, and
+  `agent serve` logs it at start ([Repository models](configuration.md#repository-models)).
 - `mcp:<your name>` in `policy.people` lets you run `agent stop` and `agent memo` from the box.
 - There is no `budgets:` section, so a session Ticket and the Router have no cap. A swarm's budget comes from the Router
   or from `executor.swarm.default_budget_microusd`. To cap them, add
@@ -377,6 +383,7 @@ forge:
       about: ...
       base: main
       owes: pull_request
+      models: {allow: [deepseek]}          # the providers its text may reach, by role
       deps: {kind: bun}                    # binary: the box's bun; default $HOME/.bun/bin/bun
       evidence: {command: "bun run solos dev verify --scope unit --json"}
 ```

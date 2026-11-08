@@ -3308,7 +3308,7 @@ executor:
 forge:
   kind: github
   repos:
-    {REPO}: {{about: \"Widgets, in Rust.\", base: main}}
+    {REPO}: {{about: \"Widgets, in Rust.\", base: main, models: {{allow: [deepseek]}}}}
 budgets: {{session_microusd: {BUDGET}}}
 ",
         fake.api,
@@ -4002,7 +4002,7 @@ executor:
 forge:
   kind: github
   repos:
-    {REPO}: {{about: \"Widgets, in Rust.\", base: main, owes: pull_request{repo}}}
+    {REPO}: {{about: \"Widgets, in Rust.\", base: main, owes: pull_request{repo}, models: {{allow: [deepseek]}}}}
 budgets: {{session_microusd: {BUDGET}}}
 ",
             fake.api,
@@ -4615,11 +4615,11 @@ fn installable(d: &Shipping, script: &str) {
     let path = d.scratch.root.join("agent.yaml");
     let yaml = std::fs::read_to_string(&path).unwrap();
     let asked = format!(
-        "owes: pull_request, deps: {{kind: bun, binary: {}, timeout_secs: 60}}}}",
+        "models: {{allow: [deepseek]}}, deps: {{kind: bun, binary: {}, timeout_secs: 60}}}}",
         bun.display()
     );
-    assert!(yaml.contains("owes: pull_request}"));
-    std::fs::write(&path, yaml.replace("owes: pull_request}", &asked)).unwrap();
+    assert!(yaml.contains("models: {allow: [deepseek]}}"));
+    std::fs::write(&path, yaml.replace("models: {allow: [deepseek]}}", &asked)).unwrap();
 }
 
 #[tokio::test]

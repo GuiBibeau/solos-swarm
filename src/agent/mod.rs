@@ -21,6 +21,7 @@ pub mod links;
 mod markdown;
 pub mod mcp;
 pub mod memo;
+pub mod models;
 pub mod pi_executor;
 pub mod pi_router;
 mod plain_answer;
@@ -220,6 +221,12 @@ where
     H::Session: Send + 'static,
 {
     private_dir(state_dir)?;
+    // Which providers may read each repository's text, by role, and the
+    // upstream each repository's workers run on. A repository with none here
+    // is still logged.
+    for line in models::ModelPolicy::from_config(&config)?.start_report() {
+        eprintln!("agent: {line}");
+    }
     let store = SqliteStore::open(state_dir.join(STORE_FILE)).context("cannot open the store")?;
     let (facts, inbound) = ports::FactSink::channel();
     // The runtime moves it when a global memo changes; the Router starts a
@@ -810,18 +817,15 @@ struct Io {
     github: Option<Arc<GithubApp>>,
 }
 
-/// Refused: the GitHub App's key sits under a path some sandbox can read.
-/// Judged before the key is read, with what is known then: the config's
-/// mounts and the state, Pi and node directories.
+/// Refused: a model key sits under a path some sandbox can read. Judged
+/// before any key is read, with what is known then: the config's mounts and
+/// the state, Pi and node directories.
 fn check_key_path(
     config: &AgentConfig,
     state_dir: &Path,
     pi_root: Option<&Path>,
     node: Option<&Path>,
 ) -> Result<()> {
-    let Some(github) = &config.github else {
-        return Ok(());
-    };
     let canonical = |path: &Path| path.canonicalize().ok();
     let host = Host {
         state_dir: canonical(state_dir),
@@ -829,10 +833,17 @@ fn check_key_path(
         node: node.and_then(canonical),
         pstack: None,
     };
-    Exposure::new(config, &host)
-        .view()
-        .hides(&github.key_file)
-        .context("github.key_file")
+    let view = Exposure::new(config, &host).view();
+    if let Some(github) = &config.github {
+        view.hides(&github.key_file).context("github.key_file")?;
+    }
+    if let ExecutorConfig::Pi { upstreams, .. } = &config.executor {
+        for (name, upstream) in upstreams {
+            view.hides(&upstream.key_file)
+                .with_context(|| format!("executor.upstreams.{name}.key_file"))?;
+        }
+    }
+    Ok(())
 }
 
 impl Io {
@@ -990,5 +1001,53 @@ pub async fn shutdown() {
     tokio::select! {
         Ok(()) = tokio::signal::ctrl_c() => {}
         () = terminate => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_upstream_key_under_a_path_a_sandbox_can_read_is_refused() {
+        let shared = std::env::temp_dir().join(format!("agent-key-path-{}", std::process::id()));
+        std::fs::create_dir_all(&shared).unwrap();
+        let key = shared.join("venice.key");
+        std::fs::write(&key, "a key").unwrap();
+        let yaml = format!(
+            "policy: {{people: [slack:alice]}}
+sources: [{{kind: jsonl, path: triggers.jsonl}}]
+channels: [{{kind: jsonl, source: slack, path: outbox.jsonl}}]
+router: {{kind: scripted}}
+executor:
+  kind: pi
+  provider: deepseek
+  model: deepseek-flash
+  prices: {{input_microusd_per_million: 300000, output_microusd_per_million: 1200000}}
+  run_code:
+    mounts: [{{target: /data, source: {}}}]
+  upstreams:
+    venice:
+      provider: venice
+      model: zai-org-glm-5
+      wire: chat
+      harness: pi
+      key_file: {}
+      prices: {{input_microusd_per_million: 300000, output_microusd_per_million: 1200000}}
+",
+            shared.display(),
+            key.display()
+        );
+        let config: AgentConfig = serde_yaml::from_str(&yaml).unwrap();
+        let refused =
+            check_key_path(&config, Path::new("/nonexistent-state"), None, None).unwrap_err();
+        let said = format!("{refused:#}");
+        std::fs::remove_dir_all(&shared).unwrap();
+        assert!(
+            said.contains("executor.upstreams.venice.key_file")
+                && said.contains(&key.display().to_string())
+                && said.contains("which a sandbox can read"),
+            "{said}"
+        );
     }
 }

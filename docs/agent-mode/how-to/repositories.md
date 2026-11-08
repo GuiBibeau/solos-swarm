@@ -20,6 +20,7 @@ forge:
       budget_microusd: 3000000             # an accept that names no budget gets this
       notes: Tests run with cargo test -p solos-agent-core --offline.   # the worker reads this
       owes: pull_request                   # answer (the default), change or pull_request
+      models: {allow: [deepseek]}          # the providers its text may reach, by role
       # protected: [".github/**"]          # paths no commit may change (a merge by its own edits)
       # max_pushes: 6                      # heads published for one Ticket, review rounds included
       # max_change_bytes: 5000000          # the largest change a ready is admitted with
@@ -86,6 +87,7 @@ forge:
       about: ...
       base: main
       owes: pull_request
+      models: {allow: [deepseek]}     # the providers its text may reach, by role
       deps: {kind: bun}     # binary: $HOME/.bun/bin/bun; timeout_secs: 600; max_bytes: 8 GiB; memory_bytes: 16 GiB
       evidence: {command: "bun run solos dev verify --scope unit --json"}   # heading: "## Evidence" by default
 ```
@@ -116,6 +118,7 @@ forge:
       about: solos-swarm, the agent's own code (Rust and TypeScript).
       base: main
       owes: pull_request
+      models: {allow: [deepseek]}                 # the providers its text may reach, by role
       deps:
         kind: cargo
         # Required, and the cargo of one toolchain, not rustup's proxy at ~/.cargo/bin/cargo.

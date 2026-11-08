@@ -8,3 +8,4 @@ forge:
       about: A throwaway repository for agent-mode proofs.
       base: main
       budget_microusd: 500000
+      models: {allow: [deepseek]}

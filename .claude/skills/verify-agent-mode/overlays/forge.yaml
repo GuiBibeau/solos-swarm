@@ -7,3 +7,4 @@ forge:
       about: solos-swarm, the agent's own code, Rust and TypeScript.
       base: main
       budget_microusd: 500000
+      models: {allow: [deepseek]}
