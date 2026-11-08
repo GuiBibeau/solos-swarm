@@ -146,9 +146,10 @@ from `extensions/agent-tools.json`, which tests hold equal to the registry. No n
 A session Ticket can run on Claude Code under the same governance as a Pi worker: the broker's Anthropic Messages
 facade (`src/agent/broker/messages.rs`, `src/gateway/anthropic.rs`), `ClaudeCodeHarness`
 (`src/harness/claude_code.rs`) and `solos-swarm bridge`. `executor.harness: claude-code` makes it the default, and a
-Plan that names `pi` or `claude-code` picks one. Checked with Claude Code 2.1.231 in `agent serve`. No new
-dependencies. See [Claude Code sessions](runtime.md#claude-code-sessions) and
-[Run workers on Claude Code](how-to/claude-code.md).
+Plan that names `pi` or `claude-code` picks one. With `executor.wire: anthropic`, the facade forwards the calls to
+DeepSeek's own Messages endpoint (`src/gateway/forward.rs`) instead of translating them onto chat. Checked with Claude
+Code 2.1.231 in `agent serve`, and the Anthropic wire against a fake upstream. No new dependencies. See
+[Claude Code sessions](runtime.md#claude-code-sessions) and [Run workers on Claude Code](how-to/claude-code.md).
 
 ### P8 GitHub and schedules
 

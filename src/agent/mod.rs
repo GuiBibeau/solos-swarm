@@ -48,8 +48,8 @@ use crate::broker::{now_ms, write_json};
 use crate::browse::{Browsers, Launcher, TrailSigner};
 use crate::code::{CodeConfig, CodeExecutor};
 use crate::exposure::{self, Exposure, Host};
-use crate::gateway::{Provider, provider_for, upstream_profile};
-use crate::harness::claude_code::ClaudeCodeHarness;
+use crate::gateway::{BothWires, Provider, Wire, messages_for, provider_for, upstream_profile};
+use crate::harness::claude_code::{AnthropicWire, ClaudeCodeHarness};
 use crate::harness::{AgentHarness, PiHarness, Role, SessionSpec};
 use crate::remote::Listener;
 use crate::vault::Vault;
@@ -160,10 +160,18 @@ pub async fn serve_until(
                 "the isolation of pi sessions requires Linux"
             );
             let upstream = upstream_profile(provider, model)?;
-            let provider = provider_for(&upstream, crate::swarm::http_client()?, key)?;
+            let client = crate::swarm::http_client()?;
+            let chat = provider_for(&upstream, client.clone(), key.clone())?;
+            let provider: Arc<dyn Provider> = match config.messages_wire() {
+                (Wire::Chat, _) => Arc::new(chat),
+                (Wire::Anthropic, web_search) => Arc::new(BothWires {
+                    chat,
+                    messages: messages_for(&upstream, client, key, web_search)?,
+                }),
+            };
             Some(PiHost {
                 harness: PiHarness,
-                provider: Arc::new(provider),
+                provider,
                 pi_root,
                 node,
                 browser: Launcher::Lightpanda,
@@ -554,6 +562,8 @@ where
                     prepare,
                     harness: default_harness,
                     claude,
+                    wire,
+                    max_input_bytes,
                     ..
                 },
                 Some(model),
@@ -561,7 +571,11 @@ where
                 harness,
                 claude: claude
                     .as_deref()
-                    .map(claude_harness)
+                    .map(|install| {
+                        let anthropic_wire = (*wire == Wire::Anthropic)
+                            .then(|| AnthropicWire::for_input_limit(*max_input_bytes));
+                        claude_harness(install, anthropic_wire)
+                    })
                     .transpose()?
                     .map(Arc::new),
                 default_harness: *default_harness,
@@ -644,7 +658,10 @@ fn local_browsers(
 
 /// The `claude-code` harness of `install`, its paths resolved. Its sandbox
 /// runs this binary for the session's tools unless `install` names another.
-fn claude_harness(install: &ClaudeConfig) -> Result<ClaudeCodeHarness> {
+fn claude_harness(
+    install: &ClaudeConfig,
+    anthropic_wire: Option<AnthropicWire>,
+) -> Result<ClaudeCodeHarness> {
     let solos_swarm = match &install.solos_swarm {
         Some(path) => path.clone(),
         None => std::env::current_exe().context("cannot find this solos-swarm binary")?,
@@ -653,6 +670,7 @@ fn claude_harness(install: &ClaudeConfig) -> Result<ClaudeCodeHarness> {
         binary: canonical(&install.binary)?,
         node: install.node.as_deref().map(canonical).transpose()?,
         solos_swarm: canonical(&solos_swarm)?,
+        anthropic_wire,
     })
 }
 

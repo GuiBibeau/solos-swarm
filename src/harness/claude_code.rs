@@ -4,7 +4,9 @@
 //! bridge` on a loopback port of the sandbox's own network namespace, with
 //! the session's bearer token as its API key. Its built-in tools are off;
 //! its only tools are the broker's, served by `solos-swarm mcp` against the
-//! broker socket with the session's token file.
+//! broker socket with the session's token file. Where the broker forwards
+//! its calls to DeepSeek's own Messages endpoint, it runs with the model
+//! settings DeepSeek recommends for Claude Code.
 
 use super::{
     AgentHarness, Observation, PiSession, Session, SessionEvent, SessionSpec, frames, stderr_log,
@@ -12,6 +14,7 @@ use super::{
 use crate::bwrap::Bwrap;
 use crate::exposure::{self, CLAUDE, NODE, SOLOS_SWARM};
 use crate::gateway::anthropic::MCP_SERVER;
+use crate::gateway::forward::LONG_CONTEXT;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::io::Write as _;
@@ -31,6 +34,8 @@ const HOME: &str = "/home/claude";
 /// The Ticket's work directory, `<run dir>/work`, when the session has one.
 const WORK: &str = "work";
 const SESSION_WAIT: Duration = Duration::from_secs(10);
+/// The context DeepSeek recommends Claude Code compact at, in tokens.
+const DEEPSEEK_COMPACT_WINDOW: u64 = 786_432;
 
 /// Where Claude Code and the solos-swarm it runs for tools are installed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,6 +47,30 @@ pub struct ClaudeCodeHarness {
     pub node: Option<PathBuf>,
     /// The solos-swarm binary the sandbox runs as its MCP server and bridge.
     pub solos_swarm: PathBuf,
+    /// DeepSeek's settings, where the broker forwards the calls to its own
+    /// Messages endpoint; `None` on the chat wire.
+    pub anthropic_wire: Option<AnthropicWire>,
+}
+
+/// What Claude Code runs with on DeepSeek's Anthropic wire, as DeepSeek
+/// recommends: the model's long-context name for its main loop, opus and
+/// sonnet, the plain name for haiku and subagents, the most effort, and a
+/// compaction window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnthropicWire {
+    /// The context, in tokens, at which Claude Code compacts its
+    /// conversation.
+    pub compact_window: u64,
+}
+
+impl AnthropicWire {
+    /// DeepSeek's window, or a smaller one whose calls still fit under the
+    /// broker's `max_input_bytes`, at about five bytes a token.
+    pub fn for_input_limit(max_input_bytes: usize) -> Self {
+        Self {
+            compact_window: (max_input_bytes as u64 / 5).min(DEEPSEEK_COMPACT_WINDOW),
+        }
+    }
 }
 
 /// A session's files on the host, bound read-only into its sandbox.
@@ -92,6 +121,10 @@ impl ClaudeCodeHarness {
             .map(|tool| format!("mcp__{MCP_SERVER}__{tool}"))
             .collect();
         let allowed = allowed.join(",");
+        let main_model = match self.anthropic_wire {
+            Some(_) => format!("{}{LONG_CONTEXT}", spec.model),
+            None => spec.model.clone(),
+        };
         program.extend(
             [
                 "--print",
@@ -102,7 +135,7 @@ impl ClaudeCodeHarness {
                 "--verbose",
                 "--bare",
                 "--model",
-                spec.model.as_str(),
+                main_model.as_str(),
                 "--tools",
                 "",
                 "--strict-mcp-config",
@@ -122,7 +155,7 @@ impl ClaudeCodeHarness {
         if let Some(prompt) = system_prompt {
             program.extend(["--system-prompt".to_owned(), prompt.to_owned()]);
         }
-        let args = sandbox
+        sandbox = sandbox
             .ro_bind(&files.mcp_config, MCP_CONFIG)
             .ro_bind(&files.token, TOKEN)
             .ro_bind(&spec.broker_socket, SOCKET)
@@ -137,7 +170,22 @@ impl ClaudeCodeHarness {
             .setenv("ANTHROPIC_API_KEY", &spec.token)
             // Background calls name the session's model too, so the
             // broker's contract admits them.
-            .setenv("ANTHROPIC_DEFAULT_HAIKU_MODEL", &spec.model)
+            .setenv("ANTHROPIC_DEFAULT_HAIKU_MODEL", &spec.model);
+        if let Some(wire) = self.anthropic_wire {
+            // Every model Claude Code may pick is the session's, so the
+            // broker's contract admits each call.
+            sandbox = sandbox
+                .setenv("ANTHROPIC_MODEL", &main_model)
+                .setenv("ANTHROPIC_DEFAULT_OPUS_MODEL", &main_model)
+                .setenv("ANTHROPIC_DEFAULT_SONNET_MODEL", &main_model)
+                .setenv("CLAUDE_CODE_SUBAGENT_MODEL", &spec.model)
+                .setenv("CLAUDE_CODE_EFFORT_LEVEL", "max")
+                .setenv(
+                    "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+                    wire.compact_window.to_string(),
+                );
+        }
+        let args = sandbox
             .setenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
             .setenv("DISABLE_AUTOUPDATER", "1")
             .setenv("DISABLE_TELEMETRY", "1")
@@ -374,6 +422,7 @@ mod tests {
             binary: PathBuf::from("/opt/claude/versions/2.1.231"),
             node: None,
             solos_swarm: PathBuf::from("/usr/local/bin/solos-swarm"),
+            anthropic_wire: None,
         }
     }
 
@@ -441,6 +490,7 @@ mod tests {
             binary: PathBuf::from("/opt/npm/lib/node_modules/@anthropic-ai/claude-code/cli.js"),
             node: Some(PathBuf::from("/opt/node-v24/bin/node")),
             solos_swarm: PathBuf::from("/usr/local/bin/solos-swarm"),
+            anthropic_wire: None,
         };
         let args = args(&harness, &spec(Path::new("/nowhere")), None);
         let window = |needle: &[&str]| args.windows(needle.len()).any(|w| w == needle);
@@ -459,6 +509,69 @@ mod tests {
             "/runtime/claude/cli.js",
             "--print"
         ]));
+    }
+
+    #[test]
+    fn on_deepseeks_anthropic_wire_it_runs_with_deepseeks_settings_and_still_no_key() {
+        let harness = ClaudeCodeHarness {
+            anthropic_wire: Some(AnthropicWire::for_input_limit(16_777_216)),
+            ..native()
+        };
+        let spec = spec(Path::new("/nowhere"));
+        let on = args(&harness, &spec, None);
+        let chat = args(&native(), &spec, None);
+        let env = |args: &[String]| -> Vec<(String, String)> {
+            args.windows(3)
+                .filter(|w| w[0] == "--setenv")
+                .map(|w| (w[1].clone(), w[2].clone()))
+                .collect()
+        };
+        let added: Vec<(String, String)> = env(&on)
+            .into_iter()
+            .filter(|pair| !env(&chat).contains(pair))
+            .collect();
+        #[rustfmt::skip]
+        let expected = [
+            ("ANTHROPIC_MODEL", "deepseek-v4-flash[1m]"),
+            ("ANTHROPIC_DEFAULT_OPUS_MODEL", "deepseek-v4-flash[1m]"),
+            ("ANTHROPIC_DEFAULT_SONNET_MODEL", "deepseek-v4-flash[1m]"),
+            ("CLAUDE_CODE_SUBAGENT_MODEL", "deepseek-v4-flash"),
+            ("CLAUDE_CODE_EFFORT_LEVEL", "max"),
+            ("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "786432"),
+        ]
+        .map(|(name, value)| (name.to_owned(), value.to_owned()));
+        assert_eq!(added, expected);
+        let kept = env(&on);
+        for pair in [
+            ("ANTHROPIC_BASE_URL", "http://127.0.0.1:41300"),
+            ("ANTHROPIC_API_KEY", "tok-1"),
+            ("ANTHROPIC_DEFAULT_HAIKU_MODEL", "deepseek-v4-flash"),
+        ] {
+            assert!(
+                kept.contains(&(pair.0.to_owned(), pair.1.to_owned())),
+                "{pair:?}: the broker, its token and the plain model stay"
+            );
+        }
+        assert!(
+            !kept.iter().any(|(name, _)| name == "ANTHROPIC_AUTH_TOKEN"),
+            "no provider key or second credential"
+        );
+        let model = on.iter().position(|arg| arg == "--model").unwrap();
+        assert_eq!(on[model + 1], "deepseek-v4-flash[1m]");
+        assert!(
+            on.windows(2).any(|w| w == ["--tools", ""]),
+            "no built-in tool"
+        );
+        assert!(on.contains(&"--unshare-all".to_owned()), "no network");
+
+        assert_eq!(
+            AnthropicWire::for_input_limit(1_048_576).compact_window,
+            209_715
+        );
+        assert_eq!(
+            AnthropicWire::for_input_limit(3_932_160).compact_window,
+            786_432
+        );
     }
 
     #[test]

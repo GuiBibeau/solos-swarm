@@ -151,6 +151,8 @@ its Ticket's budget:
 | `swarm` | none | How `Plan::Swarm` Tickets run. Without it, they fail. See [executor.swarm](#executorswarm). |
 | `harness` | `pi` | The harness of a session Ticket whose Plan names none: `pi` or `claude-code`. `claude-code` needs `claude`. |
 | `claude` | none | Where Claude Code is. See [executor.claude](#executorclaude). |
+| `wire` | `chat` | How a Claude Code session's Messages calls reach `provider`: `chat` translates them onto its chat completions, or `anthropic` forwards them to its own Messages endpoint with the broker's key. `anthropic` needs `claude`, and only `deepseek` serves it. See [executor.wire](#executorwire). |
+| `web_search` | none | The provider's own web search, which the broker adds to every call it forwards. Needs `wire: anthropic`. See [executor.web_search](#executorweb_search). |
 | `environment` | `local` | Where a session's commands run when its Plan names nowhere: `local` or a node in `nodes.allow`. |
 
 #### executor.run_code
@@ -198,6 +200,45 @@ Every path is absolute.
 `agent health` runs `claude auth status --json` on `binary` (under `node`, if set) to see whether the host's Claude Code
 login has ended. It skips the check when `binary` is not installed, unless `executor.harness` is `claude-code`. See
 [Alerts from outside the agent](production.md#alerts-from-outside-the-agent).
+
+#### executor.wire
+
+`chat` (the default) keeps the broker's translation of Anthropic Messages onto the provider's OpenAI-compatible chat
+completions: `src/gateway/anthropic.rs` turns each request into a chat body and each completion into a Message.
+
+`anthropic` forwards each admitted Messages request to the provider's own Messages endpoint instead:
+`https://api.deepseek.com/anthropic/v1/messages` for `deepseek`. The broker's key is the only credential sent, and the
+session's prompt, tools, `thinking` and `output_config` go upstream as the session wrote them, minus fields such as
+`metadata` and `mcp_servers`. The broker still sets `model`, `max_tokens` (the lower of the session's and the
+executor's), `stream` and, where the call does not think, `temperature`. A streamed reply comes back as the provider
+frames it, as it arrives. Only `deepseek` has an admitted Messages endpoint; `venice` is refused at config load.
+
+A forwarded call is held and settled like a chat call. Its usage is counted as every input token: `cache_read_input_tokens`
+settle at `prices.cache_hit_microusd_per_million`, and `cache_creation_input_tokens` at the input rate, since the price
+table has no cache-write rate of its own. The receipt's `output_tokens` must fit the call's `max_tokens`. A reply whose
+usage cannot be read, or a stream that ends before its usage, charges the call's hold as an unknown cost.
+
+Claude Code runs on this wire with the model settings DeepSeek recommends: the session's model with `[1m]` for its
+main, opus and sonnet model names, the plain model for haiku and subagents, `CLAUDE_CODE_EFFORT_LEVEL=max`, and an
+auto-compaction window of 786,432 tokens or less where `max_input_bytes` is smaller. See
+[Run workers on Claude Code](how-to/claude-code.md#run-on-deepseeks-anthropic-api).
+
+#### executor.web_search
+
+Needs `wire: anthropic`. DeepSeek serves Anthropic's server-side web search on its Messages endpoint as the tool
+`web_search_20250305`, and bills each search that returns results apart from the tokens. The broker adds the tool to
+every call it forwards and refuses a session that names a server tool itself.
+
+The hold includes each search's price and the input its results may add: every search may run a further round that
+reads the request and the results so far again, so a call of `max_uses` searches holds the request `max_uses + 1`
+times and each result once per round after it. The settlement bills the searches the provider reports in
+`server_tool_use.tool_search`, which are the ones that returned results.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `max_uses` | `1` | The most searches one call may run, 1 to 8. |
+| `microusd_per_search` | `750` | What one search that returns results costs, 750 ($0.00075, DeepSeek's $0.75 per 1,000 searches) to 1000000. |
+| `result_tokens` | `131072` | The most input tokens one search's results may add to the hold, 1 to 1000000. One search measured on DeepSeek added about 56,000. |
 
 ### budgets
 

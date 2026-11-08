@@ -1,6 +1,7 @@
 //! The admitted upstreams, their one transport, and the model request
 //! contract a broker enforces before it forwards a call.
 
+use super::forward::WebSearch;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -61,9 +62,99 @@ pub fn upstream_profile(provider: &str, model: &str) -> Result<Upstream> {
     })
 }
 
+/// How a harness's Anthropic Messages calls reach the provider.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Wire {
+    /// Translated onto the provider's chat completions (`anthropic::Chat`).
+    #[default]
+    Chat,
+    /// Forwarded untranslated to the provider's own Messages endpoint
+    /// (`forward::Forward`).
+    Anthropic,
+}
+
 pub type Dispatch = Pin<Box<dyn Future<Output = Result<Value>> + Send>>;
 pub trait Provider: Send + Sync {
     fn dispatch(&self, body: Value) -> Dispatch;
+
+    /// The provider's own Messages endpoint, where a harness's Messages
+    /// calls go untranslated. `None` translates them onto `dispatch`.
+    fn messages(&self) -> Option<&AnthropicMessages> {
+        None
+    }
+}
+
+/// The version header every Messages call carries.
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// A provider's own Anthropic Messages endpoint. The broker's key is the
+/// only credential sent; nothing of a session's request but the body the
+/// broker made from it goes upstream.
+#[derive(Clone)]
+pub struct AnthropicMessages {
+    pub endpoint: String,
+    pub client: reqwest::Client,
+    pub key: Zeroizing<String>,
+    /// The server-side web search the broker adds to every call, or `None`
+    /// for no search.
+    pub web_search: Option<WebSearch>,
+}
+
+impl AnthropicMessages {
+    /// Post `body`, and answer the response once its status is a success.
+    /// Any other status is an error naming it and the provider's reason.
+    pub async fn post(&self, body: &Value) -> Result<reqwest::Response> {
+        let response = self
+            .client
+            .post(&self.endpoint)
+            .header("x-api-key", self.key.as_str())
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .json(body)
+            .send()
+            .await
+            .map_err(|_| anyhow::anyhow!("provider transport failure; outcome unknown"))?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+        let reason = error_reason(response).await;
+        bail!("provider returned HTTP {}: {reason}", status.as_u16())
+    }
+}
+
+/// The `error.message` of a provider's error body, which both the Messages
+/// and the chat error formats carry, cut to a line.
+async fn error_reason(mut response: reqwest::Response) -> String {
+    let mut bytes = Vec::new();
+    while let Ok(Some(chunk)) = response.chunk().await {
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() > 16_384 {
+            break;
+        }
+    }
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    match body["error"]["message"].as_str() {
+        Some(message) => message.chars().take(300).collect(),
+        None => "no reason given".into(),
+    }
+}
+
+/// A provider on both of its wires: chat completions for every session, and
+/// its own Messages endpoint for a harness that speaks Messages.
+pub struct BothWires {
+    pub chat: OpenAiCompatible,
+    pub messages: AnthropicMessages,
+}
+
+impl Provider for BothWires {
+    fn dispatch(&self, body: Value) -> Dispatch {
+        self.chat.dispatch(body)
+    }
+
+    fn messages(&self) -> Option<&AnthropicMessages> {
+        Some(&self.messages)
+    }
 }
 /// An OpenAI-compatible hosted endpoint. `dialect` is the only difference
 /// between the shipped profiles, so one transport serves both and neither
@@ -146,14 +237,16 @@ pub fn reasoning_model(model: &str) -> bool {
     model.starts_with("deepseek-v4-1-flash") || model.starts_with("zai-org-glm-5")
 }
 
-/// The admitted endpoint of each shipped provider profile. A profile's dialect
-/// is fixed here rather than read from the Goal, so a Goal cannot make the
-/// transport speak a dialect its provider does not.
-pub fn endpoint(provider: &str) -> Result<&'static str> {
-    match provider {
-        "deepseek" => Ok("https://api.deepseek.com/chat/completions"),
-        "venice" => Ok("https://api.venice.ai/api/v1/chat/completions"),
-        other => anyhow::bail!("provider outside the deployment allowlist: {other}"),
+/// The admitted endpoint of each shipped provider profile on each wire. A
+/// profile's dialect is fixed here rather than read from the Goal, so a Goal
+/// cannot make the transport speak a dialect its provider does not.
+pub fn endpoint(provider: &str, wire: Wire) -> Result<&'static str> {
+    match (provider, wire) {
+        ("deepseek", Wire::Chat) => Ok("https://api.deepseek.com/chat/completions"),
+        ("deepseek", Wire::Anthropic) => Ok("https://api.deepseek.com/anthropic/v1/messages"),
+        ("venice", Wire::Chat) => Ok("https://api.venice.ai/api/v1/chat/completions"),
+        ("venice", Wire::Anthropic) => bail!("provider venice has no Anthropic wire"),
+        (other, _) => bail!("provider outside the deployment allowlist: {other}"),
     }
 }
 /// Build the transport for a resolved upstream, so both shipped profiles share
@@ -164,10 +257,25 @@ pub fn provider_for(
     key: Zeroizing<String>,
 ) -> Result<OpenAiCompatible> {
     Ok(OpenAiCompatible {
-        endpoint: endpoint(&upstream.provider)?,
+        endpoint: endpoint(&upstream.provider, Wire::Chat)?,
         dialect: upstream.dialect,
         client,
         key,
+    })
+}
+
+/// The Messages endpoint of a resolved upstream's provider.
+pub fn messages_for(
+    upstream: &Upstream,
+    client: reqwest::Client,
+    key: Zeroizing<String>,
+    web_search: Option<WebSearch>,
+) -> Result<AnthropicMessages> {
+    Ok(AnthropicMessages {
+        endpoint: endpoint(&upstream.provider, Wire::Anthropic)?.to_owned(),
+        client,
+        key,
+        web_search,
     })
 }
 
@@ -409,10 +517,17 @@ mod tests {
                 Dialect::DeepSeek
             )
         );
+        let messages = messages_for(&deepseek, reqwest::Client::new(), key(), None).unwrap();
+        assert_eq!(
+            messages.endpoint,
+            "https://api.deepseek.com/anthropic/v1/messages"
+        );
+        assert!(messages_for(&venice, reqwest::Client::new(), key(), None).is_err());
         let other = Upstream {
             provider: "openrouter".into(),
             ..deepseek
         };
         assert!(provider_for(&other, reqwest::Client::new(), key()).is_err());
+        assert!(messages_for(&other, reqwest::Client::new(), key(), None).is_err());
     }
 }

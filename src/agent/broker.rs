@@ -333,12 +333,12 @@ impl WorkerSeat {
 
     /// A model call ended as `reply`: the turn's latest call failed, or did
     /// not any more. `named` is the failure the call itself named.
-    fn model_called(&self, reply: &Reply, named: Option<ModelFailure>) {
+    fn model_called(&self, reply: std::result::Result<(), &Refusal>, named: Option<ModelFailure>) {
         let Ok(mut failure) = self.model_failure.lock() else {
             return;
         };
         match reply {
-            Ok(_) => *failure = None,
+            Ok(()) => *failure = None,
             // A pause is waited out by the session, and nothing failed.
             Err((StatusCode::SERVICE_UNAVAILABLE, _)) => {}
             Err((_, Json(body))) => {
@@ -1462,21 +1462,44 @@ impl Call {
         let mut named = None;
         let reply = self.attempt(broker, grant, &mut named).await;
         if let Principal::Worker(seat) = &grant.principal {
-            seat.model_called(&reply, named);
+            seat.model_called(reply.as_ref().map(|_| ()), named);
         }
         reply
     }
 
-    /// Refuse the call past the model limit, while paused, outside the
-    /// contract, after an overrun or past the account's cap (which it names
-    /// in `named`); else hold it, send it upstream and settle it.
+    /// Refuse the call as [`check`](Self::check) does, or past the
+    /// account's cap (which it names in `named`); else hold it, send it
+    /// upstream and settle it.
     async fn attempt(
         self,
         broker: &AgentBroker,
         grant: &Arc<Grant>,
         named: &mut Option<ModelFailure>,
     ) -> Reply {
-        let terms = &grant.terms;
+        self.check(broker, grant, named)?;
+        let spent = broker
+            .spend(
+                &grant.account,
+                &grant.terms,
+                self.input_bytes,
+                self.max_output_tokens,
+                self.upstream,
+            )
+            .await?;
+        match spent {
+            Spent::Answered(reply) => reply,
+            Spent::CapReached { committed, cap } => Err(cap_reached(grant, named, committed, cap)),
+        }
+    }
+
+    /// Refuse the call of a worker whose turn is stopped, past the model
+    /// limit, while paused, or outside the contract. Nothing is held yet.
+    fn check(
+        &self,
+        broker: &AgentBroker,
+        grant: &Grant,
+        named: &mut Option<ModelFailure>,
+    ) -> std::result::Result<(), Refusal> {
         // First of all: the turn of a worker that loops, makes no progress or
         // has made its ceiling of calls ends here, with no hold, no upstream
         // call and no cost.
@@ -1486,7 +1509,7 @@ impl Call {
             *named = Some(failure);
             return Err(forbidden(reason));
         }
-        if self.input_bytes > terms.max_input_bytes {
+        if self.input_bytes > grant.terms.max_input_bytes {
             return Err(forbidden("request exceeds the model limit"));
         }
         // Before any hold: a paused call costs nothing and leaves no row.
@@ -1496,27 +1519,24 @@ impl Call {
                 Json(gateway::paused_reply(wait)),
             ));
         }
-        self.admitted.map_err(forbidden)?;
-        let spent = broker
-            .spend(
-                &grant.account,
-                terms,
-                self.input_bytes,
-                self.max_output_tokens,
-                self.upstream,
-            )
-            .await?;
-        match spent {
-            Spent::Answered(reply) => reply,
-            Spent::CapReached { committed, cap } => {
-                *named = Some(ModelFailure::BudgetReached {
-                    committed,
-                    budget: cap,
-                });
-                Err(forbidden(grant.account.cap_reached(committed, cap)))
-            }
-        }
+        self.admitted.as_ref().map_err(forbidden)?;
+        Ok(())
     }
+}
+
+/// The refusal of a call whose account's cap has no room for its hold,
+/// which it also names in `named`.
+fn cap_reached(
+    grant: &Grant,
+    named: &mut Option<ModelFailure>,
+    committed: MicroUsd,
+    cap: MicroUsd,
+) -> Refusal {
+    *named = Some(ModelFailure::BudgetReached {
+        committed,
+        budget: cap,
+    });
+    forbidden(grant.account.cap_reached(committed, cap))
 }
 
 /// What holding a model call on an account came to.
@@ -1528,10 +1548,29 @@ enum Spent {
     CapReached { committed: MicroUsd, cap: MicroUsd },
 }
 
+/// What reserving a call's hold came to.
+enum Reserved {
+    Held(HoldId),
+    /// The account's cap has no room for the hold.
+    CapReached {
+        committed: MicroUsd,
+        cap: MicroUsd,
+    },
+}
+
+/// How a held call ended, which decides how its hold closes.
+enum Closing {
+    /// The provider refused it or could not be reached: released.
+    Failed,
+    /// It may have been billed, for what is unknown: charged at the hold.
+    Unknown,
+    /// It answered with this receipt, costing `cost`: settled.
+    Answered { receipt: Receipt, cost: u64 },
+}
+
 impl AgentBroker {
     /// Hold a call of `input_bytes` that may answer `max_output_tokens` on
-    /// `account`, send `body` upstream and close the hold. An account with a
-    /// cap is refused after an overrun, since only a hold bounds its spend.
+    /// `account`, send `body` upstream and close the hold.
     async fn spend(
         &self,
         account: &Account,
@@ -1540,6 +1579,33 @@ impl AgentBroker {
         max_output_tokens: u64,
         body: Value,
     ) -> std::result::Result<Spent, Refusal> {
+        let hold = terms.prices.request_hold(input_bytes, max_output_tokens);
+        let id = match self.reserve(account, terms, hold).await? {
+            Reserved::Held(id) => id,
+            Reserved::CapReached { committed, cap } => {
+                return Ok(Spent::CapReached { committed, cap });
+            }
+        };
+        // Its own task, so a session that hangs up mid-call still gets its hold closed.
+        let call = tokio::spawn(dispatch(
+            self.clone(),
+            account.clone(),
+            terms.clone(),
+            id,
+            hold,
+            body,
+        ));
+        Ok(Spent::Answered(call.await.map_err(failed)?))
+    }
+
+    /// Reserve `hold` on `account`. An account with a cap is refused after
+    /// an overrun, since only a hold bounds its spend.
+    async fn reserve(
+        &self,
+        account: &Account,
+        terms: &ModelTerms,
+        hold: u64,
+    ) -> std::result::Result<Reserved, Refusal> {
         // An account with no cap relies on no hold to bound its spend, so
         // an overrun stops only the accounts that have one.
         if account.capped() && self.inner.overrun.load(Ordering::SeqCst) {
@@ -1547,7 +1613,6 @@ impl AgentBroker {
                 "an earlier call cost more than its hold, so model calls are stopped",
             ));
         }
-        let hold = terms.prices.request_hold(input_bytes, max_output_tokens);
         let now = now_ms();
         let (since_ms, cap) = account.allowance(now);
         let (key, provider) = (account.key(), terms.upstream.provider.clone());
@@ -1564,26 +1629,65 @@ impl AgentBroker {
             })
             .await
             .map_err(failed)?;
-        let id = match reservation {
-            Reservation::Held(id) => id,
+        Ok(match reservation {
+            Reservation::Held(id) => Reserved::Held(id),
             // Only an account with a cap is refused for spend.
-            Reservation::Refused { committed } => {
-                return Ok(Spent::CapReached {
-                    committed,
-                    cap: cap.unwrap_or_default(),
-                });
+            Reservation::Refused { committed } => Reserved::CapReached {
+                committed,
+                cap: cap.unwrap_or_default(),
+            },
+        })
+    }
+
+    /// Close hold `id` of `hold` on `account` as `closing` says. A
+    /// settlement above its hold stops every later call on a capped
+    /// account, and is refused.
+    async fn close(
+        &self,
+        account: &Account,
+        id: HoldId,
+        hold: u64,
+        closing: Closing,
+    ) -> std::result::Result<(), Refusal> {
+        let (receipt, cost) = match closing {
+            Closing::Failed => {
+                return self
+                    .store(move |store| store.release(id, now_ms()))
+                    .await
+                    .map_err(failed);
             }
+            Closing::Unknown => {
+                return self
+                    .store(move |store| store.charge_hold(id, now_ms()))
+                    .await
+                    .map_err(failed);
+            }
+            Closing::Answered { receipt, cost } => (receipt, cost),
         };
-        // Its own task, so a session that hangs up mid-call still gets its hold closed.
-        let call = tokio::spawn(dispatch(
-            self.clone(),
-            account.clone(),
-            terms.clone(),
-            id,
-            hold,
-            body,
-        ));
-        Ok(Spent::Answered(call.await.map_err(failed)?))
+        let tokens = Tokens {
+            input: receipt.input_tokens,
+            cached_input: receipt.cached_input_tokens,
+            output: receipt.output_tokens,
+        };
+        self.store(move |store| store.settle(id, cost, tokens, &receipt.request_id, now_ms()))
+            .await
+            .map_err(failed)?;
+        if cost > hold {
+            if account.capped() {
+                self.inner.overrun.store(true, Ordering::SeqCst);
+                return Err(forbidden(
+                    "provider exceeded reservation; admission stopped",
+                ));
+            }
+            // No cap means nothing here is bounded by the hold: the settlement
+            // above is the record, and the call stands.
+            eprintln!(
+                "agent: a call on {} cost {cost} microusd, above its {hold} hold; it has no cap, \
+                 so the cost is recorded and the call stands",
+                account.key()
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1605,10 +1709,7 @@ async fn dispatch(
         Some(limit) => match tokio::time::timeout(limit, sent).await {
             Ok(sent) => sent,
             Err(_) => {
-                broker
-                    .store(move |store| store.charge_hold(id, now_ms()))
-                    .await
-                    .map_err(failed)?;
+                broker.close(&account, id, hold, Closing::Unknown).await?;
                 return Err(forbidden(format!(
                     "the model call took longer than {limit:?}"
                 )));
@@ -1618,48 +1719,21 @@ async fn dispatch(
     let mut response = match sent {
         Ok(response) => response,
         Err(error) => {
-            broker
-                .store(move |store| store.release(id, now_ms()))
-                .await
-                .map_err(failed)?;
+            broker.close(&account, id, hold, Closing::Failed).await?;
             return Err(forbidden(error));
         }
     };
     let receipt = match Receipt::read(&response, terms.max_output_tokens) {
         Ok(receipt) => receipt,
         Err(error) => {
-            broker
-                .store(move |store| store.charge_hold(id, now_ms()))
-                .await
-                .map_err(failed)?;
+            broker.close(&account, id, hold, Closing::Unknown).await?;
             return Err(forbidden(error));
         }
     };
     let cost = receipt.cost(&terms.prices);
-    let tokens = Tokens {
-        input: receipt.input_tokens,
-        cached_input: receipt.cached_input_tokens,
-        output: receipt.output_tokens,
-    };
     broker
-        .store(move |store| store.settle(id, cost, tokens, &receipt.request_id, now_ms()))
-        .await
-        .map_err(failed)?;
-    if cost > hold {
-        if account.capped() {
-            broker.inner.overrun.store(true, Ordering::SeqCst);
-            return Err(forbidden(
-                "provider exceeded reservation; admission stopped",
-            ));
-        }
-        // No cap means nothing here is bounded by the hold: the settlement
-        // above is the record, and the call stands.
-        eprintln!(
-            "agent: a call on {} cost {cost} microusd, above its {hold} hold; it has no cap, so \
-             the cost is recorded and the call stands",
-            account.key()
-        );
-    }
+        .close(&account, id, hold, Closing::Answered { receipt, cost })
+        .await?;
     response["swarm_cost_microusd"] = json!(cost);
     Ok(Json(response))
 }
@@ -2521,7 +2595,8 @@ mod messages;
 #[cfg(test)]
 mod tests {
     use super::{
-        Account, DecideArgs, DecideTerms, ModelFailure, Reply, SwarmTerms, WorkerSeat, clip, refuse,
+        Account, DecideArgs, DecideTerms, ModelFailure, Refusal, SwarmTerms, WorkerSeat, clip,
+        refuse,
     };
     use crate::agent::config::RepoConfig;
     use axum::{Json, http::StatusCode};
@@ -3046,8 +3121,8 @@ mod tests {
         )
     }
 
-    fn refused(why: &str) -> Reply {
-        Err(refuse(StatusCode::FORBIDDEN, why))
+    fn refused(why: &str) -> Refusal {
+        refuse(StatusCode::FORBIDDEN, why)
     }
 
     #[test]
@@ -3064,14 +3139,14 @@ mod tests {
     #[test]
     fn a_turn_that_said_nothing_tells_why_its_model_call_failed_and_one_that_reported_does_not() {
         let seat = seat();
-        seat.model_called(&refused("the provider is down"), None);
+        seat.model_called(Err(&refused("the provider is down")), None);
         assert_eq!(
             seat.take_model_failure(),
             Some(ModelFailure::Failed("the provider is down".into()))
         );
         assert_eq!(seat.take_model_failure(), None, "once");
 
-        seat.model_called(&refused("the provider is down"), None);
+        seat.model_called(Err(&refused("the provider is down")), None);
         seat.reported(ReportStatus::Progress);
         assert!(
             seat.take_model_failure().is_some(),
@@ -3086,21 +3161,21 @@ mod tests {
             ReportStatus::Dropped,
         ] {
             seat.begin_turn();
-            seat.model_called(&refused("the provider is down"), None);
+            seat.model_called(Err(&refused("the provider is down")), None);
             seat.reported(status);
             assert_eq!(seat.take_model_failure(), None, "{status:?} said it");
             assert_eq!(seat.take_model_failure(), None, "and it is not kept");
         }
 
         seat.begin_turn();
-        let paused = Err((
+        let paused = (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"paused": true})),
-        ));
-        seat.model_called(&paused, None);
+        );
+        seat.model_called(Err(&paused), None);
         assert_eq!(seat.take_model_failure(), None, "a pause is not a failure");
-        seat.model_called(&refused("no"), None);
-        seat.model_called(&Ok(Json(json!({}))), None);
+        seat.model_called(Err(&refused("no")), None);
+        seat.model_called(Ok(()), None);
         assert_eq!(
             seat.take_model_failure(),
             None,
