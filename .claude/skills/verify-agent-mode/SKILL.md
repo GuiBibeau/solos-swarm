@@ -128,16 +128,17 @@ cleanup, check that both copies still exist.
 
 ## Restart a run and keep its state
 
-`launch.sh` always empties `state/`. A feature that restarts the agent on the same state, such as a crash or a
-second start on the same day, uses `launch.sh`'s own start commands without its `rm -rf state`. No recipe has run
-these yet.
+`launch.sh` empties `state/` unless it is given `--keep-state`. A feature that restarts the agent on the same state,
+such as a crash or a second start on the same day, launches it again with that flag, so the tickets, threads, memos
+and the dream slot survive:
 
 ```sh
-python3 -I -c 'import json,os,sys; sys.stdout.write(json.load(open(os.path.expanduser("~/.pi/agent/auth.json")))["deepseek"]["key"].strip())' |
-	ssh remote-ai "umask 077; cat > /run/user/\$(id -u)/verify-$RUN-key"
-ssh remote-ai "cd ~/work/verify/$RUN && setsid -f bash -c 'echo \$\$ > serve.pid; exec timeout 2h bin/solos-swarm agent serve --config agent.yaml --state-dir state --pi-root src --node \$HOME/.local/bin/node --credential-file /run/user/\$(id -u)/verify-$RUN-key >> serve.log 2>&1 < /dev/null' > /dev/null 2>&1 < /dev/null"
+$S/bin/launch.sh $RUN --keep-state
 $S/bin/doctor.sh $RUN
 ```
+
+The flag also works with overlays (`launch.sh $RUN --keep-state $S/overlays/vault.yaml`). Without it, nothing about
+`launch.sh` changes.
 
 ## Isolation
 

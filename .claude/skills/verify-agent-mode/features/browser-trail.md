@@ -27,4 +27,4 @@ Preconditions: a run launched with `overlays/browser.yaml` (Lightpanda 1.0.2 at 
 
 - The host starts Lightpanda with `--block-private-networks` by default, so the browser cannot reach a page on the box's loopback. Use a public page, or add `allow_private_networks: true` to the browser overlay for a local page.
 - example.com's body text changes over time: in 2026 it shows a multilingual notice. Verify the heading and the link, not the paragraph.
-- A relaunch empties `state/`. Run `evidence.sh`, which runs `agent trail`, before you relaunch.
+- A relaunch with `launch.sh` empties `state/`; with `--keep-state` it does not. Run `evidence.sh`, which runs `agent trail`, before you relaunch either way.

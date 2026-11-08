@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Usage: launch.sh <run> [overlay.yaml...]
+# Usage: launch.sh <run> [--keep-state] [overlay.yaml...]
 # Starts `agent serve` for <run> on the box with a real DeepSeek Router and Pi workers, from an empty state dir.
+# --keep-state keeps the run's state/ instead: the way to restart the agent on the same state (a crash, a second
+# start on the same day), so the tickets, threads, memos and dream slot survive.
 # The config is the skill's agent.verify.yaml with each overlay appended (an overlay adds top-level sections such
 # as vault:, browser:, pstack: or forge:; relative paths in it resolve against ~/work/verify/<run>/). The DeepSeek key goes from this
 # Mac's ~/.pi/agent/auth.json over ssh stdin into a 0600 file on the box's tmpfs, which serve reads once and deletes.
@@ -10,16 +12,29 @@ set -euo pipefail
 run=$1
 shift
 check_run "$run"
+keep_state=0
+overlays=()
+for arg in "$@"; do
+	case $arg in
+	--keep-state) keep_state=1 ;;
+	-*) echo "launch.sh: unknown flag $arg" >&2; exit 2 ;;
+	*) overlays+=("$arg") ;;
+	esac
+done
 config=$(mktemp)
 trap 'rm -f "$config"' EXIT
-cat "$SKILL_DIR/agent.verify.yaml" "$@" > "$config"
+cat "$SKILL_DIR/agent.verify.yaml" ${overlays[@]+"${overlays[@]}"} > "$config"
 hours=${VERIFY_HOURS:-2}
 box "test -x ~/work/verify/$run/bin/solos-swarm" || { echo "no binary for $run: run ship.sh first" >&2; exit 1; }
 if box "test -f ~/work/verify/$run/serve.pid && kill -0 \$(cat ~/work/verify/$run/serve.pid) 2>/dev/null"; then
 	echo "an agent already serves run $run; run cleanup.sh $run first" >&2
 	exit 1
 fi
-box "rm -rf ~/work/verify/$run/state; cat > ~/work/verify/$run/agent.yaml" < "$config"
+if ((keep_state)); then
+	box "cat > ~/work/verify/$run/agent.yaml" < "$config"
+else
+	box "rm -rf ~/work/verify/$run/state; cat > ~/work/verify/$run/agent.yaml" < "$config"
+fi
 box "set -e; cd ~/work/verify/$run; mkdir -p secrets; chmod 700 secrets
 	if grep -q '^vault:' agent.yaml && ! test -e secrets/vault.enc; then bin/solos-swarm vault init --config agent.yaml; fi
 	if grep -q '^browser:' agent.yaml && ! test -e secrets/audit.key; then bin/solos-swarm browser init-key --out secrets/audit.key; fi

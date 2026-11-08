@@ -56,7 +56,7 @@ approved the spend cap). The sandbox needs a `CONTRIBUTING.md`, or the worker cr
 - `crash`: ask for another small change, and poll the chain until `proposal_admitted` appears
   (`q "select count(*) from events where json_extract(body, '$.type') = 'proposal_admitted'"`). Then at once run
   `ssh remote-ai "pkill -9 -f 'solos-swarm agent serve.*verify-$RUN-key'"`, start the agent again on the same state
-  ("Restart a run and keep its state" in SKILL.md, not `launch.sh`, which empties `state/`), and wait for idle.
+  ("Restart a run and keep its state" in SKILL.md: `launch.sh $RUN --keep-state`, not a plain `launch.sh`, which empties `state/`), and wait for idle.
   `gh pr list -R GuiBibeau/solos-swarm-sandbox --head solos/<ticket>/<slug>` shows exactly one pull request, and
   `q "select count(*) from events where json_extract(body, '$.type') = 'delivered'"` counts one for the Ticket.
 - `no-token-at-rest`: `ssh remote-ai 'grep -r ghs_ ~/work/verify/$RUN || echo none'` prints `none`.
