@@ -34,7 +34,9 @@ On Slack, a top-level post cannot be searched for the way a thread reply can, so
 can post one alert twice. A Discord post carries a `nonce`, which Discord checks for a few minutes, so a repeat soon
 after is not posted again.
 
-What each alert means is in [The Watchdog](../runtime.md#the-watchdog).
+What each alert means is in [The Watchdog](../runtime.md#the-watchdog). The person who was asked is reminded
+separately, on their own thread, after `remind_after` (4h by default): see
+[`remind_after`](../configuration.md#remind_after).
 
 ## Watch jobs that are not Tickets
 

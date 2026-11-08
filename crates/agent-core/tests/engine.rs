@@ -1,8 +1,9 @@
 use solos_agent_core::change::{Deliverable, ForgeTerms, MergeMode, RepoName};
+use solos_agent_core::engine::REMIND_WITHIN_MS;
 use solos_agent_core::model::{
-    Accept, Acknowledge, Actor, Addressed, Approval, ChannelRef, DecisionKind, Effect, Mandate,
-    MessageKind, Method, Plan, ReportIn, ReportStatus, Stage, ThreadKey, TicketId, TicketOutcome,
-    Trigger, TriggerId, Verdict,
+    Accept, Acknowledge, Actor, Addressed, Approval, Ask, ChannelRef, DecisionKind, DomainEvent,
+    Effect, Mandate, MessageKind, Method, Plan, ReportIn, ReportStatus, Stage, ThreadKey, TicketId,
+    TicketOutcome, Trigger, TriggerId, Verdict,
 };
 use solos_agent_core::{
     AcceptMode, AllowlistPolicy, Engine, Error, Intake, MAX_EXPIRED_EVALS, MemoryRepositories,
@@ -1540,4 +1541,234 @@ fn a_listed_person_who_cannot_approve_may_still_stop_their_work() {
             .unwrap()
             .stopped_by_person()
     );
+}
+
+const HOUR: u64 = 3_600_000;
+
+fn asking(question: &str) -> ReportIn {
+    ReportIn {
+        status: ReportStatus::Blocked,
+        text: question.into(),
+        question: Some(question.into()),
+        spent_microusd: 0,
+        harvest: None,
+    }
+}
+
+fn reminders(w: &World) -> usize {
+    let events = &w.engine.repos().events;
+    let told = events
+        .iter()
+        .filter(|e| matches!(e.event, DomainEvent::Reminded { .. }));
+    told.count()
+}
+
+#[test]
+fn a_ticket_that_waits_for_a_person_has_its_thread_reminded_once_per_wait() {
+    let mut w = World::new(policy());
+    let (ticket, assignment) = started_ticket(&mut w, "th1");
+    w.engine
+        .report(
+            &ticket,
+            &assignment,
+            asking("Which branch should I target?"),
+        )
+        .unwrap();
+    assert_eq!(sent(&w.effects()).len(), 1, "the question, asked once");
+
+    assert!(!w.engine.remind(&ticket, 4 * HOUR).unwrap());
+    w.advance(4 * HOUR - 1);
+    assert!(
+        !w.engine.remind(&ticket, 4 * HOUR).unwrap(),
+        "a millisecond short"
+    );
+    assert!(w.effects().is_empty());
+    w.advance(1);
+    assert!(w.engine.remind(&ticket, 4 * HOUR).unwrap());
+
+    let effects = w.effects();
+    let [Effect::Send(message)] = &effects[..] else {
+        panic!("{effects:?}")
+    };
+    assert_eq!(message.kind, MessageKind::Attention);
+    assert_eq!(
+        message.channel.address["thread_ts"], "th1",
+        "in its own thread"
+    );
+    assert_eq!(message.ticket.as_ref(), Some(&ticket));
+    assert_eq!(
+        message.text,
+        "I'm still waiting for your answer. I asked: Which branch should I target?"
+    );
+    assert_eq!(message.ask, None);
+    assert_eq!(reminders(&w), 1);
+
+    for later in [0, HOUR, 24 * HOUR] {
+        w.advance(later);
+        assert!(
+            !w.engine.remind(&ticket, 4 * HOUR).unwrap(),
+            "once per wait"
+        );
+    }
+    assert!(w.effects().is_empty());
+    assert_eq!(reminders(&w), 1);
+}
+
+#[test]
+fn a_new_wait_is_reminded_of_again_and_an_answered_one_is_not() {
+    let mut w = World::new(policy());
+    let (ticket, assignment) = started_ticket(&mut w, "th1");
+    w.engine
+        .report(
+            &ticket,
+            &assignment,
+            asking("Which branch should I target?"),
+        )
+        .unwrap();
+    w.advance(5 * HOUR);
+    assert!(w.engine.remind(&ticket, 4 * HOUR).unwrap());
+    w.effects();
+
+    let answer = slack(
+        "t2",
+        Actor::person("alice"),
+        Addressed::Unaddressed,
+        "th1",
+        "main",
+    );
+    w.engine.receive(answer).unwrap();
+    w.effects();
+    assert_eq!(w.engine.repos().tickets[&ticket].stage(), Stage::Working);
+    w.advance(10 * HOUR);
+    assert!(
+        !w.engine.remind(&ticket, 4 * HOUR).unwrap(),
+        "a Ticket that works waits for nobody"
+    );
+
+    w.engine
+        .report(&ticket, &assignment, asking("And the remote?"))
+        .unwrap();
+    w.effects();
+    w.advance(4 * HOUR);
+    assert!(w.engine.remind(&ticket, 4 * HOUR).unwrap(), "a second wait");
+    assert_eq!(
+        sent(&w.effects())[0].1,
+        "I'm still waiting for your answer. I asked: And the remote?"
+    );
+    assert_eq!(reminders(&w), 2);
+}
+
+#[test]
+fn a_failed_or_blocked_ticket_and_an_unapproved_budget_are_reminded_in_their_own_words() {
+    let mut w = World::new(policy());
+    let (ticket, assignment) = started_ticket(&mut w, "th1");
+    let failed = ReportIn {
+        status: ReportStatus::Failed,
+        text: "provider outage".into(),
+        question: None,
+        spent_microusd: 0,
+        harvest: None,
+    };
+    w.engine.report(&ticket, &assignment, failed).unwrap();
+    w.effects();
+    w.advance(4 * HOUR);
+    assert!(w.engine.remind(&ticket, 4 * HOUR).unwrap());
+    assert_eq!(
+        sent(&w.effects())[0].1,
+        "I'm still waiting on a person after a failure. I said: provider outage. Reply here \
+         and I will try again."
+    );
+
+    let (blocked, assignment) = started_ticket(&mut w, "th2");
+    let report = ReportIn {
+        status: ReportStatus::Blocked,
+        text: "I need the staging password".into(),
+        question: None,
+        spent_microusd: 0,
+        harvest: None,
+    };
+    w.engine.report(&blocked, &assignment, report).unwrap();
+    w.effects();
+    w.advance(4 * HOUR);
+    assert!(w.engine.remind(&blocked, 4 * HOUR).unwrap());
+    assert_eq!(
+        sent(&w.effects())[0].1,
+        "I'm still waiting on a person. I said: I need the staging password. Reply here and I \
+         will pick the work back up."
+    );
+
+    let eval = w.receive_and_start_eval(slack(
+        "t9",
+        Actor::person("alice"),
+        Addressed::Mention,
+        "th3",
+        "survey",
+    ));
+    let swarm = Plan::Swarm {
+        agents: 20,
+        goal_template: Some("research".into()),
+    };
+    w.engine.decide(&eval, accept(swarm, 25_000_000)).unwrap();
+    w.effects();
+    let approval = w
+        .engine
+        .repos()
+        .tickets
+        .values()
+        .find(|t| t.stage() == Stage::Approval)
+        .unwrap()
+        .id
+        .clone();
+    w.advance(4 * HOUR);
+    assert!(w.engine.remind(&approval, 4 * HOUR).unwrap());
+    let effects = w.effects();
+    let [Effect::Send(message)] = &effects[..] else {
+        panic!("{effects:?}")
+    };
+    assert!(
+        message
+            .text
+            .starts_with("I'm still waiting for a person to approve this. ")
+            && message.text.contains("a swarm of 20 agents"),
+        "{}",
+        message.text
+    );
+    assert_eq!(message.ask, Some(Ask::Budget), "the buttons come back");
+}
+
+#[test]
+fn a_wait_nobody_can_answer_or_a_week_old_is_not_reminded_of() {
+    let mut w = World::new(policy());
+    let (ticket, assignment) = started_ticket(&mut w, "th1");
+    w.advance(10 * HOUR);
+    assert!(
+        !w.engine.remind(&ticket, 4 * HOUR).unwrap(),
+        "it is working"
+    );
+
+    w.engine
+        .report(
+            &ticket,
+            &assignment,
+            asking("Which branch should I target?"),
+        )
+        .unwrap();
+    w.effects();
+    w.advance(REMIND_WITHIN_MS + 1);
+    assert!(
+        !w.engine.remind(&ticket, 4 * HOUR).unwrap(),
+        "the person has had a week"
+    );
+
+    let (ended, assignment) = started_ticket(&mut w, "th2");
+    w.engine
+        .report(&ended, &assignment, asking("Which branch should I target?"))
+        .unwrap();
+    w.engine
+        .stop_ticket(&ended, "slack", Actor::person("alice"), "enough")
+        .unwrap();
+    w.advance(5 * HOUR);
+    assert!(!w.engine.remind(&ended, 4 * HOUR).unwrap(), "it ended");
+    assert!(!w.engine.remind(&TicketId::new("tk_none"), HOUR).unwrap());
+    assert_eq!(reminders(&w), 0);
 }

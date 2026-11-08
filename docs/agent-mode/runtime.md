@@ -200,7 +200,8 @@ sessions do not report their last text yet, so they keep the old behavior.
 ### The loop guard
 
 The broker stops a worker that loops or makes no progress (`src/agent/broker/repeat.rs`), per seat and per turn. It
-works in steps, and each step catches what the one before cannot.
+works in steps, and each step catches what the one before cannot: a circle, refusals that are ignored, calls that
+bring nothing new, a failure that comes back in a call that is never byte-identical, and finally the turn's ceilings.
 
 **Circles.** A circle is one call, or up to ten calls in turn, repeated three times with byte-identical arguments:
 `A A A`, `A B A B A B`, or five `sed -n` slices of one file gone round three times. The call that closes the third round
@@ -236,21 +237,55 @@ The thresholds come from the transcripts of the Tickets that looped and of the o
 most 2 or 3 such calls in a row, compactions included, and the longest turn that ended well made 128 tool calls,
 while the loops made 767 and 1,107.
 
+**Failures that come back.** One Ticket (#94) sent eight heredoc edits of one file that failed alike, between reads of
+it, and made about ninety calls before the steps above caught it: each edit differed in whitespace or in its body, so
+it was a call the worker had not made, and a failed command was never counted. So the guard also stops a turn on 3
+calls of one shape that failed the same way, with no call of that shape that succeeded and no `repeatable` call (a
+wait) between. A shape is the tool's name and the programs and files it names; whitespace, quotes, redirections and a
+heredoc's body do not make it new. A command that exits 1 with nothing printed said "no" (`grep` found nothing, `test`
+was false), which is an answer, not a failure. Digits are left out of a failure's text, so a line number, a count or a
+duration that moves does not make it new. The turn stops on the third such call, whether it ran or a circle refused it
+before it ran.
+
 **The stop.** From then on, the broker answers the seat's tool calls with the stop, and refuses its next model call
 before any hold or upstream call, so the stop costs nothing. That ends a Pi turn exactly as a failed provider call does.
 The seat keeps `ModelFailure::Stuck` with what the worker kept doing, read from the arguments of its latest calls: the
-command's program and the file it names, or else the command, or else the tool. The host reports `failed` in the
-worker's place, for example:
+tool, its programs and the file it names. The host reports `failed` in the worker's place, with one question that
+would get it going again. A failure that came back says:
 
 ```text
-I kept re-reading the same parts of meteora-dlmm-allocate-encode.js without making progress, so I stopped. Reply here
-to have me try again with a different approach.
+I tried 3 times to run `python3` on lib.sh, and it failed the same way each time, so I stopped. Is there another way
+you want me to handle lib.sh, or should I stop here?
 ```
 
-A ceiling says `I made 200 tool calls without finishing, so I stopped.` The Report is recorded with the Ticket like the
-failed-call one, so the person hears it once and a restart sends nothing. A reply on the thread starts a new turn,
-which starts every count again. A Claude Code session has no turn to end on a refused model call: its session ends on
-the error, and the Assignment fails with that reason, as for any session that dies.
+A circle or a ceiling asks its own question, such as `I kept re-reading the same parts of meteora-dlmm-allocate-encode.js
+without making progress, so I stopped. What should I be looking for in meteora-dlmm-allocate-encode.js?` or `I made 200
+tool calls without finishing, so I stopped. Should I keep going from where I am?` The Report is recorded with the
+Ticket, and its text is also the Ticket's question, so the Ticket waits at `Stage::Answer` rather than
+`Stage::Failed`: the person hears it once, a restart sends nothing, and a reply on the thread answers it. The reply
+starts a new turn, which starts every count again. A Claude Code session has no turn to end on a refused model call:
+its session ends on the error, and the Assignment fails with that reason, as for any session that dies.
+
+### A reminder to the person who was asked
+
+A Ticket that waits for a person can wait a long time: #94's Ticket sat 19 hours after a stuck worker asked. With
+`remind_after` (4h unless set, `null` tells nobody), the runtime looks at the open Tickets every quarter of that,
+between 250 ms and 1 min, and sends one reminder to the Ticket's own thread (`Engine::remind`). A wait is an
+approval, a question, or a blocked or failed Report. The reminder repeats one line of what the wait is for, since the
+message that began it may be far up the thread:
+
+- an approval: `I'm still waiting for a person to approve this. <what the Ticket is for>`, with the Approve buttons
+  offered again;
+- an answer: `I'm still waiting for your answer. I asked: <the question>`;
+- a failure: `I'm still waiting on a person after a failure. I said: <the Report>. Reply here and I will try again.`;
+- a block: `I'm still waiting on a person. I said: <the Report>. Reply here and I will pick the work back up.`
+
+The Ticket records the start of the wait it was reminded of (`Ticket.reminded_ms`, schema 10) and a `Reminded` event
+goes on the chain, so each wait is told once, across restarts. A wait that begins after an allowed person writes or
+the worker asks again is a new wait, and is told again. A wait older than seven days is not reminded of: the person
+has had a week, and a late ping is noise. Nothing is reminded while the agent is paused, since it would act on no
+answer; the wait is looked at again once the pause lifts. To set the threshold, see
+[`remind_after`](configuration.md#remind_after).
 
 ### Sampling
 

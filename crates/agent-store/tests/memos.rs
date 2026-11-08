@@ -216,7 +216,7 @@ fn a_schema_7_file_opens_with_its_rows_and_chain_and_then_holds_memos() {
     drop(raw);
 
     let mut e = engine(&db, &now);
-    assert_eq!(e.repos().schema_version().unwrap(), 9);
+    assert_eq!(e.repos().schema_version().unwrap(), 10);
     assert_eq!(sqlite_contents(e.repos()), before);
     assert_eq!(e.repos().verify_chain().unwrap(), chain);
     let id = remember(&mut e, MemoScope::Global, "Answer in French.");
@@ -230,7 +230,7 @@ const V8_ACTIVE: &str = r#"{"id":"mm_v8active","scope":"repo:acme/widgets","text
 const V8_RETIRED: &str = r#"{"id":"mm_v8retired","scope":"global","text":"Answer in French.","text_sha256":"sha256:3333333333333333333333333333333333333333333333333333333333333333","sources":[{"kind":"operator"}],"trust":"person","author":{"kind":"operator","source":"slack","by":{"id":"alice","kind":"person"}},"state":{"state":"retired","by":{"kind":"operator","source":"slack","by":{"id":"alice","kind":"person"}},"reason":"changed my mind","at_ms":9},"created_ms":2,"verified_ms":2}"#;
 
 #[test]
-fn a_schema_8_file_opens_at_9_and_its_memos_read_back_as_superseding_nothing() {
+fn a_schema_8_file_opens_at_the_latest_version_and_its_memos_read_back_as_superseding_nothing() {
     let db = TempDb::new("memo-v8");
     let now = Rc::new(Cell::new(1_000));
     drop(engine(&db, &now));
@@ -251,7 +251,7 @@ fn a_schema_8_file_opens_at_9_and_its_memos_read_back_as_superseding_nothing() {
     drop(raw);
 
     let e = engine(&db, &now);
-    assert_eq!(e.repos().schema_version().unwrap(), 9);
+    assert_eq!(e.repos().schema_version().unwrap(), 10);
     let active = e
         .repos()
         .read_memo(&MemoId::new("mm_v8active"))

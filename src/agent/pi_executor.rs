@@ -1113,9 +1113,10 @@ impl Turns<'_> {
     /// A model call failed and the turn ended on it with nothing reported:
     /// the worker cannot say so, so the host reports in its place. The
     /// Report asks the person (the Engine sends a `blocked` or `failed`
-    /// Report's text to the Ticket's Channels) and is recorded with the
-    /// Ticket, which then waits for a person, so a restart starts nothing
-    /// and tells nothing twice.
+    /// Report's text to the Ticket's Channels, and a stuck worker's question
+    /// as the Ticket's question) and is recorded with the Ticket, which then
+    /// waits for a person, so a restart starts nothing and tells nothing
+    /// twice.
     async fn stopped(&self, failure: &ModelFailure) -> Result<()> {
         eprintln!(
             "agent: the worker of {} on {} stopped on a failed model call: {failure:?}",
@@ -1126,7 +1127,7 @@ impl Turns<'_> {
         let report = ReportIn {
             status,
             text,
-            question: None,
+            question: failure.question(),
             spent_microusd: spent,
             harvest: None,
         };

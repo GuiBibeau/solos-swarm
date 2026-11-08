@@ -270,6 +270,9 @@ where
     };
     let runtime_options = RunOptions {
         until_idle,
+        remind_after: config
+            .remind_after
+            .map(|after| Duration::from_millis(after.0)),
         ..RunOptions::default()
     };
     let watchdog = watchdog::Running::start(&config, state_dir, &io.channels, &facts)?;

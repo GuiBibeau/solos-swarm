@@ -41,6 +41,11 @@ pub type AgentEngine = Engine<SqliteStore, AllowlistPolicy, fn() -> Ms>;
 const MAX_IN_FLIGHT: usize = 64;
 /// How often proposals no review decided are looked at for expiry.
 const EXPIRY_CHECK: Duration = Duration::from_secs(60);
+/// How often the open Tickets are looked at for a wait to remind, at most
+/// and at least: a quarter of the threshold between the two, so a reminder
+/// comes at most a quarter late.
+const REMIND_CHECK: Duration = Duration::from_secs(60);
+const REMIND_CHECK_MIN: Duration = Duration::from_millis(250);
 /// Why a start ends the Assignments the last run left without a worker.
 pub const HOST_RESTARTED: &str = "host restarted";
 
@@ -63,6 +68,9 @@ pub struct RunOptions {
     /// one before, up to `retry_max`.
     pub retry_base: Duration,
     pub retry_max: Duration,
+    /// A Ticket that has waited this long for a person has its thread told,
+    /// once per wait (see `Engine::remind`). `None` tells nobody.
+    pub remind_after: Option<Duration>,
 }
 
 impl Default for RunOptions {
@@ -72,6 +80,7 @@ impl Default for RunOptions {
             tick: Duration::from_millis(200),
             retry_base: Duration::from_secs(1),
             retry_max: Duration::from_secs(300),
+            remind_after: None,
         }
     }
 }
@@ -128,6 +137,8 @@ pub struct Runtime {
     memo_repos: Option<BTreeSet<RepoName>>,
     /// When unreviewed proposals were last expired.
     memos_expired: Option<Instant>,
+    /// When the open Tickets were last looked at for a wait to remind.
+    reminded: Option<Instant>,
     /// When the daily dream is asked for, if the agent dreams.
     dream: Option<DreamSchedule>,
     /// When the clock was last looked at for the dream, and the latest slot
@@ -180,6 +191,7 @@ impl Runtime {
             global_memos: None,
             memo_repos: None,
             memos_expired: None,
+            reminded: None,
             dream: None,
             dream_checked: None,
             dreamed: None,
@@ -262,6 +274,7 @@ impl Runtime {
             self.gate();
             self.evaluate()?;
             self.expire_memos()?;
+            self.remind_waiting()?;
             self.ask_for_dream()?;
             self.dispatch(&mut work, &facts)?;
             let drained =
@@ -852,6 +865,37 @@ impl Runtime {
                 Ok(())
             }
         }
+    }
+
+    /// Tell the thread of each open Ticket that has waited `remind_after` for
+    /// a person, once per wait. Nothing is told while the agent is paused,
+    /// since it would act on no answer: the wait is looked at again once the
+    /// pause lifts. A Store error stops the runtime.
+    fn remind_waiting(&mut self) -> Result<()> {
+        let Some(after) = self.options.remind_after else {
+            return Ok(());
+        };
+        let every = (after / 4).clamp(REMIND_CHECK_MIN, REMIND_CHECK);
+        if self.engine.policy().paused() || self.reminded.is_some_and(|at| at.elapsed() < every) {
+            return Ok(());
+        }
+        self.reminded = Some(Instant::now());
+        let after = u64::try_from(after.as_millis()).unwrap_or(u64::MAX);
+        let open = match self.engine.repos().open_tickets() {
+            Ok(open) => open,
+            Err(why) => bail!("listing the open tickets to remind: {why}"),
+        };
+        for ticket in open {
+            match self.engine.remind(&ticket, after) {
+                Ok(true) => {
+                    eprintln!("agent: {ticket} still waits for a person; its thread was reminded")
+                }
+                Ok(false) => {}
+                Err(Error::Store(why)) => bail!("reminder of {ticket}: {why}"),
+                Err(err) => eprintln!("agent: reminder of {ticket}: {err}"),
+            }
+        }
+        Ok(())
     }
 
     /// Look at the latest daily slot once: when a Ticket ended since the
@@ -1527,6 +1571,45 @@ mod tests {
             .stop_ticket(&ticket, "slack", Actor::person("alice"), "stopped")
             .unwrap();
         assert_eq!(offered(&runtime), [None], "a stopped Ticket asks nothing");
+    }
+
+    #[test]
+    fn a_ticket_waiting_for_an_approval_has_its_thread_reminded_once_with_its_buttons() {
+        let (mut runtime, _) = runtime_with_a_ticket(5_000_000);
+        assert_eq!(offered(&runtime), [Some(Ask::Budget)]);
+
+        runtime.remind_waiting().unwrap();
+        assert_eq!(offered(&runtime).len(), 1, "no threshold, no reminder");
+
+        runtime.options.remind_after = Some(Duration::ZERO);
+        runtime.remind_waiting().unwrap();
+        assert_eq!(
+            offered(&runtime),
+            [Some(Ask::Budget), Some(Ask::Budget)],
+            "the reminder offers the buttons again"
+        );
+        for _ in 0..3 {
+            runtime.reminded = None;
+            runtime.remind_waiting().unwrap();
+        }
+        assert_eq!(offered(&runtime).len(), 2, "once per wait");
+    }
+
+    #[test]
+    fn nothing_is_reminded_while_the_agent_is_paused_and_the_wait_is_kept_for_after() {
+        let (mut runtime, _) = runtime_with_a_ticket(5_000_000);
+        runtime.options.remind_after = Some(Duration::ZERO);
+        let mut policy = runtime.engine.policy().clone();
+        policy.paused = true;
+        runtime.engine.set_policy(policy.clone());
+        runtime.remind_waiting().unwrap();
+        assert_eq!(offered(&runtime).len(), 1, "paused");
+
+        policy.paused = false;
+        runtime.engine.set_policy(policy);
+        runtime.reminded = None;
+        runtime.remind_waiting().unwrap();
+        assert_eq!(offered(&runtime).len(), 2, "told once the pause lifts");
     }
 
     fn repo(name: &str) -> MemoScope {

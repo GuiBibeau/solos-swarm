@@ -119,6 +119,7 @@ fn runtime(scratch: &Scratch, source: ScheduleSource, until_idle: bool) -> Runti
         tick: Duration::from_millis(10),
         retry_base: Duration::from_millis(10),
         retry_max: Duration::from_millis(500),
+        remind_after: None,
     };
     Runtime::new(
         scratch.store(),

@@ -474,7 +474,20 @@ pub struct Ticket {
     /// admitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change: Option<Change>,
+    /// The start of the wait ([`Wait::since_ms`]) its thread was last
+    /// reminded of, so each wait is reminded of once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reminded_ms: Option<Ms>,
 }
+
+/// What an open Ticket waits for from a person, and since when.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Wait {
+    /// `Approval`, `Answer`, `Blocked` or `Failed`.
+    pub stage: Stage,
+    pub since_ms: Ms,
+}
+
 impl Ticket {
     pub fn latest_assignment(&self) -> Option<&Assignment> {
         self.assignments.last()
@@ -528,6 +541,43 @@ impl Ticket {
                 .inputs
                 .iter()
                 .any(|input| input.from_allowed_person && input.seq > report.seq)
+    }
+    /// What the Ticket waits for from a person, if it does, and since when.
+    /// A Report that asks, blocks or fails starts a wait. The Store keeps no
+    /// time for an approval asked at a later launch or for a question the
+    /// forge raised, so those count from the Ticket's latest step: its
+    /// creation, its latest Assignment or Report, or an allowed person's
+    /// latest Input.
+    pub fn wait(&self) -> Option<Wait> {
+        let stage = self.stage();
+        if !matches!(
+            stage,
+            Stage::Approval | Stage::Answer | Stage::Blocked | Stage::Failed
+        ) {
+            return None;
+        }
+        let reports = || self.assignments.iter().flat_map(|a| &a.reports);
+        let asked = match stage {
+            Stage::Answer => reports()
+                .filter(|r| r.question.is_some())
+                .map(|r| r.at_ms)
+                .max(),
+            Stage::Blocked | Stage::Failed => self.latest_report().map(|r| r.at_ms),
+            _ => None,
+        };
+        let since_ms = asked.unwrap_or_else(|| {
+            let steps = [
+                self.assignments.last().map(|a| a.created_ms),
+                reports().map(|r| r.at_ms).max(),
+                self.inputs
+                    .iter()
+                    .filter(|i| i.from_allowed_person)
+                    .map(|i| i.at_ms)
+                    .max(),
+            ];
+            steps.into_iter().flatten().fold(self.created_ms, Ms::max)
+        });
+        Some(Wait { stage, since_ms })
     }
     pub fn stage(&self) -> Stage {
         if self.ended.is_some() {
@@ -884,6 +934,12 @@ pub enum DomainEvent {
         ticket: TicketId,
         head: CommitSha,
         why: Withheld,
+    },
+    /// The Ticket's thread was told, once, that it still waits for a person.
+    /// `since_ms` is when the wait began.
+    Reminded {
+        ticket: TicketId,
+        since_ms: Ms,
     },
     /// A memo's text is in its row; the chain holds its digest. `active`: a
     /// person's own word, so it is in the index at once.

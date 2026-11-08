@@ -2,11 +2,13 @@
 //! never answers stalls its Assignment: one alert reaches the operator's
 //! channel, a restarted Watchdog tells nothing new, and with
 //! `retry_stalled` the Assignment is retried once per Ticket. `agent status`
-//! reads the same state as text and as JSON without writing to the Store.
+//! reads the same state as text and as JSON without writing to the Store. A
+//! Ticket that waits for an answer past `remind_after` has its own thread
+//! reminded, once.
 
 use serde_json::{Value, json};
 use solos_agent_core::model::{
-    AssignmentState, MessageKind, OutboundMessage, Ticket, TicketOutcome,
+    AssignmentState, MessageKind, OutboundMessage, Stage, Ticket, TicketOutcome,
 };
 use solos_agent_store::SqliteStore;
 use solos_swarm::agent::jsonl::JsonlChannel;
@@ -27,10 +29,11 @@ const SETTLE: Duration = Duration::from_millis(2_500);
 const OPS: &str = "ops.jsonl";
 
 /// The workers' model. Its first `hang` calls never answer; every later
-/// one reports `ready`.
+/// one reports `ready`, or with a `question`, `blocked` on it.
 struct Model {
     calls: AtomicUsize,
     hang: usize,
+    question: Option<&'static str>,
 }
 
 impl Model {
@@ -38,6 +41,14 @@ impl Model {
         Arc::new(Self {
             calls: AtomicUsize::new(0),
             hang,
+            question: None,
+        })
+    }
+    fn asking(question: &'static str) -> Arc<Self> {
+        Arc::new(Self {
+            calls: AtomicUsize::new(0),
+            hang: 0,
+            question: Some(question),
         })
     }
 }
@@ -45,12 +56,15 @@ impl Model {
 impl Provider for Model {
     fn dispatch(&self, _: Value) -> Dispatch {
         let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
-        let hang = n <= self.hang;
+        let (hang, question) = (n <= self.hang, self.question);
         Box::pin(async move {
             if hang {
                 std::future::pending::<()>().await;
             }
-            let report = json!({"status":"ready","text":"Fixed the flaky retry test."});
+            let report = match question {
+                Some(q) => json!({"status":"blocked","text":q,"question":q}),
+                None => json!({"status":"ready","text":"Fixed the flaky retry test."}),
+            };
             let call = json!({"id":"call-report","type":"function",
                 "function":{"name":"worker_report","arguments":report.to_string()}});
             Ok(
@@ -168,7 +182,12 @@ executor:
     /// Serve in a runtime of its own until `operator` alerts have been out
     /// for [`SETTLE`], then drop it whole, as a crash would.
     fn serve_until_alerted(&self, config: AgentConfig, model: Arc<Model>, operator: usize) {
-        let (state, host, ops) = (self.state(), self.host(model), self.root.join(OPS));
+        self.serve_until_sent(config, model, OPS, operator);
+    }
+    /// Serve in a runtime of its own until `file` holds `count` messages, and
+    /// for [`SETTLE`] after, then drop it whole, as a crash would.
+    fn serve_until_sent(&self, config: AgentConfig, model: Arc<Model>, file: &str, count: usize) {
+        let (state, host, ops) = (self.state(), self.host(model), self.root.join(file));
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -179,8 +198,8 @@ executor:
                     let started = Instant::now();
                     let mut told = None;
                     loop {
-                        assert!(started.elapsed() < LIMIT, "{operator} alert(s) never came");
-                        if told.is_none() && sent(&ops).len() >= operator {
+                        assert!(started.elapsed() < LIMIT, "{count} message(s) never came");
+                        if told.is_none() && sent(&ops).len() >= count {
                             told = Some(Instant::now());
                         }
                         if told.is_some_and(|at| at.elapsed() >= SETTLE) {
@@ -313,7 +332,7 @@ async fn a_stalled_worker_alerts_the_operator_once_and_a_restart_tells_nothing_n
         "{text}"
     );
     assert!(text.contains("alerts now: 1\n  [stalled]"), "{text}");
-    assert_eq!(report["schema_version"], 9);
+    assert_eq!(report["schema_version"], 10);
     assert_eq!(report["tickets"][0]["stage"], "working");
     assert_eq!(
         report["tickets"][0]["request"]["text"],
@@ -374,6 +393,52 @@ async fn a_stalled_worker_alerts_the_operator_once_and_a_restart_tells_nothing_n
     let (text, _) = status(&scratch);
     assert!(text.contains("open tickets: 0\n"), "{text}");
     assert!(text.contains("alerts now: 0\n"), "{text}");
+}
+
+#[tokio::test]
+async fn a_ticket_waiting_for_an_answer_has_its_own_thread_reminded_once_after_the_threshold() {
+    let scratch = Scratch::new("remind");
+    scratch.ask("Fix the flaky retry test");
+    let question = "Which environment should I fix it on?";
+    let budgets = "budgets: {session_microusd: 500000}\nremind_after: 1s\n";
+    let config = scratch.config_under(false, budgets);
+
+    // Until the thread holds the acknowledgement, the question and a
+    // reminder, and for two Watchdog ticks after, where a second would show.
+    scratch.serve_until_sent(config.clone(), Model::asking(question), "outbox.jsonl", 3);
+
+    let thread = scratch.sent("outbox.jsonl");
+    let told: Vec<_> = thread
+        .iter()
+        .map(|m| (m.channel.address["thread_ts"].as_str(), m.kind))
+        .collect();
+    assert_eq!(
+        told,
+        [
+            ("T1", MessageKind::Acknowledgement),
+            ("T1", MessageKind::Attention),
+            ("T1", MessageKind::Attention),
+        ],
+        "the question, then one reminder in the same thread"
+    );
+    assert_eq!(thread[1].text, question);
+    assert_eq!(
+        thread[2].text,
+        format!("I'm still waiting for your answer. I asked: {question}")
+    );
+    assert!(
+        scratch.sent(OPS).is_empty(),
+        "the operator's hour is not up"
+    );
+    let ticket = scratch.ticket();
+    assert_eq!(ticket.stage(), Stage::Answer);
+    assert_eq!(ticket.reminded_ms, ticket.wait().map(|wait| wait.since_ms));
+
+    // A restarted agent finds the wait told, and tells nothing again.
+    scratch
+        .serve_until_idle(config, Model::asking(question))
+        .await;
+    assert_eq!(scratch.sent("outbox.jsonl").len(), 3);
 }
 
 #[tokio::test]

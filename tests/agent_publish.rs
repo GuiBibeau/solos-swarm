@@ -98,6 +98,7 @@ impl Scratch {
             tick: Duration::from_millis(10),
             retry_base: Duration::from_millis(50),
             retry_max: Duration::from_secs(1),
+            remind_after: None,
         };
         Runtime::new(
             SqliteStore::open(self.db()).unwrap(),

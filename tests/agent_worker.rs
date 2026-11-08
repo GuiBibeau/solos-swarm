@@ -772,18 +772,13 @@ async fn counting_page() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<(
 
 /// What the person reads of a worker that kept calling `fetch_url`.
 const FETCH_LOOP: &str = "I kept calling fetch_url with the same arguments without making \
-                          progress, so I stopped.";
-
-/// What the host tells the person of a worker that was stopped for `what`.
-fn stuck(what: &str) -> String {
-    format!("{what} Reply here to have me try again with a different approach.")
-}
+                          progress, so I stopped. Is there another way you want me to handle \
+                          this, or should I stop here?";
 
 /// What a Ticket whose worker looped and was stopped shows: the person was
-/// told once, in plain words that say what it was doing, and the Ticket
-/// waits for them.
-fn assert_told_once_that_it_got_stuck(scratch: &Scratch, what: &str) {
-    let said = stuck(what);
+/// told once, in plain words that say what it was doing and that ask one
+/// question, and the Ticket waits for their answer.
+fn assert_told_once_that_it_got_stuck(scratch: &Scratch, said: &str) {
     assert_eq!(
         scratch.replies(),
         [
@@ -793,6 +788,7 @@ fn assert_told_once_that_it_got_stuck(scratch: &Scratch, what: &str) {
         "an acknowledgement, then exactly one reply that says why nothing came"
     );
     assert_eq!(scratch.sent()[1].text, said);
+    assert_eq!(said.matches('?').count(), 1, "one question: {said}");
     let tickets = scratch.tickets();
     let [ticket] = &tickets[..] else {
         panic!("{tickets:?}")
@@ -800,9 +796,11 @@ fn assert_told_once_that_it_got_stuck(scratch: &Scratch, what: &str) {
     let report = ticket.latest_report().unwrap();
     assert_eq!(
         (report.status, report.text.as_str()),
-        (ReportStatus::Failed, said.as_str())
+        (ReportStatus::Failed, said)
     );
-    assert_eq!(ticket.stage(), Stage::Failed);
+    assert_eq!(report.question.as_deref(), Some(said));
+    assert_eq!(ticket.stage(), Stage::Answer);
+    assert_eq!(ticket.attention.as_deref(), Some(said));
     assert!(ticket.ended.is_none(), "a person may still answer");
     assert_eq!(
         ticket.assignments[0].reports.len(),
@@ -1084,7 +1082,8 @@ async fn a_worker_is_stopped_at_the_ceiling_of_tool_calls_however_different_they
 
     assert_told_once_that_it_got_stuck(
         &scratch,
-        "I made 200 tool calls without finishing, so I stopped.",
+        "I made 200 tool calls without finishing, so I stopped. Should I keep going from \
+         where I am?",
     );
     assert_eq!(model.worker_calls(), 201);
     assert_eq!(hits.load(Ordering::SeqCst), 200);
@@ -1117,12 +1116,13 @@ async fn a_worker_that_only_reports_progress_is_stopped_at_the_ceiling_of_model_
     );
     assert_eq!(
         scratch.sent()[1].text,
-        stuck("I made 250 model calls without finishing, so I stopped.")
+        "I made 250 model calls without finishing, so I stopped. Should I keep going from \
+         where I am?"
     );
     let tickets = scratch.tickets();
     let report = tickets[0].latest_report().unwrap();
     assert_eq!(report.status, ReportStatus::Failed);
-    assert_eq!(tickets[0].stage(), Stage::Failed);
+    assert_eq!(tickets[0].stage(), Stage::Answer);
     assert_settled(&scratch.store());
 }
 
@@ -1177,6 +1177,110 @@ async fn workers_are_sampled_at_the_executors_temperature_and_the_router_at_zero
     }
 }
 
+/// A worker whose model sends `command(n)` as its `n`-th `run_code` call, for
+/// ever, with the `executor` settings a `run_code` needs.
+fn running(command: impl Fn(usize) -> String + Send + Sync + 'static) -> Arc<Model> {
+    let seen = AtomicUsize::new(0);
+    Model::looping(Box::new(move |_| {
+        let n = seen.fetch_add(1, Ordering::SeqCst);
+        match n {
+            0..=20 => vec![("run_code", json!({"code": command(n)}))],
+            _ => Vec::new(),
+        }
+    }))
+}
+
+/// What a Ticket shows when its worker was stopped on failing commands: asked
+/// once, in a question that names what failed and quotes none of the commands.
+fn assert_asked_once_about_a_failing_command(scratch: &Scratch, said: &str, quoted: &[&str]) {
+    assert_told_once_that_it_got_stuck(scratch, said);
+    for raw in quoted {
+        assert!(!scratch.sent()[1].text.contains(raw), "{raw:?} leaked");
+    }
+    assert_settled(&scratch.store());
+}
+
+#[tokio::test]
+async fn a_worker_whose_command_fails_the_same_way_three_times_is_stopped_with_a_question() {
+    if !sandbox() {
+        return;
+    }
+    let scratch = Scratch::new("fail-same");
+    scratch.ask("t-ask", "T1", "Fix the helper script");
+    let model = running(|_| "cat bin/missing.sh".to_owned());
+
+    scratch
+        .serve(
+            scratch.config(false, "  run_code: {}\n"),
+            scratch.host(agent_loop(), model.clone()),
+        )
+        .await;
+
+    assert_asked_once_about_a_failing_command(
+        &scratch,
+        "I tried 3 times to read missing.sh, and it failed the same way each time, so I \
+         stopped. Is there another way you want me to handle missing.sh, or should I stop \
+         here?",
+        &[],
+    );
+    assert_eq!(
+        model.worker_calls(),
+        3,
+        "two commands that ran, a third that was refused, and no model call after it"
+    );
+    assert_eq!(
+        model.tool_results().len(),
+        2,
+        "the model read two results, then its next call was refused"
+    );
+}
+
+#[tokio::test]
+async fn edits_that_fail_alike_stop_the_worker_though_each_is_written_a_little_differently() {
+    if !sandbox() {
+        return;
+    }
+    let scratch = Scratch::new("fail-alike");
+    scratch.ask("t-ask", "T1", "Fix the helper script");
+    // The edit of #94: a script on a heredoc that names its file and fails, a
+    // little differently written each time, with a secret in its text. The
+    // spaces go where the shell still reads one assignment and one echo, so
+    // the failure reads the same and only the call's text differs.
+    let model = running(|n| {
+        let spaces = " ".repeat(n);
+        format!(
+            "cd /work && sh <<'EOF'\n{spaces}f='bin/lib.sh'\n\
+             echo \"cannot edit $f: ghp_SECRET\"{spaces} >&2\nexit 3\nEOF"
+        )
+    });
+
+    scratch
+        .serve(
+            scratch.config(false, "  run_code: {}\n"),
+            scratch.host(agent_loop(), model.clone()),
+        )
+        .await;
+
+    assert_asked_once_about_a_failing_command(
+        &scratch,
+        "I tried 3 times to run `sh` on lib.sh, and it failed the same way each time, so I \
+         stopped. Is there another way you want me to handle lib.sh, or should I stop here?",
+        &["ghp_SECRET", "<<", "EOF", "cannot edit"],
+    );
+    assert_eq!(
+        model.worker_calls(),
+        3,
+        "all three ran, since no two were the same, and the third failure stopped the turn"
+    );
+    let results = model.tool_results();
+    assert!(
+        results
+            .iter()
+            .all(|result| result.contains("\"exit_code\":3")),
+        "each call ran and failed: {results:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_refusal_of_a_looped_run_code_quotes_its_exit_code_and_output() {
     if !sandbox() {
@@ -1200,8 +1304,8 @@ async fn a_refusal_of_a_looped_run_code_quotes_its_exit_code_and_output() {
 
     assert_told_once_that_it_got_stuck(
         &scratch,
-        "I kept re-running `echo found it; echo and more; echo oops >&2` without making \
-         progress, so I stopped.",
+        "I kept re-running `echo` without making progress, so I stopped. Is there another \
+         way you want me to handle this, or should I stop here?",
     );
     assert_eq!(model.worker_calls(), 5);
     let results = model.tool_results();

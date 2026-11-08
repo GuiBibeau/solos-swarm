@@ -238,6 +238,7 @@ impl Source {
             | DomainEvent::ProposalAdmitted { ticket, .. }
             | DomainEvent::Delivered { ticket, .. }
             | DomainEvent::Withheld { ticket, .. }
+            | DomainEvent::Reminded { ticket, .. }
             | DomainEvent::Reported { ticket, .. } => touch(self, ticket),
             DomainEvent::TicketResumed { ticket, .. } => {
                 touch(self, ticket);

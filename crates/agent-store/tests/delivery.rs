@@ -92,7 +92,7 @@ fn a_v6_file_opens_at_the_latest_version_and_reads_its_ticket_effect_and_events_
 
     let store = SqliteStore::open(&db.path).unwrap();
 
-    assert_eq!(store.schema_version().unwrap(), 9);
+    assert_eq!(store.schema_version().unwrap(), 10);
     let ticket = store.read_ticket(&TicketId::new("tk_1")).unwrap().unwrap();
     assert_eq!(
         (ticket.change.clone(), ticket.mandate.forge.clone()),
@@ -114,7 +114,7 @@ fn a_v6_file_opens_at_the_latest_version_and_reads_its_ticket_effect_and_events_
         .collect();
     assert_eq!(events, V6_EVENTS);
     assert_eq!(store.verify_chain().unwrap().len, 2);
-    assert_eq!(version(&db), 9, "the migration is recorded once");
+    assert_eq!(version(&db), 10, "the migration is recorded once");
 }
 
 #[test]

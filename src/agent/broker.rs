@@ -430,11 +430,12 @@ pub enum ModelFailure {
     /// limit, or the stop after an overrun. The text is the broker's reason.
     Failed(String),
     /// The broker stopped the turn: the worker kept sending the same call
-    /// after it was refused, or made calls that brought nothing new, or
-    /// passed the turn's ceiling of calls, so the call after the stop was
-    /// refused too, with no model call spent. The text is what the host
-    /// tells the person in the worker's place, in the worker's words: what it
-    /// kept doing, and that it stopped.
+    /// after it was refused, or made calls that failed the same way or
+    /// brought nothing new, or passed the turn's ceiling of calls, so the
+    /// call after the stop was refused too, with no model call spent. The
+    /// text is what the host tells the person in the worker's place, in the
+    /// worker's words: what it kept doing, that it stopped, and the one
+    /// question that would get it going again.
     Stuck(String),
 }
 
@@ -445,13 +446,7 @@ impl ModelFailure {
     /// words what stopped the work and how to go on.
     pub fn report(&self) -> (ReportStatus, String) {
         match self {
-            Self::Stuck(what) => (
-                ReportStatus::Failed,
-                format!(
-                    "{} Reply here to have me try again with a different approach.",
-                    clip(what, FAILURE_CHARS).0
-                ),
-            ),
+            Self::Stuck(what) => (ReportStatus::Failed, what.clone()),
             Self::BudgetReached { committed, budget } => (
                 ReportStatus::Blocked,
                 format!(
@@ -471,6 +466,17 @@ impl ModelFailure {
                     clip(why, FAILURE_CHARS).0
                 ),
             ),
+        }
+    }
+
+    /// What the Report asks the person, when the host stopped the worker for
+    /// being stuck: the one question that would get it going again. The
+    /// Ticket then waits for an answer, and the Engine sends the question to
+    /// its thread.
+    pub fn question(&self) -> Option<String> {
+        match self {
+            Self::Stuck(what) => Some(what.clone()),
+            Self::BudgetReached { .. } | Self::Failed(_) => None,
         }
     }
 }
@@ -3213,12 +3219,20 @@ mod tests {
         assert!(long.chars().count() < 600, "a long reason is cut: {long}");
 
         let sentence = "I kept re-reading the same parts of encode.js without making progress, so \
-                        I stopped.";
-        let (status, text) = ModelFailure::Stuck(sentence.into()).report();
+                        I stopped. What should I be looking for in encode.js?";
+        let stuck = ModelFailure::Stuck(sentence.into());
+        let (status, text) = stuck.report();
         assert_eq!(status, ReportStatus::Failed);
-        assert_eq!(
-            text,
-            format!("{sentence} Reply here to have me try again with a different approach.")
-        );
+        assert_eq!(text, sentence, "the sentence asks, so it goes as it is");
+        assert_eq!(stuck.question().as_deref(), Some(sentence));
+        for failure in [
+            ModelFailure::Failed("provider returned 503".into()),
+            ModelFailure::BudgetReached {
+                committed: 1,
+                budget: 2,
+            },
+        ] {
+            assert_eq!(failure.question(), None, "{failure:?} asks nothing");
+        }
     }
 }

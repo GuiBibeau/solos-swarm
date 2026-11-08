@@ -1,0 +1,3 @@
+# A Ticket that waits for a person is reminded of after one second, so a recipe can see the reminder without waiting
+# four hours. The default is 4h; see docs/agent-mode/configuration.md#remind_after.
+remind_after: 1s

@@ -24,6 +24,7 @@ These rules hold for every file on this page:
 | [`executor`](#executor) | yes | What runs a Ticket's work. |
 | [`budgets`](#budgets) | no | Caps on spend. Without it, nothing is capped except a swarm. |
 | [`watchdog`](#watchdog) | no | Alerts to an operator. Without it, no Watchdog runs. |
+| [`remind_after`](#remind_after) | no | How long a Ticket waits for a person before its own thread is reminded. `4h` unless set. |
 | [`nodes`](#nodes) | no | Remote machines that run workers' commands. |
 | [`pass_through`](#pass_through) | no | Whether a follow-up skips the Router. |
 | [`vault`](#vault) | no | This host's sealed logins and API keys. |
@@ -301,6 +302,18 @@ example: [Watch jobs that are not Tickets](how-to/operate.md#watch-jobs-that-are
 | `disk` | `{path, min_free_gb}`: an absolute path, and the free space in GB that its disk must keep. A running job below it is low on disk. |
 
 At most 64 jobs. Every path is absolute, because the agent's working directory is not where an owner would look.
+
+### remind_after
+
+How long a Ticket may wait for a person before the agent sends one reminder to the Ticket's own thread. A wait is an
+approval, a question, or a blocked or failed Report. The reminder names what the wait is for (the question, the
+block, or the last thing the worker said) and offers the Approve buttons again for a budget. Each wait is told once:
+one that begins after a person writes or the worker asks again is told again. A wait older than seven days is left
+alone, so the value must be `7d` or less.
+
+The default is `4h`. `null` tells nobody. This is separate from the Watchdog's `waiting` alert: the Watchdog tells
+the operator at `watchdog.thresholds.waiting` (1h), and the reminder tells the person who was asked, on their
+thread. Nothing is reminded while `policy.paused` is on, and a wait that was due is reminded once the pause lifts.
 
 ### nodes
 
