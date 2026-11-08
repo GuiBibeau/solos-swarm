@@ -381,7 +381,11 @@ def check_run(run_dir, expected_path, runtime=None, extension=None, package_lock
 
     if state is not None:
         agents, intents, findings = state.get("agents", {}), state.get("intents", []), state.get("findings", [])
-        identities = {f"agent-{index:02d}" for index in range(len(expected.get("tasks", {})) if expected else 10)}
+        # The runtime admits `agent-00`..`agent-{n-1}` from the Goal's agent count,
+        # not from its Task count (`swarm.rs`), so a Goal whose agent count and
+        # task count disagree must still be judged against its agent count.
+        admitted = (config or {}).get("agent_count")
+        identities = {f"agent-{index:02d}" for index in range(admitted)} if type(admitted) is int and admitted >= 0 else set()
         check("admitted-identities", "runtime", bool(identities) and isinstance(agents, dict) and set(agents) == identities, "One distinct admitted identity per admitted agent required")
         check("goal-completed", "runtime", state.get("goal_status") == "completed", "Goal must have completed")
         check("settled-ledger", "evidence", state.get("held_microusd") == 0 and all(intent.get("state") in {"completed", "denied"} for intent in intents), "Unknown or unsettled holds block qualification")

@@ -265,6 +265,44 @@ class ScenarioTests(unittest.TestCase):
         (self.run / "events.jsonl").write_text("")
         self.assertEqual(self.report()["evidence_verdict"], "FAIL")
 
+    def test_admitted_identities_follow_the_goal_agent_count_not_its_task_count(self):
+        # A security-review Goal admits one agent per shard but freezes fewer
+        # private Tasks than shards, so the two counts disagree. The runtime
+        # admits `agent-00`..`agent-{agent_count-1}`, so the checker must judge
+        # the roster by the Goal's agent count.
+        shards = 4
+        tasks = [{"id": f"task-{index:02d}", "input": {"shard": index}} for index in range(shards)]
+        goal = {**self.goal, "scope": "authorized-audit:synthetic-review", "agent_count": shards, "tasks": tasks}
+        goal_bytes = json.dumps(goal, indent=2, ensure_ascii=False).encode() + b"\n"
+        (self.run / "config.yaml").write_bytes(goal_bytes)
+        expected = {
+            "schema_version": 1,
+            "scorer_id": "security-review",
+            "scorer_version": "1",
+            "catalog_version": goal["catalog_version"],
+            "seed": goal["seed"],
+            "scorer_kind": "security-review",
+            "fixture_digest": hashlib.sha256(checker.canonical(tasks)).hexdigest(),
+            "tasks": {task["id"]: {"files": [f"src/{task['id']}.ts"]} for task in tasks[:2]},
+            "artifact_contract": {
+                "kind": "security-review",
+                "result_key": "vulnerabilities",
+                "required_fields": ["id", "severity", "title", "file", "description"],
+                "optional_fields": ["line", "evidence", "impact", "recommendation"],
+                "severities": ["critical", "high", "medium", "low"],
+            },
+            "config_sha256": hashlib.sha256(goal_bytes).hexdigest(),
+        }
+        self.expected_path.write_text(json.dumps(expected) + "\n")
+        self.manifest["artifacts"] = {"config.yaml": checker.digest(self.run / "config.yaml")}
+        self.write("manifest.json", self.manifest)
+        self.state["agents"] = {f"agent-{index:02d}": self.state["agents"][f"agent-{index:02d}"] for index in range(shards)}
+        self.write("state.json", self.state)
+        self.assertEqual(self.report()["runtime_verdict"], "PASS")
+        self.state["agents"].pop("agent-03")
+        self.write("state.json", self.state)
+        self.assertEqual(self.report()["runtime_verdict"], "FAIL")
+
     def test_duplicate_rows_and_boolean_values_are_rejected(self):
         row = self.expected["artifact"]["inconsistencies"][0]
         with self.assertRaises(ValueError):
