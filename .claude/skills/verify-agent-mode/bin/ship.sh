@@ -15,7 +15,7 @@ box "bash -lc $(printf %q "
 	export PATH=\$HOME/.cargo/bin:\$HOME/.local/opt/node-v24.18.0-linux-x64/bin:\$PATH
 	export RUSTUP_TOOLCHAIN=1.96.0 CARGO_TARGET_DIR=\$HOME/work/ci/target-verify CARGO_BUILD_JOBS=24
 	cd ~/work/verify/$run/src
-	npm ci --no-audit --no-fund > /dev/null 2>&1
+	npm ci --ignore-scripts --no-audit --no-fund > /dev/null 2>&1
 	test -f node_modules/@earendil-works/pi-coding-agent/dist/cli.js
 	nice -n 10 cargo build --locked --release --bin solos-swarm 2>&1 | tail -1
 	cp \$CARGO_TARGET_DIR/release/solos-swarm ~/work/verify/$run/bin/solos-swarm.new

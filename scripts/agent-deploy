@@ -210,7 +210,7 @@ if [[ ${1:-} == --on-host ]]; then
 		free=$(df -BG --output=avail "$A" | tail -1 | tr -dc 0-9)
 		((free >= 30)) || { echo "only ${free} GB free on the box; refusing to build" >&2; exit 1; }
 		cd "$rel.tmp"
-		npm ci --no-audit --no-fund > npm.log 2>&1 || { tail -20 npm.log >&2; exit 1; }
+		npm ci --ignore-scripts --no-audit --no-fund > npm.log 2>&1 || { tail -20 npm.log >&2; exit 1; }
 		CARGO_TARGET_DIR=$A/target RUSTUP_TOOLCHAIN=1.96.0 CARGO_BUILD_JOBS=24 nice -n 10 \
 			cargo build --locked --release --bin solos-swarm 2>&1 | tail -3
 		mkdir -p bin && cp "$A/target/release/solos-swarm" bin/solos-swarm
