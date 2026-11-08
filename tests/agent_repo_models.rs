@@ -11,7 +11,7 @@ use solos_swarm::agent::{AgentConfig, PiHost, STORE_FILE, TICKETS_DIR, serve_wit
 use solos_swarm::gateway::{Dispatch, Provider};
 use solos_swarm::harness::scripted::{Call, ScriptedHarness};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -204,8 +204,26 @@ impl Drop for Scratch {
     }
 }
 
+/// The runtime builds its workers' `run_code` at start, which needs
+/// bubblewrap even when no worker launches. CI's shards have none, so this
+/// test skips there as `agent_forge`'s do; run it where `/usr/bin/bwrap` is.
+fn sandbox() -> bool {
+    let found = cfg!(target_os = "linux")
+        && Path::new("/usr/bin/bwrap").is_file()
+        && Path::new("/usr/bin/prlimit").is_file();
+    if !found {
+        eprintln!(
+            "skipped: the runtime's run_code needs Linux, /usr/bin/bwrap and /usr/bin/prlimit"
+        );
+    }
+    found
+}
+
 #[tokio::test]
 async fn a_deepseek_only_host_declines_a_repository_that_allows_only_anthropic() {
+    if !sandbox() {
+        return;
+    }
     let scratch = Scratch::new("decline");
     let judge = Arc::new(Judge::default());
     scratch.serve(scratch.config(), judge.clone()).await;
