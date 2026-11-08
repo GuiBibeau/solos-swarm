@@ -121,6 +121,7 @@ fn working(w: &mut World, deliverable: Deliverable) -> (TicketId, AssignmentId) 
                 rules: Vec::new(),
                 repo: Some(widgets()),
                 forge: owed.then(terms),
+                upstream: None,
             }),
         )
         .unwrap();

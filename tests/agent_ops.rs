@@ -514,6 +514,7 @@ fn ticket_at(state: &Path, name: &str, at_ms: u64, end: bool) -> TicketId {
         rules: Vec::new(),
         repo: None,
         forge: None,
+        upstream: None,
     });
     let decision = engine.decide(&eval, accept).unwrap();
     let ticket = engine.repos().decision(&decision).unwrap().ticket.unwrap();

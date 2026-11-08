@@ -16,7 +16,7 @@ use solos_agent_core::memo::{
 use solos_agent_core::model::{
     Actor, Ask, AssignmentId, Candidate, ChannelRef, Decision, EvalId, Input, MemoId, MicroUsd,
     OutboundMessage, Plan, Report, ReportIn, SecretGrant, SecretId, TicketId, Trigger, TriggerId,
-    Verdict,
+    UpstreamChoice, Verdict,
 };
 use solos_agent_core::trail::{TrailAction, TrailOutcome};
 use solos_agent_store::EffectId;
@@ -104,6 +104,10 @@ pub struct Launch {
     /// The repository the Mandate names, which the worker's `/work` is a
     /// clone of.
     pub repo: Option<RepoName>,
+    /// The upstream the Ticket was accepted on, checked against the policy
+    /// before the clone. `None` for a Ticket with no repository, and for one
+    /// accepted before this build: its launch checks `default`.
+    pub upstream: Option<UpstreamChoice>,
     /// A resume or restart, or a Launch an earlier run may have performed:
     /// check the working directory before repeating outside actions.
     pub recovery: bool,

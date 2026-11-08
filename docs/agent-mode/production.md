@@ -138,6 +138,11 @@ Read these before you change it:
   deploying a release that includes the model policy, add a `models:` line to each repository in the live config, or
   the agent will refuse to start. A repository whose allowed providers no upstream here serves still loads, and
   `agent serve` logs it at start ([Repository models](configuration.md#repository-models)).
+- A repository that allows no provider for which an upstream runs here is declined at accept: the requester hears one
+  sentence saying why, and nothing starts. Tickets accepted before this release recorded no upstream, so their first launch
+  checks `default`; where the repository's worker role does not allow it, the Assignment fails with a Report naming the
+  policy rather than cloning. If the live config's `models` lines and the executor's provider do not meet, those
+  Tickets fail visibly instead of running on the wrong provider.
 - `mcp:<your name>` in `policy.people` lets you run `agent stop` and `agent memo` from the box.
 - There is no `budgets:` section, so a session Ticket and the Router have no cap. A swarm's budget comes from the Router
   or from `executor.swarm.default_budget_microusd`. To cap them, add

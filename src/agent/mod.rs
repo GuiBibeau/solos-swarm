@@ -565,6 +565,7 @@ where
                 )))
             }
         };
+        let model_policy = Arc::new(models::ModelPolicy::from_config(config)?);
         let executor = match (&config.executor, worker_model) {
             (
                 ExecutorConfig::Pi {
@@ -599,6 +600,7 @@ where
                 prepare: prepare.clone(),
                 forge: forge.clone(),
                 swarm,
+                models: model_policy,
             })?)),
             _ => None,
         };

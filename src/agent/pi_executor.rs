@@ -11,6 +11,7 @@ use super::config::{DepsKind, EvidenceConfig, HarnessKind};
 use super::dream;
 use super::earlier;
 use super::environment::{self, Launchable};
+use super::models::ModelPolicy;
 use super::plain_answer::Answer;
 use super::ports::{
     BoxFuture, Delivered, Delivery, Dependencies, Executor, Fact, FactSink, Forge, Launch,
@@ -459,6 +460,9 @@ pub struct PiExecutorParts<H, C = ClaudeCodeHarness> {
     pub forge: Option<Arc<dyn Forge>>,
     /// Runs `Plan::Swarm` Assignments; without it they fail.
     pub swarm: Option<SwarmExecutor<H>>,
+    /// Which providers may read each repository's text. A repository Ticket
+    /// whose upstream it does not admit fails before the clone.
+    pub models: Arc<ModelPolicy>,
 }
 
 pub struct PiExecutor<H, C = ClaudeCodeHarness> {
@@ -576,6 +580,14 @@ where
     fn launch(&self, launch: Launch, facts: FactSink) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
             let parts = &self.inner.parts;
+            // Before the clone, and whatever the environment: a Ticket whose
+            // repository's policy no longer admits its upstream ends here,
+            // and nothing of the repository is read.
+            if let Some(repo) = &launch.repo
+                && let Some(why) = parts.models.launch_refusal(repo, launch.upstream.as_ref())
+            {
+                return failed(&facts, &launch, false, &why, 0).await;
+            }
             let runner = runner(&launch.plan, parts.default_harness, parts.claude.is_some());
             match (runner, &parts.swarm) {
                 (Runner::Session(harness), _) => {
@@ -1264,6 +1276,7 @@ mod tests {
     use crate::agent::config::{DepsKind, EvidenceConfig, HarnessKind};
     use crate::agent::environment::{ExecutionEnvironment, Nodes, Offline, Work};
     use crate::agent::jobs::JobLimits;
+    use crate::agent::models::ModelPolicy;
     use crate::agent::ports::{
         Delivered, Delivery, Dependencies, Executor, Fact, FactSink, Inbound, Launch, Workspace,
     };
@@ -1435,6 +1448,23 @@ mod tests {
             nodes: Nodes,
             pstack: Option<Arc<Pstack>>,
         ) -> Self {
+            Self::build_with(
+                default_harness,
+                max_workers,
+                prepare,
+                nodes,
+                pstack,
+                ModelPolicy::default(),
+            )
+        }
+        fn build_with(
+            default_harness: HarnessKind,
+            max_workers: usize,
+            prepare: Option<&str>,
+            nodes: Nodes,
+            pstack: Option<Arc<Pstack>>,
+            models: ModelPolicy,
+        ) -> Self {
             let dir = std::env::temp_dir().join(format!("pi-executor-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&dir).unwrap();
             let (facts, inbound) = FactSink::channel();
@@ -1488,6 +1518,7 @@ mod tests {
                 prepare: prepare.map(String::from),
                 forge: None,
                 swarm: None,
+                models: Arc::new(models),
             })
             .unwrap();
             Self {
@@ -1575,6 +1606,7 @@ mod tests {
             },
             budget_microusd: Some(500_000),
             repo: None,
+            upstream: None,
             recovery: false,
             inputs: Vec::new(),
             earlier: Vec::new(),
@@ -2381,6 +2413,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_launch_whose_repository_no_longer_admits_its_upstream_fails_before_the_clone() {
+        let models = crate::agent::models::test_policy("{allow: [anthropic]}", "");
+        let mut w = World::build_with(HarnessKind::Pi, 1, None, Nodes::default(), None, models);
+        let repo = solos_agent_core::change::RepoName::try_from("acme/widgets".to_owned()).unwrap();
+
+        let mut accepted = launch("tk_1", "as_1");
+        accepted.repo = Some(repo.clone());
+        accepted.upstream = Some(solos_agent_core::model::UpstreamChoice {
+            name: "default".into(),
+            provider: "deepseek".into(),
+            model: "deepseek-flash".into(),
+            harness: "pi".into(),
+        });
+        w.launch(accepted).await;
+        let said = failure(&mut w, "as_1").await;
+        assert!(
+            said.contains(
+                "the policy for acme/widgets here no longer admits deepseek for its workers"
+            ) && said.contains("its code may go only to anthropic"),
+            "{said}"
+        );
+        assert!(!w.ticket_dir("tk_1").exists(), "nothing was cloned");
+        assert!(w.fake.started().is_empty(), "no session ran");
+
+        // A Ticket accepted before this build recorded no upstream: its
+        // launch checks `default`, which this policy does not admit either.
+        let mut old = launch("tk_2", "as_2");
+        old.repo = Some(repo);
+        w.launch(old).await;
+        let said = failure(&mut w, "as_2").await;
+        assert!(
+            said.contains("no longer admits deepseek for its workers"),
+            "{said}"
+        );
+        assert!(!w.ticket_dir("tk_2").exists(), "nothing was cloned");
+        w.executor.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn a_swarm_plan_or_a_dead_session_fails_and_ends_its_assignment() {
         let mut w = World::new(1, None);
         let mut swarm = launch("tk_s", "as_s");
@@ -2542,6 +2613,7 @@ mod tests {
             prepare: None,
             forge: None,
             swarm: None,
+            models: Arc::new(crate::agent::models::ModelPolicy::default()),
         })
         .unwrap();
         let mut asks = launch("tk_1", "as_1");

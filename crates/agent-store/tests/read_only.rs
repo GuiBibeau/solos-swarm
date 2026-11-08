@@ -46,7 +46,7 @@ fn a_read_only_store_reads_everything_and_writes_nothing() {
     let before = std::fs::read(&db.path).unwrap();
 
     let store = SqliteStore::open_read_only(&db.path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 10);
+    assert_eq!(store.schema_version().unwrap(), 11);
     assert_eq!(store.open_tickets().unwrap().len(), 2);
     assert!(!store.pending_effects().unwrap().is_empty());
     let refused = store.mark_alert_sent("wd_x", 1).unwrap_err();
@@ -70,7 +70,7 @@ fn a_file_from_a_newer_build_is_refused_and_this_build_writes_the_version_older_
         .unwrap()
         .schema_version()
         .unwrap();
-    assert_eq!(known, 10, "a build that knows only 9 refuses this file");
+    assert_eq!(known, 11, "a build that knows only 10 refuses this file");
 
     db.raw()
         .execute(

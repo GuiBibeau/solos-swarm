@@ -18,12 +18,19 @@ it and names the ceiling. So `owes: answer` makes a repository read-only to the 
 `router_decide` also refuses an unknown repository, a repository on a swarm plan, a repository on a remote node, and a
 `deliverable` with no repository.
 
-The Ticket records the repository in its Mandate and the deliverable in its Plan. For a change or a pull request, it
-also records the repository's terms: the merge mode, CI, and the limits. A later config edit never changes the terms of
-work in flight.
+The Ticket records the repository in its Mandate and the deliverable in its Plan. The host also records the upstream
+its workers run on (`Mandate.upstream`: the name, provider, model and harness) and names that upstream's harness in the
+Plan, picked from the repository's `models` policy at accept. The Router never names a model or a harness. For a change
+or a pull request, the Ticket also records the repository's terms: the merge mode, CI, and the limits. A later config
+edit never changes the terms of work in flight.
 
-Tickets that name a repository need schema V6 of `agent.db`, and Tickets that deliver a change or a pull request need
-V7, so an older build refuses the file.
+A repository that allows no provider for which an upstream runs here is declined at accept: the request's channel hears one
+sentence saying why, once, and nothing starts. Before the clone, the executor checks the Ticket's upstream against the
+policy as it is now; a Ticket whose upstream is no longer admitted ends with a failed Report that names the policy and
+nothing is cloned.
+
+Tickets that name a repository need schema V6 of `agent.db`, Tickets that deliver a change or a pull request need V7,
+and Tickets accepted on a recorded upstream need V11, so an older build refuses the file.
 
 ## The mirror and the clone
 

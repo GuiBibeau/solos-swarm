@@ -268,6 +268,7 @@ pub fn verdict(store: &SqliteStore, candidate: &Candidate, now: Ms) -> Result<Ve
         rules: Vec::new(),
         repo: None,
         forge: None,
+        upstream: None,
     }))
 }
 

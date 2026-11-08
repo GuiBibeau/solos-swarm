@@ -39,10 +39,19 @@ default, and a config without it does not load. `agent serve` logs each reposito
 the upstream its workers run on. The rule, the roles and the providers are in
 [Repository models](configuration.md#repository-models).
 
-**Open.** This release records the allowlist. The paths that read a repository's text — the Router's cards and reads,
-a worker's prompt, the memory review and the dream — are filtered by it in the changes that follow
-([the design](repo-models/design.md)). Until then an allowlist says which providers are approved; it does not yet
-withhold a read.
+The host picks every upstream; the Router never names a model or a harness. At accept it fills a repository Ticket's
+`Mandate.upstream` and its Plan's harness from the repository's policy. A repository that allows no provider any
+upstream here runs is declined, and the requester hears one sentence saying why: once, on an explicit request only, so
+an outsider's follow-up cannot make the agent post. An accept whose GitHub thread carries a restricted repository's
+text must name that repository, so the text cannot reach a worker on another provider through a Ticket with no
+repository. Before the clone, the executor checks the Ticket's upstream against the policy as it is now; a Ticket
+whose upstream is no longer admitted, or one accepted before this build that recorded none on such a repository, ends
+with a failed Report and nothing is cloned.
+
+**Open.** The paths that read a repository's text — the Router's cards and reads, a worker's prompt, a memo, the memory
+review and the dream — are filtered by the policy in the changes that follow ([the design](repo-models/design.md)).
+Until then the policy decides which upstream a repository's Tickets run on and whether they are declined; it does not
+yet withhold a read that another provider's session makes.
 
 **Open.** Shared mounts and vault items are not scoped by repository: `executor.run_code.mounts` binds into every
 worker's sandbox, and a vault item is scoped by requester. Do not mount a private repository's data globally, and do

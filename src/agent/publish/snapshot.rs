@@ -337,6 +337,7 @@ pub fn decision_kind(kind: DecisionKind) -> &'static str {
         DecisionKind::Ignore => "ignore",
         DecisionKind::Stop => "stop",
         DecisionKind::Unavailable => "unavailable",
+        DecisionKind::Declined => "declined",
     }
 }
 

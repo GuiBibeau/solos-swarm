@@ -56,14 +56,20 @@ const PRICES: PriceTable = PriceTable {
 /// 100 prompt tokens and 50 completion tokens at `PRICES`.
 const COST: u64 = 90;
 const LIMIT: Duration = Duration::from_secs(30);
-const TERMS: DecideTerms = DecideTerms {
-    default_budget_microusd: Some(500_000),
-    max_budget_microusd: Some(2_000_000),
-    approval_sources: BTreeSet::new(),
-    auto_approve_microusd: 0,
-    swarm: None,
-    repos: BTreeMap::new(),
-};
+/// A broker's accept terms. The policy names no repository: these tests
+/// accept none.
+fn decide_terms() -> DecideTerms {
+    DecideTerms {
+        default_budget_microusd: Some(500_000),
+        max_budget_microusd: Some(2_000_000),
+        approval_sources: BTreeSet::new(),
+        auto_approve_microusd: 0,
+        swarm: None,
+        repos: BTreeMap::new(),
+        models: solos_swarm::agent::models::ModelPolicy::default(),
+        router_provider: None,
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Behaviour {
@@ -366,7 +372,7 @@ fn model_request(text: &str) -> Value {
 }
 
 fn serve(scratch: &Scratch, provider: Arc<Scripted>, facts: FactSink, daily: u64) -> Served {
-    serve_deciding(scratch, provider, facts, daily, TERMS)
+    serve_deciding(scratch, provider, facts, daily, decide_terms())
 }
 
 fn serve_deciding(
@@ -1724,7 +1730,7 @@ fn fetching_worker(
         Scripted::new(),
         runtime.facts(),
         1_000_000,
-        TERMS,
+        decide_terms(),
         Nodes::default(),
         WorkerParts {
             allow_private_networks,
@@ -2026,7 +2032,7 @@ impl Looper {
             provider.clone(),
             runtime.facts(),
             1_000_000,
-            TERMS,
+            decide_terms(),
             Nodes::default(),
             WorkerParts {
                 terms: worker_terms,
@@ -2623,7 +2629,7 @@ fn serve_with_a_node_a_vault_and_a_browser(scratch: &Scratch) -> (Runtime, Serve
         Scripted::new(),
         runtime.facts(),
         1_000_000,
-        TERMS,
+        decide_terms(),
         nodes,
         workers(Some(vault), Some(browser)),
         Some(Arc::new(pstack)),
@@ -2794,7 +2800,7 @@ fn serve_with_run_code(scratch: &Scratch) -> (Runtime, Served, PathBuf) {
         Scripted::new(),
         runtime.facts(),
         1_000_000,
-        TERMS,
+        decide_terms(),
         Nodes::default(),
         parts,
         None,
@@ -3019,7 +3025,7 @@ async fn a_host_with_only_a_pstack_gives_a_seat_read_and_refuses_the_rest_with_w
         Scripted::new(),
         runtime.facts(),
         1_000_000,
-        TERMS,
+        decide_terms(),
         Nodes::default(),
         workers(None, None),
         Some(Arc::new(pstack)),
@@ -3076,7 +3082,7 @@ async fn without_a_pstack_only_a_seat_on_a_repository_holds_read_of_its_own_clon
         Scripted::new(),
         runtime.facts(),
         1_000_000,
-        TERMS,
+        decide_terms(),
         Nodes::default(),
         workers(None, None),
         None,

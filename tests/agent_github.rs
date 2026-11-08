@@ -6171,6 +6171,7 @@ impl Forged {
                         max_pushes: 6,
                         max_repairs: 2,
                     }),
+                    upstream: None,
                 }),
             )
             .unwrap();

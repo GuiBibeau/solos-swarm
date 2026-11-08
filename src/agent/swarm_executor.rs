@@ -835,6 +835,7 @@ mod tests {
             },
             budget_microusd: Some(500_000),
             repo: None,
+            upstream: None,
             recovery: false,
             inputs: Vec::new(),
             earlier: Vec::new(),

@@ -87,6 +87,7 @@ fn accept(plan: Plan, budget: u64) -> Verdict {
         rules: Vec::new(),
         repo: None,
         forge: None,
+        upstream: None,
     })
 }
 
@@ -184,6 +185,89 @@ fn explicit_request_runs_to_a_result_in_the_same_thread() {
     assert_eq!(
         t.ended.as_ref().map(|e| e.outcome),
         Some(TicketOutcome::Completed)
+    );
+}
+
+#[test]
+fn a_declined_accept_records_a_declined_decision_and_tells_the_requester_once() {
+    let told = "I can't work on acme/widgets here: its code may go only to anthropic, and this \
+                agent runs no anthropic model. Nothing was started.";
+    let mut w = World::new(policy());
+    let eval = w.receive_and_start_eval(slack(
+        "t1",
+        Actor::person("alice"),
+        Addressed::Mention,
+        "th1",
+        "@agent fix the widgets",
+    ));
+    w.effects();
+    let decision = w
+        .engine
+        .decide(
+            &eval,
+            Verdict::Decline {
+                reason: told.into(),
+                told: told.into(),
+            },
+        )
+        .unwrap();
+    let record = w.engine.repos().decisions[&decision].clone();
+    assert_eq!(record.kind, DecisionKind::Declined);
+    assert_eq!(record.ticket, None);
+    assert!(record.reason.contains("Nothing was started"), "{record:?}");
+    assert!(w.engine.repos().tickets.is_empty(), "nothing started");
+    let effects = w.effects();
+    assert!(launched(&effects).is_empty());
+    assert_eq!(sent(&effects), [(MessageKind::Result, told.to_owned())]);
+    let [Effect::Send(message)] = &effects[..] else {
+        panic!("one send: {effects:?}")
+    };
+    assert_eq!(message.ticket, None);
+    assert_eq!(message.channel.address["thread_ts"], "th1");
+
+    // The Eval is decided once, and no second sentence goes out.
+    assert!(
+        w.engine
+            .decide(
+                &eval,
+                Verdict::Decline {
+                    reason: told.into(),
+                    told: told.into(),
+                }
+            )
+            .is_err()
+    );
+    assert!(w.effects().is_empty());
+}
+
+#[test]
+fn a_declined_inferred_accept_tells_nobody() {
+    let mut w = World::new(policy());
+    let eval = w.receive_and_start_eval(slack(
+        "t1",
+        Actor::person("alice"),
+        Addressed::Unaddressed,
+        "th1",
+        "the deploy script crashes",
+    ));
+    w.effects();
+    let decision = w
+        .engine
+        .decide(
+            &eval,
+            Verdict::Decline {
+                reason: "declined".into(),
+                told: "declined".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        w.engine.repos().decisions[&decision].kind,
+        DecisionKind::Declined
+    );
+    assert!(
+        w.effects().is_empty(),
+        "an inferred request buys no message, so an outsider cannot make the agent post"
     );
 }
 
@@ -561,6 +645,7 @@ fn uncapped(plan: Plan) -> Verdict {
     };
     Verdict::Accept(Accept {
         budget_microusd: None,
+        upstream: None,
         ..accept
     })
 }

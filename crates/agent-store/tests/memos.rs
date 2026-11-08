@@ -216,7 +216,7 @@ fn a_schema_7_file_opens_with_its_rows_and_chain_and_then_holds_memos() {
     drop(raw);
 
     let mut e = engine(&db, &now);
-    assert_eq!(e.repos().schema_version().unwrap(), 10);
+    assert_eq!(e.repos().schema_version().unwrap(), 11);
     assert_eq!(sqlite_contents(e.repos()), before);
     assert_eq!(e.repos().verify_chain().unwrap(), chain);
     let id = remember(&mut e, MemoScope::Global, "Answer in French.");
@@ -251,7 +251,7 @@ fn a_schema_8_file_opens_at_the_latest_version_and_its_memos_read_back_as_supers
     drop(raw);
 
     let e = engine(&db, &now);
-    assert_eq!(e.repos().schema_version().unwrap(), 10);
+    assert_eq!(e.repos().schema_version().unwrap(), 11);
     let active = e
         .repos()
         .read_memo(&MemoId::new("mm_v8active"))

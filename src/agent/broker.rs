@@ -19,6 +19,7 @@ use super::config::{ExecutorConfig, RepoConfig};
 use super::environment::{Environments, ExecutionEnvironment, Harvested, Nodes};
 use super::forge::REPO_JSON;
 use super::jobs::{Host, JobLimits, Jobs, Refused};
+use super::models::{ModelPolicy, Provider as ModelProvider, Role as ModelRole};
 use super::pi_executor::private_dir;
 use super::ports::{Applied, Fact, FactSink, Forge, Proposal, Refusal as Unadmitted, Workspace};
 use super::pstack::{self, Pstack, Reader};
@@ -45,8 +46,8 @@ use solos_agent_core::change::{CommitSha, Deliverable, Harvest, RepoName};
 use solos_agent_core::delivery::{Admission, NotReady, ready_gate};
 use solos_agent_core::memo::MemoAudience;
 use solos_agent_core::model::{
-    Accept, Acknowledge, AssignmentId, EvalId, Method, MicroUsd, Ms, Plan, ReportIn, ReportStatus,
-    ThreadKey, Ticket, TicketId, Trigger, TriggerId, Verdict,
+    Accept, Acknowledge, AssignmentId, DecisionKind, EvalId, Method, MicroUsd, Ms, Plan, ReportIn,
+    ReportStatus, Strength, ThreadKey, Ticket, TicketId, Trigger, TriggerId, Verdict,
 };
 use solos_agent_store::{
     Charge, HoldId, HoldRequest, Reservation, SqliteStore, StoreError, Tokens,
@@ -633,6 +634,15 @@ pub struct DecideTerms {
     pub swarm: Option<SwarmTerms>,
     /// The repositories an accept may name, from `forge.repos`.
     pub repos: BTreeMap<RepoName, RepoConfig>,
+    /// Which providers may read each repository's text, and the upstream
+    /// each repository's workers run on. The host picks the upstream from
+    /// here; the Router never names one.
+    pub models: ModelPolicy,
+    /// The provider the Router's own model calls go to. `None` for a
+    /// scripted Router, which reads no text: then no card can carry a
+    /// repository's text to a provider, and the GitHub-thread accept rule
+    /// has nothing to protect.
+    pub router_provider: Option<ModelProvider>,
 }
 
 /// The Goal templates a swarm plan may name.
@@ -696,6 +706,49 @@ impl DecideTerms {
         }
     }
 
+    /// An accept whose Eval holds a Trigger on `github:R#n`, where R's router
+    /// role does not admit the Router's provider, must name R. Otherwise a
+    /// Ticket with no repository would take R's issue text as its Inputs and
+    /// hand it to a worker on another provider.
+    fn admit_github_threads(
+        &self,
+        triggers: &[Trigger],
+        repo: Option<&RepoName>,
+    ) -> std::result::Result<(), String> {
+        let Some(router) = self.router_provider else {
+            return Ok(());
+        };
+        for trigger in triggers {
+            for thread in &trigger.threads {
+                let Some(on) = super::github::thread_repo(thread) else {
+                    continue;
+                };
+                if self.models.admits(Some(&on), ModelRole::Router, router) {
+                    continue;
+                }
+                if repo == Some(&on) {
+                    continue;
+                }
+                let why = match self.models.allowed(&on, ModelRole::Router) {
+                    Some(allowed) if !allowed.is_empty() => format!(
+                        "{on}'s text may go only to {} for the router here",
+                        allowed
+                            .iter()
+                            .map(|provider| provider.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" or ")
+                    ),
+                    _ => format!("no provider may read {on}'s text for the router here"),
+                };
+                return Err(format!(
+                    "this eval's triggers are on {thread}, and {why}: an accept from that thread \
+                     must name {on}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// What `config` lets an accept name: above `policy.auto_approve_microusd`
     /// only when Slack or Discord can take the approval its Ticket then waits
     /// for, and a swarm only when `executor.swarm` runs one.
@@ -722,6 +775,13 @@ impl DecideTerms {
                 .as_ref()
                 .map(|forge| forge.repos().clone())
                 .unwrap_or_default(),
+            models: ModelPolicy::from_config(config).expect("config load checked the model policy"),
+            router_provider: match &config.router {
+                super::config::RouterConfig::Pi { provider, .. } => {
+                    ModelProvider::named(provider).ok()
+                }
+                super::config::RouterConfig::Scripted { .. } => None,
+            },
         }
     }
 }
@@ -1362,6 +1422,30 @@ impl AgentBroker {
         .flatten()
     }
 
+    /// The running Eval's strength and Triggers: what an accept must check
+    /// beyond the Router's words. `None` when `eval` is not running, and then
+    /// the Engine refuses the Decision itself.
+    async fn eval_context(&self, eval: &EvalId) -> Result<(Option<Strength>, Vec<Trigger>)> {
+        use solos_agent_core::ports::Repositories as _;
+        let eval = eval.clone();
+        self.store(move |store| {
+            let Some(key) = store.thread_of_eval(&eval) else {
+                return Ok((None, Vec::new()));
+            };
+            let Some(running) = store.read_thread(&key)?.and_then(|thread| thread.eval) else {
+                return Ok((None, Vec::new()));
+            };
+            let mut triggers = Vec::new();
+            for id in &running.triggers {
+                if let Some(trigger) = store.read_trigger(id)? {
+                    triggers.push(trigger);
+                }
+            }
+            Ok((Some(running.strength), triggers))
+        })
+        .await
+    }
+
     /// Run `work` on the broker's Store connection off the async threads.
     async fn store<T: Send + 'static>(
         &self,
@@ -1877,7 +1961,7 @@ enum Choice {
     Stop,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum PlanKind {
     Session,
@@ -1921,10 +2005,12 @@ struct DecideArgs {
 
 impl DecideArgs {
     /// `origin`: the Source of the Trigger that gave the Eval its strength.
+    /// `triggers`: the Eval's Triggers, for the GitHub-thread accept rule.
     fn verdict(
         self,
         terms: &DecideTerms,
         origin: Option<&str>,
+        triggers: &[Trigger],
     ) -> std::result::Result<(EvalId, Verdict), String> {
         let reason = self.reason.trim().to_owned();
         if reason.is_empty() {
@@ -1942,6 +2028,26 @@ impl DecideArgs {
                     .as_deref()
                     .map(|name| terms.repo(name))
                     .transpose()?;
+                terms.admit_github_threads(triggers, repo.as_ref().map(|(name, _)| name))?;
+                // The host picks the upstream; the Router never names one. A
+                // repository no upstream here serves is declined, and the
+                // person who asked hears why.
+                if self.plan.unwrap_or(PlanKind::Session) == PlanKind::Session
+                    && let Some((name, _)) = &repo
+                    && terms.models.worker_upstream(name).is_none()
+                {
+                    let told = terms.models.decline_sentence(name);
+                    return Ok((
+                        self.eval,
+                        Verdict::Decline {
+                            reason: told.clone(),
+                            told,
+                        },
+                    ));
+                }
+                let upstream = repo
+                    .as_ref()
+                    .and_then(|(name, _)| terms.models.worker_choice(name));
                 let plan = match (self.plan.unwrap_or(PlanKind::Session), self.agents) {
                     (PlanKind::Session, None) if self.goal_template.is_none() => {
                         let method = match (&repo, self.deliverable) {
@@ -1965,7 +2071,9 @@ impl DecideArgs {
                             }
                         };
                         Plan::Session {
-                            harness: None,
+                            // The harness is the upstream's: the host picked
+                            // it from the repository's policy at accept.
+                            harness: upstream.as_ref().map(|upstream| upstream.harness.clone()),
                             environment: self.environment,
                             method,
                         }
@@ -2057,6 +2165,7 @@ impl DecideArgs {
                     rules: self.rules,
                     repo: repo.map(|(name, _)| name),
                     forge,
+                    upstream: upstream.map(Box::new),
                 })
             }
         };
@@ -2087,9 +2196,14 @@ async fn decide(broker: &AgentBroker, args: Value) -> Reply {
         ));
     }
     let origin = broker.origin_source(&args.eval).await;
+    let (strength, triggers) = broker.eval_context(&args.eval).await.map_err(failed)?;
     let (eval, verdict) = args
-        .verdict(&broker.inner.decide, origin.as_deref())
+        .verdict(&broker.inner.decide, origin.as_deref(), &triggers)
         .map_err(|why| refuse(StatusCode::UNPROCESSABLE_ENTITY, why))?;
+    let told = match &verdict {
+        Verdict::Decline { told, .. } => Some(told.clone()),
+        _ => None,
+    };
     let answer = broker
         .inner
         .facts
@@ -2097,13 +2211,27 @@ async fn decide(broker: &AgentBroker, args: Value) -> Reply {
         .await
         .map_err(failed)?;
     match answer {
-        Ok(Applied::Decision(decision)) => Ok(Json(json!({
-            "decision": decision.id,
-            "kind": decision.kind,
-            "ticket": decision.ticket,
-            "would_accept": decision.would_accept,
-            "reason": decision.reason,
-        }))),
+        Ok(Applied::Decision(decision)) => {
+            let mut reply = json!({
+                "decision": decision.id,
+                "kind": decision.kind,
+                "ticket": decision.ticket,
+                "would_accept": decision.would_accept,
+                "reason": decision.reason,
+            });
+            if decision.kind == DecisionKind::Declined {
+                reply["told"] = match (strength, &told) {
+                    (Some(Strength::Explicit), Some(told)) => {
+                        json!(format!("The person who asked was told: {told}"))
+                    }
+                    _ => json!(
+                        "Nobody was told: only an explicit request is answered, and nothing \
+                         started."
+                    ),
+                };
+            }
+            Ok(Json(reply))
+        }
         Ok(_) => Ok(Json(json!({"applied": true}))),
         Err(why) => Err(refuse(StatusCode::CONFLICT, why)),
     }
@@ -2608,14 +2736,21 @@ mod tests {
         refuse,
     };
     use crate::agent::config::RepoConfig;
+    use crate::agent::models::{ModelPolicy, Provider as ModelProvider};
     use axum::{Json, http::StatusCode};
     use serde_json::json;
     use solos_agent_core::change::{Deliverable, RepoName};
     use solos_agent_core::model::{
-        Acknowledge, AssignmentId, Method, Plan, ReportStatus, TicketId, Verdict,
+        Acknowledge, AssignmentId, Method, Plan, ReportStatus, TicketId, UpstreamChoice, Verdict,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+
+    /// A policy naming `acme/widgets` with `models` under it, and the
+    /// executor's `upstreams` when given.
+    fn policy(models: &str, upstreams: &str) -> ModelPolicy {
+        crate::agent::models::test_policy(models, upstreams)
+    }
 
     fn terms() -> DecideTerms {
         DecideTerms {
@@ -2627,6 +2762,7 @@ mod tests {
                 default_budget_microusd: None,
             }),
             repos: BTreeMap::new(),
+            models: policy("{allow: [deepseek]}", ""),
             ..DecideTerms::default()
         }
     }
@@ -2636,8 +2772,17 @@ mod tests {
     }
 
     fn verdict_under(terms: &DecideTerms, args: serde_json::Value) -> Result<Verdict, String> {
+        verdict_with(terms, args, &[])
+    }
+
+    fn verdict_with(
+        terms: &DecideTerms,
+        args: serde_json::Value,
+        triggers: &[solos_agent_core::model::Trigger],
+    ) -> Result<Verdict, String> {
         let args: DecideArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
-        args.verdict(terms, None).map(|(_, verdict)| verdict)
+        args.verdict(terms, None, triggers)
+            .map(|(_, verdict)| verdict)
     }
 
     #[test]
@@ -2845,7 +2990,7 @@ mod tests {
             verdict_under(&with_repos, args)
         };
         let owes = |deliverable| Plan::Session {
-            harness: None,
+            harness: Some("pi".into()),
             environment: None,
             method: Some(Method { deliverable }),
         };
@@ -2941,6 +3086,173 @@ mod tests {
         assert_eq!(
             verdict(elsewhere),
             Err("this agent works on no repository; accept the work without a repo".to_owned())
+        );
+    }
+
+    fn widgets_repo() -> RepoConfig {
+        RepoConfig {
+            about: "Widgets.".into(),
+            base: "main".into(),
+            owes: Deliverable::Answer,
+            ..RepoConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_repository_no_allowed_upstream_runs_here_is_declined_with_the_told_sentence() {
+        let widgets = RepoName::try_from("acme/widgets".to_owned()).unwrap();
+        let terms = DecideTerms {
+            repos: BTreeMap::from([(widgets.clone(), widgets_repo())]),
+            models: policy("{allow: [anthropic]}", ""),
+            ..terms()
+        };
+        let said = "I can't work on acme/widgets here: its code may go only to anthropic, and \
+                    this agent runs no anthropic model. Nothing was started.";
+        assert_eq!(
+            verdict_under(
+                &terms,
+                json!({"eval":"ev_1","decision":"accept","reason":"asked","title":"T",
+                       "scope":"S","repo":"acme/widgets"})
+            ),
+            Ok(Verdict::Decline {
+                reason: said.into(),
+                told: said.into(),
+            })
+        );
+    }
+
+    #[test]
+    fn an_accept_from_a_restricted_repositorys_github_thread_must_name_it() {
+        let widgets = RepoName::try_from("acme/widgets".to_owned()).unwrap();
+        let terms = DecideTerms {
+            repos: BTreeMap::from([(widgets.clone(), widgets_repo())]),
+            models: policy(
+                "{allow: {router: [anthropic], worker: [deepseek], memory: [deepseek]}}",
+                "",
+            ),
+            router_provider: Some(ModelProvider::Deepseek),
+            ..terms()
+        };
+        let on_widgets = solos_agent_core::model::Trigger {
+            id: solos_agent_core::model::TriggerId::new("t-1"),
+            source: "github".into(),
+            at_ms: 1,
+            actor: solos_agent_core::model::Actor::person("alice"),
+            addressed: solos_agent_core::model::Addressed::Mention,
+            text: "please fix the retry test".into(),
+            threads: vec![crate::agent::github::thread("acme/widgets", 12)],
+            reply_to: vec![crate::agent::github::reply_to("acme/widgets", 12)],
+            meta: json!({}),
+        };
+
+        let refused = verdict_with(
+            &terms,
+            json!({"eval":"ev_1","decision":"accept","reason":"asked","title":"T","scope":"S"}),
+            std::slice::from_ref(&on_widgets),
+        )
+        .unwrap_err();
+        assert!(refused.contains("must name acme/widgets"), "{refused}");
+
+        let named = json!({"eval":"ev_1","decision":"accept","reason":"asked","title":"T",
+                           "scope":"S","repo":"acme/widgets"});
+        assert!(matches!(
+            verdict_with(&terms, named, std::slice::from_ref(&on_widgets)),
+            Ok(Verdict::Accept(_))
+        ));
+
+        // When the repository's router role admits the Router's provider the
+        // thread rule has nothing to protect, and an accept may name none.
+        let open = DecideTerms {
+            models: policy(
+                "{allow: {router: [deepseek], worker: [deepseek], memory: [deepseek]}}",
+                "",
+            ),
+            ..terms
+        };
+        assert!(matches!(
+            verdict_with(
+                &open,
+                json!({"eval":"ev_1","decision":"accept","reason":"asked","title":"T",
+                       "scope":"S"}),
+                std::slice::from_ref(&on_widgets)
+            ),
+            Ok(Verdict::Accept(_))
+        ));
+    }
+
+    #[test]
+    fn an_accept_names_the_worker_upstream_and_its_harness() {
+        let widgets = RepoName::try_from("acme/widgets".to_owned()).unwrap();
+        let default = DecideTerms {
+            repos: BTreeMap::from([(widgets.clone(), widgets_repo())]),
+            ..terms()
+        };
+        let Ok(Verdict::Accept(accept)) = verdict_under(
+            &default,
+            json!({"eval":"ev_1","decision":"accept","reason":"asked","title":"T",
+                   "scope":"S","repo":"acme/widgets"}),
+        ) else {
+            panic!("refused")
+        };
+        assert_eq!(
+            accept.upstream.as_deref(),
+            Some(&UpstreamChoice {
+                name: "default".into(),
+                provider: "deepseek".into(),
+                model: "deepseek-flash".into(),
+                harness: "pi".into(),
+            })
+        );
+        assert_eq!(
+            accept.plan,
+            Plan::Session {
+                harness: Some("pi".into()),
+                environment: None,
+                method: Some(Method {
+                    deliverable: Deliverable::Answer
+                }),
+            }
+        );
+
+        let venice = "  upstreams:
+    venice:
+      provider: venice
+      model: zai-org-glm-5
+      wire: chat
+      harness: pi
+      key_file: keys/venice.key
+      prices: {input_microusd_per_million: 300000, output_microusd_per_million: 1200000}
+";
+        let chosen = DecideTerms {
+            repos: BTreeMap::from([(widgets, widgets_repo())]),
+            models: policy("{allow: [deepseek, venice], worker: venice}", venice),
+            ..terms()
+        };
+        let Ok(Verdict::Accept(accept)) = verdict_under(
+            &chosen,
+            json!({"eval":"ev_1","decision":"accept","reason":"asked","title":"T",
+                   "scope":"S","repo":"acme/widgets"}),
+        ) else {
+            panic!("refused")
+        };
+        assert_eq!(
+            accept.upstream.as_deref(),
+            Some(&UpstreamChoice {
+                name: "venice".into(),
+                provider: "venice".into(),
+                model: "zai-org-glm-5".into(),
+                harness: "pi".into(),
+            })
+        );
+        assert_eq!(
+            accept.plan,
+            Plan::Session {
+                harness: Some("pi".into()),
+                environment: None,
+                method: Some(Method {
+                    deliverable: Deliverable::Answer
+                }),
+            }
         );
     }
 
@@ -3085,7 +3397,7 @@ mod tests {
                 auto_approve_microusd: 500_000,
                 ..terms()
             };
-            args.verdict(&terms, origin).map(|_| ())
+            args.verdict(&terms, origin, &[]).map(|_| ())
         };
 
         assert_eq!(
