@@ -1505,6 +1505,7 @@ mod tests {
             kind: DecisionKind::Unavailable,
             reason: "the Router did not decide in time".into(),
             ticket: None,
+            reply: None,
             would_accept: false,
             policy_version: "v1".into(),
             at_ms,

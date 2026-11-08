@@ -303,6 +303,7 @@ impl Op {
             Op::Decide(_, Verdict::Ignore { .. }) => "decide(ignore)",
             Op::Decide(_, Verdict::Stop { .. }) => "decide(stop)",
             Op::Decide(_, Verdict::Decline { .. }) => "decide(decline)",
+            Op::Decide(_, Verdict::Reply { .. }) => "decide(reply)",
             Op::Approve(..) => "approve",
             Op::Note(_) => "note",
             Op::StopTicket(..) => "stop_ticket",
@@ -2926,6 +2927,7 @@ fn show(cmd: &Op) -> String {
         Op::Decide(e, Verdict::Ignore { .. }) => format!("decide {e} ignore"),
         Op::Decide(e, Verdict::Stop { ticket, .. }) => format!("decide {e} stop {ticket}"),
         Op::Decide(e, Verdict::Decline { .. }) => format!("decide {e} decline"),
+        Op::Decide(e, Verdict::Reply { .. }) => format!("decide {e} reply"),
         Op::Approve(t, source, by) => format!("approve {t} by {source}:{} ({:?})", by.id, by.kind),
         Op::Note(t) => format!("note {t}"),
         Op::StopTicket(t, source, by) => {

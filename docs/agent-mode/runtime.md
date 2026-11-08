@@ -63,14 +63,25 @@ keep the transport's own limit.
 **Stale ids.** A decision on an Eval that is no longer running is refused, and the refusal lists the Evals open now,
 by Thread. Each prompt says that only its own ids can be decided.
 
-**Tools.** The Router has two tools and no `run_code` or `fetch_url`:
+**Tools.** The Router has four tools and no `run_code` or `fetch_url`:
 
-- `router_decide`, one flat object: the Eval, the decision, the reason, and the accept or stop fields. The Engine's
-  answer, or its refusal, goes back to the model. An accept names a Plan (a session or a swarm), a budget, and for a
-  repository Ticket a `repo` and a `deliverable`. A session accept may name an `environment` and a swarm accept a
-  `goal_template`.
+- `router_decide`, one flat object: the Eval, the decision, the reason, and the accept, stop or reply fields. The
+  Engine's answer, or its refusal, goes back to the model. An accept names a Plan (a session or a swarm), a budget,
+  and for a repository Ticket a `repo` and a `deliverable`. A session accept may name an `environment` and a swarm
+  accept a `goal_template`.
 - `router_read`: a Trigger, a Thread or a Ticket with its neighbours' ids, or memos (`{kind: memo, id: global}` or a
-  memo's id).
+  memo's id). A Thread's decisions carry what a `reply` said, so the next message in a conversation continues it.
+- `router_status`: the agent's own state, read through the Store's read-only connection: open Tickets with their
+  stage, age, plan, spend, waiting question and latest report, the recent Decisions, the pause and the Watchdog's
+  alerts. This is how the Router supervises the work it handed out.
+- `router_note`: a fact one of the agent's Tickets reads as new input. It starts nothing and grants nothing, so it is
+  how the Router steers work already running.
+
+**Reply.** `router_decide` with `decision: reply` answers the person in the chat itself: no Ticket and no worker, so
+conversation about the agent's own work — a status question, a thanks, a "what happened to my request?" — costs no
+session. The reply is sent once on the Trigger's own channels and recorded as a Decision of kind `answered`; on a web
+Thread the dashboard reads it from `notes/index.json` and shows it in the chat. Only an explicit request is answered:
+an inferred candidate is accepted or ignored, so an outsider's message never makes the agent post.
 
 The Pi extension picks the set with `SWARM_TOOLSET=router`, and takes the Router's system prompt from the broker.
 

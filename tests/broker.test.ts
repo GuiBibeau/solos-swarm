@@ -218,7 +218,8 @@ test("provider rejects malformed responses and handles denial and cancellation w
   }
 });
 
-const routerNames = ["router_decide", "router_read"];
+const routerNames = ["router_decide", "router_note", "router_read", "router_status"];
+const routerCalls = ["router_decide", "router_read"];
 
 test("the router tool set talks to the broker, takes its system prompt and sees a refused decision as a tool error", { timeout: 30_000 }, async (t) => {
   const dir = await mkdtemp(`${tmpdir()}/swarm-router-`);
@@ -241,7 +242,7 @@ test("the router tool set talks to the broker, takes its system prompt and sees 
         modelCalls++;
         assert.deepEqual(body.tools.map((tool: { function: { name: string } }) => tool.function.name).sort(), routerNames);
         const decide = body.tools.find((tool: { function: { name: string } }) => tool.function.name === "router_decide");
-        assert.deepEqual(decide.function.parameters.properties.decision.enum, ["accept", "ignore", "stop"]);
+        assert.deepEqual(decide.function.parameters.properties.decision.enum, ["accept", "ignore", "stop", "reply"]);
         assert.equal(decide.function.parameters.properties.environment.type, "string");
         const system = body.messages.find((message: { role: string }) => message.role === "system");
         assert.ok(JSON.stringify(system?.content ?? "").includes("You are the test Router."), JSON.stringify(body.messages));
@@ -323,7 +324,7 @@ test("the router tool set talks to the broker, takes its system prompt and sees 
     await settled;
     assert.equal(modelCalls, 2, `${stderr}\n${JSON.stringify(records.filter((record) => record.type === "message_end"))}`);
     assert.equal(sessionCalls, 1);
-    assert.deepEqual(toolCalls.sort(), routerNames);
+    assert.deepEqual(toolCalls.sort(), routerCalls);
     const ends = records.filter((record) => record.type === "tool_execution_end");
     const decided = ends.find((record) => record.toolName === "router_decide");
     assert.equal(decided?.isError, true, JSON.stringify(ends));

@@ -240,9 +240,12 @@ pub struct Notes {
 pub struct NoteView {
     pub thread: String,
     pub at_ms: Ms,
-    /// `accept`, `ignore`, `stop`, `unavailable` or `declined`.
+    /// `accept`, `ignore`, `stop`, `unavailable`, `declined` or `answered`.
     pub kind: &'static str,
     pub reason: String,
+    /// What the Router said when it answered the person itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -365,6 +368,7 @@ pub fn decision_kind(kind: DecisionKind) -> &'static str {
         DecisionKind::Stop => "stop",
         DecisionKind::Unavailable => "unavailable",
         DecisionKind::Declined => "declined",
+        DecisionKind::Answered => "answered",
     }
 }
 
@@ -398,6 +402,7 @@ pub fn note_view(decision: &Decision) -> NoteView {
         at_ms: decision.at_ms,
         kind: decision_kind(decision.kind),
         reason: decision.reason.clone(),
+        text: decision.reply.clone(),
     }
 }
 

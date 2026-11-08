@@ -232,6 +232,27 @@ describe("the chat page", () => {
     expect(out).toContain("Nothing to hand to a worker.");
   });
 
+  it("shows the Router's own answer when it answered the message itself", async () => {
+    readIndex.mockResolvedValue({ ...index, tickets: [webRow, ...index.tickets] });
+    readTicket.mockResolvedValue(null);
+    readNotes.mockResolvedValue({
+      v: 1,
+      notes: [
+        {
+          thread: `web:${thread}`,
+          at_ms: NOW - 1000,
+          kind: "answered",
+          reason: "a question about the agent's own work",
+          text: "Two tickets are open: the release notes and the flaky test.",
+        },
+      ],
+    });
+    const out = await html(Chat({ searchParams: Promise.resolve({ t: thread }) }));
+    expect(out).toContain("replied");
+    expect(out).toContain("Two tickets are open: the release notes and the flaky test.");
+    expect(out).not.toContain("no ticket");
+  });
+
   it("starts a new conversation with the starters when the thread has no ticket yet", async () => {
     // The fixture index has one web conversation; this case is the empty list.
     readIndex.mockResolvedValue({

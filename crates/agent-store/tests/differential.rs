@@ -145,6 +145,7 @@ impl Op {
             Op::Decide(_, Verdict::Ignore { .. }) => "decide(ignore)",
             Op::Decide(_, Verdict::Stop { .. }) => "decide(stop)",
             Op::Decide(_, Verdict::Decline { .. }) => "decide(decline)",
+            Op::Decide(_, Verdict::Reply { .. }) => "decide(reply)",
             Op::Approve(..) => "approve",
             Op::Note(_) => "note",
             Op::StopTicket(_) => "stop_ticket",

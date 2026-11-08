@@ -2017,6 +2017,7 @@ impl<R: Repositories> Tx<'_, R> {
                     kind: DecisionKind::Unavailable,
                     reason: "the Router did not decide in time".into(),
                     ticket: None,
+                    reply: None,
                     would_accept: false,
                     policy_version: eval.policy_version,
                     at_ms: self.now,
@@ -2066,6 +2067,7 @@ impl<R: Repositories> Tx<'_, R> {
                         .join("; ")
                 ),
                 ticket: None,
+                reply: None,
                 would_accept: false,
                 policy_version: version.clone(),
                 at_ms: self.now,
@@ -2149,6 +2151,7 @@ impl<R: Repositories> Tx<'_, R> {
             kind: DecisionKind::Ignore,
             reason: String::new(),
             ticket: None,
+            reply: None,
             would_accept: false,
             policy_version: version.clone(),
             at_ms: self.now,
@@ -2207,6 +2210,36 @@ impl<R: Repositories> Tx<'_, R> {
                             channel: channel.clone(),
                             kind: MessageKind::Result,
                             text: told.clone(),
+                            ticket: None,
+                            ask: None,
+                        }));
+                    }
+                }
+            }
+            Verdict::Reply { text, reason } => {
+                if current.strength != Strength::Explicit {
+                    return Err(Error::Refused(
+                        "only an explicit request is answered".into(),
+                    ));
+                }
+                if text.trim().is_empty() {
+                    return Err(Error::Invalid("a reply needs a text".into()));
+                }
+                decision.kind = DecisionKind::Answered;
+                decision.reason = reason;
+                decision.reply = Some(text.clone());
+                // The person who asked hears it on the channels their message
+                // came from. There is no Ticket to retry the Send from, so its
+                // id comes from the Decision, as a Decline's does.
+                if let Some(primary) = self.trigger(&current.primary) {
+                    for (n, channel) in primary.reply_to.iter().enumerate() {
+                        let id =
+                            MessageId(key("ms", &[decision.id.as_str(), "reply", &n.to_string()]));
+                        self.effect(Effect::Send(OutboundMessage {
+                            id,
+                            channel: channel.clone(),
+                            kind: MessageKind::Result,
+                            text: text.clone(),
                             ticket: None,
                             ask: None,
                         }));

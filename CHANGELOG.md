@@ -350,6 +350,14 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   messages are always answered — where the Router would ignore a web message, the host starts a session with the
   message as its scope. The production config sets `[web]`. Each conversation carries an idle/working/needs-you mark,
   and the chat no longer shows one answer twice when the delivered result and the worker's ready report share a text.
+- Agent mode, the Router as the chat's supervisor (#140): `router_status` reads the agent's own state (open Tickets with
+  stage, age, plan, spend, waiting question and latest report, recent Decisions, the pause and the Watchdog's alerts
+  through the Store's read-only connection), `router_note` steers a running Ticket with a fact its worker reads as new
+  input, and `router_decide` takes `decision: reply`: the Router answers the person itself, once, on the Trigger's own
+  channels, with no Ticket and no worker (Decision kind `answered`, kept with the `reply` text; only an explicit request
+  is answered). The Router's prompt tells it to supervise with `router_status`, steer with `router_note` and answer
+  conversation with `reply`; the dashboard renders an `answered` note as the agent's chat message from
+  `notes/index.json`, and `router_read` of a Thread carries each reply so the next message continues the conversation.
 - Agent mode, the publisher's web notes (#138): `agent publish` uploads `notes/index.json` with the latest 50 Decisions
   on `web:` Threads (newest last; Thread, time, kind and reason, every kind including `declined`), so the dashboard's
   chat can show why a web message became no Ticket instead of leaving it silent. It goes up only when its content

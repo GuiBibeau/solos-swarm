@@ -347,6 +347,7 @@ fn decision_name(kind: DecisionKind) -> &'static str {
         DecisionKind::Stop => "stop",
         DecisionKind::Unavailable => "unavailable",
         DecisionKind::Declined => "declined",
+        DecisionKind::Answered => "answered",
     }
 }
 

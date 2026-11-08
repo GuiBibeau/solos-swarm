@@ -1795,6 +1795,47 @@ fn decided_store(scratch: &Scratch) {
         .unwrap();
 }
 
+#[test]
+fn an_answered_decision_carries_the_routers_reply_in_the_notes() {
+    let scratch = Scratch::new("answered-note");
+    let now = std::rc::Rc::new(std::cell::Cell::new(NOTE_AT));
+    let clock = {
+        let now = now.clone();
+        move || now.get()
+    };
+    let policy = AllowlistPolicy {
+        people: [format!("web:{GUI}")].into(),
+        ..AllowlistPolicy::default()
+    };
+    let mut engine = Engine::new(SqliteStore::open(scratch.db()).unwrap(), policy, clock);
+    engine
+        .receive(web_request("t-web", NOTE_THREAD, "what is the status?"))
+        .unwrap();
+    let eval = engine.evaluate_due().unwrap().remove(0);
+    engine
+        .decide(
+            &eval,
+            Verdict::Reply {
+                text: "Two tickets are open: the release notes and the flaky test.".into(),
+                reason: NOTE_REASON.into(),
+            },
+        )
+        .unwrap();
+
+    let built = scratch.source().build().unwrap();
+    let notes = value(&built.notes);
+    let [note] = notes["notes"].as_array().unwrap().as_slice() else {
+        panic!("one answered note: {notes}")
+    };
+    assert_eq!(note["thread"], format!("web:{NOTE_THREAD}"));
+    assert_eq!(note["kind"], "answered");
+    assert_eq!(
+        note["text"],
+        "Two tickets are open: the release notes and the flaky test."
+    );
+    assert_eq!(note["reason"], NOTE_REASON);
+}
+
 #[tokio::test]
 async fn the_notes_blob_has_the_shape_the_dashboard_reads_and_feeds_its_fixtures() {
     let scratch = Scratch::new("notes");
