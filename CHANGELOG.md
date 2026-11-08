@@ -335,6 +335,10 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   carbon, hairline panels and lavender only on live data. A failed or stale read shows a quiet notice instead of
   taking the page down. `DASHBOARD_FIXTURES=1 npm run dev` previews every screen from the test fixtures without a
   deployment, and cannot open a production build.
+- Agent dashboard, web chat (#133): the hosted command center's home is now a live chat with the agent — the thread
+  with each worker's reports in the middle, recent web conversations on the left, and what the swarm is doing on the
+  right — polled every two seconds, with the thread kept in the address and a server-side message write to a private
+  Blob inbox. Discord and GitHub stay their own sources; the full field moved to `/command`.
 
 ### Fixed
 
