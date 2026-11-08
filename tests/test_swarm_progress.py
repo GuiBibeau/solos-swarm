@@ -2,9 +2,13 @@
 
 import importlib.util
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 root = Path(__file__).parents[1]
 
@@ -54,6 +58,17 @@ class ProgressTests(unittest.TestCase):
     def test_missing_state_is_a_clean_error(self):
         with tempfile.TemporaryDirectory() as directory, self.assertRaises(ValueError):
             progress.summarize(directory)
+
+    def test_run_id_resolves_under_state_runs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / ".local/state/solos-swarm"
+            (state / "runs/tourney-1").mkdir(parents=True)
+            run_dir(state / "runs/tourney-1")
+            with patch.dict(os.environ, {"HOME": directory}):
+                result = subprocess.run([sys.executable, str(root / "scripts/swarm_progress.py"),
+                                         "--run-id", "tourney-1", "--json"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["cap_microusd"], 20_000_000)
 
     def test_remote_status_brief_matches(self):
         with tempfile.TemporaryDirectory() as directory:

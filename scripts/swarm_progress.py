@@ -2,7 +2,7 @@
 """Read-only progress summary of one run from its state.json (and config.yaml).
 
     python3 scripts/swarm_progress.py RUN_DIR [--json]
-    python3 scripts/swarm_progress.py --run-id NAME      # ~/.local/state/solos-swarm/NAME on the host
+    python3 scripts/swarm_progress.py --run-id NAME      # ~/.local/state/solos-swarm/runs/NAME on the host
 
 Shows agents running/filed/deferred/partial, the ledger against the cap, and spend per task
 against its envelope. The ledger is the conservative one; see `cache_hit_price` in IMPROVEMENTS.md.
@@ -95,7 +95,7 @@ def main():
     if bool(args.run_dir) == bool(args.run_id):
         parser.error("give RUN_DIR or --run-id")
     try:
-        summary = summarize(args.run_dir or STATE / args.run_id)
+        summary = summarize(args.run_dir or STATE / "runs" / args.run_id)
     except ValueError as error:
         parser.exit(2, f"swarm_progress: {error}\n")
     print(json.dumps(summary, indent=2) if args.json else render(summary))
