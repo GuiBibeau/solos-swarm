@@ -272,6 +272,12 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
 - Design records: the vault and verifiable browser (#36, `docs/agent-mode/vault-browser/`), pstack as the coding method
   (#53, `docs/agent-mode/pstack/`) and the agent's GitHub App (#62, `docs/agent-mode/github-app/`). Docs matched to
   the code in #40, #41, #42, #44 and #50 (the live P10 run with a DeepSeek Router).
+- Agent mode, external jobs (#122): `watchdog.jobs` lists work that runs outside agent mode, and the Watchdog
+  checks each job on every look as the agent's user: a systemd user unit, a tmux session, a pid file or an
+  owner-written status command (exit 0 healthy, 2 stalled, anything else down), with optional progress-file and
+  free-disk floors. It tells the operator once an incident, keeps `state/watchdog-jobs.json`, and tells the same
+  conversation once when the job is back. `agent publish` uploads the file as `jobs/index.json`, and the dashboard
+  lists the jobs above the tickets.
 
 ### Changed
 
