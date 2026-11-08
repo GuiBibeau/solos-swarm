@@ -3,8 +3,12 @@
 This runbook is for the person who operates the always-on agent. One box runs `solos-swarm agent serve` as the systemd
 user unit `solos-agent`, with three helper units beside it: the dashboard publisher, the health check and the daily
 prune. You run `scripts/agent-deploy` on the Mac, in this repository, and it does the work on the box over SSH. The box
-is `remote-ai` unless `AGENT_HOST` names another. Everything on the box is under `~/agent`
-([layout](#layout-on-the-box)).
+is `remote-ai` unless `AGENT_HOST` names another, and the agent runs as the user that SSH logs in as (`AGENT_USER`
+names another). Everything on the box is under that user's `~/agent` ([layout](#layout-on-the-box)).
+
+Run the agent as a user of its own, with no sudo and no groups, so that anything that escapes a worker, or runs on the
+host from a repository, finds nothing else to take. [Hardening the units](#hardening-the-units) limits what the agent's
+processes can do, and [Run the agent as its own user](#run-the-agent-as-its-own-user) limits what the user owns.
 
 What each config key means is in [the agent-mode plan](README.md). This page says how to run the agent. The
 [Reference](#reference) at the end lists the units, the commands, the files and the limits.
@@ -20,11 +24,13 @@ Once per box:
 3. Install `bwrap` and `prlimit`, which the sandboxes need. For a repository with `deps`
    ([below](#install-a-repositorys-dependencies-and-require-evidence)), also install `bun` at `~/.bun/bin/bun`.
 4. Turn on lingering for that user (`loginctl enable-linger <user>`), so its units start at boot with nobody logged in.
-5. Make the directory the units go in: `mkdir -p ~/.config/systemd/user`.
-6. Write `~/agent/agent.yaml` ([the production config](#the-production-config)) and store the tokens it names
-   ([Store a token](#store-a-token)). A deploy refuses to switch without the config.
+5. Write `~/agent/agent.yaml` ([the production config](#the-production-config)) and store the tokens it names
+   ([Store a token](#store-a-token)). A deploy refuses to switch without the config. A deploy makes
+   `~/.config/systemd/user` and `~/agent/state` itself.
 
-The units' runtime directories are `/run/user/1000/...`, so the examples assume the agent runs as uid 1000.
+The units' runtime directories are `/run/user/<uid>/...`, where `<uid>` is `id -u` of the agent's user, and
+`agent.yaml` names them in `token_file` and `key_file`. The examples below write 1000, the first user of a box. A
+deploy refuses to switch when `agent.yaml` names another uid's directory, and says which.
 
 ## Store a token
 
@@ -47,7 +53,7 @@ vault key.
 ## The production config
 
 `~/agent/agent.yaml` on the box is the production config. It is not in git. This is its shape, with your values in
-`<...>`:
+`<...>`. `/run/user/1000` is the runtime directory of uid 1000; write the one of the agent's user (`id -u`):
 
 ```yaml
 # ~/agent/agent.yaml on the box
@@ -450,7 +456,7 @@ From then on, `deploy`, `rollback`, `start`, `stop` and `restart` install and re
 stop it while `agent.db` is backed up or restored, so it never reads a file being replaced.
 
 The publisher's unit copies `tokens/vercel-blob-token`, and only that, into its own runtime directory,
-`/run/user/1000/solos-agent-publish/`. `agent publish` reads it once and deletes it. The agent's unit does not copy this
+`/run/user/<uid>/solos-agent-publish/`. `agent publish` reads it once and deletes it. The agent's unit does not copy this
 token. A `web:` section without `publish:` only sets `public_url`, the link the Discord replies carry, and installs
 nothing.
 
@@ -526,7 +532,7 @@ open incident, which kinds were told, the restart count, whether the check made 
 config named, so a config that no longer loads is still told to the right channel.
 
 The check uses the agent's own bot token. Its `ExecStartPre` copies `~/agent/tokens/discord-token` into
-`/run/user/1000/solos-agent-health/` before each run, and the directory goes when the run ends. The check never starts,
+`/run/user/<uid>/solos-agent-health/` before each run, and the directory goes when the run ends. The check never starts,
 stops or restarts anything.
 
 Deploys do not alert. While `scripts/agent-deploy` stops and starts the agent, it writes `state/health-hold`, an expiry
@@ -582,6 +588,230 @@ To free space when the floor trips:
 2. Run `cargo clean` in `~/agent/target`, the build cache. The prune never touches it, and the next deploy rebuilds it.
 3. Delete old releases or backups only by hand. A deploy keeps five releases and twenty backups.
 
+## Hardening the units
+
+The agent runs what repositories ask of it: workers in `bwrap` sandboxes, and the host's own `git` and package manager.
+If a worker escapes its sandbox, or the host runs something it should not, the attacker is the agent's user. Every
+unit therefore limits what that user's processes can do, and the limits apply to every worker too, because a child
+inherits its parent's seccomp filters and `NoNewPrivileges`.
+
+A user unit cannot take every systemd sandboxing option, and some break `bwrap`. Each option below was tried on the
+box (Debian 13, systemd 257, bubblewrap 0.12.0, kernel 6.12) with transient units, against the real command lines of
+a `run_code` call (`src/code.rs`), a Pi session (`src/harness.rs`) and a dependency install (`src/agent/forge/deps.rs`),
+and then the finished unit text against the real `solos-swarm doctor`, `agent health --dry-run`, `agent prune
+--dry-run` and `agent publish --once` (against a copy of an old `agent.db` and a stand-in for the Blob API).
+
+systemd 257 gives a user unit that asks for a mount namespace an identity user namespace: its user maps to itself and
+every other user to `nobody`. So no option needs `PrivateUsers=`, and files that other users own show as `nobody`
+inside a unit.
+
+### What the units set
+
+| Option | What it does | Units |
+|---|---|---|
+| `NoNewPrivileges=yes` | `sudo` and any other setuid or file-capability program cannot raise privileges, in the unit and in every worker. | all |
+| `LockPersonality`, `RestrictRealtime`, `SystemCallArchitectures=native` | No `personality()` changes, no realtime scheduling, no 32-bit system calls. | all |
+| `SystemCallFilter=~@cpu-emulation @obsolete @raw-io @reboot @swap`, `SystemCallErrorNumber=EPERM` | Drops system calls no worker needs. A blocked call fails with `EPERM`; without the error number it would kill the process. | all |
+| `RestrictNamespaces` | `user mnt pid net ipc uts cgroup` for the agent: the seven namespaces `bwrap --unshare-all` makes, and no `time` namespace. `yes` (none) for the others. | all |
+| `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK` | No raw packet sockets, no vsock, no other families. Netlink is for name lookups and for `bwrap`'s loopback. | all |
+| `ProtectClock`, `ProtectKernelModules`, `ProtectControlGroups` | No setting the clock, no loading modules, a read-only `/sys/fs/cgroup`. | all |
+| `PrivateTmp=yes` | The unit's `/tmp` and `/var/tmp` are its own. | all |
+| `ProtectSystem=strict`, `ProtectHome=read-only`, `ReadWritePaths=%h/agent/state` | The file system is read-only except the state directory and the unit's runtime directory. The agent cannot change `agent.yaml`, `tokens/`, `releases/` (so not the program the unit starts), the units in `~/.config/systemd/user`, `~/.ssh` or a shell profile. The dashboard template has no `ReadWritePaths`: it writes nothing. | all |
+| `RestrictSUIDSGID`, `ProtectKernelTunables`, `RestrictNamespaces=yes` | The options that break `bwrap` ([below](#what-breaks-bwrap)). | every unit but `solos-agent.service` |
+
+`ProtectSystem=strict` alone leaves the home writable in a user unit, so `ProtectHome=read-only` is what confines the
+writes. A deploy makes `~/agent/state` before it starts the agent, because a unit whose `ReadWritePaths` is missing does
+not start (`226/NAMESPACE`).
+
+`systemd-analyze --user security --offline=true` scores the units 9.4 to 9.6 (UNSAFE) before and 6.7 for
+`solos-agent.service` and 5.7 for the helpers (MEDIUM) after.
+
+To check a running agent: `systemctl --user show solos-agent -p NoNewPrivileges -p ProtectHome -p ProtectSystem`, and
+`grep -E 'NoNewPrivs|Seccomp' /proc/$(systemctl --user show -p MainPID --value solos-agent)/status` should say
+`NoNewPrivs: 1` and `Seccomp: 2`.
+
+### What breaks bwrap
+
+These are not in `solos-agent.service`, and a test (`tests/agent_deploy.rs`) keeps `RestrictSUIDSGID`,
+`ProtectKernelTunables` and `MemoryDenyWriteExecute` out of it.
+
+| Option | What happens | Why |
+|---|---|---|
+| `RestrictSUIDSGID=yes` | `bwrap: Can't open source /usr: Function not implemented` | systemd cannot inspect the argument of `openat2()`, so it answers `ENOSYS`, and bubblewrap 0.12 opens its bind sources with `openat2()` and does not fall back. Denying only `openat2` gives the same error. `NoNewPrivileges` already stops a setuid file from granting anything. |
+| `ProtectKernelTunables=yes` | `bwrap: Can't mount proc on /proc: Operation not permitted` | systemd mounts `/proc/sys` and other paths read-only over `/proc`, and the kernel then refuses a fresh `proc` mount in `bwrap`'s user namespace. A user without privileges cannot write them anyway. |
+| `RestrictNamespaces=user mnt pid net ipc uts` | `bwrap: No permissions to create a new namespace` | `--unshare-all` also asks for a cgroup namespace. The list needs `cgroup`. |
+| `MemoryDenyWriteExecute=yes` | Pi's `node` dies in V8 (exit 133) | V8 needs memory that is writable and executable. |
+| `SystemCallFilter=@system-service` | The sandbox dies of `SIGSYS` | `bwrap` needs `mount`, `pivot_root` and others outside the list. `~@privileged` fails the same way (exit 255): `bwrap` needs `capset`. |
+| `CapabilityBoundingSet=` (empty) | `218/CAPABILITIES` | A user manager can drop capabilities only inside a user namespace, so it works only beside another option here. The process has no capabilities to drop, and `NoNewPrivileges` keeps it from gaining any. |
+| `ProtectHome=yes` or `tmpfs` | The unit cannot find `~/agent` | They hide `/home` and `/run/user`, where the agent and its runtime directory are. |
+
+`PrivateDevices`, `ProtectProc=invisible`, `ProcSubset=pid`, `ProtectHostname` and `PrivateIPC` also work with `bwrap`.
+They are not set, for little gain.
+
+After a systemd or bubblewrap upgrade, or to try another option, run `bwrap` the way a worker does inside a transient
+unit with the option, and the agent's own check:
+
+```sh
+ssh <box> 'systemd-run --user --wait --pipe -p NoNewPrivileges=yes -p ProtectHome=read-only \
+  /usr/bin/bwrap --unshare-all --die-with-parent --ro-bind /usr /usr --ro-bind-try /lib /lib --ro-bind-try /lib64 /lib64 \
+  --symlink usr/bin /bin --proc /proc --dev /dev /usr/bin/true'
+ssh <box> 'systemd-run --user --wait --pipe -p NoNewPrivileges=yes -p ProtectHome=read-only \
+  ~/agent/current/bin/solos-swarm doctor --pi-root ~/agent/current --node ~/.local/opt/node-v24.18.0-linux-x64/bin/node'
+```
+
+`doctor` ends with `"verdict":"PASS"`. Transient units start nothing of the agent's and go away when they exit.
+
+### What hardening does not do
+
+The units limit the agent's processes. They do not change what the user owns. The agent can still read everything the
+user can read: its whole home, including `~/.ssh`, and every other service's files that the user's groups open. On a
+box where the agent's user is also the owner of other production services, with sudo, that is a lot. Hence the next
+section.
+
+If the agent needs a path outside `~/agent/state` that is not covered here, such as a `trail.path` outside it, add a
+drop-in rather than editing the unit, because a deploy rewrites the unit: `systemctl --user edit solos-agent`, then
+`[Service]` and `ReadWritePaths=/that/path`. A tool that dies with `Operation not permitted` on a system call, or on
+a write to a path it used to write, points at one of these limits.
+
+## Run the agent as its own user
+
+Run the agent as a user that has no sudo, no extra groups and owns nothing else. Then an escape from a worker, or code
+that runs on the host from a repository, reaches the agent's own files and the network and nothing more. Today's box
+runs it as the main user, which has passwordless sudo and owns the other services.
+
+Nothing in the repository assumes a user name or uid. `scripts/agent-deploy` logs in as `AGENT_USER` when it is set,
+and as the SSH config's user otherwise. This section moves an agent from one user (`debian` below) to a new one
+(`solos-agent`). Do it when the agent has nothing running that you mind interrupting, and plan for the downtime of one
+cold build: the new user builds its own release. The old user's `~/agent` stays untouched until you are sure, so
+rolling back is starting it again.
+
+### 1. Make the user
+
+On the box, as a user with sudo. The user gets no `-G`, so no supplementary groups, and no sudo:
+
+```sh
+sudo useradd --create-home --shell /bin/bash --user-group solos-agent
+sudo loginctl enable-linger solos-agent
+id solos-agent                       # one group, solos-agent
+sudo -l -U solos-agent               # "User solos-agent is not allowed to run sudo"
+ls -d /run/user/$(id -u solos-agent) # exists: lingering started its systemd
+```
+
+From the Mac, put the key the Mac logs in with into the new user's `authorized_keys`, and check that it works:
+
+```sh
+ssh remote-ai "sudo -Hu solos-agent sh -c 'umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys'" < ~/.ssh/<key>.pub
+ssh -l solos-agent remote-ai id
+```
+
+`useradd` leaves the password locked, and keys still work because sshd uses PAM on Debian. If SSH refuses the account,
+set its password field to `*` with `sudo usermod -p '*' solos-agent`. `-l` beats the `User` of your ssh config for that
+one command, so the `remote-ai` alias and its key serve both users.
+
+### 2. Give it the build tools
+
+As the new user (`ssh -l solos-agent remote-ai`), the same as [Before you start](#before-you-start): rustup with
+toolchain 1.96.0, Node 24.18.0 at `~/.local/opt/node-v24.18.0-linux-x64/`, and `bun` at `~/.bun/bin/bun` for a repository
+with `deps`. `bwrap` and `prlimit` are the box's. Nothing is shared with the old user's home, which the new user cannot
+read.
+
+### 3. Stop the old agent
+
+From the Mac, as the old user. Only one process may hold the Discord bot's token, so the old agent stops first, and its
+units are disabled so that neither a reboot nor the old health check brings it or its alerts back:
+
+```sh
+scripts/agent-deploy releases                  # note the release marked (current)
+scripts/agent-deploy stop                      # drains, then stops the publisher and the agent
+ssh remote-ai 'systemctl --user disable --now solos-agent solos-agent-publish solos-agent-health.timer solos-agent-prune.timer'
+```
+
+Leave out `solos-agent-publish` if you never turned on the dashboard.
+
+### 4. Copy the data
+
+On the box, as a user with sudo. Copy `agent.yaml`, the tokens, the state and the backups. Do not copy `releases/`,
+`current`, `previous` or `target/`: the links are absolute paths into the old home, and the new user builds its own.
+
+```sh
+sudo install -d -m 0700 -o solos-agent -g solos-agent /home/solos-agent/agent
+sudo cp -a /home/debian/agent/{agent.yaml,tokens,state,backups} /home/solos-agent/agent/
+sudo rm -f /home/solos-agent/agent/state/broker.sock
+sudo chown -R solos-agent:solos-agent /home/solos-agent/agent
+```
+
+Then edit `/home/solos-agent/agent/agent.yaml`. Every `/run/user/<uid>/` path (`token_file`, `key_file`) takes the new
+uid, and every path under `/home/debian/` takes one the new user can read, such as `run_code` mounts of Node and `bun`:
+
+```sh
+sudo sed -i -E "s|/run/user/[0-9]+/|/run/user/$(id -u solos-agent)/|g; s|/home/debian/|/home/solos-agent/|g" \
+  /home/solos-agent/agent/agent.yaml
+sudo grep -n '/home/\|/run/user/' /home/solos-agent/agent/agent.yaml   # nothing of the old user's is left
+```
+
+A dataset or a repository checkout that only the old user can read is not readable by the new one. Give it exactly
+that, read-only, with an ACL (`sudo setfacl -R -m u:solos-agent:rX <dir>`, and `x` on each parent directory), or
+copy it. Do not add the user to a group to make it work.
+
+The state has no path of the old home that the agent needs: a Ticket's clone has the GitHub URL as its `origin`, and
+the dependency caches link to each other relatively.
+
+### 5. Deploy as the new user
+
+Deploy the revision the old agent runs, from step 3, so that a rollback never meets a newer `agent.db` schema. Upgrade
+afterwards, when it has run for a while:
+
+```sh
+AGENT_USER=solos-agent scripts/agent-deploy deploy <the sha from step 3>
+```
+
+This sends the release to the new user's `~/agent`, builds it, installs the units into the new user's
+`~/.config/systemd/user`, enables them, starts the agent and waits until it is healthy. It refuses to switch, before it
+stops anything, if `agent.yaml` names another uid's `/run/user` directory.
+
+### 6. Check it
+
+```sh
+AGENT_USER=solos-agent scripts/agent-deploy status             # "user: solos-agent (uid ...)", the release, no health incident
+ssh -l solos-agent remote-ai 'id; sudo -n true; systemctl --user show solos-agent -p NoNewPrivileges -p ProtectHome'
+```
+
+`id` shows one group, `sudo -n true` is refused, and the unit shows `NoNewPrivileges=yes` and
+`ProtectHome=read-only`. Then see that the agent works: a message in its Discord channel gets an answer, and a small
+Ticket on a repository runs a worker to a Report. Once it does, make the new user the default. Either `export
+AGENT_USER=solos-agent` in the Mac's shell profile, or give the new user its own ssh alias with `User solos-agent` and
+set `AGENT_HOST` to it.
+
+### 7. Clean up the old user
+
+After the agent has run as the new user for several days: remove the old agent's units and files, and replace the
+tokens the old home held, because they stay readable to its owner.
+
+```sh
+ssh remote-ai 'rm -f ~/.config/systemd/user/solos-agent*.service ~/.config/systemd/user/solos-agent*.timer; \
+  rm -rf ~/.config/systemd/user/solos-agent-publish.service.d; systemctl --user daemon-reload; \
+  shred -u ~/agent/tokens/* ; rm -rf ~/agent'
+```
+
+Rotate the Discord token, the GitHub App's key, the model key and the Blob token if you want the old copies dead
+([Store a token](#store-a-token), [Rotate the dashboard's secrets](#rotate-the-dashboards-secrets)).
+
+### Roll back
+
+Before step 7 the old user's `~/agent`, its release and its units are as they were. Stop the new agent, disable its
+units so a reboot does not start them, and start the old ones:
+
+```sh
+AGENT_USER=solos-agent scripts/agent-deploy stop
+ssh -l solos-agent remote-ai 'systemctl --user disable --now solos-agent solos-agent-publish solos-agent-health.timer solos-agent-prune.timer'
+ssh remote-ai 'systemctl --user enable --now solos-agent solos-agent-publish solos-agent-health.timer solos-agent-prune.timer'
+scripts/agent-deploy status
+```
+
+Leave out the publisher in both lines if you never turned it on, and unset `AGENT_USER` for the last command. The old
+agent comes back with the state it had at step 3. What the new agent did since is in the new user's `state/`. Copy it
+back only if you must, with the agent stopped, and only to the same release: an older binary refuses a newer schema.
+
 ## Reference
 
 ### Layout on the box
@@ -623,9 +853,9 @@ switch.
 
 | Unit | Runs | When | Runtime directory, tokens |
 |---|---|---|---|
-| `solos-agent.service` | `agent serve` | Always. Restarts 15 s after a failure. When systemd gives up (five starts in 15 minutes), the unit stays failed and the health check runs. | `/run/user/1000/solos-agent/`: every file in `tokens/` except `vercel-blob-token` |
-| `solos-agent-publish.service` | `agent publish` | Always, when `agent.yaml` has `web.publish`. Restarts 30 s after a failure; five starts in 15 minutes leave it failed. | `/run/user/1000/solos-agent-publish/`: `vercel-blob-token` |
-| `solos-agent-health.service`, `.timer` | `agent health` | 2 minutes after boot, then 3 minutes after each start; and on the agent's failure | `/run/user/1000/solos-agent-health/`: `discord-token` |
+| `solos-agent.service` | `agent serve` | Always. Restarts 15 s after a failure. When systemd gives up (five starts in 15 minutes), the unit stays failed and the health check runs. | `/run/user/<uid>/solos-agent/`: every file in `tokens/` except `vercel-blob-token` |
+| `solos-agent-publish.service` | `agent publish` | Always, when `agent.yaml` has `web.publish`. Restarts 30 s after a failure; five starts in 15 minutes leave it failed. | `/run/user/<uid>/solos-agent-publish/`: `vercel-blob-token` |
+| `solos-agent-health.service`, `.timer` | `agent health` | 2 minutes after boot, then 3 minutes after each start; and on the agent's failure | `/run/user/<uid>/solos-agent-health/`: `discord-token` |
 | `solos-agent-prune.service`, `.timer` | `agent prune --keep-days 14` | Daily at 04:30, up to 15 minutes late, made up after downtime | none |
 
 The publisher, the health check and the prune run with `TOKIO_WORKER_THREADS=2`. The box has 128 cores, and one runtime
@@ -638,7 +868,7 @@ thread per core filled the publisher's `TasksMax` and hung its uploads.
 | `deploy [REV]` | Builds `REV` (default `origin/main`) as a release, then switches to it ([Deploy a release](#deploy-a-release)). |
 | `rollback` | Switches to `previous`. |
 | `start`, `stop`, `restart` | The agent's unit, with the publisher and the timers. `stop` and `restart` drain. |
-| `status` | The release, the unit, `agent status`, the publisher, the timers, any health incident, and `agent health --dry-run`. |
+| `status` | The user, the release, the unit, `agent status`, the publisher, the timers, any health incident, and `agent health --dry-run`. |
 | `logs [ARGS]` | `journalctl` for the agent. Default `-n 100`. Any `journalctl` arguments, such as `-f` or `--since 1h`. |
 | `publish-logs [ARGS]`, `health-logs [ARGS]`, `prune-logs [ARGS]` | The same for the publisher, the health check and the prune. |
 | `token NAME` | Stores stdin as `~/agent/tokens/NAME`, mode 0600. `NAME` is letters, digits, `.`, `_` and `-`. |
@@ -650,6 +880,7 @@ thread per core filled the publisher's `TasksMax` and hung its uploads.
 | `--no-drain` | No drain: stop at once. |
 | `AGENT_DRAIN_SECS` | The default for `--drain`. |
 | `AGENT_HOST` | The box. Default `remote-ai`. |
+| `AGENT_USER` | The user the agent runs as: SSH logs in with `-l`, which beats the `User` of your ssh config. Default: whatever the config or the Mac's login says. Letters, digits, `_` and `-`. |
 
 On the box, `bash ~/agent/.agent-deploy --on-host drain [SECONDS]`, `--on-host resume` and
 `--on-host running-assignments` run one piece of a deploy alone. The tests use them.

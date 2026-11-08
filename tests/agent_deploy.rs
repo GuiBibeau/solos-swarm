@@ -140,6 +140,7 @@ cat \"$f\"
 /// A `systemctl` that logs its arguments and keeps one bit of state: whether solos-agent is active.
 const FAKE_SYSTEMCTL: &str = "#!/bin/sh
 echo \"$*\" >> \"$HOME/fake/systemctl.log\"
+echo \"$XDG_RUNTIME_DIR\" >> \"$HOME/fake/xdg.log\"
 shift # --user
 case \"$*\" in
 \"is-active -q solos-agent\") [ -f \"$HOME/fake/active\" ] ;;
@@ -759,4 +760,345 @@ fn the_flags_are_read_on_the_mac_and_reach_the_box_as_its_drain_time() {
     ] {
         assert!(text.contains(word), "the usage text lacks {word}: {text}");
     }
+}
+
+/// The `Key=value` settings of a shipped unit, comments and blank lines left out.
+fn unit_settings(file: &str) -> Vec<(String, String)> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/systemd");
+    std::fs::read_to_string(path.join(file))
+        .unwrap()
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.starts_with('['))
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect()
+}
+
+#[test]
+fn every_unit_is_hardened_and_the_agents_leaves_out_what_breaks_bwrap() {
+    let setting = |settings: &[(String, String)], key: &str| {
+        settings
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.clone())
+    };
+    let all = [
+        "solos-agent.service",
+        "solos-agent-health.service",
+        "solos-agent-prune.service",
+        "solos-agent-publish.service",
+        "solos-dashboard@.service",
+    ];
+    for file in all {
+        let settings = unit_settings(file);
+        for yes in [
+            "NoNewPrivileges",
+            "LockPersonality",
+            "RestrictRealtime",
+            "ProtectClock",
+            "ProtectKernelModules",
+            "ProtectControlGroups",
+            "PrivateTmp",
+        ] {
+            assert_eq!(
+                setting(&settings, yes).as_deref(),
+                Some("yes"),
+                "{file} {yes}"
+            );
+        }
+        assert_eq!(
+            setting(&settings, "ProtectSystem").as_deref(),
+            Some("strict"),
+            "{file}"
+        );
+        assert_eq!(
+            setting(&settings, "ProtectHome").as_deref(),
+            Some("read-only"),
+            "{file}"
+        );
+        assert_eq!(
+            setting(&settings, "SystemCallArchitectures").as_deref(),
+            Some("native"),
+            "{file}"
+        );
+        assert!(
+            setting(&settings, "RestrictAddressFamilies")
+                .unwrap_or_default()
+                .contains("AF_UNIX"),
+            "{file}"
+        );
+        assert_eq!(
+            setting(&settings, "SystemCallErrorNumber").as_deref(),
+            Some("EPERM"),
+            "{file}: a blocked call fails, it does not kill the worker"
+        );
+        for (key, value) in &settings {
+            if key == "ReadWritePaths" {
+                assert_eq!(
+                    value, "%h/agent/state",
+                    "{file} may write the state directory only"
+                );
+            }
+            assert!(
+                !(key.starts_with("ExecStartPre") && value.contains("$HOME")),
+                "{file}: %h is the home of the user the unit runs as, with no help from the environment"
+            );
+        }
+    }
+
+    // bwrap --unshare-all needs all seven namespaces, and bubblewrap 0.12 opens its bind sources with openat2, which
+    // RestrictSUIDSGID turns into ENOSYS. ProtectKernelTunables remounts /proc/sys, so bwrap cannot mount a /proc.
+    let agent = unit_settings("solos-agent.service");
+    let namespaces = setting(&agent, "RestrictNamespaces").unwrap();
+    for namespace in ["user", "mnt", "pid", "net", "ipc", "uts", "cgroup"] {
+        assert!(
+            namespaces.split(' ').any(|word| word == namespace),
+            "{namespaces}"
+        );
+    }
+    for broken in [
+        "RestrictSUIDSGID",
+        "ProtectKernelTunables",
+        "MemoryDenyWriteExecute",
+    ] {
+        assert_eq!(
+            setting(&agent, broken),
+            None,
+            "{broken} breaks the sandboxes"
+        );
+    }
+    // Units that run no bwrap take them.
+    for file in [
+        "solos-agent-health.service",
+        "solos-agent-prune.service",
+        "solos-agent-publish.service",
+        "solos-dashboard@.service",
+    ] {
+        let settings = unit_settings(file);
+        assert_eq!(
+            setting(&settings, "RestrictSUIDSGID").as_deref(),
+            Some("yes")
+        );
+        assert_eq!(
+            setting(&settings, "ProtectKernelTunables").as_deref(),
+            Some("yes")
+        );
+        assert_eq!(
+            setting(&settings, "RestrictNamespaces").as_deref(),
+            Some("yes")
+        );
+    }
+}
+
+fn uid() -> u32 {
+    let output = Command::new("id").arg("-u").output().unwrap();
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn the_agent_user_is_the_login_name_of_every_ssh_command() {
+    let scratch = Scratch::new("agent-user");
+    let bin = scratch.root.join("bin");
+    let log = scratch.root.join("ssh.log");
+    executable(
+        &bin.join("ssh"),
+        &format!(
+            "#!/bin/sh\necho \"$*\" >> {}\ncat > /dev/null\n",
+            log.display()
+        ),
+    );
+    let run = |user: Option<&str>| {
+        let mut command = Command::new("bash");
+        command
+            .arg(SCRIPT)
+            .arg("restart")
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env_remove("AGENT_HOST")
+            .env_remove("AGENT_USER");
+        if let Some(user) = user {
+            command.env("AGENT_USER", user);
+        }
+        command.output().unwrap()
+    };
+    let lines = || {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+
+    assert!(run(None).status.success());
+    let plain = lines();
+    assert_eq!(plain.len(), 2, "the script goes over, then the command");
+    assert!(
+        plain.iter().all(|line| !line.contains(" -l ")),
+        "no user is named, so ssh's own config decides: {plain:?}"
+    );
+
+    let _ = std::fs::remove_file(&log);
+    assert!(run(Some("solos-agent")).status.success());
+    let named = lines();
+    assert_eq!(named.len(), 2);
+    for line in &named {
+        assert!(
+            line.contains("-o ServerAliveInterval=30 -l solos-agent remote-ai "),
+            "{line}"
+        );
+    }
+
+    let _ = std::fs::remove_file(&log);
+    for bad in ["-oProxyCommand=x", "agent;reboot", "Agent", "a b"] {
+        let output = run(Some(bad));
+        assert_eq!(output.status.code(), Some(2), "{bad:?}");
+        assert!(
+            err(&output).contains("AGENT_USER must be a user name"),
+            "{bad:?}"
+        );
+    }
+    assert!(lines().is_empty(), "a bad name never reaches ssh");
+}
+
+#[test]
+fn a_users_first_deploy_makes_the_unit_directory_and_the_state_directory_the_unit_needs() {
+    let boxed = Host::new("first-deploy");
+    release(&boxed, "new", true);
+    std::fs::remove_dir_all(boxed.home.join(".config")).unwrap();
+    std::fs::remove_dir_all(boxed.agent().join("state")).unwrap();
+    // The agent's broker socket appears once its state directory does, as it would when the unit starts.
+    let socket = boxed.state("broker.sock");
+    let waiter = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if socket.parent().unwrap().is_dir() {
+                return UnixListener::bind(&socket).ok();
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        None
+    });
+    let (output, _) = boxed.on_host(&["switch", "new"], None);
+    let listener = waiter.join().unwrap();
+    assert!(output.status.success(), "{}{}", out(&output), err(&output));
+    assert!(listener.is_some(), "the state directory was never made");
+    assert_eq!(
+        std::fs::metadata(boxed.agent().join("state"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    for file in ["solos-agent.service", "solos-agent-health.timer"] {
+        assert!(
+            boxed.home.join(".config/systemd/user").join(file).exists(),
+            "{file} was not installed"
+        );
+    }
+}
+
+#[test]
+fn a_switch_refuses_a_config_that_names_another_users_runtime_directory_before_it_stops_anything() {
+    let mut boxed = Host::new("uid");
+    release(&boxed, "new", true);
+    boxed._socket = Some(UnixListener::bind(boxed.state("broker.sock")).unwrap());
+    let mine = uid();
+    let other = mine + 1;
+    std::fs::write(
+        boxed.agent().join("agent.yaml"),
+        format!(
+            "sources:\n  - token_file: /run/user/{other}/solos-agent/discord-token\n\
+             github:\n  key_file: /run/user/{other}/solos-agent/github-app.pem\n"
+        ),
+    )
+    .unwrap();
+    let (output, _) = boxed.on_host(&["switch", "new"], None);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}{}",
+        out(&output),
+        err(&output)
+    );
+    let said = err(&output);
+    assert!(
+        said.contains(&format!(
+            "/run/user/{other} but this user (uid {mine}) has /run/user/{mine}"
+        )),
+        "{said}"
+    );
+    assert!(
+        boxed.calls().iter().all(|call| !call.contains("stop")),
+        "a working agent is not stopped for a config that cannot work: {:?}",
+        boxed.calls()
+    );
+    assert_eq!(
+        std::fs::read_link(boxed.agent().join("current")).unwrap(),
+        boxed.agent().join("releases/old")
+    );
+
+    std::fs::write(
+        boxed.agent().join("agent.yaml"),
+        format!("sources:\n  - token_file: /run/user/{mine}/solos-agent/discord-token\n"),
+    )
+    .unwrap();
+    boxed.statuses(&[status(Vec::new())]);
+    let (output, _) = boxed.on_host(&["switch", "new"], None);
+    assert!(output.status.success(), "{}{}", out(&output), err(&output));
+}
+
+#[test]
+fn the_box_commands_find_the_users_manager_without_a_login_environment() {
+    let boxed = Host::new("xdg");
+    let run = |xdg: Option<&str>| {
+        let mut command = Command::new("bash");
+        command
+            .arg(SCRIPT)
+            .args(["--on-host", "stop"])
+            .env("HOME", &boxed.home)
+            .env("AGENT_DRAIN_SECS", "0")
+            .env_remove("XDG_RUNTIME_DIR");
+        if let Some(xdg) = xdg {
+            command.env("XDG_RUNTIME_DIR", xdg);
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{}{}", out(&output), err(&output));
+        let seen: Vec<String> = std::fs::read_to_string(boxed.home.join("fake/xdg.log"))
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let _ = std::fs::remove_file(boxed.home.join("fake/xdg.log"));
+        seen
+    };
+    let bare = run(None);
+    assert!(!bare.is_empty());
+    assert!(
+        bare.iter()
+            .all(|dir| *dir == format!("/run/user/{}", uid())),
+        "no login set it: {bare:?}"
+    );
+    let given = run(Some("/run/user/4242"));
+    assert!(
+        given.iter().all(|dir| dir == "/run/user/4242"),
+        "one that is set is kept: {given:?}"
+    );
+}
+
+#[test]
+fn status_says_which_user_it_is_looking_at() {
+    let boxed = Host::new("who");
+    boxed.statuses(&[status(Vec::new())]);
+    let (output, _) = boxed.on_host(&["status"], None);
+    let me = Command::new("id").arg("-un").output().unwrap();
+    let me = String::from_utf8(me.stdout).unwrap();
+    assert!(
+        out(&output).starts_with(&format!("user: {} (uid {})\n", me.trim(), uid())),
+        "{}",
+        out(&output)
+    );
 }

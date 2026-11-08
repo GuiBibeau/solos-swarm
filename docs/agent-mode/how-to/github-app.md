@@ -70,7 +70,7 @@ policy:
   approvers: [github:alice]
 github:
   app_id: 123456                       # the App's numeric id
-  key_file: secrets/github-app.pem     # a one-use token file; in production /run/user/1000/solos-agent/github-app.pem
+  key_file: secrets/github-app.pem     # a one-use token file; in production /run/user/<uid>/solos-agent/github-app.pem
   # poll_secs: 60                      # the source's interval; a quiet poll costs 304s, which GitHub does not count
   # writes: true                       # false: no write token is ever minted, so the agent writes nothing on GitHub
 forge:

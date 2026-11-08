@@ -28,7 +28,7 @@ RuntimeDirectory=solos-agent
 RuntimeDirectoryMode=0700
 UMask=0077
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
-ExecStartPre=/bin/sh -c 'for f in "$HOME"/agent/tokens/*; do case "$f" in */vercel-blob-token) ;; *) [ -f "$f" ] && cp "$f" "$RUNTIME_DIRECTORY/" || true ;; esac; done'
+ExecStartPre=/bin/sh -c 'for f in "%h"/agent/tokens/*; do case "$f" in */vercel-blob-token) ;; *) [ -f "$f" ] && cp "$f" "$RUNTIME_DIRECTORY/" || true ;; esac; done'
 ExecStart=%h/agent/current/bin/solos-swarm agent serve --config %h/agent/agent.yaml --state-dir %h/agent/state --pi-root %h/agent/current --node %h/.local/opt/node-v24.18.0-linux-x64/bin/node --credential-file %t/solos-agent/model.key
 KillSignal=SIGTERM
 TimeoutStopSec=60
@@ -40,6 +40,28 @@ CPUWeight=50
 IOWeight=50
 MemoryMax=64G
 TasksMax=8192
+# Hardening for a user unit. systemd 257 gives a user unit an identity user namespace for the options that need a mount
+# namespace, so none of these needs PrivateUsers=. Each was tried on the box against the real bwrap command lines
+# of run_code, a Pi session and a dependency install; docs/agent-mode/production.md, "Hardening the units", lists
+# the options left out and why (they break bwrap). Workers inherit the seccomp filters and NoNewPrivileges.
+NoNewPrivileges=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+SystemCallFilter=~@cpu-emulation @obsolete @raw-io @reboot @swap
+SystemCallErrorNumber=EPERM
+# bwrap --unshare-all makes user, mnt, pid, net, ipc, uts and cgroup namespaces; without cgroup it cannot start.
+RestrictNamespaces=user mnt pid net ipc uts cgroup
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+ProtectClock=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+PrivateTmp=yes
+# The agent writes the state directory and its runtime directory (RuntimeDirectory= stays writable) and nothing
+# else: not agent.yaml, tokens/, releases/, the current link, nor the rest of the home (~/.ssh, ~/.config/systemd).
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/agent/state
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=solos-agent

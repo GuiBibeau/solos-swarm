@@ -29,7 +29,7 @@ Environment=PATH=/usr/local/bin:/usr/bin:/bin
 Environment=TOKIO_WORKER_THREADS=2
 # A token that cannot be copied is not fatal here: the check runs and fails on "alerts cannot be delivered", which
 # is the honest report.
-ExecStartPre=-/bin/sh -c 'cp "$HOME/agent/tokens/discord-token" "$RUNTIME_DIRECTORY/discord-token"'
+ExecStartPre=-/bin/sh -c 'cp "%h/agent/tokens/discord-token" "$RUNTIME_DIRECTORY/discord-token"'
 ExecStart=%h/agent/current/bin/solos-swarm agent health --config %h/agent/agent.yaml --state-dir %h/agent/state --token-file %t/solos-agent-health/discord-token
 TimeoutStartSec=2min
 # The box runs other production services, and the agent itself: this is a few syscalls and one HTTPS call.
@@ -38,7 +38,26 @@ CPUWeight=10
 IOWeight=10
 MemoryMax=256M
 TasksMax=256
+# Hardening for a user unit, as in solos-agent.service. This unit runs no bwrap, so it also takes the options that
+# break one (RestrictSUIDSGID, ProtectKernelTunables, RestrictNamespaces=yes). It writes only the state directory and
+# its runtime directory.
 NoNewPrivileges=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallFilter=~@cpu-emulation @obsolete @raw-io @reboot @swap
+SystemCallErrorNumber=EPERM
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+ProtectClock=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/agent/state
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=solos-agent-health
