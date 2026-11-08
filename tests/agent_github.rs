@@ -1361,6 +1361,7 @@ impl Agent<'_> {
             tick: Duration::from_millis(10),
             retry_base: Duration::from_millis(10),
             retry_max: Duration::from_millis(500),
+            remind_after: None,
         };
         Runtime::new(self.scratch.store(), policy(), adapters, options)
     }
@@ -2368,6 +2369,7 @@ async fn a_wrong_key_is_refused_and_stops_only_the_github_source() {
         tick: Duration::from_millis(10),
         retry_base: Duration::from_millis(10),
         retry_max: Duration::from_millis(500),
+        remind_after: None,
     };
     let runtime = Runtime::new(scratch.store(), policy(), adapters, options);
 
@@ -3195,6 +3197,7 @@ async fn a_source_whose_every_repository_the_app_cannot_read_stops_and_the_agent
         tick: Duration::from_millis(10),
         retry_base: Duration::from_millis(10),
         retry_max: Duration::from_millis(500),
+        remind_after: None,
     };
     let runtime = Runtime::new(scratch.store(), policy(), adapters, options);
 
@@ -6211,6 +6214,7 @@ impl Forged {
             tick: Duration::from_millis(10),
             retry_base: Duration::from_millis(10),
             retry_max: Duration::from_millis(500),
+            remind_after: None,
         };
         let mut rules = policy();
         rules.paused = paused;

@@ -1883,12 +1883,11 @@ async fn a_worker_that_ignores_its_refusals_has_its_turn_stopped_and_pays_for_no
     let failure = seat.take_model_failure();
     assert_eq!(failure, Some(ModelFailure::Stuck(FETCH_LOOP.into())));
     assert_eq!(seat.take_model_failure(), None, "told once");
-    let (status, text) = failure.unwrap().report();
+    let failure = failure.unwrap();
+    let (status, text) = failure.report();
     assert_eq!(status, ReportStatus::Failed);
-    assert_eq!(
-        text,
-        format!("{FETCH_LOOP} Reply here to have me try again with a different approach.")
-    );
+    assert_eq!(text, FETCH_LOOP, "the question is the report");
+    assert_eq!(failure.question().as_deref(), Some(FETCH_LOOP));
 
     for call in ["other", "status"] {
         let (status, refused) = fetch(call).await;
@@ -1964,9 +1963,42 @@ async fn refusals_that_are_spread_over_a_turn_are_stopped_at_the_ceiling_too() {
     web.abort();
 }
 
+#[tokio::test]
+async fn a_worker_refused_the_same_way_three_times_has_its_turn_stopped_with_a_question() {
+    let (url, hits, web) = counting_page().await;
+    let scratch = Scratch::new("refused-three");
+    let (_runtime, served, seat) = fetching_worker(&scratch, false);
+    let fetch = || served.post("tool/fetch_url", Some(WORKER), json!({"url": url}));
+    seat.begin_turn();
+
+    for call in 1..=2 {
+        let (status, reply) = fetch().await;
+        assert_eq!(status, 403, "call {call}: {reply}");
+        let request = model_request_for("worker_report", "fix it");
+        assert_eq!(served.post("model", Some(WORKER), request).await.0, 200);
+    }
+    let (status, third) = fetch().await;
+    assert_eq!(status, 429, "the third is stopped: {third}");
+    let why = third["error"].as_str().unwrap();
+    assert!(why.contains("Your turn is stopped"), "{why}");
+    assert!(why.contains("failed the same way each time"), "{why}");
+
+    let request = model_request_for("worker_report", "fix it");
+    let (status, refused) = served.post("model", Some(WORKER), request).await;
+    assert_eq!(status, 403, "no model call after the stop: {refused}");
+    let failure = seat.take_model_failure().unwrap();
+    let said = "I tried 3 times to call fetch_url, and it failed the same way each time, so I \
+                stopped. Is there another way you want me to handle this, or should I stop here?";
+    assert_eq!(failure, ModelFailure::Stuck(said.into()));
+    assert_eq!(failure.question().as_deref(), Some(said));
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing was fetched");
+    web.abort();
+}
+
 /// What the host tells the person when a worker kept calling `fetch_url`.
 const FETCH_LOOP: &str = "I kept calling fetch_url with the same arguments without making \
-                          progress, so I stopped.";
+                          progress, so I stopped. Is there another way you want me to handle \
+                          this, or should I stop here?";
 
 /// A worker on a seat of its own, whose `fetch_url` reaches a loopback page
 /// that counts its hits, and whose model calls reach `provider`.
@@ -2167,7 +2199,9 @@ async fn a_turn_is_stopped_at_its_ceiling_of_tool_calls() {
     assert_eq!(
         worker.seat.take_model_failure(),
         Some(ModelFailure::Stuck(
-            "I made 200 tool calls without finishing, so I stopped.".into()
+            "I made 200 tool calls without finishing, so I stopped. Should I keep going from \
+             where I am?"
+                .into()
         ))
     );
 }
@@ -2199,7 +2233,9 @@ async fn a_turn_is_stopped_at_its_ceiling_of_model_calls_and_runs_no_tool_after(
     assert_eq!(
         worker.seat.take_model_failure(),
         Some(ModelFailure::Stuck(
-            "I made 250 model calls without finishing, so I stopped.".into()
+            "I made 250 model calls without finishing, so I stopped. Should I keep going from \
+             where I am?"
+                .into()
         ))
     );
     assert_eq!(
@@ -2325,32 +2361,25 @@ async fn a_wait_between_refusals_is_a_call_that_went_through_and_the_turn_goes_o
         served.post("model", Some(THERE), request)
     };
 
-    for call in 1..=2 {
-        assert_eq!(run("rg -n for_config src").await.0, 422, "call {call}");
+    // Two refusals of one shape are a retry; a wait is a call that went
+    // through, so neither the circle nor the count of failures carries past
+    // it. Three refusals without one are stopped by the failing-shape guard.
+    for round in 1..=2 {
+        for call in 1..=2 {
+            assert_eq!(
+                run("rg -n for_config src").await.0,
+                422,
+                "round {round}, call {call}"
+            );
+        }
+        for _ in 0..5 {
+            assert_ne!(wait().await.0, 429, "a repeat of a wait is normal");
+        }
     }
-    let (status, refused) = run("rg -n for_config src").await;
-    assert_eq!(status, 429);
-    let why = refused["error"].as_str().unwrap();
-    assert!(
-        why.contains("What it answered before: it was refused: not in this test"),
-        "a call that failed is an answer too: {why}"
-    );
-    assert_eq!(run("rg -n for_config src").await.0, 429);
-
-    for _ in 0..5 {
-        assert_ne!(wait().await.0, 429, "a repeat of a wait is normal");
-    }
-    assert_eq!(run("rg -n for_config src").await.0, 422);
-    assert_eq!(run("rg -n for_config src").await.0, 422);
-    assert_eq!(
-        run("rg -n for_config src").await.0,
-        429,
-        "refused again, but only once since the wait"
-    );
     let (status, reply) = ask().await;
     assert_eq!(
         status, 200,
-        "two refusals with a wait between do not stop it: {reply}"
+        "two refusals, a wait, two more, and a wait do not stop it: {reply}"
     );
 }
 

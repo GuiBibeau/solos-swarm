@@ -115,7 +115,7 @@ The agent broker has no outage pause of its own yet.
 
 `crates/agent-store` (`solos-agent-store`) has `SqliteStore`, which implements `Repositories` on one SQLite file,
 `<state>/agent.db`. It uses `rusqlite` 0.41.1 with bundled SQLite, WAL, `synchronous=FULL`, and a versioned schema
-(latest: 9). A connection that writes runs with `secure_delete`.
+(latest: 10). A connection that writes runs with `secure_delete`.
 
 - Aggregates are JSON rows, with index columns for active Threads, `thread_of_eval` and open Tickets.
 - Each commit writes state, Effects and events in one transaction.
@@ -127,7 +127,8 @@ The agent broker has no outage pause of its own yet.
 
 Every PR that adds a Ticket field, an Input kind or an event bumps the schema version, with an empty migration when no
 table changes, so an older build refuses the file instead of dropping what it cannot read. The tables added so far:
-the `spend` ledger (V2), `watchdog_alerts` (V3), the trail (V4) and memos (V8).
+the `spend` ledger (V2), `watchdog_alerts` (V3), the trail (V4) and memos (V8). V10 adds no table: it refuses an
+older build that would drop a Ticket's `reminded_ms` or its `Reminded` event.
 
 ## The agent broker
 

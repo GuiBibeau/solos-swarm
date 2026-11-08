@@ -110,6 +110,7 @@ memory:                                    # optional; these are the defaults
 watchdog:
   operator: {source: discord, address: {channel: <a channel id you read>}}
   every: 1m
+# remind_after: 4h                          # a Ticket waiting on a person is reminded once after this; null tells nobody
 health:
   min_free_gb: 50                          # pause new work below 50 GB free on the state directory's disk
 web:

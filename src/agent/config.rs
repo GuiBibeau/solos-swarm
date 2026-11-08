@@ -34,6 +34,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Deserializer, Serialize};
 use solos_agent_core::AllowlistPolicy;
 use solos_agent_core::change::{Deliverable, ForgeTerms, MergeMode, RepoName};
+use solos_agent_core::engine::REMIND_WITHIN_MS;
 use solos_agent_core::model::MicroUsd;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -54,6 +55,10 @@ pub struct AgentConfig {
     /// Without it, no Watchdog runs.
     #[serde(default)]
     pub watchdog: Option<WatchdogConfig>,
+    /// How long a Ticket waits for a person before its own thread is told,
+    /// once per wait. 4h unless set; `null` tells nobody.
+    #[serde(default = "default_remind_after")]
+    pub remind_after: Option<Interval>,
     /// Remote nodes that run workers' commands. Without it, none connect.
     #[serde(default)]
     pub nodes: Option<NodesConfig>,
@@ -98,6 +103,14 @@ pub struct AgentConfig {
 
 fn pass_through() -> bool {
     true
+}
+
+/// Half a working day: long enough that the person has seen the question and
+/// is not just at lunch, short enough that a stuck Ticket is not left over a
+/// night. The Watchdog tells the operator at 1h; this is for the person who
+/// was asked, and is sent once.
+fn default_remind_after() -> Option<Interval> {
+    Some(Interval(4 * 3_600_000))
 }
 
 /// How long one review call may take: the transport's own limit.
@@ -1260,6 +1273,11 @@ impl AgentConfig {
                     .any(|channel| matches!(channel, ChannelConfig::Mcp {})),
             "the mcp source needs the mcp channel, or nobody hears back"
         );
+        ensure!(
+            self.remind_after
+                .is_none_or(|after| after.0 <= REMIND_WITHIN_MS),
+            "remind_after must be 7d or less: a wait older than a week is not reminded of"
+        );
         self.validate_schedules(&served)?;
         self.validate_watchdog(&served)?;
         self.validate_health()?;
@@ -1886,6 +1904,25 @@ budgets: {session_microusd: 500000}
                 path: dir.join("out/outbox.jsonl")
             }]
         );
+    }
+
+    #[test]
+    fn a_waiting_ticket_is_reminded_after_four_hours_unless_the_config_says_otherwise() {
+        let after = |extra: &str| parse(&format!("{VALID}{extra}")).map(|c| c.remind_after);
+        assert_eq!(after("").unwrap().map(|i| i.0), Some(4 * 3_600_000));
+        assert_eq!(
+            after("remind_after: 90m\n").unwrap().map(|i| i.0),
+            Some(90 * 60_000)
+        );
+        assert_eq!(after("remind_after: null\n").unwrap(), None, "tells nobody");
+        assert_eq!(
+            after("remind_after: 7d\n").unwrap().map(|i| i.0),
+            Some(7 * 86_400_000)
+        );
+        for refused in ["8d", "0s", "soon"] {
+            let yaml = format!("remind_after: {refused}\n");
+            assert!(after(&yaml).is_err(), "{refused} was accepted");
+        }
     }
 
     #[test]

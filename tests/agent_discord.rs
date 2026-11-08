@@ -905,6 +905,7 @@ impl Agent<'_> {
             tick: Duration::from_millis(10),
             retry_base: Duration::from_millis(10),
             retry_max: Duration::from_millis(500),
+            remind_after: None,
         };
         Runtime::new(self.scratch.store(), policy(), adapters, options)
     }

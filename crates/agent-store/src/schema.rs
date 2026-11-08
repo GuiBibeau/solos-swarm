@@ -1,7 +1,7 @@
 use crate::StoreError;
 use rusqlite::{Connection, TransactionBehavior};
 
-pub(crate) const LATEST: u32 = 9;
+pub(crate) const LATEST: u32 = 10;
 
 /// Aggregates are JSON in `body`; the other columns index the port's queries.
 const V1: &str = "
@@ -152,8 +152,15 @@ CREATE INDEX IF NOT EXISTS memos_live ON memos (scope, id) WHERE state IN ('prop
 /// version 8 memo reads as one that supersedes nothing.
 const V9: &str = "";
 
+/// No new table. A file whose Tickets remember which wait their thread was
+/// reminded of (`Ticket.reminded_ms`), and whose events can say that a thread
+/// was, is one an older build refuses to open, instead of dropping the
+/// marker and reminding the same wait again. A version 9 Ticket reads as one
+/// never reminded.
+const V10: &str = "";
+
 /// Migration `n` is `MIGRATIONS[n - 1]`.
-const MIGRATIONS: [&str; LATEST as usize] = [V1, V2, V3, V4, V5, V6, V7, V8, V9];
+const MIGRATIONS: [&str; LATEST as usize] = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10];
 
 /// Applies the migrations the file lacks. The write lock makes a second
 /// process that opens the file at the same time wait, then find nothing to do.
@@ -190,7 +197,7 @@ pub(crate) fn version(conn: &Connection) -> Result<u32, StoreError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LATEST, V1, V2, V3, V4, V5, V6, V7, V8, V9, migrate, version};
+    use super::{LATEST, V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, migrate, version};
     use rusqlite::Connection;
 
     #[test]
@@ -213,6 +220,7 @@ mod tests {
         conn.execute_batch(V7).unwrap();
         conn.execute_batch(V8).unwrap();
         conn.execute_batch(V9).unwrap();
+        conn.execute_batch(V10).unwrap();
     }
 
     #[test]

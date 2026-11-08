@@ -12,7 +12,7 @@ One Cargo workspace builds one binary, `solos-swarm`. It holds two live modes an
 | Stack | Commands | Core | State | Status |
 |---|---|---|---|---|
 | Swarm mode | `run`, `resume-plan`, `smoke`, `doctor`, `fetch-probe` | Goal, Task, Board, Finding and Artifact in `src/broker.rs`, run by `swarm::run_goal` (`src/swarm.rs`) | One run directory: `state.json`, the hash-chained `events.jsonl`, agent transcripts | Live |
-| Agent mode | `agent ...`, `mcp`, `node ...`, `vault ...`, `browser init-key` | Trigger, Thread, Eval, Ticket, Assignment, Change and Memo in `crates/agent-core`, driven by `src/agent/runtime.rs` | One state directory: `agent.db` (SQLite, schema 9), Ticket directories, transcripts, the trail's blobs | Live |
+| Agent mode | `agent ...`, `mcp`, `node ...`, `vault ...`, `browser init-key` | Trigger, Thread, Eval, Ticket, Assignment, Change and Memo in `crates/agent-core`, driven by `src/agent/runtime.rs` | One state directory: `agent.db` (SQLite, schema 10), Ticket directories, transcripts, the trail's blobs | Live |
 | `mvp` cluster | `mvp ...`, `sandbox-enter`, the hidden `wasi-worker` | `src/domain.rs` and `src/kernel.rs` over openraft (`src/cluster.rs`) | The Raft store, the Merkle audit log, and the witness's and evaluator's own state | Frozen: kept and tested, not extended |
 
 Swarm mode is also one of agent mode's execution plans: a `Plan::Swarm` Ticket runs one governed swarm through
@@ -24,7 +24,7 @@ Swarm mode is also one of agent mode's execution plans: a `Plan::Swarm` Ticket r
 |---|---|---|
 | `.` | `solos-swarm` | The binary (`src/main.rs`), swarm mode, agent mode's shell and adapters (`src/agent/`), the shared kernel, and the `mvp` stack. |
 | `crates/agent-core` | `solos-agent-core` | Agent mode's domain: the Engine, the model, the core ports, `AllowlistPolicy` and `MemoryRepositories`. No I/O and no async runtime. |
-| `crates/agent-store` | `solos-agent-store` | `SqliteStore`, which implements `Repositories` on one SQLite file (`rusqlite` 0.41.1, bundled SQLite, WAL), with the durable Effect queue, the spend ledger and the hash-chained event log. Schema version 9 (`LATEST` in `src/schema.rs`). |
+| `crates/agent-store` | `solos-agent-store` | `SqliteStore`, which implements `Repositories` on one SQLite file (`rusqlite` 0.41.1, bundled SQLite, WAL), with the durable Effect queue, the spend ledger and the hash-chained event log. Schema version 10 (`LATEST` in `src/schema.rs`). |
 
 `default-members` lists all three, so `cargo test` and `cargo clippy` cover the workspace. `agent-core` depends on
 `serde`, `serde_json` and `sha2` only, and `crates/agent-core/tests/boundary.rs` refuses any other dependency and any

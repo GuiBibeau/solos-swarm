@@ -277,6 +277,7 @@ See [Memory](runtime.md#memory) and [Manage the agent's memory](how-to/memory.md
 | #77, #78 | The loop guard stops a worker that ignores refusals or makes no progress, and workers sample at 0.6. | [The loop guard](runtime.md#the-loop-guard) |
 | #81 | `fetch_url` refuses private, loopback and metadata addresses. | [What fetch_url can reach](runtime.md#what-fetch_url-can-reach) |
 | #83 | A repository's dependencies are installed on the host and mounted read-only. | [Installed dependencies](repository-tickets.md#installed-dependencies) |
+| #106 | The loop guard stops a worker whose calls fail the same way three times, with one question; a Ticket that waits on a person gets one reminder after `remind_after` (4h). | [The loop guard](runtime.md#the-loop-guard), [A reminder to the person who was asked](runtime.md#a-reminder-to-the-person-who-was-asked) |
 
 ## Later steps
 

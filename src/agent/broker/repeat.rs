@@ -24,6 +24,15 @@
 //!    with nothing new in them (no call it had not made this turn, and no
 //!    answer it had not seen), and one that passes a hard ceiling of tool
 //!    calls or of model calls, which nothing else has to catch.
+//! 4. A failure that comes back is a loop even when the calls differ. One
+//!    Ticket sent eight heredoc edits of one file that failed alike, between
+//!    reads of it, and made about ninety calls before the steps above caught
+//!    it: each edit differed in whitespace or in its body, so it was a call
+//!    the worker had not made, and a failure was never counted as anything.
+//!    So the guard stops a turn on [`STOP_FAILING`] calls of one shape (the
+//!    same tool, the same programs, the same files) that failed with the same
+//!    output, with no call of that shape that succeeded and no `repeatable`
+//!    call (a wait for something that may change) between.
 //!
 //! The guard is per seat and per turn, remembers hashes of the calls and of
 //! their answers, and leaves alone a tool whose registry entry says a repeat
@@ -34,11 +43,11 @@
 
 mod gist;
 
-use self::gist::{Doing, gist};
+use self::gist::{Doing, failed, stuck};
 use super::clip;
 use serde_json::Value;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 
@@ -56,6 +65,11 @@ pub(super) const STOP_IN_A_ROW: usize = 3;
 /// calls that went through came between them: a loop with a call in it that
 /// differs is still a loop.
 pub(super) const STOP_IN_A_TURN: usize = 10;
+/// The turn is stopped when this many calls of one shape failed the same way,
+/// with nothing in between that could have changed the outcome. The first two
+/// are a retry that may be a fix; the third is a worker that does not learn
+/// from its failures.
+pub(super) const STOP_FAILING: usize = 3;
 /// The turn is stopped when this many calls in a row brought nothing new: each
 /// is a call the worker already made in the turn, and answered what it had
 /// already been answered. Normal work has runs of two or three (a model that
@@ -83,6 +97,11 @@ const QUOTED_CHARS: usize = 320;
 // What the stop of a turn says about the calls before it is read from the
 // latest ones, which this many remembered calls must cover.
 const _: () = assert!(NOTHING_NEW <= RECENT);
+
+/// The question after a ceiling: the worker was working, not looping.
+const CARRY_ON: &str = "Should I keep going from where I am?";
+/// The question when there is nothing to name.
+const OTHER_WAY: &str = "Is there another way you want me to handle this, or should I stop here?";
 
 /// Why a call is refused as a repeat.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +148,8 @@ pub(super) enum Stopped {
     InTurn(usize),
     /// This many calls in a row brought nothing new.
     NothingNew(usize),
+    /// This many calls of one shape failed the same way.
+    Failing(usize),
     /// It made this many tool calls, the turn's ceiling.
     ToolCalls(usize),
     /// It made this many model calls, the turn's ceiling.
@@ -143,6 +164,9 @@ impl Stopped {
             Self::InTurn(count) => format!("sent {count} refused calls in this turn"),
             Self::NothingNew(count) => {
                 format!("made {count} calls in a row that found nothing new")
+            }
+            Self::Failing(count) => {
+                format!("made {count} calls of one kind that failed the same way each time")
             }
             Self::ToolCalls(count) => format!("made {count} tool calls in this turn"),
             Self::ModelCalls(count) => format!("made {count} model calls in this turn"),
@@ -175,6 +199,17 @@ pub(super) struct RepeatGuard {
     stopped: Option<Stopped>,
     /// How many of the latest calls say what the worker was doing.
     look_back: usize,
+    /// How each shape of call has failed lately.
+    failures: HashMap<u64, Failure>,
+    /// What kept failing, once the turn is stopped on it.
+    failing: Option<Doing>,
+}
+
+/// A shape of call that failed, how, and how many times in a row.
+#[derive(Debug)]
+struct Failure {
+    how: u64,
+    times: usize,
 }
 
 /// A hash of a call: the tool's name and its arguments.
@@ -217,6 +252,37 @@ fn digest(answer: Result<&Value, &str>) -> u64 {
     hasher.finish()
 }
 
+/// How a call failed, as a hash, or `None` for a call that did not: a refusal,
+/// or a command that timed out or exited with a code other than 0. A command
+/// that exits 1 and prints nothing said "no" (`grep` found nothing, `test`
+/// was false), which is an answer, not a failure. Digits are left out, so a
+/// line number, a duration or a count that moves does not make a failure new.
+fn failure(answer: Result<&Value, &str>) -> Option<u64> {
+    let mut hasher = DefaultHasher::new();
+    let text = match answer {
+        Err(why) => why.to_owned(),
+        Ok(result) => {
+            let code = result["exit_code"].as_i64()?;
+            let timed_out = result["timed_out"] == true;
+            let (stdout, stderr) = (
+                result["stdout"].as_str().unwrap_or_default(),
+                result["stderr"].as_str().unwrap_or_default(),
+            );
+            if !timed_out
+                && (code == 0 || code == 1 && stdout.trim().is_empty() && stderr.trim().is_empty())
+            {
+                return None;
+            }
+            (code, timed_out).hash(&mut hasher);
+            format!("{stdout}\n{stderr}")
+        }
+    };
+    text.split(|c: char| c.is_ascii_digit() || c.is_whitespace())
+        .filter(|word| !word.is_empty())
+        .for_each(|word| word.hash(&mut hasher));
+    Some(hasher.finish())
+}
+
 impl RepeatGuard {
     /// A new turn starts from nothing: new input is a reason to look again,
     /// and a stopped turn is over.
@@ -236,8 +302,16 @@ impl RepeatGuard {
     /// ceiling. See [`stopped`](Self::stopped).
     pub(super) fn call(&mut self, tool: &str, args: &Value, repeatable: bool) -> Option<Repeated> {
         let call = (!repeatable).then(|| key(tool, args));
+        if repeatable {
+            // A wait is what a retry waits for: whatever failed before may
+            // not fail now.
+            self.failures.clear();
+        }
+        let mut doing = None;
         if let Some(call) = call {
-            self.doings.push_back(Doing::of(call, tool, args));
+            let this = Doing::of(call, tool, args);
+            doing = Some(this.clone());
+            self.doings.push_back(this);
             if self.doings.len() > RECENT {
                 self.doings.pop_front();
             }
@@ -254,6 +328,17 @@ impl RepeatGuard {
         } else {
             self.refused_in_a_row += 1;
             self.refused_in_turn += 1;
+        }
+        if self.stopped.is_none()
+            && repeated.is_some()
+            && let Some(doing) = doing
+            && let Some(failed) = self.failures.get(&doing.shape())
+            && failed.times + 1 >= STOP_FAILING
+        {
+            // The call that closes a circle is not run, so it is the third
+            // attempt at what failed twice the same way.
+            self.stopped = Some(Stopped::Failing(failed.times + 1));
+            self.failing = Some(doing);
         }
         if self.stopped.is_none()
             && let Some((stopped, look_back)) = self.stop_for(repeated)
@@ -305,26 +390,36 @@ impl RepeatGuard {
     }
 
     /// What the host tells the person about a stopped turn, in the worker's
-    /// place and in words they can follow: what it kept doing, and that it
-    /// made no progress.
+    /// place and in words they can follow: what it kept doing, that it made no
+    /// progress, and the one question that would get it going again. It names
+    /// the programs and files of the calls and quotes none of them.
     pub(super) fn sentence(&self) -> Option<String> {
         Some(match self.stopped? {
             Stopped::ToolCalls(calls) => {
-                format!("I made {calls} tool calls without finishing, so I stopped.")
+                format!("I made {calls} tool calls without finishing, so I stopped. {CARRY_ON}")
             }
             Stopped::ModelCalls(calls) => {
-                format!("I made {calls} model calls without finishing, so I stopped.")
+                format!("I made {calls} model calls without finishing, so I stopped. {CARRY_ON}")
             }
+            Stopped::Failing(times) => match &self.failing {
+                Some(doing) => failed(doing, times),
+                None => format!(
+                    "I tried the same step {times} times and it failed the same way each \
+                     time, so I stopped. {OTHER_WAY}"
+                ),
+            },
             Stopped::InARow(_) | Stopped::InTurn(_) | Stopped::NothingNew(_) => {
                 let mut latest: Vec<&Doing> =
                     self.doings.iter().rev().take(self.look_back).collect();
                 latest.reverse();
-                let doing = if latest.is_empty() {
-                    "repeating the same steps".to_owned()
+                if latest.is_empty() {
+                    format!(
+                        "I kept repeating the same steps without making progress, so I \
+                         stopped. {OTHER_WAY}"
+                    )
                 } else {
-                    gist(&latest)
-                };
-                format!("I kept {doing} without making progress, so I stopped.")
+                    stuck(&latest)
+                }
             }
         })
     }
@@ -337,6 +432,26 @@ impl RepeatGuard {
         let key = key(tool, args);
         if self.answers_seen.insert(digest(answer)) {
             self.since_new = 0;
+        }
+        let doing = Doing::of(key, tool, args);
+        match failure(answer) {
+            None => {
+                self.failures.remove(&doing.shape());
+            }
+            Some(how) => {
+                let seen = self
+                    .failures
+                    .entry(doing.shape())
+                    .or_insert(Failure { how, times: 0 });
+                if seen.how != how {
+                    *seen = Failure { how, times: 0 };
+                }
+                seen.times += 1;
+                if seen.times >= STOP_FAILING && self.stopped.is_none() {
+                    self.stopped = Some(Stopped::Failing(seen.times));
+                    self.failing = Some(doing);
+                }
+            }
         }
         let quoted = match answer {
             Ok(result) => summary(result),
@@ -435,8 +550,8 @@ fn first_lines(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ANSWERS, MODEL_CALLS, NOTHING_NEW, RECENT, RepeatGuard, Repeated, STOP_IN_A_ROW,
-        STOP_IN_A_TURN, Stopped, TOOL_CALLS,
+        ANSWERS, MODEL_CALLS, NOTHING_NEW, RECENT, RepeatGuard, Repeated, STOP_FAILING,
+        STOP_IN_A_ROW, STOP_IN_A_TURN, Stopped, TOOL_CALLS,
     };
     use serde_json::json;
 
@@ -620,7 +735,10 @@ mod tests {
         );
         assert_eq!(
             guard.sentence().as_deref(),
-            Some("I kept re-running `ls` without making progress, so I stopped.")
+            Some(
+                "I kept re-running `ls` without making progress, so I stopped. Is there \
+                 another way you want me to handle this, or should I stop here?"
+            )
         );
         run(&mut guard, "ls");
         run(&mut guard, "pwd");
@@ -657,7 +775,8 @@ mod tests {
             guard.sentence().as_deref(),
             Some(
                 "I kept re-running `cargo test` and `git diff` without making progress, so I \
-                 stopped."
+                 stopped. Is there another way you want me to handle this, or should I stop \
+                 here?"
             )
         );
     }
@@ -823,7 +942,8 @@ mod tests {
             guard.sentence().as_deref(),
             Some(
                 "I kept re-reading the same parts of meteora-dlmm-allocate-encode.js without \
-                 making progress, so I stopped."
+                 making progress, so I stopped. What should I be looking for in \
+                 meteora-dlmm-allocate-encode.js?"
             )
         );
     }
@@ -851,7 +971,8 @@ mod tests {
             guard.sentence().as_deref(),
             Some(
                 "I kept re-reading the same parts of meteora-dlmm-allocate-encode.js without \
-                 making progress, so I stopped."
+                 making progress, so I stopped. What should I be looking for in \
+                 meteora-dlmm-allocate-encode.js?"
             )
         );
         assert_eq!(
@@ -913,7 +1034,10 @@ mod tests {
         assert_eq!(guard.stopped(), Some(Stopped::ToolCalls(TOOL_CALLS)));
         assert_eq!(
             guard.sentence().as_deref(),
-            Some("I made 200 tool calls without finishing, so I stopped.")
+            Some(
+                "I made 200 tool calls without finishing, so I stopped. Should I keep going \
+                 from where I am?"
+            )
         );
         assert_eq!(
             Stopped::ToolCalls(200).note(),
@@ -935,7 +1059,10 @@ mod tests {
         assert_eq!(guard.stopped(), Some(Stopped::ModelCalls(MODEL_CALLS)));
         assert_eq!(
             guard.sentence().as_deref(),
-            Some("I made 250 model calls without finishing, so I stopped.")
+            Some(
+                "I made 250 model calls without finishing, so I stopped. Should I keep going \
+                 from where I am?"
+            )
         );
         guard.model_call();
         assert_eq!(
@@ -985,5 +1112,234 @@ mod tests {
             assert_eq!(seen, None, "poll {poll}");
         }
         assert_eq!(guard.stopped(), None);
+    }
+
+    /// `run`, answered as a command that failed with `stderr`.
+    fn fail(guard: &mut RepeatGuard, code: &str, stderr: &str) -> Option<Repeated> {
+        let refused = run(guard, code);
+        let receipt = json!({"exit_code": 1, "stdout": "", "stderr": stderr});
+        guard.answered("run_code", &json!({"code": code}), Ok(&receipt));
+        refused
+    }
+
+    /// The edit that went wrong on #94: a Python script on a heredoc, its file
+    /// named on its first line, and a body that differs a little each time.
+    fn edit(attempt: usize) -> String {
+        let spaces = " ".repeat(attempt);
+        let quote = if attempt.is_multiple_of(2) { '"' } else { '\'' };
+        format!(
+            "cd /work/.harness && python3 - <<'PY'\np{spaces}={quote}bin/lib.sh{quote}\n\
+             s=open(p).read()\nold = {quote}retry {attempt}{quote}\nassert old in s\nPY"
+        )
+    }
+
+    /// What it printed: the same error, at a line that moves.
+    fn traceback(attempt: usize) -> String {
+        format!(
+            "Traceback (most recent call last):\n  File \"<stdin>\", line {}, in <module>\n\
+             AssertionError\n",
+            6 + attempt
+        )
+    }
+
+    #[test]
+    fn three_edits_that_fail_alike_stop_the_turn_though_no_two_calls_are_the_same() {
+        let mut guard = RepeatGuard::default();
+        for attempt in 1..=STOP_FAILING {
+            assert_eq!(guard.stopped(), None, "before attempt {attempt}");
+            assert_eq!(fail(&mut guard, &edit(attempt), &traceback(attempt)), None);
+            // Between the edits, a look at the file: a different slice, which
+            // answers something new, so nothing else here sees a loop.
+            let look = format!("sed -n {attempt},{}p bin/lib.sh", attempt + 20);
+            run_and_answer(&mut guard, &look, &format!("slice {attempt}"));
+        }
+        assert_eq!(guard.stopped(), Some(Stopped::Failing(STOP_FAILING)));
+        let said = guard.sentence().unwrap();
+        assert_eq!(
+            said,
+            "I tried 3 times to run `python3` on lib.sh, and it failed the same way each \
+             time, so I stopped. Is there another way you want me to handle lib.sh, or \
+             should I stop here?"
+        );
+        for raw in ["<<", "PY", "open(p)", "retry", "assert"] {
+            assert!(!said.contains(raw), "{raw:?} is quoted in {said}");
+        }
+        assert_eq!(
+            Stopped::Failing(3).note(),
+            "made 3 calls of one kind that failed the same way each time"
+        );
+        guard.begin_turn();
+        assert_eq!(guard.stopped(), None, "a new turn is a new chance");
+    }
+
+    #[test]
+    fn the_same_failing_command_three_times_is_stopped_at_the_third_call() {
+        let mut guard = RepeatGuard::default();
+        for _ in 0..2 {
+            assert_eq!(fail(&mut guard, "cargo test --lib", "error[E0432]"), None);
+        }
+        assert_eq!(guard.stopped(), None);
+        assert_eq!(
+            run(&mut guard, "cargo test --lib"),
+            Some(Repeated::InARow(3)),
+            "the third is refused as it always was, and not run"
+        );
+        assert_eq!(guard.stopped(), Some(Stopped::Failing(3)));
+        assert_eq!(
+            guard.sentence().as_deref(),
+            Some(
+                "I tried 3 times to run `cargo test`, and it failed the same way each time, \
+                 so I stopped. Is there another way you want me to handle this, or should I \
+                 stop here?"
+            )
+        );
+    }
+
+    #[test]
+    fn a_failure_that_changes_is_progress() {
+        let mut guard = RepeatGuard::default();
+        for attempt in 1..=12 {
+            let error = format!("AssertionError: step {}", "x".repeat(attempt));
+            assert_eq!(fail(&mut guard, &edit(attempt), &error), None);
+            assert_eq!(
+                guard.stopped(),
+                None,
+                "attempt {attempt} failed in a new way"
+            );
+        }
+        // Only a count or a line that moves is the same failure.
+        let mut guard = RepeatGuard::default();
+        for attempt in 1..=2 {
+            fail(&mut guard, &edit(attempt), &traceback(attempt));
+        }
+        fail(&mut guard, &edit(3), "a different error");
+        assert_eq!(guard.stopped(), None);
+        fail(&mut guard, &edit(4), &traceback(4));
+        fail(&mut guard, &edit(5), &traceback(5));
+        assert_eq!(
+            guard.stopped(),
+            None,
+            "the count starts again from the new failure"
+        );
+    }
+
+    #[test]
+    fn a_success_or_a_wait_between_failures_starts_the_count_again() {
+        let mut guard = RepeatGuard::default();
+        for attempt in 1..=2 {
+            fail(&mut guard, &edit(attempt), &traceback(attempt));
+        }
+        run_and_answer(&mut guard, &edit(3), "");
+        for attempt in 4..=5 {
+            fail(&mut guard, &edit(attempt), &traceback(attempt));
+        }
+        assert_eq!(guard.stopped(), None, "the edit that worked in between");
+
+        // A server that is coming up: the check fails, a wait for its job
+        // goes by, and it is asked again, as long as it takes.
+        let wait = json!({"job": "job_1"});
+        for poll in 0..30 {
+            let check = "curl -sf http://localhost:8080/health";
+            assert_eq!(fail(&mut guard, check, "refused"), None);
+            assert_eq!(guard.call("job_wait", &wait, true), None);
+            assert_eq!(guard.stopped(), None, "poll {poll}");
+        }
+    }
+
+    #[test]
+    fn a_command_that_says_no_is_not_a_failure() {
+        // `grep` exits 1 and prints nothing when it finds nothing.
+        let mut guard = RepeatGuard::default();
+        for pattern in ["alpha", "beta", "gamma", "delta"] {
+            let command = json!({"code": format!("grep -n {pattern} src/lib.rs")});
+            let no = json!({"exit_code": 1, "stdout": "", "stderr": ""});
+            guard.call("run_code", &command, false);
+            guard.answered("run_code", &command, Ok(&no));
+        }
+        assert_eq!(guard.stopped(), None);
+        // The same command timing out is a failure.
+        let mut guard = RepeatGuard::default();
+        for _ in 0..3 {
+            let timeout = json!({"exit_code": 1, "stdout": "", "stderr": "", "timed_out": true});
+            let command = json!({"code": "make"});
+            guard.call("run_code", &command, false);
+            guard.answered("run_code", &command, Ok(&timeout));
+            if guard.stopped().is_some() {
+                break;
+            }
+        }
+        assert_eq!(guard.stopped(), Some(Stopped::Failing(3)));
+    }
+
+    #[test]
+    fn a_tool_that_refuses_three_times_the_same_way_is_stopped_too() {
+        let mut guard = RepeatGuard::default();
+        let args = json!({"url": "http://example.test/missing"});
+        for call in 0..3 {
+            guard.call("fetch_url", &args, false);
+            guard.answered("fetch_url", &args, Err("blocked address 10.0.0.1"));
+            // Another call that goes through between them changes nothing.
+            run_and_answer(&mut guard, &format!("ls {call}"), "ok");
+        }
+        assert_eq!(guard.stopped(), Some(Stopped::Failing(3)));
+        assert_eq!(
+            guard.sentence().as_deref(),
+            Some(
+                "I tried 3 times to call fetch_url, and it failed the same way each time, so \
+                 I stopped. Is there another way you want me to handle this, or should I \
+                 stop here?"
+            )
+        );
+    }
+
+    #[test]
+    fn a_wait_between_refusals_is_a_call_that_went_through() {
+        let mut guard = RepeatGuard::default();
+        let run = json!({"code": "rg -n for_config src"});
+        for _ in 0..2 {
+            assert_eq!(guard.call("run_code", &run, false), None);
+        }
+        assert_eq!(
+            guard.call("run_code", &run, false),
+            Some(Repeated::InARow(3)),
+            "the third identical call is a circle"
+        );
+        assert_eq!(guard.call("job_wait", &json!({"job": "job_1"}), true), None);
+        assert_eq!(
+            guard.call("run_code", &run, false),
+            None,
+            "a wait is a call that went through and ends the circle"
+        );
+    }
+
+    #[test]
+    fn what_the_person_is_told_is_one_question_whatever_stopped_the_turn() {
+        let long = "x".repeat(28);
+        let mut worst = RepeatGuard::default();
+        for attempt in 1..=3 {
+            let command = format!(
+                "cargo test; git diff; npm run; sed -i s/a/b/ {long}.md {attempt}; yarn add"
+            );
+            fail(&mut worst, &command, "boom");
+        }
+        let mut stopped = vec![worst];
+        let mut tools = RepeatGuard::default();
+        for call in 0..=TOOL_CALLS {
+            run_and_answer(&mut tools, &format!("echo {call}"), &call.to_string());
+        }
+        stopped.push(tools);
+        let mut models = RepeatGuard::default();
+        for _ in 0..=MODEL_CALLS {
+            models.model_call();
+        }
+        stopped.push(models);
+        let mut circle = RepeatGuard::default();
+        loop_on(&mut circle, "ls", 5);
+        stopped.push(circle);
+        for guard in stopped {
+            let said = guard.sentence().unwrap();
+            assert_eq!(said.matches('?').count(), 1, "{said}");
+            assert!(said.ends_with('?') && said.chars().count() < 500, "{said}");
+        }
     }
 }

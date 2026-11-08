@@ -46,6 +46,7 @@ The overlays in `overlays/` each add top-level sections. Relative paths in them 
 | `vault.yaml` | `vault:` at `secrets/vault.enc` | Runs `vault init` once. |
 | `browser.yaml` | `browser:` with Lightpanda 1.0.2 and the trail key `secrets/audit.key` | Runs `browser init-key` once, which prints the key's public half (`ed25519:…`). |
 | `pstack.yaml` | `pstack: {}`: every worker enters the default `entry`, `poteto-mode` | Nothing. |
+| `remind.yaml` | `remind_after: 1s`: a Ticket waiting on a person is reminded of after one second | Nothing. |
 | `forge.yaml` | `forge: local` with `GuiBibeau/solos-swarm` and the identity `solos-swarm-verify` | Seeds the bare repository `forge-remote/GuiBibeau/solos-swarm.git` with one commit of the shipped checkout. |
 | `github-app.yaml` | `github:` (the App's id and `secrets/github-app.pem`) and `forge: github` with `GuiBibeau/solos-swarm-sandbox` | Nothing. Set `app_id` and put the key in place first; see [github-app-auth.md](features/github-app-auth.md). |
 | `external-jobs.yaml` | `watchdog:` with the MCP thread `ops` as the operator, a 5 s look, and the jobs `verify-unit` (`verify-job.service`) and `verify-tmux` (the tmux session `verify-job`) | Nothing. Start the unit and the session yourself; see [external-jobs.md](features/external-jobs.md). |

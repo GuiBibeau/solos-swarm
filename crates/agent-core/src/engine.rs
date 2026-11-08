@@ -15,8 +15,8 @@ use crate::model::{
     Candidate, ChangeSet, Decision, DecisionId, DecisionKind, DomainEvent, Effect, Ended, EndedBy,
     Eval, EvalId, Event, Input, InputBody, InputId, Mandate, MemoId, MessageId, MessageKind,
     MicroUsd, Ms, OutboundMessage, Plan, Report, ReportIn, ReportStatus, SecretGrant, SecretId,
-    Strength, Thread, ThreadKey, Ticket, TicketId, TicketOutcome, TicketSummary, Trigger,
-    TriggerId, Verdict,
+    Stage, Strength, Thread, ThreadKey, Ticket, TicketId, TicketOutcome, TicketSummary, Trigger,
+    TriggerId, Verdict, Wait,
 };
 use crate::ports::{Clock, Error, Gate, Policy, Repositories};
 use crate::trail::{self, Digest, TrailAction, TrailCursor, TrailOutcome};
@@ -27,9 +27,69 @@ pub const MAX_EXPIRED_EVALS: u32 = 3;
 pub const MAX_SWARM_AGENTS: u16 = 30;
 const MAX_METHOD_CHARS: usize = 16;
 
+/// A wait older than this is not reminded of.
+pub const REMIND_WITHIN_MS: Ms = 7 * 24 * 60 * 60 * 1_000;
+/// How much of an earlier question or report a reminder repeats.
+const REMINDER_CHARS: usize = 200;
+
 /// How a person is named to other people: their display name, else their id.
 fn who(by: &Actor) -> &str {
     by.name.as_deref().unwrap_or(&by.id)
+}
+
+/// What the thread reads when a Ticket still waits for a person, and the ask
+/// to offer again when buttons can answer it. It repeats a line of what the
+/// wait is for, since the message that began it may be far up the thread.
+fn reminder(ticket: &Ticket, wait: Wait) -> (String, Option<Ask>) {
+    let line = |text: &str| {
+        let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut line: String = if line.chars().count() > REMINDER_CHARS {
+            let cut: String = line.chars().take(REMINDER_CHARS).collect();
+            format!("{cut}...")
+        } else {
+            line
+        };
+        if !line.is_empty() && !line.ends_with(['.', '?', '!']) {
+            line.push('.');
+        }
+        line
+    };
+    let attention = ticket.attention.as_deref().unwrap_or_default();
+    let said = ticket
+        .latest_report()
+        .map_or("", |report| report.text.as_str());
+    match wait.stage {
+        Stage::Approval => (
+            format!(
+                "I'm still waiting for a person to approve this. {}",
+                line(attention)
+            ),
+            Some(Ask::Budget),
+        ),
+        Stage::Answer => (
+            format!(
+                "I'm still waiting for your answer. I asked: {}",
+                line(attention)
+            ),
+            None,
+        ),
+        Stage::Failed => (
+            format!(
+                "I'm still waiting on a person after a failure. I said: {} Reply here and I will \
+                 try again.",
+                line(said)
+            ),
+            None,
+        ),
+        _ => (
+            format!(
+                "I'm still waiting on a person. I said: {} Reply here and I will pick the work \
+                 back up.",
+                line(said)
+            ),
+            None,
+        ),
+    }
 }
 
 /// What `receive` did with a Trigger.
@@ -288,6 +348,43 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
             let id = tx.start(&mut t, policy);
             tx.save_ticket(t);
             Ok(id)
+        })
+    }
+
+    /// Tell the Ticket's thread, once, that it still waits for a person: when
+    /// it has waited at least `after_ms` for an approval, an answer, or a look
+    /// at its blocked or failed work, and its thread was not told of this wait
+    /// yet. A new wait, after a person wrote or the worker asked again, is
+    /// told again. A wait older than [`REMIND_WITHIN_MS`] is left alone: the
+    /// person has had a week, and a late ping is noise. Returns whether it
+    /// reminded.
+    pub fn remind(&mut self, ticket: &TicketId, after_ms: Ms) -> Result<bool, Error> {
+        let due = |t: &Ticket, now: Ms| {
+            let wait = t.wait()?;
+            let waited = now.saturating_sub(wait.since_ms);
+            let told = t.reminded_ms == Some(wait.since_ms);
+            (!told && !t.channels.is_empty() && (after_ms..=REMIND_WITHIN_MS).contains(&waited))
+                .then_some(wait)
+        };
+        let now = self.clock.now_ms();
+        let found = self.repos.ticket(ticket);
+        if found.is_none_or(|t| due(&t, now).is_none()) {
+            return Ok(false);
+        }
+        self.run(|tx, _| {
+            let mut t = tx.open_ticket(ticket)?;
+            let Some(wait) = due(&t, tx.now) else {
+                return Ok(false);
+            };
+            t.reminded_ms = Some(wait.since_ms);
+            tx.event(DomainEvent::Reminded {
+                ticket: t.id.clone(),
+                since_ms: wait.since_ms,
+            });
+            let (text, ask) = reminder(&t, wait);
+            tx.send(&mut t, MessageKind::Attention, text, ask);
+            tx.save_ticket(t);
+            Ok(true)
         })
     }
 
@@ -2160,6 +2257,7 @@ impl<R: Repositories> Tx<'_, R> {
             seq: 0,
             handed_back: BTreeSet::new(),
             change: None,
+            reminded_ms: None,
         };
         self.event(DomainEvent::TicketCreated {
             ticket: id.clone(),

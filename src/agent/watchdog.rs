@@ -26,7 +26,7 @@ use solos_agent_core::delivery::ForgeJob;
 use solos_agent_core::ids::key;
 use solos_agent_core::model::{
     AssignmentId, ChannelRef, Decision, DecisionKind, Effect, MessageId, MessageKind, MicroUsd, Ms,
-    OutboundMessage, Plan, Stage, Ticket, TicketId,
+    OutboundMessage, Plan, Stage, Ticket, TicketId, Wait,
 };
 use solos_agent_store::{AlertRow, QueuedEffect, SpendState, SqliteStore};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -403,14 +403,10 @@ fn job(record: &Record) -> Option<Alert> {
 }
 
 fn waiting(ticket: &Ticket, now: Ms, limits: &Thresholds) -> Option<Alert> {
-    let stage = ticket.stage();
-    if !matches!(
+    let Wait {
         stage,
-        Stage::Approval | Stage::Answer | Stage::Blocked | Stage::Failed
-    ) {
-        return None;
-    }
-    let since = waiting_since(ticket, stage);
+        since_ms: since,
+    } = ticket.wait()?;
     let waited = now
         .checked_sub(since)
         .filter(|waited| *waited >= limits.waiting_ms)?;
@@ -452,35 +448,6 @@ fn waiting(ticket: &Ticket, now: Ms, limits: &Thresholds) -> Option<Alert> {
         since_ms: Some(since),
         text: format!("\"{}\" ({}) {what}.{said}{nobody}", ticket.title, ticket.id),
         stalled: None,
-    })
-}
-
-/// When the Ticket began to wait. A Report that asks, blocks or fails
-/// starts a wait. The Store keeps no time for an approval asked at a later
-/// launch, so an approval counts from the Ticket's latest step: its
-/// creation, its latest Assignment or Report, or a person's latest Input.
-fn waiting_since(ticket: &Ticket, stage: Stage) -> Ms {
-    let reports = || ticket.assignments.iter().flat_map(|a| &a.reports);
-    let asked = match stage {
-        Stage::Answer => reports()
-            .filter(|r| r.question.is_some())
-            .map(|r| r.at_ms)
-            .max(),
-        Stage::Blocked | Stage::Failed => ticket.latest_report().map(|r| r.at_ms),
-        _ => None,
-    };
-    asked.unwrap_or_else(|| {
-        let steps = [
-            ticket.assignments.last().map(|a| a.created_ms),
-            reports().map(|r| r.at_ms).max(),
-            ticket
-                .inputs
-                .iter()
-                .filter(|i| i.from_allowed_person)
-                .map(|i| i.at_ms)
-                .max(),
-        ];
-        steps.into_iter().flatten().fold(ticket.created_ms, Ms::max)
     })
 }
 
@@ -1180,6 +1147,7 @@ mod tests {
             seq: 0,
             handed_back: BTreeSet::new(),
             change: None,
+            reminded_ms: None,
         }
     }
 

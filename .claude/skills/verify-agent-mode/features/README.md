@@ -47,6 +47,7 @@ recipe is a plan.
 | [Use an API key the model never sees](./keyed-fetch.md) | 2026-11-04, v20261104-1815, 04ceeec | passed: probe 401 without, 200 with the vault key, `key_used` on the chain, no test value in state |
 | [Chat on Discord with approvals](./discord-chat.md) | 2026-11-04, zelix, b04f9f2, scripted Router | passed: approval buttons, Approve, result |
 | [Follow up on a request](./follow-up.md) | not yet | not yet |
+| [Stop a looping worker and remind a waiting person](./loop-stop-and-remind.md) | not yet | not yet |
 | [Work on GitHub as the App's own bot](./github-app-auth.md) | not yet | not yet: needs the App created by hand |
 | [Ask for a change and get a pull request from the bot](./github-pr.md) | not yet | not yet: needs the App created by hand and `owes: pull_request` on the sandbox |
 | [The owner's memory shapes later work](./memo-owner.md) | not yet | not yet |

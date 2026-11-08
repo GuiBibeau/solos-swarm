@@ -265,6 +265,12 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   memos, and retires memos with `memo_retire`, citing transcript lines whose digest and text the broker checks
   against the original transcripts. The review decides its proposals, and the Watchdog sends the operator one digest
   of what changed. Store schema 9.
+- Agent mode, a worker that fails the same way and a person who was asked (#106): the loop guard also stops a turn
+  after 3 calls of one shape (the same tool, programs and files, whatever the whitespace, quotes or heredoc body)
+  failed with the same output. The stop's Report now asks one question instead of saying "Reply here", so the Ticket
+  waits at `Stage::Answer` and a reply answers it. A Ticket that waits `remind_after` (4h unless set, `null` to tell
+  nobody) for a person has one reminder sent to its own thread, once per wait, naming what the wait is for; a wait
+  older than 7 days is left alone. Store schema 10 adds `Ticket.reminded_ms` and the `Reminded` event.
 - `collect` (#15) leaves the per-run `code/` scratch directory on the host and writes `collect-manifest.json`; `--include-code` opts back in.
 - `work/tournament-20261028/` (#17): the record of the 2026-10-28 discovery tournament (frozen Goals, driver, dataset
   builder, gate, systemd units and evidence summaries), without raw logs.

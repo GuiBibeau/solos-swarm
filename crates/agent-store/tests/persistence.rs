@@ -5,7 +5,8 @@ use common::{
     port_view, slack, sqlite_contents,
 };
 use solos_agent_core::model::{
-    Actor, AssignmentId, EvalId, Plan, ReportIn, ReportStatus, Stage, TicketId, Verdict,
+    Actor, AssignmentId, DomainEvent, Effect, EvalId, Plan, ReportIn, ReportStatus, Stage,
+    TicketId, Verdict,
 };
 use solos_agent_core::trail::{TrailAction, TrailOutcome};
 use solos_agent_core::{AllowlistPolicy, Engine, Error, Intake, MemoryRepositories, Repositories};
@@ -161,7 +162,7 @@ fn state_survives_closing_and_reopening_the_file() {
     assert_eq!(store.effects().unwrap(), queue);
     assert_eq!(store.open_tickets().unwrap(), open);
     assert_eq!(store.verify_chain().unwrap(), chain);
-    assert_eq!(store.schema_version().unwrap(), 9);
+    assert_eq!(store.schema_version().unwrap(), 10);
     for t in &before.triggers {
         assert_eq!(store.trigger(&t.id).as_ref(), Some(t));
     }
@@ -275,7 +276,7 @@ fn a_file_store_uses_wal_and_migrates_once() {
     let db = TempDb::new("wal");
     drop(SqliteStore::open(&db.path).unwrap());
     let store = SqliteStore::open(&db.path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 9);
+    assert_eq!(store.schema_version().unwrap(), 10);
     let raw = db.raw();
     let mode: String = raw
         .query_row("PRAGMA journal_mode", [], |row| row.get(0))
@@ -284,5 +285,79 @@ fn a_file_store_uses_wal_and_migrates_once() {
     let rows: u32 = raw
         .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(rows, 9, "one row per migration");
+    assert_eq!(rows, 10, "one row per migration");
+}
+
+#[test]
+fn a_reminded_wait_survives_a_reopen_and_is_never_reminded_again() {
+    let db = TempDb::new("reminded");
+    let now = Rc::new(Cell::new(1_000));
+    let store = SqliteStore::open(&db.path).unwrap();
+    let mut engine: SqlEngine = Engine::new(store, policy(), clock(&now));
+    engine
+        .receive(slack("t1", Actor::person("alice"), "th1", "@agent fix it"))
+        .unwrap();
+    let eval = one_eval(&mut engine);
+    let session = Plan::Session {
+        harness: None,
+        environment: None,
+        method: None,
+    };
+    let ticket = ticket_of(&mut engine, &eval, accept("Fix it", session, 1_000_000));
+    let assignment = latest(&engine, &ticket);
+    engine.assignment_started(&ticket, &assignment).unwrap();
+    engine
+        .report(
+            &ticket,
+            &assignment,
+            report(ReportStatus::Blocked, Some("which branch?")),
+        )
+        .unwrap();
+    now.set(now.get() + 4 * 3_600_000);
+    assert!(engine.remind(&ticket, 4 * 3_600_000).unwrap());
+
+    let told = engine.repos().ticket(&ticket).unwrap();
+    let since = told.reminded_ms.expect("the wait was told");
+    assert_eq!(
+        told.wait().map(|wait| wait.since_ms),
+        Some(since),
+        "the marker names this wait"
+    );
+    let reminders = |engine: &SqlEngine| {
+        engine
+            .repos()
+            .effects()
+            .unwrap()
+            .into_iter()
+            .filter(|queued| {
+                matches!(&queued.effect, Effect::Send(message)
+                    if message.text.starts_with("I'm still waiting"))
+            })
+            .count()
+    };
+    assert_eq!(reminders(&engine), 1, "one reminder was queued");
+    drop(engine);
+
+    let mut reopened: SqlEngine =
+        Engine::new(SqliteStore::open(&db.path).unwrap(), policy(), clock(&now));
+    let kept = reopened.repos().ticket(&ticket).unwrap();
+    assert_eq!(
+        kept.reminded_ms,
+        Some(since),
+        "a reopened file keeps the marker"
+    );
+    assert!(
+        !reopened.remind(&ticket, 4 * 3_600_000).unwrap(),
+        "a wait already told is not told again"
+    );
+    assert_eq!(reminders(&reopened), 1, "no second reminder");
+    assert!(
+        reopened
+            .repos()
+            .events()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event.event, DomainEvent::Reminded { .. })),
+        "the chain says the wait was reminded of"
+    );
 }
