@@ -300,10 +300,12 @@ enum AgentCommand {
     /// itself is down: the unit is active and not restart-looping, the broker
     /// socket answers `GET /api/hello`, the state directory's disk has room
     /// (below `health.min_free_gb` it pauses new work by writing `PAUSE`, and
-    /// lifts that pause again once space returns), and the bot token can
-    /// reach the Watchdog's Discord channel. A failure posts once per
-    /// incident to that channel with no help from serve. Exits 1 while
-    /// anything fails. systemd runs it from a timer.
+    /// lifts that pause again once space returns), the bot token can reach
+    /// the Watchdog's Discord channel, and, where `executor.claude` names an
+    /// installed `claude`, the host's Claude Code login has not ended (asked
+    /// with `claude auth status`, which spends no tokens). A failure posts
+    /// once per incident to that channel with no help from serve. Exits 1
+    /// while anything fails. systemd runs it from a timer.
     Health {
         /// The agent's `agent.yaml`: the Watchdog's channel and `health`.
         #[arg(long)]

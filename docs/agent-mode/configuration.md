@@ -195,6 +195,10 @@ Every path is absolute.
 | `node` | none | The node that runs `binary`. Without it, `binary` runs by itself, as the native build does. |
 | `solos_swarm` | this binary | The solos-swarm the sandbox runs for the session's tools and model bridge. |
 
+`agent health` runs `claude auth status --json` on `binary` (under `node`, if set) to see whether the host's Claude Code
+login has ended. It skips the check when `binary` is not installed, unless `executor.harness` is `claude-code`. See
+[Alerts from outside the agent](production.md#alerts-from-outside-the-agent).
+
 ### budgets
 
 Each cap is optional. Where one is absent, what it would cap is not capped, though each model call is still held and

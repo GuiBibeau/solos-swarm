@@ -515,8 +515,9 @@ The Watchdog runs inside `agent serve`, so it cannot say that `serve` itself is 
 - at once when systemd gives up on the agent (five failed starts in 15 minutes), through `OnFailure=` in
   `solos-agent.service`
 
-Each run checks the unit, its restarts, the broker socket, the free disk, the Discord token and the config
-([Health checks](#health-checks)). It needs nothing from the agent.
+Each run checks the unit, its restarts, the broker socket, the free disk, the Discord token and the config, and where
+`executor.claude` is set, the host's Claude Code login ([Health checks](#health-checks)). It needs nothing from the
+agent.
 
 A failure posts once per incident to the Watchdog's channel, `watchdog.operator`, which must be `source: discord`. It
 posts as the bot, through the API root of the config's `discord` Source. It posts again only when a new kind of
@@ -532,6 +533,23 @@ stops or restarts anything.
 Deploys do not alert. While `scripts/agent-deploy` stops and starts the agent, it writes `state/health-hold`, an expiry
 time 30 minutes ahead. Until then the check records problems and tells nobody. A deploy, rollback, start or restart
 removes the hold when it finishes, so a deploy that went wrong alerts at the next run. `stop` leaves the hold in place.
+
+**Claude Code's login.** An expired sign-in makes every Claude Code run on the host fail with `Failed to authenticate:
+OAuth session expired and could not be refreshed`, and nothing in the agent notices. When `executor.claude` names a
+`claude` that is installed, the check runs `claude auth status --json` as the unit's user. That reads what Claude Code
+stored on the host: it starts no session and spends no tokens. The check reads two fields of the
+answer, `loggedIn` and `loginExpiresAt`. It never reads the credential, and it keeps and posts nothing else the answer
+holds, such as the account's email. It fails when Claude Code is signed out, or when `loginExpiresAt`, the date the
+stored sign-in ends, has passed. The alert says what to do: sign in again as the agent's user with `claude auth login`
+(or `/login` inside `claude`). The next run clears it and posts the recovery once.
+
+- With `executor.harness: claude-code`, a `claude` that is not at the configured path fails the check. With the default
+  `pi` harness, where only a Plan may name Claude Code, a `claude` that is not installed is skipped.
+- `loginExpiresAt` needs Claude Code 2.1.318 or later. An older one gives only `loggedIn`, so a sign-in that has ended
+  is caught only once Claude Code itself says it is signed out.
+- A session that Anthropic ended before its recorded date still shows as signed in. Only a real request finds that.
+- The check sees the login of the user that owns the unit (`~/.claude`, or `CLAUDE_CONFIG_DIR` if the unit sets it). A
+  token passed to other jobs through `CLAUDE_CODE_OAUTH_TOKEN` is not the login the check reads.
 
 If Discord or the token is what is broken, nobody can be told. The check fails, which shows in
 `scripts/agent-deploy health-logs` and in `systemctl --user --failed`, and it tells Discord the next time it can. The
@@ -673,6 +691,7 @@ On the box, `bash ~/agent/.agent-deploy --on-host drain [SECONDS]`, `--on-host r
 | `disk` | free space on the state directory's disk is under `health.min_free_gb` |
 | `discord` | the bot token cannot read the Watchdog's channel: the network is down, the token is refused, or the bot lost access. Nothing is sent to find out |
 | `config` | `agent.yaml` does not load, the likeliest reason for a crash loop right after an edit |
+| `claude` | Only when `executor.claude` is set and `claude` is installed there, or `executor.harness` is `claude-code`. `claude auth status --json` says `loggedIn: false`, or its `loginExpiresAt` has passed, or it cannot be run or does not answer within 20 s, or (with `harness: claude-code`) the binary is missing. It starts no session, so it spends no tokens |
 
 ### Prune
 

@@ -68,7 +68,9 @@ solos-swarm agent health --config agent.yaml --state-dir DIR --token-file F [--d
 ```
 
 It checks that the systemd unit (`--unit`, default `solos-agent`) is active and not restart-looping, that the broker
-socket answers, that the state directory's disk has room, and that the bot can reach the Watchdog's Discord channel. It
+socket answers, that the state directory's disk has room, and that the bot can reach the Watchdog's Discord channel.
+Where `executor.claude` names an installed `claude`, it also runs `claude auth status --json` to see whether the host's
+Claude Code login has ended; sign in again with `claude auth login` as the agent's user. It
 posts once per incident to that channel, with no help from `serve`, and exits 1 while anything fails. Below
 `health.min_free_gb` it pauses new work by writing `PAUSE`, alerts, and lifts that pause again once space returns.
 `--dry-run` only looks. Without `--token-file`, nothing is posted and the Discord check is skipped.

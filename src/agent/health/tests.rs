@@ -1,6 +1,7 @@
 use super::{
-    Alerts, HOLD_FILE, Kind, PAUSE_FILE, Probe, Report, Run, STARTUP_GRACE_SECS, STATE_FILE,
-    Settings, State, UnitState, alert_target, free_bytes, hello, parse_unit, restart_check, run,
+    Alerts, ClaudeInstall, ClaudeLogin, HOLD_FILE, Kind, PAUSE_FILE, Probe, Report, Run,
+    STARTUP_GRACE_SECS, STATE_FILE, Settings, State, UnitState, alert_target, claude_install,
+    free_bytes, hello, output_within, parse_claude_status, parse_unit, restart_check, run,
 };
 use crate::agent::AgentConfig;
 use crate::agent::ports::BoxFuture;
@@ -9,8 +10,10 @@ use std::cell::{Cell, RefCell};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const GIB: u64 = 1 << 30;
 const T0: u64 = 1_800_000_000_000;
@@ -41,11 +44,13 @@ impl Drop for Scratch {
     }
 }
 
-/// A unit, a broker and a disk that the test sets.
+/// A unit, a broker, a disk and a Claude Code login that the test sets.
 struct Fake {
     unit: RefCell<Result<UnitState, String>>,
     broker: RefCell<Result<(), String>>,
     free: Cell<u64>,
+    /// `None`: the config names no `claude`, so nothing is asked.
+    claude: RefCell<Option<Result<ClaudeLogin, String>>>,
 }
 
 fn running() -> UnitState {
@@ -64,6 +69,7 @@ impl Fake {
             unit: RefCell::new(Ok(running())),
             broker: RefCell::new(Ok(())),
             free: Cell::new(50 * GIB),
+            claude: RefCell::new(None),
         }
     }
     fn stopped(&self) {
@@ -88,6 +94,10 @@ impl Probe for Fake {
     }
     fn free_bytes(&self) -> Result<u64> {
         Ok(self.free.get())
+    }
+    fn claude_login(&self) -> Option<Result<ClaudeLogin>> {
+        let login = self.claude.borrow().clone()?;
+        Some(login.map_err(|why| anyhow!(why)))
     }
 }
 
@@ -751,5 +761,317 @@ async fn a_config_that_no_longer_loads_is_told_and_the_target_it_last_named_is_k
         State::load(scratch.path()).target,
         Some(target),
         "a config that does not load does not forget it"
+    );
+}
+
+const DAY: u64 = 24 * 60 * MINUTE;
+
+fn signed_in(ends_ms: Option<u64>) -> Option<Result<ClaudeLogin, String>> {
+    Some(Ok(ClaudeLogin {
+        logged_in: true,
+        ends_ms,
+    }))
+}
+
+fn claude_detail(report: &Report) -> Option<(bool, String)> {
+    let found = report.checks.iter().find(|check| check.name == "claude");
+    found.map(|check| (check.ok, check.detail.clone()))
+}
+
+#[tokio::test]
+async fn an_ended_claude_code_sign_in_is_told_once_per_incident_and_its_renewal_once() {
+    let scratch = Scratch::new("claude");
+    let (fake, chat) = (Fake::healthy(), Arc::new(Chat::default()));
+    *fake.claude.borrow_mut() = signed_in(Some(T0 + 10 * MINUTE));
+    let well = check(&scratch, &fake, Some(&chat), T0, false).await;
+    assert!(well.ok, "{well:?}");
+    assert_eq!(
+        claude_detail(&well),
+        Some((true, "signed in until 2027-01-15T08:10:00Z".into()))
+    );
+
+    let ended = check(&scratch, &fake, Some(&chat), T0 + 12 * MINUTE, false).await;
+    assert!(!ended.ok, "an ended sign-in makes `agent health` exit 1");
+    assert_eq!(ended.posted, Some("down"));
+    for minute in [15, 18, 21] {
+        let again = check(&scratch, &fake, Some(&chat), T0 + minute * MINUTE, false).await;
+        assert_eq!(again.quiet, Some("already told"));
+    }
+    let posts = chat.posts();
+    assert_eq!(posts.len(), 1, "{posts:?}");
+    assert!(
+        posts[0].contains("the Claude Code sign-in on this host ended at 2027-01-15T08:10:00Z"),
+        "{}",
+        posts[0]
+    );
+    assert!(posts[0].contains("`claude auth login`"), "{}", posts[0]);
+    assert_eq!(
+        State::load(scratch.path()).incident.unwrap().announced,
+        [Kind::Claude].into()
+    );
+
+    *fake.claude.borrow_mut() = signed_in(Some(T0 + 7 * DAY));
+    let back = check(&scratch, &fake, Some(&chat), T0 + 24 * MINUTE, false).await;
+    assert!(back.ok);
+    assert_eq!(back.posted, Some("recovered"));
+    check(&scratch, &fake, Some(&chat), T0 + 27 * MINUTE, false).await;
+    assert_eq!(chat.posts().len(), 2, "nothing more once it is renewed");
+}
+
+#[tokio::test]
+async fn a_claude_code_that_is_signed_out_or_cannot_be_asked_is_trouble_not_silence() {
+    let scratch = Scratch::new("claude-out");
+    let (fake, chat) = (Fake::healthy(), Arc::new(Chat::default()));
+    let none = check(&scratch, &fake, Some(&chat), T0, false).await;
+    assert_eq!(
+        claude_detail(&none),
+        None,
+        "no claude in the config: no check"
+    );
+
+    *fake.claude.borrow_mut() = signed_in(None);
+    let old = check(&scratch, &fake, Some(&chat), T0, false).await;
+    assert_eq!(
+        claude_detail(&old),
+        Some((true, "signed in".into())),
+        "a Claude Code that does not say when it ends is trusted on `loggedIn`"
+    );
+
+    *fake.claude.borrow_mut() = Some(Ok(ClaudeLogin {
+        logged_in: false,
+        ends_ms: None,
+    }));
+    let out = check(&scratch, &fake, Some(&chat), T0 + 3 * MINUTE, false).await;
+    assert_eq!(out.posted, Some("down"));
+    assert!(
+        chat.posts()[0].contains("Claude Code is not signed in on this host"),
+        "{:?}",
+        chat.posts()
+    );
+
+    let scratch = Scratch::new("claude-hang");
+    *fake.claude.borrow_mut() = Some(Err("no answer in 20s".into()));
+    let hung = check(&scratch, &fake, Some(&chat), T0, false).await;
+    assert!(!hung.ok);
+    assert!(
+        chat.posts()[1].contains("cannot ask Claude Code about its login: no answer in 20s"),
+        "{:?}",
+        chat.posts()
+    );
+}
+
+#[test]
+fn claude_auth_status_is_read_for_its_login_and_nothing_else() {
+    let signed_in = r#"{"loggedIn": true, "authMethod": "claude.ai", "loginExpiresAt":
+        "2026-11-17T00:26:39.036Z", "email": "owner@example.com", "orgName": "Acme"}"#;
+    assert_eq!(
+        parse_claude_status(signed_in).unwrap(),
+        ClaudeLogin {
+            logged_in: true,
+            ends_ms: Some(1_794_875_199_036),
+        }
+    );
+    assert_eq!(
+        parse_claude_status(r#"{"loggedIn": false, "authMethod": "none", "loginExpiresAt": null}"#)
+            .unwrap(),
+        ClaudeLogin {
+            logged_in: false,
+            ends_ms: None,
+        }
+    );
+    assert_eq!(
+        parse_claude_status(r#"{"loggedIn": true}"#)
+            .unwrap()
+            .ends_ms,
+        None,
+        "a Claude Code before 2.1.318 has no end date"
+    );
+    for (case, text) in [
+        (
+            "text",
+            "Not logged in. Run claude auth login to authenticate.",
+        ),
+        ("nothing", ""),
+        ("no loggedIn", r#"{"authMethod": "claude.ai"}"#),
+        (
+            "an end it cannot read",
+            r#"{"loggedIn": true, "loginExpiresAt": "next week"}"#,
+        ),
+    ] {
+        let why = format!("{:#}", parse_claude_status(text).unwrap_err());
+        assert!(!why.contains("owner@example.com"), "{case}: {why}");
+        assert!(
+            why.contains("loggedIn") || why.contains("loginExpiresAt"),
+            "{case}: {why}"
+        );
+    }
+}
+
+/// A `claude` that prints what the test queued, for `auth status --json` only,
+/// and writes each call's arguments to `calls`. It is run by `sh`, as an
+/// install with `node` is, so no executable is written.
+fn fake_claude(scratch: &Scratch, status: &str, exit: u8) -> ClaudeInstall {
+    let script = scratch.path().join("claude.sh");
+    std::fs::write(
+        &script,
+        "d=$(dirname \"$0\")\necho \"$*\" >> \"$d/calls\"\n\
+         [ \"$*\" = \"auth status --json\" ] || exit 2\n\
+         cat \"$d/status.json\"\nexit \"$(cat \"$d/exit\")\"\n",
+    )
+    .unwrap();
+    queue_claude(scratch, status, exit);
+    ClaudeInstall {
+        binary: script,
+        node: Some("/bin/sh".into()),
+        required: false,
+    }
+}
+
+fn queue_claude(scratch: &Scratch, status: &str, exit: u8) {
+    std::fs::write(scratch.path().join("status.json"), status).unwrap();
+    std::fs::write(scratch.path().join("exit"), exit.to_string()).unwrap();
+}
+
+#[test]
+fn the_claude_binary_is_asked_only_for_its_status_and_a_signed_out_exit_1_is_still_an_answer() {
+    let scratch = Scratch::new("claude-bin");
+    let signed = r#"{"loggedIn": true, "loginExpiresAt": "2027-01-01T00:00:00Z"}"#;
+    let claude = fake_claude(&scratch, signed, 0);
+    let login = claude.ask().unwrap().unwrap();
+    assert_eq!(login.ends_ms, Some(1_798_761_600_000));
+
+    queue_claude(&scratch, r#"{"loggedIn": false}"#, 1);
+    let out = claude.ask().unwrap().unwrap();
+    assert!(
+        !out.logged_in,
+        "`claude auth status` exits 1 when signed out"
+    );
+
+    queue_claude(&scratch, "Segmentation fault", 139);
+    let why = format!("{:#}", claude.ask().unwrap().unwrap_err());
+    assert!(why.contains("exit status: 139"), "{why}");
+    assert!(why.contains("JSON"), "{why}");
+    assert!(
+        !why.contains("Segmentation"),
+        "its output is not echoed: {why}"
+    );
+
+    let calls = std::fs::read_to_string(scratch.path().join("calls")).unwrap();
+    assert_eq!(
+        calls.lines().collect::<Vec<_>>(),
+        ["auth status --json"; 3],
+        "no session, no prompt, no other command"
+    );
+}
+
+#[test]
+fn the_native_build_runs_itself_and_the_npm_build_runs_under_node() {
+    let native = ClaudeInstall {
+        binary: "/opt/claude/claude".into(),
+        node: None,
+        required: false,
+    };
+    let command = native.status_command();
+    assert_eq!(command.get_program(), "/opt/claude/claude");
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        ["auth", "status", "--json"]
+    );
+    let npm = ClaudeInstall {
+        binary: "/opt/claude/cli.js".into(),
+        node: Some("/opt/node/bin/node".into()),
+        required: false,
+    };
+    let command = npm.status_command();
+    assert_eq!(command.get_program(), "/opt/node/bin/node");
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        ["/opt/claude/cli.js", "auth", "status", "--json"]
+    );
+    let env: Vec<_> = command
+        .get_envs()
+        .map(|(key, value)| (key.to_string_lossy().into_owned(), value.is_some()))
+        .collect();
+    assert!(
+        env.contains(&("DISABLE_AUTOUPDATER".into(), true)),
+        "asking never updates it: {env:?}"
+    );
+}
+
+#[test]
+fn a_missing_claude_is_skipped_unless_the_config_runs_workers_on_it() {
+    let scratch = Scratch::new("claude-missing");
+    let gone = scratch.path().join("no-such-claude");
+    let optional = ClaudeInstall {
+        binary: gone.clone(),
+        node: None,
+        required: false,
+    };
+    assert!(
+        optional.ask().is_none(),
+        "a Plan may name it; nothing to check"
+    );
+    let required = ClaudeInstall {
+        required: true,
+        ..optional
+    };
+    let why = format!("{:#}", required.ask().unwrap().unwrap_err());
+    assert!(why.contains(&gone.display().to_string()), "{why}");
+    assert!(why.contains("claude-code"), "{why}");
+
+    let node_gone = ClaudeInstall {
+        binary: scratch.path().to_owned(),
+        node: Some(gone.clone()),
+        required: true,
+    };
+    assert!(format!("{:#}", node_gone.ask().unwrap().unwrap_err()).contains("no-such-claude"));
+}
+
+#[test]
+fn a_claude_that_hangs_is_killed_and_reported_inside_the_limit() {
+    let started = Instant::now();
+    let mut sleeper = Command::new("sleep");
+    sleeper.arg("30");
+    let why = format!(
+        "{:#}",
+        output_within(sleeper, Duration::from_millis(200)).unwrap_err()
+    );
+    assert!(why.contains("no answer in 200ms"), "{why}");
+    assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+#[test]
+fn the_config_says_where_claude_code_is_and_whether_workers_run_on_it() {
+    let load = |executor: &str| {
+        let yaml = format!(
+            "policy:\n  people: [slack:alice]\nsources:\n  - kind: jsonl\n    path: t.jsonl\n\
+             channels:\n  - kind: jsonl\n    source: slack\n    path: o.jsonl\n\
+             router: {{kind: scripted}}\nexecutor: {executor}\n"
+        );
+        let config: AgentConfig = serde_yaml::from_str(&yaml).unwrap();
+        config.validate().unwrap();
+        config
+    };
+    let pi = "\n  kind: pi\n  provider: deepseek\n  model: deepseek-flash\n  prices: \
+              {input_microusd_per_million: 300000, output_microusd_per_million: 1200000}";
+    assert_eq!(claude_install(&load("{kind: scripted}")), None);
+    assert_eq!(claude_install(&load(pi)), None, "Pi workers, no claude");
+    let install = |extra: &str| claude_install(&load(&format!("{pi}\n{extra}")));
+    assert_eq!(
+        install("  claude: {binary: /opt/claude/claude}"),
+        Some(ClaudeInstall {
+            binary: "/opt/claude/claude".into(),
+            node: None,
+            required: false,
+        }),
+        "a Plan may still name it, so it is checked where it is installed"
+    );
+    assert_eq!(
+        install("  harness: claude-code\n  claude: {binary: /opt/cli.js, node: /opt/node}"),
+        Some(ClaudeInstall {
+            binary: "/opt/cli.js".into(),
+            node: Some("/opt/node".into()),
+            required: true,
+        })
     );
 }

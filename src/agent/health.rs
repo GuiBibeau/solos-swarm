@@ -4,8 +4,8 @@
 //!
 //! systemd runs it from a timer every few minutes
 //! (`scripts/systemd/solos-agent-health.timer`) and, through `OnFailure=`, at
-//! once when the agent's unit gives up. Each run asks four questions, none of
-//! which needs the agent to answer for itself:
+//! once when the agent's unit gives up. Each run asks these questions, none
+//! of which needs the agent to answer for itself:
 //!
 //! - is the unit active, and is it restart-looping (systemd's `NRestarts`
 //!   moved by `restart_burst` since the last run)?
@@ -16,6 +16,10 @@
 //!   once space returns.
 //! - can an alert be delivered: can the bot token read the Watchdog's Discord
 //!   channel?
+//! - where `executor.claude` names a `claude` that is installed, is the host's
+//!   Claude Code still signed in? `claude auth status` answers from what is
+//!   stored on disk: it starts no session and spends no tokens, and this
+//!   check reads only its `loggedIn` and `loginExpiresAt`.
 //!
 //! A failure posts once per incident to that channel with the bot token, with
 //! no help from serve, and says so again only for a problem of a new kind; the
@@ -28,7 +32,7 @@
 //! The probes and the Discord channel are traits, so the logic is tested
 //! with a fake unit, a fake socket and a fake Discord.
 
-use super::config::{AgentConfig, HealthConfig, SourceConfig};
+use super::config::{AgentConfig, ExecutorConfig, HarnessKind, HealthConfig, SourceConfig};
 use super::discord::{self, DEFAULT_API_BASE, Reply, Token};
 use super::ports::BoxFuture;
 use super::{utc, watchdog};
@@ -43,8 +47,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// What the check remembers between runs, in the state directory.
 pub const STATE_FILE: &str = "health-state.json";
@@ -58,6 +62,10 @@ const PAUSE_MARK: &str = "paused by solos-agent-health";
 /// A unit this young is still starting: its socket may not be up yet.
 pub const STARTUP_GRACE_SECS: u64 = 60;
 const SOCKET_WAIT: Duration = Duration::from_secs(5);
+/// `claude auth status` takes a fraction of a second. A hang must end well
+/// inside the unit's `TimeoutStartSec`, so it is reported and does not get
+/// the whole check killed.
+const CLAUDE_WAIT: Duration = Duration::from_secs(20);
 /// Discord refuses a message past 2000 characters.
 const MESSAGE_CHARS: usize = 1_900;
 const LINE_CHARS: usize = 300;
@@ -78,6 +86,16 @@ pub struct UnitState {
     pub uptime_secs: Option<u64>,
 }
 
+/// What `claude auth status` says of the login Claude Code holds on this host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClaudeLogin {
+    pub logged_in: bool,
+    /// When the stored sign-in ends, Unix ms: Claude Code 2.1.318 and later
+    /// say. After it the login cannot be renewed, and every run fails with
+    /// "OAuth session expired and could not be refreshed".
+    pub ends_ms: Option<Ms>,
+}
+
 /// What the check asks the machine.
 pub trait Probe {
     fn unit(&self) -> Result<UnitState>;
@@ -85,6 +103,11 @@ pub trait Probe {
     fn broker(&self) -> Result<()>;
     /// Bytes free to an ordinary process on the state directory's disk.
     fn free_bytes(&self) -> Result<u64>;
+    /// The host's Claude Code login. `None`: there is none to check, because
+    /// the config names no `claude`, or an optional one is not installed.
+    fn claude_login(&self) -> Option<Result<ClaudeLogin>> {
+        None
+    }
 }
 
 /// The alert channel: Discord, with the bot token.
@@ -119,6 +142,8 @@ pub enum Kind {
     Discord,
     /// agent.yaml no longer loads, so the agent cannot start with it.
     Config,
+    /// Claude Code on this host is signed out, or its sign-in has ended.
+    Claude,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -297,6 +322,11 @@ pub async fn run(ctx: &Run<'_>) -> Result<Report> {
         pause = lift(state_dir, &mut state)?;
     }
 
+    if let Some(login) = probe.claude_login() {
+        let found = claude_check(&login, now_ms);
+        record(&mut checks, &mut failing, "claude", Kind::Claude, found);
+    }
+
     match alerts {
         Some(alerts) => {
             let found = alerts
@@ -449,6 +479,31 @@ fn disk_check(settings: &Settings, free: &Result<u64>, paused: bool) -> Result<S
         ));
     }
     Ok(format!("{left} free"))
+}
+
+/// Whether the login is good at `now_ms`. Signed out, and past its end date,
+/// are the two failures `claude auth status` shows. A session its server
+/// revoked early, with the date still ahead, it cannot show.
+fn claude_check(login: &Result<ClaudeLogin>, now_ms: Ms) -> Result<String, String> {
+    const RELOGIN: &str = "Sign in again as the agent's user with `claude auth login`.";
+    let login = match login {
+        Ok(login) => login,
+        Err(err) => return Err(format!("cannot ask Claude Code about its login: {err:#}")),
+    };
+    if !login.logged_in {
+        return Err(format!(
+            "Claude Code is not signed in on this host. {RELOGIN}"
+        ));
+    }
+    match login.ends_ms {
+        Some(ends) if ends <= now_ms => Err(format!(
+            "the Claude Code sign-in on this host ended at {}, so its runs fail with \"OAuth \
+             session expired\". {RELOGIN}",
+            utc::format(ends)
+        )),
+        Some(ends) => Ok(format!("signed in until {}", utc::format(ends))),
+        None => Ok("signed in".to_owned()),
+    }
 }
 
 fn gb(bytes: u64) -> String {
@@ -605,11 +660,14 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// The probes on this machine: systemd's answer about `unit`, the broker's
-/// socket, and `statvfs` on the state directory.
+/// socket, `statvfs` on the state directory, and Claude Code's own account of
+/// its login.
 pub struct SystemProbe {
     pub unit: String,
     pub socket: PathBuf,
     pub state_dir: PathBuf,
+    /// `None`: the config names no `claude`.
+    pub claude: Option<ClaudeInstall>,
 }
 
 impl Probe for SystemProbe {
@@ -653,6 +711,130 @@ impl Probe for SystemProbe {
     fn free_bytes(&self) -> Result<u64> {
         free_bytes(&self.state_dir)
     }
+
+    fn claude_login(&self) -> Option<Result<ClaudeLogin>> {
+        self.claude.as_ref()?.ask()
+    }
+}
+
+/// The `claude` that `executor.claude` names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaudeInstall {
+    /// The `claude` executable, or with `node`, the npm package's `cli.js`.
+    pub binary: PathBuf,
+    pub node: Option<PathBuf>,
+    /// `executor.harness` is `claude-code`, so a missing install is trouble.
+    /// Otherwise only a Plan may name it, and a missing one is skipped.
+    pub required: bool,
+}
+
+/// Where the config says Claude Code is, if it does.
+pub fn claude_install(config: &AgentConfig) -> Option<ClaudeInstall> {
+    let ExecutorConfig::Pi {
+        harness,
+        claude: Some(claude),
+        ..
+    } = &config.executor
+    else {
+        return None;
+    };
+    Some(ClaudeInstall {
+        binary: claude.binary.clone(),
+        node: claude.node.clone(),
+        required: *harness == HarnessKind::ClaudeCode,
+    })
+}
+
+impl ClaudeInstall {
+    /// The login, or `None` when this install is optional and not there.
+    pub fn ask(&self) -> Option<Result<ClaudeLogin>> {
+        let missing = [Some(&self.binary), self.node.as_ref()]
+            .into_iter()
+            .flatten()
+            .find(|path| !path.exists());
+        match missing {
+            None => Some(self.login()),
+            Some(path) if self.required => Some(Err(anyhow::anyhow!(
+                "{} does not exist, and executor.harness is claude-code",
+                path.display()
+            ))),
+            Some(_) => None,
+        }
+    }
+
+    /// `claude auth status --json`. The updater and telemetry are off so a
+    /// check that runs every few minutes never changes the install or phones
+    /// home.
+    fn status_command(&self) -> Command {
+        let mut command = match &self.node {
+            Some(node) => {
+                let mut command = Command::new(node);
+                command.arg(&self.binary);
+                command
+            }
+            None => Command::new(&self.binary),
+        };
+        command
+            .args(["auth", "status", "--json"])
+            .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+            .env("DISABLE_AUTOUPDATER", "1");
+        command
+    }
+
+    /// Its status prints JSON and exits 1 when signed out, so the answer is
+    /// read from the output whatever the exit code.
+    fn login(&self) -> Result<ClaudeLogin> {
+        let output = output_within(self.status_command(), CLAUDE_WAIT)
+            .with_context(|| format!("{} auth status", self.binary.display()))?;
+        parse_claude_status(&String::from_utf8_lossy(&output.stdout))
+            .with_context(|| format!("`claude auth status` ({})", output.status))
+    }
+}
+
+/// `claude auth status --json` as a [`ClaudeLogin`]. It also prints an email
+/// and an organisation; only `loggedIn` and `loginExpiresAt` are read, so
+/// nothing else is kept or put in an error.
+pub fn parse_claude_status(text: &str) -> Result<ClaudeLogin> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Status {
+        logged_in: bool,
+        #[serde(default)]
+        login_expires_at: Option<String>,
+    }
+    let status: Status =
+        serde_json::from_str(text).context("did not print JSON with a `loggedIn` field")?;
+    let ends_ms = status
+        .login_expires_at
+        .map(|at| {
+            utc::parse(&at).with_context(|| format!("gave a `loginExpiresAt` it cannot read: {at}"))
+        })
+        .transpose()?;
+    Ok(ClaudeLogin {
+        logged_in: status.logged_in,
+        ends_ms,
+    })
+}
+
+/// `command`'s output, or an error if it has not ended in `limit`, in which
+/// case it is killed. The output is small, so it is read after the exit.
+fn output_within(mut command: Command, limit: Duration) -> Result<std::process::Output> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("cannot start")?;
+    let deadline = Instant::now() + limit;
+    while child.try_wait()?.is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("no answer in {limit:?}");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Ok(child.wait_with_output()?)
 }
 
 /// `systemctl show`'s `Key=value` lines as a [`UnitState`]. `boot_secs` is
@@ -892,6 +1074,7 @@ pub async fn check(args: &Args, now_ms: Ms) -> Result<Report> {
         unit: args.unit.clone(),
         socket: args.state_dir.join(super::broker::SOCKET_FILE),
         state_dir: args.state_dir.clone(),
+        claude: loaded.as_ref().ok().and_then(claude_install),
     };
     run(&Run {
         state_dir: &args.state_dir,
