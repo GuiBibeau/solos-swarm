@@ -462,8 +462,8 @@ upstreams here whose providers are allowed, and no `worker`, is an error that as
 
 At accept the host, not the Router, picks the repository's worker upstream. The Ticket records it in `Mandate.upstream`
 (its name, provider, model and harness) and its Plan names that upstream's harness, so a later config edit never changes
-what work in flight runs on. A repository that allows no provider any upstream here runs is declined: the request's
-channel hears one sentence saying why — `I can't work on <repo> here: its code may go only to <providers>, and this
+what work in flight runs on. A repository that allows no provider for which an upstream runs here is declined: the
+request's channel hears one sentence saying why — `I can't work on <repo> here: its code may go only to <providers>, and this
 agent runs no <providers> model. Nothing was started.` — once, and only for an explicit request, so a stranger's
 follow-up cannot make the agent post. Before the clone, the executor checks the upstream against the policy as it is
 now; a Ticket whose upstream is no longer admitted, including one accepted before this build (which recorded none and

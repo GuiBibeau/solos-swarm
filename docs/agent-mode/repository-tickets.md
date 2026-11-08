@@ -24,7 +24,7 @@ Plan, picked from the repository's `models` policy at accept. The Router never n
 or a pull request, the Ticket also records the repository's terms: the merge mode, CI, and the limits. A later config
 edit never changes the terms of work in flight.
 
-A repository that allows no provider any upstream here runs is declined at accept: the request's channel hears one
+A repository that allows no provider for which an upstream runs here is declined at accept: the request's channel hears one
 sentence saying why, once, and nothing starts. Before the clone, the executor checks the Ticket's upstream against the
 policy as it is now; a Ticket whose upstream is no longer admitted ends with a failed Report that names the policy and
 nothing is cloned.
