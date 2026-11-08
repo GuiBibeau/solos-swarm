@@ -329,7 +329,12 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   merge on green, and deploy the merge in one command. CI runs the jobs a change needs (`scripts/ci-changes.sh`):
   documentation-only and dashboard-only pull requests skip the Rust jobs, one with no dashboard file skips `web`.
   Five test shards replace four, the tokenizers are fetched inside `build`, and doc tests run only when a doc
-  comment holds one rustdoc would run (`scripts/has-doc-tests.sh`).
+- Agent dashboard (#131): the hosted site is one command center in the swarm's own field — Command (the field, what
+  needs a person, the numbers, recent tickets and external jobs), Chat (the latest conversations with each worker's
+  reports, and a link to the thread the agent reads), Tickets, one ticket, Swarm and Jobs — with the brand's matte
+  carbon, hairline panels and lavender only on live data. A failed or stale read shows a quiet notice instead of
+  taking the page down. `DASHBOARD_FIXTURES=1 npm run dev` previews every screen from the test fixtures without a
+  deployment, and cannot open a production build.
 
 ### Fixed
 
