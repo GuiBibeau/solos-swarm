@@ -365,6 +365,20 @@ impl ModelPolicy {
             ));
         };
         if self.admits(Some(repo), Role::Worker, info.provider) {
+            // The broker holds one transport, on the default upstream's
+            // provider, until a transport per upstream lands. A Ticket on
+            // another provider's upstream could not be sent there; its calls
+            // would go to `default`, whose provider its repository may not
+            // allow. Refused rather than run on the wrong provider.
+            if let Some(default) = self.upstreams.get(&UpstreamName::default_upstream())
+                && info.provider != default.provider
+            {
+                return Some(format!(
+                    "this build's broker holds one transport, on {}: upstream {name} runs on {}, \
+                     and a Ticket on it cannot be sent there. Nothing was cloned",
+                    default.provider, info.provider
+                ));
+            }
             return None;
         }
         let allowed = self
@@ -774,6 +788,39 @@ executor:
         };
         let said = policy.launch_refusal(&widgets, Some(&gone)).unwrap();
         assert!(said.contains("names no upstream claude"), "{said}");
+    }
+
+    #[test]
+    fn a_launch_on_another_providers_upstream_is_refused_until_its_transport_lands() {
+        let named = "  upstreams:
+    venice:
+      provider: venice
+      model: zai-org-glm-5
+      wire: chat
+      harness: pi
+      key_file: keys/venice.key
+      prices: {input_microusd_per_million: 300000, output_microusd_per_million: 1200000}
+";
+        let policy = build(
+            "    acme/widgets:
+      about: Widgets.
+      base: main
+      models: {allow: [deepseek, venice], worker: venice}",
+            named,
+        )
+        .unwrap();
+        let widgets = repo("acme/widgets");
+        let choice = policy.worker_choice(&widgets).unwrap();
+        assert_eq!(
+            (choice.name.as_str(), choice.provider.as_str()),
+            ("venice", "venice")
+        );
+        let said = policy.launch_refusal(&widgets, Some(&choice)).unwrap();
+        assert!(
+            said.contains("holds one transport, on deepseek")
+                && said.contains("upstream venice runs on venice"),
+            "{said}"
+        );
     }
 
     #[test]
