@@ -7,3 +7,6 @@ __pycache__/
 *.pyc
 .env*
 /.claude/worktrees/
+
+# design-taste-frontend working files (screenshots, dealt direction)
+.taste-skill/

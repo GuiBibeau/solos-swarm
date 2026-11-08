@@ -5,6 +5,7 @@
 
 import { NextResponse, type NextRequest } from "next/server";
 import { authConfig, ConfigError } from "@/lib/config";
+import { FIXTURES } from "@/lib/fixtures";
 import { viewerFromCookieHeader } from "@/lib/viewer-core";
 
 const PUBLIC = (pathname: string) => pathname === "/login" || pathname.startsWith("/auth/");
@@ -28,27 +29,29 @@ export function contentSecurityPolicy(nonce: string, dev: boolean): string {
 
 export async function proxy(request: NextRequest): Promise<NextResponse> {
   const { pathname, search } = request.nextUrl;
-  let settings;
-  try {
-    settings = authConfig();
-  } catch (error) {
-    if (!(error instanceof ConfigError)) throw error;
-    console.error(`dashboard: ${error.message}`);
-    // Not configured: nobody is let in, and nothing says why beyond this.
-    return new NextResponse("The dashboard is not configured.", {
-      status: 503,
-      headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" },
-    });
-  }
+  if (!FIXTURES) {
+    let settings;
+    try {
+      settings = authConfig();
+    } catch (error) {
+      if (!(error instanceof ConfigError)) throw error;
+      console.error(`dashboard: ${error.message}`);
+      // Not configured: nobody is let in, and nothing says why beyond this.
+      return new NextResponse("The dashboard is not configured.", {
+        status: 503,
+        headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" },
+      });
+    }
 
-  if (!PUBLIC(pathname)) {
-    const viewer = await viewerFromCookieHeader(request.headers.get("cookie"), settings);
-    if (!viewer) {
-      const login = new URL("/login", settings.publicUrl);
-      if (request.method === "GET" && pathname !== "/") {
-        login.searchParams.set("next", `${pathname}${search}`);
+    if (!PUBLIC(pathname)) {
+      const viewer = await viewerFromCookieHeader(request.headers.get("cookie"), settings);
+      if (!viewer) {
+        const login = new URL("/login", settings.publicUrl);
+        if (request.method === "GET" && pathname !== "/") {
+          login.searchParams.set("next", `${pathname}${search}`);
+        }
+        return NextResponse.redirect(login, 303);
       }
-      return NextResponse.redirect(login, 303);
     }
   }
 

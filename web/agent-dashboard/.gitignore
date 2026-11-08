@@ -8,3 +8,5 @@ next-env.d.ts
 # The repository's root ignore file has .env*; the example is the one that is committed.
 !.env.example
 .vercel
+
+.taste-skill/

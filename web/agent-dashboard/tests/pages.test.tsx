@@ -45,8 +45,12 @@ vi.mock("next/navigation", () => ({
   },
 }));
 
-const { default: Tickets } = await import("@/app/page");
+const { default: Command } = await import("@/app/page");
+const { default: Tickets } = await import("@/app/tickets/page");
 const { default: TicketPage } = await import("@/app/tickets/[id]/page");
+const { default: Chat } = await import("@/app/chat/page");
+const { default: Swarm } = await import("@/app/swarm/page");
+const { default: JobsPage } = await import("@/app/jobs/page");
 const { default: Login } = await import("@/app/login/page");
 
 beforeEach(() => {
@@ -60,80 +64,82 @@ beforeEach(() => {
 const html = async (element: Promise<React.ReactElement>) => renderToStaticMarkup(await element);
 const page = (id: string) => TicketPage({ params: Promise.resolve({ id }) });
 
-describe("the ticket list", () => {
-  it("lists the open ticket first, with what it waits for, and each ticket links to its page", async () => {
+describe("the command center", () => {
+  it("answers what the swarm is doing with the field, what needs a person, the numbers and the latest tickets", async () => {
     readIndex.mockResolvedValue(index);
-    const out = await html(Tickets());
-    expect(out.indexOf("<h2>Open</h2>")).toBeGreaterThan(-1);
-    expect(out.indexOf("<h2>Open</h2>")).toBeLessThan(out.indexOf("<h2>Recently ended</h2>"));
-    expect(out.indexOf("Rotate the staging keys")).toBeLessThan(out.indexOf("Read my notifications"));
+    readJobs.mockResolvedValue(jobs);
+    const out = await html(Command());
+    expect(out).toContain("<h1>Command</h1>");
+    expect(out).toContain('role="img"');
+    expect(out).toContain('aria-label="The swarm:');
+    expect(out).toContain("Needs you");
     expect(out).toContain("Which staging environment should I rotate: eu or us?");
     expect(out).toContain("needs an answer");
-    expect(out).toContain("completed");
+    expect(out).toContain("Open tickets");
+    expect(out).toContain("Committed");
+    expect(out).toContain("Recent tickets");
     for (const row of index.tickets) expect(out).toContain(`href="/tickets/${row.id}"`);
     expect(out).toContain("alice");
-    expect(out).toContain("1 open");
-    expect(out).not.toContain("may be down");
+    expect(out).not.toContain("may be old");
   });
 
   it("says so when the publisher has gone quiet", async () => {
     readIndex.mockResolvedValue({ ...index, generated_at: "2026-11-06T13:00:00Z" });
-    expect(await html(Tickets())).toContain("may be down");
+    expect(await html(Command())).toContain("may be old");
   });
 
   it("says nothing has been published, shows no error text from storage, and survives a failed read", async () => {
     readIndex.mockResolvedValue(null);
-    expect(await html(Tickets())).toContain("Nothing has been published yet");
+    expect(await html(Command())).toContain("Nothing has been published yet");
     readIndex.mockRejectedValue(new Error("token vercel_blob_rw_secret leaked"));
-    const out = await html(Tickets());
+    const out = await html(Command());
     expect(out).toContain("could not be read from storage");
     expect(out).not.toContain("vercel_blob_rw_secret");
   });
 });
 
 describe("the external jobs", () => {
-  it("lists every job with how it is checked, the ones in trouble first with what was found, above the tickets", async () => {
+  it("lists every job with how it is checked, the ones in trouble first with what was found", async () => {
     readIndex.mockResolvedValue(index);
     readJobs.mockResolvedValue(jobs);
-    const out = await html(Tickets());
+    const out = await html(Command());
     expect(readJobs).toHaveBeenCalledWith(expect.anything());
-    expect(out).toContain("<h2>External jobs</h2>");
-    expect(out).toContain("1 of 4 up");
-    for (const job of jobs.jobs) {
-      expect(out, job.name).toContain(`<span>${job.name}</span>`);
+    expect(out).toContain("External jobs");
+    expect(out).toContain("3 in trouble");
+    // The command center shows the three jobs in trouble and links to the full list.
+    for (const job of jobs.jobs.filter((row) => row.status !== "up")) {
+      expect(out, job.name).toContain(`<span class="name">${job.name}</span>`);
       expect(out, job.check).toContain(job.check);
     }
-    const at = (name: string) => out.indexOf(`<span>${name}</span>`);
+    expect(out).toContain('href="/jobs"');
+    const at = (name: string) => out.indexOf(`<span class="name">${name}</span>`);
     expect(at("data-build")).toBeLessThan(at("modal-wave-3"));
     expect(at("modal-wave-3")).toBeLessThan(at("l2book-archive"));
-    expect(at("l2book-archive")).toBeLessThan(at("l2book"));
-    for (const label of ["down", "stalled", "low on disk", "up"]) expect(out).toContain(`>${label}</span>`);
+    for (const label of ["down", "stalled", "low on disk"]) expect(out).toContain(`>${label}</span>`);
     expect(out).toContain("can&#x27;t find session: data-build");
     expect(out).toContain("no new shard for 40m");
     expect(out).toContain("11.2 GB free on /data/l2book (floor 50.0 GB)");
-    expect(out).toContain("active (running)");
-    expect(out.indexOf("External jobs")).toBeLessThan(out.indexOf("<h2>Open</h2>"));
     expect(out).not.toContain("has not looked");
   });
 
   it("says so when the Watchdog has not looked for a long time", async () => {
     readIndex.mockResolvedValue(index);
     readJobs.mockResolvedValue({ ...jobs, checked_ms: NOW - 40 * 60 * 1000 });
-    const out = await html(Tickets());
+    const out = await html(Command());
     expect(out).toContain("The Watchdog has not looked at these jobs for 40m");
   });
 
-  it("shows nothing for jobs when none are published or none are registered", async () => {
+  it("keeps the frame and says so when no job is published", async () => {
     readIndex.mockResolvedValue(index);
-    expect(await html(Tickets())).not.toContain("External jobs");
+    expect(await html(Command())).toContain("The Watchdog has no external jobs configured.");
     readJobs.mockResolvedValue({ ...jobs, jobs: [] });
-    expect(await html(Tickets())).not.toContain("External jobs");
+    expect(await html(Command())).toContain("The Watchdog has no external jobs configured.");
   });
 
   it("does not let a failed read of the jobs hide the tickets, or show what storage said", async () => {
     readIndex.mockResolvedValue(index);
     readJobs.mockRejectedValue(new Error("token vercel_blob_rw_secret leaked"));
-    const out = await html(Tickets());
+    const out = await html(Command());
     expect(out).toContain("The external jobs could not be read from storage.");
     expect(out).not.toContain("vercel_blob_rw_secret");
     expect(out).toContain("Rotate the staging keys");
@@ -143,9 +149,79 @@ describe("the external jobs", () => {
     readIndex.mockResolvedValue(index);
     const hostile = { ...jobs.jobs[1], detail: '<script>alert(1)</script><img src=x onerror="y">' };
     readJobs.mockResolvedValue({ ...jobs, jobs: [hostile] });
-    const out = await html(Tickets());
+    const out = await html(Command());
     expect(out).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
     for (const bad of ["<script", "<img"]) expect(out, bad).not.toContain(bad);
+  });
+
+  it("the jobs page lists them all with their state and check", async () => {
+    readJobs.mockResolvedValue(jobs);
+    const out = await html(JobsPage());
+    expect(out).toContain("<h1>Jobs</h1>");
+    for (const job of jobs.jobs) expect(out).toContain(job.name);
+    expect(out).toContain("3 in trouble");
+    expect(out).toContain("active (running)");
+  });
+});
+
+describe("the ticket list", () => {
+  it("lists the open ticket first, with what it waits for, and each ticket links to its page", async () => {
+    readIndex.mockResolvedValue(index);
+    const out = await html(Tickets());
+    expect(out.indexOf('id="open-title"')).toBeGreaterThan(-1);
+    expect(out.indexOf('id="open-title"')).toBeLessThan(out.indexOf('id="ended-title"'));
+    expect(out.indexOf("Rotate the staging keys")).toBeLessThan(out.indexOf("Read my notifications"));
+    expect(out).toContain("Which staging environment should I rotate: eu or us?");
+    expect(out).toContain("needs an answer");
+    expect(out).toContain("completed");
+    for (const row of index.tickets) expect(out).toContain(`href="/tickets/${row.id}"`);
+    expect(out).toContain("alice");
+    expect(out).toContain("1 open");
+  });
+
+  it("says nothing has been published, shows no error text from storage, and survives a failed read", async () => {
+    readIndex.mockResolvedValue(null);
+    expect(await html(Tickets())).toContain("No tickets have been published yet.");
+    readIndex.mockRejectedValue(new Error("token vercel_blob_rw_secret leaked"));
+    const out = await html(Tickets());
+    expect(out).toContain("could not be read from storage");
+    expect(out).not.toContain("vercel_blob_rw_secret");
+  });
+});
+
+describe("the chat page", () => {
+  it("shows the latest conversation and where to reply, with the turns as text", async () => {
+    readIndex.mockResolvedValue(index);
+    readTicket.mockImplementation(async (id: string) => tickets.find((ticket) => ticket.id === id) ?? null);
+    const newest = [...index.tickets].sort((a, b) => b.updated_ms - a.updated_ms)[0];
+    if (!newest) throw new Error("the fixture index is empty");
+    const out = await html(Chat({ searchParams: Promise.resolve({ t: newest.id }) }));
+    expect(out).toContain("<h1>Chat</h1>");
+    expect(out).toContain("Conversations");
+    expect(out).toContain("Agent");
+    expect(out).toContain("Looking into it.");
+    for (const bad of ["<script", "<img", "onerror"]) expect(out, bad).not.toContain(bad);
+  });
+
+  it("selects a conversation from the query, and says where the thread lives", async () => {
+    readIndex.mockResolvedValue(index);
+    readTicket.mockImplementation(async (id: string) => tickets.find((ticket) => ticket.id === id) ?? null);
+    const asking = byTitle("Rotate the staging keys");
+    const out = await html(Chat({ searchParams: Promise.resolve({ t: asking.id }) }));
+    expect(out).toContain("Rotate the staging keys");
+    expect(out).toContain(`/tickets/${asking.id}`);
+  });
+});
+
+describe("the swarm page", () => {
+  it("draws the field and the worker list from the index", async () => {
+    readIndex.mockResolvedValue(index);
+    const out = await html(Swarm());
+    expect(out).toContain("<h1>Swarm</h1>");
+    expect(out).toContain('role="img"');
+    expect(out).toContain("Workers");
+    expect(out).toContain("Open tickets");
+    expect(out).toContain("Rotate the staging keys");
   });
 });
 
@@ -165,8 +241,8 @@ describe("a ticket's page", () => {
     expect(out).toContain("[image: chart]");
     expect(out).toContain("replied");
     for (const bad of ["<script", "<img", "onerror", "javascript:"]) expect(out, bad).not.toContain(bad);
-    expect(out).toContain("<h2>Work</h2>");
-    expect(out).toContain("Decisions");
+    expect(out).toContain('id="work-title"');
+    expect(out).toContain('id="decisions-title"');
     expect(out).not.toContain("not delivered yet");
   });
 
@@ -180,7 +256,7 @@ describe("a ticket's page", () => {
     const browsing = byTitle("Read my notifications");
     readTicket.mockResolvedValue(browsing);
     const out = await html(page(browsing.id));
-    expect(out).toContain("<h2>Browser</h2>");
+    expect(out).toContain('id="browser-title"');
     expect(out).toContain("2 steps");
     expect(out).toContain('href="https://example.com/reset"');
     expect(out).not.toContain("SECRETVALUE");

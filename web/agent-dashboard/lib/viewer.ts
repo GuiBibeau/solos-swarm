@@ -4,13 +4,17 @@
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { authConfig, ConfigError, type AuthConfig } from "./config";
+import { FIXTURES } from "./fixtures";
 import { SESSION_COOKIE } from "./session";
 import { viewerFromCookieHeader, type Viewer } from "./viewer-core";
 
 export type { Viewer } from "./viewer-core";
 
+const PREVIEW = { email: "preview@localhost" } as Viewer;
+
 /** The viewer of this request, or null: signed out, expired, not allowed, or the dashboard is not configured. */
 export async function currentViewer(): Promise<Viewer | null> {
+  if (FIXTURES) return PREVIEW;
   let config: AuthConfig;
   try {
     config = authConfig();

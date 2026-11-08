@@ -4,7 +4,10 @@
 //
 // Every function here takes a Viewer, which only a signed-in, allowed person's request can make (viewer.ts).
 
+import { readFileSync, readdirSync } from "node:fs";
+import path from "node:path";
 import { get } from "@vercel/blob";
+import { FIXTURES } from "./fixtures";
 import { FORMAT, JOBS_FORMAT, type Index, type Jobs, type TicketSnapshot } from "./types";
 import type { Viewer } from "./viewer-core";
 
@@ -18,7 +21,31 @@ export function validTicketId(id: string): boolean {
 
 export class StoreError extends Error {}
 
+/** The same paths, from the JSON `tests/agent_publish.rs` writes. Development only; see lib/fixtures.ts. */
+function fixtureJson(pathname: string): unknown | null {
+  const dir = path.join(process.cwd(), "tests", "fixtures");
+  const read = (name: string) => JSON.parse(readFileSync(path.join(dir, name), "utf8")) as unknown;
+  if (pathname === INDEX_PATH) return read("mix-index.json");
+  if (pathname === JOBS_PATH) return read("jobs.json");
+  const ticket = /^tickets\/([A-Za-z0-9_-]+)\.json$/.exec(pathname);
+  if (ticket) {
+    for (const name of readdirSync(dir)) {
+      if (!/^mix-\d+\.json$/.test(name)) continue;
+      const json = read(name) as { id?: unknown };
+      if (json.id === ticket[1]) return json;
+    }
+  }
+  return null;
+}
+
 async function readJson(pathname: string): Promise<unknown | null> {
+  if (FIXTURES) {
+    try {
+      return fixtureJson(pathname);
+    } catch {
+      return null;
+    }
+  }
   let result;
   try {
     // useCache: false, because a blob is overwritten at the same pathname and the CDN may serve the old one for a
