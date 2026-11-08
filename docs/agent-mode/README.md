@@ -66,6 +66,8 @@ do.
 Each folder holds the design of one feature and its PR plan:
 
 - [github-app/](github-app/rationale.md): the agent's own GitHub App.
+- [long-jobs/](long-jobs/design.md): detached jobs that outlive a worker session, and external spend such as Modal on
+  a Ticket's account. A design, not built.
 - [memory/](memory/design.md): memos, the review and the dream.
 - [pstack/](pstack/rationale.md): pstack as the coding method.
 - [vault-browser/](vault-browser/rationale.md): the vault and the verifiable browser.
