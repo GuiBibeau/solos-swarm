@@ -1431,7 +1431,7 @@ fn a_deploy_pushes_only_what_the_box_lacks_then_builds_then_switches() {
     );
     let said = out(&output);
     assert!(
-        said.contains("deploy 0123456789ab: a one-line fix"),
+        said.contains("deploy 0123456789ab to testbox: a one-line fix"),
         "{said}"
     );
     assert!(said.contains("sent 0123456789ab"), "{said}");
