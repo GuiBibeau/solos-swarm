@@ -113,6 +113,28 @@ suspended or short of a permission, an installation that holds `workflows` or `a
 does not exist, or a pinned login that now names another account. It reads the key and deletes nothing. Without
 `--state-dir`, it looks the accounts up and shows them, and pins nothing.
 
+## When a repository in `forge.repos` lacks the App
+
+You can list a repository in `forge.repos` before the App is installed on it, and an owner can suspend the App on one
+account while it works on another. A repository without the App never holds back the others.
+
+- `serve` still starts. It logs once that the App is not installed on the repository, with the URL to install it from,
+  or that it is suspended, and leaves the repository out. The `github` source reads every other repository at
+  `github.poll_secs`, as usual.
+- It asks GitHub about the left-out repository again every five minutes, and logs nothing more while the answer is the
+  same. When you install or unsuspend the App, the next ask works, the log says `the App works on <repo> again`, and
+  the source reads the repository with no restart. It reads from the repository's saved position. For a repository the
+  agent has not read yet, that is when the agent first listed it, less the 10-minute overlap, so a comment written
+  meanwhile arrives then.
+- A reply or a pull request for that repository waits and tries again every five minutes, as for any suspended App.
+- If GitHub refuses the repository itself (a 403 or a 404 on `GET /repos/<repo>`) although the App is installed on it,
+  waiting cannot help. The log names the repository and GitHub's words once, and the source leaves that repository out
+  until the next restart. The other repositories are read. If the App can read none of them, the `github` source stops
+  and says so, and the rest of the agent keeps running.
+- A key GitHub rejects still stops the `github` source, since it is the same for every repository.
+
+`agent github check` lists each repository that is missing or suspended and exits 1.
+
 ## Prove it works
 
 Open one issue on the throwaway repository:
@@ -128,7 +150,9 @@ Within a minute a comment answers it, and its author is `solos-bot[bot]`.
 Any of these stops it:
 
 - Suspend or uninstall the App on GitHub, under **Settings**, **Applications**, **Installed GitHub Apps**. Every GitHub
-  call then waits five minutes and tries again. Unsuspending or reinstalling resumes the work without a restart.
+  call for a repository it covered then waits five minutes and tries again, while the `github` source reads the other
+  repositories ([details](#when-a-repository-in-forgerepos-lacks-the-app)). Unsuspending or reinstalling resumes the
+  work without a restart.
 - Set `github.writes: false` and restart. No write token is ever minted.
 - Set `policy.paused: true`. It holds every Effect with the rest of the agent.
 - Remove a repository from `forge.repos`. A repository outside it gets no token.

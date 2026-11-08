@@ -181,6 +181,45 @@ pub(crate) fn retry_after(err: &anyhow::Error) -> Option<Duration> {
         .map(|after| after.0)
 }
 
+/// The App is not installed on a repository, or is suspended there. Unlike a
+/// rate limit, which holds every call, this wait is that repository's alone,
+/// so the Source reads the others meanwhile. It is a [`RetryAfter`] too, for
+/// callers that only wait.
+#[derive(Debug)]
+pub(crate) struct Absent {
+    why: String,
+    wait: RetryAfter,
+}
+
+impl Absent {
+    pub(crate) fn new(why: String, wait: Duration) -> Self {
+        Self {
+            why,
+            wait: RetryAfter(wait),
+        }
+    }
+}
+
+impl std::fmt::Display for Absent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.why)
+    }
+}
+
+impl std::error::Error for Absent {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.wait)
+    }
+}
+
+/// How long the repository `err` is about waits, when the App is missing or
+/// suspended there.
+pub(crate) fn absent(err: &anyhow::Error) -> Option<Duration> {
+    err.chain()
+        .find_map(|e| e.downcast_ref::<Absent>())
+        .map(|absent| absent.wait.0)
+}
+
 /// Whether GitHub's refusal says the installation is suspended.
 fn suspended(message: &str) -> bool {
     message.to_ascii_lowercase().contains("suspended")

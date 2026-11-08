@@ -168,7 +168,15 @@ struct Hub {
     // ---- the App ----
     /// Installed repositories and the installation each is in.
     installed: BTreeMap<String, u64>,
+    /// Every installation is suspended.
     suspended: bool,
+    /// These installations are suspended, as an owner suspends the App on one
+    /// account.
+    suspended_installs: BTreeSet<u64>,
+    /// `GET /repos/{repo}` answers 404, though the App is installed there.
+    unreadable: BTreeSet<String>,
+    /// The issue comments of `DOCS`; the other listings of it are empty.
+    docs: Vec<Value>,
     /// The permissions an installation reports.
     granted: Value,
     tokens: BTreeMap<String, Minted>,
@@ -311,6 +319,15 @@ fn jwt(shared: &Shared, bearer: &str) -> Result<(), &'static str> {
     if verified { Ok(()) } else { Err(BAD) }
 }
 
+/// Whether the installation that holds `repo` is suspended.
+fn suspended(hub: &Hub, repo: &str) -> bool {
+    hub.suspended
+        || hub
+            .installed
+            .get(repo)
+            .is_some_and(|id| hub.suspended_installs.contains(id))
+}
+
 /// What a bearer is.
 fn who(shared: &Shared, bearer: Option<&str>) -> Who {
     let Some(bearer) = bearer else {
@@ -376,7 +393,11 @@ async fn gate(State(shared): State<Shared>, request: Request, next: Next) -> Res
         }
         (Who::App, true) => None,
         (Who::Install { repos, write, .. }, false) => {
-            if shared.hub.lock().unwrap().suspended {
+            let down = {
+                let hub = shared.hub.lock().unwrap();
+                repos.iter().any(|repo| suspended(&hub, repo))
+            };
+            if down {
                 Some(message(
                     StatusCode::FORBIDDEN,
                     "This installation has been suspended",
@@ -561,11 +582,12 @@ async fn installation(
     Path((owner, repo)): Path<(String, String)>,
 ) -> Response {
     let hub = shared.hub.lock().unwrap();
-    match hub.installed.get(&format!("{owner}/{repo}")) {
+    let name = format!("{owner}/{repo}");
+    match hub.installed.get(&name) {
         None => message(StatusCode::NOT_FOUND, "Not Found"),
         Some(id) => Json(json!({
             "id": id,
-            "suspended_at": hub.suspended.then(|| ts(now_secs() * 1_000)),
+            "suspended_at": suspended(&hub, &name).then(|| ts(now_secs() * 1_000)),
             "permissions": hub.granted,
         }))
         .into_response(),
@@ -587,7 +609,7 @@ async fn mint(
     if !hub.installed.values().any(|id| *id == installation) {
         return message(StatusCode::NOT_FOUND, "Not Found");
     }
-    if hub.suspended {
+    if hub.suspended || hub.suspended_installs.contains(&installation) {
         return message(
             StatusCode::FORBIDDEN,
             "This installation has been suspended",
@@ -660,51 +682,79 @@ async fn branch(Path((owner, repo, branch)): Path<(String, String, String)>) -> 
     }
 }
 
-async fn repository(Path((owner, repo)): Path<(String, String)>) -> Response {
-    if !ours(&owner, &repo) && format!("{owner}/{repo}") != DOCS {
+async fn repository(
+    State(shared): State<Shared>,
+    Path((owner, repo)): Path<(String, String)>,
+) -> Response {
+    let name = format!("{owner}/{repo}");
+    if (!ours(&owner, &repo) && name != DOCS)
+        || shared.hub.lock().unwrap().unreadable.contains(&name)
+    {
         return message(StatusCode::NOT_FOUND, "Not Found");
     }
     Json(json!({ "full_name": format!("{owner}/{repo}") })).into_response()
 }
 
+/// The repository a listing is of: `REPO`, or `DOCS`, which lists nothing but
+/// the issue comments in `Hub::docs`.
+fn listed(owner: &str, repo: &str) -> String {
+    let name = format!("{owner}/{repo}");
+    assert!(name == REPO || name == DOCS, "{name}");
+    name
+}
+
 async fn issues((State(shared), Path((owner, repo)), Query(query), headers): Listing) -> Response {
-    assert!(ours(&owner, &repo));
+    let name = listed(&owner, &repo);
     assert_eq!(query["state"], "all");
-    let items = shared.hub.lock().unwrap().issues.clone();
-    since(
-        &shared,
-        &format!("repos/{REPO}/issues"),
-        &items,
-        &query,
-        &headers,
-    )
+    let items = if name == REPO {
+        shared.hub.lock().unwrap().issues.clone()
+    } else {
+        Vec::new()
+    };
+    let path = format!("repos/{name}/issues");
+    since(&shared, &path, &items, &query, &headers)
 }
 
 async fn comments(
     (State(shared), Path((owner, repo)), Query(query), headers): Listing,
 ) -> Response {
-    assert!(ours(&owner, &repo));
-    let items = shared.hub.lock().unwrap().comments.clone();
-    let path = format!("repos/{REPO}/issues/comments");
+    let name = listed(&owner, &repo);
+    let items = {
+        let hub = shared.hub.lock().unwrap();
+        if name == REPO {
+            hub.comments.clone()
+        } else {
+            hub.docs.clone()
+        }
+    };
+    let path = format!("repos/{name}/issues/comments");
     since(&shared, &path, &items, &query, &headers)
 }
 
 async fn review_comments(
     (State(shared), Path((owner, repo)), Query(query), headers): Listing,
 ) -> Response {
-    assert!(ours(&owner, &repo));
-    let items = shared.hub.lock().unwrap().review_comments.clone();
-    let path = format!("repos/{REPO}/pulls/comments");
+    let name = listed(&owner, &repo);
+    let items = if name == REPO {
+        shared.hub.lock().unwrap().review_comments.clone()
+    } else {
+        Vec::new()
+    };
+    let path = format!("repos/{name}/pulls/comments");
     since(&shared, &path, &items, &query, &headers)
 }
 
 /// The latest completed runs, newest first.
 async fn runs((State(shared), Path((owner, repo)), Query(query), headers): Listing) -> Response {
-    assert!(ours(&owner, &repo));
+    let name = listed(&owner, &repo);
     assert_eq!(query["status"], "completed");
-    let mut items = shared.hub.lock().unwrap().runs.clone();
+    let mut items = if name == REPO {
+        shared.hub.lock().unwrap().runs.clone()
+    } else {
+        Vec::new()
+    };
     items.sort_by_key(|run| std::cmp::Reverse(run["id"].as_u64().unwrap()));
-    let path = format!("repos/{REPO}/actions/runs");
+    let path = format!("repos/{name}/actions/runs");
     page(
         &shared,
         &path,
@@ -1072,7 +1122,18 @@ impl Fake {
     }
 
     fn source_on(&self, api: Arc<GithubApi>, scratch: &Scratch, follow: bool) -> Box<dyn Source> {
-        let source = GithubSource::new(api, [repo(REPO)], scratch.cursor(), follow)
+        self.source_of(api, &[repo(REPO)], scratch, follow)
+    }
+
+    /// A Source of `repos`, which the Minter behind `api` must allow.
+    fn source_of(
+        &self,
+        api: Arc<GithubApi>,
+        repos: &[RepoName],
+        scratch: &Scratch,
+        follow: bool,
+    ) -> Box<dyn Source> {
+        let source = GithubSource::new(api, repos.iter().cloned(), scratch.cursor(), follow)
             .with_poll(Duration::from_millis(20))
             .with_backoff(Duration::from_millis(10), Duration::from_millis(100));
         Box::new(source)
@@ -2891,6 +2952,262 @@ async fn an_uninstalled_app_waits_and_a_reinstall_with_a_new_installation_is_fou
         7_789,
         "the new installation was found"
     );
+}
+
+// ---- One repository the App cannot act on ----
+
+/// The ids of the Triggers stored so far, sorted.
+fn stored(scratch: &Scratch) -> Vec<String> {
+    let mut ids: Vec<String> = scratch
+        .store()
+        .triggers()
+        .unwrap()
+        .iter()
+        .map(|trigger| trigger.id.to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// How many GETs the fake has had for `path`.
+fn gets(hub: &Hub, path: &str) -> usize {
+    hub.requests
+        .iter()
+        .filter(|r| r.method == "GET" && r.path == path)
+        .count()
+}
+
+/// A comment from alice on issue `number`, written a minute before the fake
+/// started.
+fn mention(fake: &Fake, id: u64, number: u64) -> Value {
+    let at = fake.t0 - 60_000;
+    comment(id, number, "alice", "@solos-bot look", at, at, false)
+}
+
+/// An agent that reads `DOCS` and `REPO` through `minter`, until stopped.
+fn two_repositories(fake: &Fake, scratch: &Scratch, minter: Arc<Minter>) -> Runtime {
+    let api = fake.api_on(minter, scratch.pins());
+    Agent {
+        scratch,
+        source: fake.source_of(api, &[repo(DOCS), repo(REPO)], scratch, true),
+        channel: None,
+        executor: Arc::new(ScriptedExecutor),
+        until_idle: false,
+    }
+    .runtime()
+}
+
+fn widgets_listed(hub: &Hub) -> usize {
+    gets(hub, "repos/acme/widgets/issues")
+}
+
+#[tokio::test]
+async fn a_repository_without_the_app_is_left_out_and_the_others_are_read_at_the_usual_rate() {
+    let fake = Fake::start().await;
+    let scratch = Scratch::new("one-missing");
+    fake.hub().installed.remove(DOCS);
+    fake.hub().comments = vec![mention(&fake, 101, 7)];
+    fake.hub().docs = vec![mention(&fake, 201, 3)];
+    // The wait is the default five minutes: a second look inside this test is
+    // a repository that was not left out.
+    let runtime = two_repositories(&fake, &scratch, fake.minter());
+    let driver = async {
+        until_triggers(&scratch, 1).await;
+        let looked = gets(&fake.hub(), "repos/acme/docs/installation");
+        fake.until("the installed repository to be read again", |hub| {
+            (widgets_listed(hub) >= 6).then_some(())
+        })
+        .await;
+        let hub = fake.hub();
+        assert_eq!(
+            gets(&hub, "repos/acme/docs/installation"),
+            looked,
+            "the missing installation is not asked about again before its wait is over"
+        );
+        assert!(
+            hub.requests.iter().all(
+                |r| !r.path.starts_with("repos/acme/docs") || r.path.ends_with("/installation")
+            ),
+            "nothing of the repository was listed"
+        );
+    };
+
+    let (summary, ()) = drive(runtime, driver).await;
+
+    assert_eq!(
+        summary.triggers_received, 1,
+        "the installed repository's comment arrived at once"
+    );
+    assert_eq!(stored(&scratch), ["github:acme/widgets:comment:101"]);
+}
+
+#[tokio::test]
+async fn a_repository_the_app_is_installed_on_later_is_read_without_a_restart() {
+    let fake = Fake::start().await;
+    let scratch = Scratch::new("installed-later");
+    fake.hub().installed.remove(DOCS);
+    fake.hub().comments = vec![mention(&fake, 101, 7)];
+    fake.hub().docs = vec![mention(&fake, 201, 3)];
+    let minter = fake.minter_with(KEY, |config| {
+        config.suspended_wait = Duration::from_millis(100)
+    });
+    let runtime = two_repositories(&fake, &scratch, minter);
+    let driver = async {
+        until_triggers(&scratch, 1).await;
+        assert_eq!(stored(&scratch), ["github:acme/widgets:comment:101"]);
+        fake.hub().installed.insert(DOCS.to_owned(), 7_788);
+        until_triggers(&scratch, 2).await;
+    };
+
+    let (summary, ()) = drive(runtime, driver).await;
+
+    assert_eq!(summary.triggers_received, 2);
+    assert_eq!(
+        stored(&scratch),
+        [
+            "github:acme/docs:comment:201",
+            "github:acme/widgets:comment:101"
+        ],
+        "the repository's comment arrived once the App was installed on it"
+    );
+}
+
+#[tokio::test]
+async fn a_repository_suspended_while_the_agent_runs_is_left_out_and_read_again_when_it_is_lifted()
+{
+    let fake = Fake::start().await;
+    let scratch = Scratch::new("one-suspended");
+    // Its own installation, as another account's is, so that it alone is suspended.
+    fake.hub().installed.insert(DOCS.to_owned(), 7_790);
+    fake.hub().comments = vec![mention(&fake, 101, 7)];
+    fake.hub().docs = vec![mention(&fake, 201, 3)];
+    let minter = fake.minter_with(KEY, |config| {
+        config.suspended_wait = Duration::from_millis(100)
+    });
+    let runtime = two_repositories(&fake, &scratch, minter);
+    let driver = async {
+        until_triggers(&scratch, 2).await;
+        fake.hub().suspended_installs.insert(7_790);
+        let now = now_secs() * 1_000;
+        {
+            let mut hub = fake.hub();
+            hub.comments.push(comment(
+                102,
+                7,
+                "alice",
+                "@solos-bot again",
+                now,
+                now,
+                false,
+            ));
+            hub.docs.push(comment(
+                202,
+                3,
+                "alice",
+                "@solos-bot again",
+                now,
+                now,
+                false,
+            ));
+        }
+        until_triggers(&scratch, 3).await;
+        assert_eq!(
+            stored(&scratch),
+            [
+                "github:acme/docs:comment:201",
+                "github:acme/widgets:comment:101",
+                "github:acme/widgets:comment:102",
+            ],
+            "the other repository went on while this one was suspended"
+        );
+        assert!(
+            fake.hub()
+                .requests
+                .iter()
+                .any(|r| r.path.starts_with("repos/acme/docs/") && r.status == 403),
+            "the suspension was met"
+        );
+        fake.hub().suspended_installs.clear();
+        until_triggers(&scratch, 4).await;
+    };
+
+    let (summary, ()) = drive(runtime, driver).await;
+
+    assert_eq!(summary.triggers_received, 4);
+    assert_eq!(
+        stored(&scratch),
+        [
+            "github:acme/docs:comment:201",
+            "github:acme/docs:comment:202",
+            "github:acme/widgets:comment:101",
+            "github:acme/widgets:comment:102",
+        ],
+        "what was written during the suspension arrived once it was lifted"
+    );
+}
+
+#[tokio::test]
+async fn a_repository_the_app_cannot_read_is_left_out_and_the_others_are_read() {
+    let fake = Fake::start().await;
+    let scratch = Scratch::new("one-unreadable");
+    // Installed, but GitHub refuses the repository itself: it is not a wait.
+    fake.hub().unreadable.insert(DOCS.to_owned());
+    fake.hub().comments = vec![mention(&fake, 101, 7)];
+    fake.hub().docs = vec![mention(&fake, 201, 3)];
+    let runtime = two_repositories(&fake, &scratch, fake.minter());
+    let driver = async {
+        until_triggers(&scratch, 1).await;
+        fake.until("the readable repository to be read again", |hub| {
+            (widgets_listed(hub) >= 6).then_some(())
+        })
+        .await;
+        let probes: Vec<u16> = fake
+            .reads("repos/acme/docs")
+            .iter()
+            .map(|(_, status, _)| *status)
+            .collect();
+        assert_eq!(probes, [404], "asked once, refused, and left out");
+        assert_eq!(gets(&fake.hub(), "repos/acme/docs/issues"), 0);
+    };
+
+    let (summary, ()) = drive(runtime, driver).await;
+
+    assert_eq!(summary.triggers_received, 1);
+    assert_eq!(stored(&scratch), ["github:acme/widgets:comment:101"]);
+}
+
+#[tokio::test]
+async fn a_source_whose_every_repository_the_app_cannot_read_stops_and_the_agent_goes_on() {
+    let fake = Fake::start().await;
+    let scratch = Scratch::new("none-readable");
+    fake.hub().unreadable.insert(DOCS.to_owned());
+    let api = fake.api_on(fake.minter(), scratch.pins());
+    let github = fake.source_of(api, &[repo(DOCS)], &scratch, true);
+    let asked = [request("t1", 7, "Fix the flaky test")];
+    let adapters = Adapters {
+        sources: vec![github, scratch.triggers(&asked)],
+        channels: BTreeMap::new(),
+        router: Arc::new(ScriptedRouter::new(BUDGET)),
+        executor: Arc::new(ScriptedExecutor),
+    };
+    let options = RunOptions {
+        until_idle: true,
+        tick: Duration::from_millis(10),
+        retry_base: Duration::from_millis(10),
+        retry_max: Duration::from_millis(500),
+    };
+    let runtime = Runtime::new(scratch.store(), policy(), adapters, options);
+
+    let summary = tokio::time::timeout(LIMIT, runtime.run(std::future::pending()))
+        .await
+        .expect("the run did not go idle")
+        .expect("a repository GitHub refuses stops the github source, not the agent");
+
+    assert_eq!(
+        summary.triggers_received, 1,
+        "the other source kept working"
+    );
+    assert!(fake.reads("repos/acme/docs/issues").is_empty());
 }
 
 // ---- The App's key ----

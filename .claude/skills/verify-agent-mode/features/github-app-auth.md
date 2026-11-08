@@ -13,6 +13,9 @@ to disk. PR 1 of `docs/agent-mode/github-app/prs.md`, merged as #63.
   `administration`), a read and a write mint, the base branch and each listed login's pinned account.
 - `no-token-at-rest`: after the drive, `grep -r ghs_ ~/work/verify/$RUN` finds nothing, and the key file is gone from
   the runtime directory.
+- `missing-install`: a repository listed under `forge.repos` that the App is not installed on is left out with one log
+  line, and an issue on the installed repository is still answered within a minute or two. Installing the App on the
+  other repository makes its issues answered within five minutes, with no restart.
 
 ## How to get to it (user POV)
 
@@ -37,6 +40,11 @@ Gotchas). `bin/doctor.sh $RUN` clean. The operator approved the spend cap.
   --jq '.[] | [.user.login, .body] | @tsv'`. The author is `solos-bot[bot]`, and the text matches `gh api
   repos/GuiBibeau/solos-swarm-sandbox/contents/README.md --jq .content | base64 -d | head -1`.
 - `no-token-at-rest`: `ssh remote-ai 'grep -r ghs_ ~/work/verify/$RUN || echo none'` prints `none`.
+- `missing-install`: add a second repository the App is not installed on to the run's `forge.repos`, before launching.
+  The run's log has one `the App is not installed on <repo>` line for it and then no more. The `app-identity` issue is
+  still answered. Install the App on the second repository (a throwaway one, with a person's login under
+  `policy.people`), open an issue there, and within five minutes the log says `the App works on <repo> again` and the
+  bot comments.
 - `bin/evidence.sh $RUN github-app-auth`.
 
 ## Gotchas
