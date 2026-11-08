@@ -15,6 +15,11 @@ env:
   # Debug info was most of the compile and link time of the 53 test binaries and of the size of target/ (and of the
   # runner running out of disk). Panic messages carry their own file:line; backtraces keep function names.
   CARGO_PROFILE_DEV_DEBUG: "0"
+# What a pull request touches decides what runs (scripts/ci-changes.sh): documentation alone, or the dashboard alone,
+# skips the Rust jobs, and a change with no dashboard file skips `web`. Each job asks for itself, in a step that takes
+# a fraction of a second after its checkout, and skips the rest of its steps. A separate `changes` job that the others
+# wait for would add its own runner's start, about 6 s, to the path every test is behind. A push to main, a manual run
+# and anything the script cannot tell run everything.
 jobs:
   # fmt + clippy. Nothing waits on it but the final `check`, so it runs beside the build.
   lint:
@@ -22,12 +27,19 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 2
+      - id: changes
+        run: scripts/ci-changes.sh >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249
+        if: steps.changes.outputs.rust == 'true'
         with:
           toolchain: 1.96.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: steps.changes.outputs.rust == 'true'
       - name: Rust format & clippy
+        if: steps.changes.outputs.rust == 'true'
         run: |
           cargo fmt --all -- --check
           cargo clippy --locked --all-targets -- -D warnings
@@ -36,31 +48,44 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    outputs:
+      rust: ${{ steps.changes.outputs.rust }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 2
+      - id: changes
+        run: scripts/ci-changes.sh >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249
+        if: steps.changes.outputs.rust == 'true'
         with:
           toolchain: 1.96.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: steps.changes.outputs.rust == 'true'
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        if: steps.changes.outputs.rust == 'true'
         with:
           tool: nextest@0.9.140
       - name: Build the test binaries
+        if: steps.changes.outputs.rust == 'true'
         run: cargo nextest archive --locked --workspace --archive-file nextest-archive.tar.zst
       # The archive goes to the shards through the cache, not as an artifact: measured on runners, restoring 400 MB
       # took 3-10 s against 5-43 s to download the same bytes as an artifact. The key is per run and attempt.
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.changes.outputs.rust == 'true'
         with:
           path: nextest-archive.tar.zst
           key: nextest-archive-${{ github.run_id }}-${{ github.run_attempt }}
-      # `cargo test` also ran doc tests, which nextest does not. There are none today (every crate reports 0), so
-      # this costs nothing; the day a doc comment has a code block, they run again.
+      # `cargo test` also ran doc tests, which nextest does not. There are none today, and rustdoc takes five seconds
+      # to find that out on the path every test waits for, so it runs only when a doc comment holds a code block
+      # that rustdoc would run (scripts/has-doc-tests.sh).
       - name: Doc tests, if any
+        if: steps.changes.outputs.rust == 'true'
         run: |
-          if grep -rqE '^\s*//[/!]\s*```' src crates --include='*.rs'; then
+          if scripts/has-doc-tests.sh; then
             cargo test --locked --workspace --doc
           else
-            echo "no doc comment has a code block: no doc tests"
+            echo "no doc comment has a code block rustdoc runs: no doc tests"
           fi
 
   # The pinned tokenizer assets come from huggingface.co. This job fetches them, once per change of the pin; the
@@ -70,21 +95,30 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 2
+      - id: changes
+        run: scripts/ci-changes.sh >> "$GITHUB_OUTPUT"
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.changes.outputs.rust == 'true'
         with:
           path: work/tokenizers
           key: tokenizers-${{ hashFiles('scripts/bootstrap_tokenizers.py', 'assets/tokenizers/**') }}
       - name: Verify pinned tokenizer assets
+        if: steps.changes.outputs.rust == 'true'
         run: python3 scripts/bootstrap_tokenizers.py --output work/tokenizers
 
   test:
     needs: [build, tokenizers]
+    if: ${{ needs.build.outputs.rust == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
+      # Five shards: a shard is about 140 s of test time on four cores, so four shards ended after the slowest isolated
+      # test (the floor below), and five end just before it.
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -115,9 +149,12 @@ jobs:
   # Three raft tests assert on the wall clock and fail when other tests share the runner, and the archive test is
   # the slowest left (see .config/nextest.toml). They run one at a time, one to a runner, beside the shards: the
   # condition they had in the serial run. nextest numbers a partition within each test binary and all four are in
-  # the library's, so `count:N/4` hands each job exactly one.
+  # the library's, so `count:N/4` hands each job exactly one. None of the four runs `node` (they pass with a `node`
+  # that fails when called), so these jobs skip setting it up: part 4, the archive test, is the slowest job in the
+  # run after `build`, and setting up Node was 5 s of it.
   test-isolated:
     needs: [build, tokenizers]
+    if: ${{ needs.build.outputs.rust == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -126,9 +163,6 @@ jobs:
         part: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: 24.18.0
       - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: nextest@0.9.140
@@ -168,18 +202,26 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 2
+      - id: changes
+        run: scripts/ci-changes.sh >> "$GITHUB_OUTPUT"
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        if: steps.changes.outputs.rust == 'true'
         with:
           node-version: 24.18.0
           cache: 'npm'
       - name: Python tests
+        if: steps.changes.outputs.rust == 'true'
         run: |
           python3 -m venv work/dashboard-python
           work/dashboard-python/bin/python -m pip install -r scripts/requirements-dashboard.txt
           work/dashboard-python/bin/python -m unittest discover -s tests -p 'test_*.py'
       - name: Dashboard tests
+        if: steps.changes.outputs.rust == 'true'
         run: node --test tests/dashboard-*.test.mjs
       - name: Node broker & MVP tests
+        if: steps.changes.outputs.rust == 'true'
         run: npm ci --ignore-scripts --no-audit --no-fund && npm run test:broker
 
   # The agent's web dashboard is its own npm project (Next.js, deployed to Vercel), not part of the Rust build.
@@ -192,18 +234,31 @@ jobs:
         working-directory: web/agent-dashboard
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 2
+      - id: changes
+        working-directory: .
+        run: scripts/ci-changes.sh >> "$GITHUB_OUTPUT"
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        if: steps.changes.outputs.web == 'true'
         with:
           node-version: 24.18.0
           cache: 'npm'
           cache-dependency-path: web/agent-dashboard/package-lock.json
-      - run: npm ci --no-audit --no-fund
-      - run: npm run lint
-      - run: npm run typecheck
-      - run: npm test
-      - run: npm run build
+      - if: steps.changes.outputs.web == 'true'
+        run: npm ci --no-audit --no-fund
+      - if: steps.changes.outputs.web == 'true'
+        run: npm run lint
+      - if: steps.changes.outputs.web == 'true'
+        run: npm run typecheck
+      - if: steps.changes.outputs.web == 'true'
+        run: npm test
+      - if: steps.changes.outputs.web == 'true'
+        run: npm run build
 
-  # The one result to watch (and to require in branch protection): green only when every job above is.
+  # The one result to watch (and to require in branch protection): green only when every job above is. The only jobs
+  # that can be skipped are the two test jobs, and only when `build` found that nothing but documentation or the
+  # dashboard changed. If `build` did not say so (it failed, or its output is missing), skipped tests do not pass.
   check:
     if: ${{ always() }}
     needs: [lint, build, tokenizers, test, test-isolated, scripts, web]
@@ -213,8 +268,15 @@ jobs:
       - name: Every job passed
         env:
           RESULTS: ${{ join(needs.*.result, ' ') }}
+          RUST: ${{ needs.build.outputs.rust }}
+          TESTS: ${{ needs.test.result }} ${{ needs.test-isolated.result }}
         run: |
-          echo "job results: $RESULTS"
+          echo "job results: $RESULTS; Rust jobs wanted: ${RUST:-unknown}"
           for result in $RESULTS; do
-            [ "$result" = success ] || { echo "a job did not pass"; exit 1; }
+            case $result in success | skipped) ;; *) echo "a job did not pass"; exit 1 ;; esac
           done
+          if [ "$RUST" != false ]; then
+            for result in $TESTS; do
+              [ "$result" = success ] || { echo "the Rust tests did not run, and the change is not documentation or dashboard only"; exit 1; }
+            done
+          fi

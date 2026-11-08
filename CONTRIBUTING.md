@@ -32,7 +32,9 @@ Run the Rust tests with one thread, as [README.md](README.md) does:
 cargo test --locked -- --test-threads=1
 ```
 
-CI builds the same tests with `cargo-nextest` and runs them in shards. To use that path locally:
+CI builds the same tests with `cargo-nextest` and runs them in shards. A pull request that changes only Markdown
+documentation, or only `web/agent-dashboard`, skips the Rust jobs, and one that changes no dashboard file skips the web
+job (`scripts/ci-changes.sh` decides). To use the nextest path locally:
 
 ```sh
 cargo nextest run --locked --workspace

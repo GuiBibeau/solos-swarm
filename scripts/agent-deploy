@@ -3,6 +3,9 @@
 #
 #   deploy [REV]      build REV (default origin/main) on the box as an immutable release, back up agent.db, switch,
 #                     restart and wait until healthy; if it does not come up, switch back and restore agent.db
+#   prebuild [REV]    the build of a deploy and nothing else: no drain, no stop, no switch. Run it while CI is still
+#                     running, and the deploy that follows finds the release built (or builds only what changed since).
+#                     scripts/ship does this
 #   rollback          switch to the previous release and restart
 #   status            the unit, the release it runs, `agent status`, the health check and prune timers, and the
 #                     dashboard publisher if there is one
@@ -24,6 +27,10 @@
 # (AGENT_USER=solos-agent scripts/agent-deploy status). Nothing here assumes a user name or uid; the units' runtime
 # directories are /run/user/<that user's uid>/..., which agent.yaml must name. "Run the agent as its own user" in
 # docs/agent-mode/production.md moves an agent from one user to another.
+# The source goes up as a git push into a bare repository there (~/agent/src.git), which sends only the objects the
+# box lacks: a one-line fix is a few kilobytes. It is built in one tree that is updated in place (~/agent/src) with
+# one build cache (~/agent/target), so cargo recompiles what changed and nothing else, and one build runs at a time
+# (~/agent/build.lock). Each command prints how long its parts took, so a timed deploy shows where the time went.
 # When ~/agent/agent.yaml has a web.publish section (block style, as docs/agent-mode/production.md writes it), the
 # dashboard publisher, scripts/systemd/solos-agent-publish.service, is installed, enabled and restarted with the
 # agent by switch, rollback, start, stop and restart. It only reads agent.db, so it is stopped while agent.db is
@@ -50,7 +57,7 @@ SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30)
 if [[ -n ${AGENT_USER:-} ]]; then SSH+=(-l "$AGENT_USER"); fi
 SSH+=("$HOST")
 # This script runs on the box too: each command first installs it as ~/agent/.agent-deploy, so stdin stays free
-# for data (a release archive, a token).
+# for data (a token).
 push_self() { "${SSH[@]}" "mkdir -p -m 0700 ~/agent && cat > ~/agent/.agent-deploy" < "$0"; }
 host() { "${SSH[@]}" "AGENT_DRAIN_SECS=$DRAIN_SECS bash ~/agent/.agent-deploy --on-host $*"; }
 
@@ -214,25 +221,45 @@ if [[ ${1:-} == --on-host ]]; then
 		ops_enable
 	}
 	case $cmd in
-	receive) # stdin: git archive of release $1
+	build) # the commit is already in ~/agent/src.git as refs/deploy/$1: the Mac pushed it
 		rel=$A/releases/$1
-		[[ -f $rel/.complete ]] && { cat > /dev/null; echo "release $1 is already built"; exit 0; }
-		rm -rf "$rel.tmp" && mkdir -p "$rel.tmp" && tar -xf - -C "$rel.tmp"
-		;;
-	build)
-		rel=$A/releases/$1
-		[[ -f $rel/.complete ]] && exit 0
+		[[ -f $rel/.complete ]] && { echo "release $1 is already built"; exit 0; }
 		free=$(df -BG --output=avail "$A" | tail -1 | tr -dc 0-9)
 		((free >= 30)) || { echo "only ${free} GB free on the box; refusing to build" >&2; exit 1; }
+		# One build at a time: a prebuild and a deploy share the source tree and the build cache. A build that waited
+		# here usually finds the release done.
+		exec 9> "$A/build.lock"
+		flock -w 1800 9 || { echo "another build has held $A/build.lock for 30 minutes" >&2; exit 1; }
+		[[ -f $rel/.complete ]] && { echo "release $1 is already built"; exit 0; }
+		started=$SECONDS
+		src=$A/src
+		g=(git --git-dir="$A/src.git")
+		commit=$("${g[@]}" rev-parse --verify -q "refs/deploy/$1^{commit}") || { echo "the box has no commit $1: run this from the Mac" >&2; exit 1; }
+		# The tree is updated in place, never extracted anew. A checkout rewrites only the files that differ, stamped
+		# with the time of the checkout, so cargo (which compares source times with the time of its outputs) rebuilds
+		# what changed. A fresh extraction stamps every file with the commit's date, which can be older than the last
+		# build: cargo then sees nothing changed, and the new release holds the previous binary.
+		mkdir -p "$src"
+		"${g[@]}" --work-tree="$src" checkout -qf --detach "$commit"
+		"${g[@]}" --work-tree="$src" clean -fdxq
+		(cd "$src" && CARGO_TARGET_DIR=$A/target RUSTUP_TOOLCHAIN=1.96.0 CARGO_BUILD_JOBS=24 nice -n 10 \
+			cargo build --locked --release --bin solos-swarm > "$A/build.log" 2>&1) || { tail -30 "$A/build.log" >&2; exit 1; }
+		tail -3 "$A/build.log"
+		echo "compiled in $((SECONDS - started))s"
+		chmod -R u+w "$rel.tmp" 2> /dev/null || true
+		rm -rf "$rel.tmp" && mkdir -p "$rel.tmp"
+		"${g[@]}" archive "$commit" | tar -xf - -C "$rel.tmp"
 		cd "$rel.tmp"
 		npm ci --ignore-scripts --no-audit --no-fund > npm.log 2>&1 || { tail -20 npm.log >&2; exit 1; }
-		CARGO_TARGET_DIR=$A/target RUSTUP_TOOLCHAIN=1.96.0 CARGO_BUILD_JOBS=24 nice -n 10 \
-			cargo build --locked --release --bin solos-swarm 2>&1 | tail -3
 		mkdir -p bin && cp "$A/target/release/solos-swarm" bin/solos-swarm
 		echo "$1" > REVISION
 		bin/solos-swarm doctor --pi-root "$rel.tmp" --node "$NODE" > /dev/null
 		touch .complete && chmod -R a-w . && chmod u+w . && mv -T "$rel.tmp" "$rel" && chmod u-w "$rel"
-		echo "built release $1"
+		# The refs keep the last twenty commits reachable; the rest can be collected.
+		"${g[@]}" for-each-ref --sort=-committerdate --format='%(refname)' refs/deploy | tail -n +21 |
+			xargs -r -n1 "${g[@]}" update-ref -d
+		"${g[@]}" gc --auto --quiet || true
+		echo "built release $1 in $((SECONDS - started))s"
 		;;
 	switch)
 		rel=$A/releases/$1
@@ -251,16 +278,22 @@ if [[ ${1:-} == --on-host ]]; then
 		mkdir -p -m 0700 "$A/state"
 		hold_on
 		trap hold_off EXIT
+		t0=$SECONDS
 		drain "$DRAIN_SECS"
+		t1=$SECONDS
 		pub_stop
 		sc stop $UNIT 2> /dev/null || true
+		t2=$SECONDS
 		b=$(backup)
 		[[ -n $b ]] && echo "backed up agent.db to $b"
+		tb=$SECONDS
 		switch "$rel"
 		sc reset-failed $UNIT 2> /dev/null || true
 		sc start $UNIT
+		t3=$SECONDS
 		if healthy; then
 			echo "release $1 is serving (pid $(sc show -p MainPID --value $UNIT))"
+			echo "switch took $((SECONDS - t0))s: drain $((t1 - t0))s, stop $((t2 - t1))s, backup $((tb - t2))s, units and start $((t3 - tb))s, health wait $((SECONDS - t3))s"
 			drain_resume
 			pub_start
 			ops_start
@@ -394,6 +427,7 @@ if [[ ${1:-} == --on-host ]]; then
 	exit 0
 fi
 
+STARTED=$SECONDS
 cmd=${1:-}
 shift || true
 # `--drain SECONDS` and `--no-drain` can come anywhere after the command; what is left is its arguments.
@@ -414,16 +448,28 @@ done
 # The empty array is spelled out so that bash 3.2, the Mac's, does not call it unset.
 set -- ${ARGS[@]+"${ARGS[@]}"}
 case $cmd in
-deploy)
+deploy | prebuild)
 	rev=${1:-origin/main}
 	repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 	git -C "$repo" fetch -q origin
-	sha=$(git -C "$repo" rev-parse --short=12 "$rev^{commit}")
-	echo "deploying $sha to ${AGENT_USER:+$AGENT_USER@}$HOST: $(git -C "$repo" log -1 --format=%s "$sha")"
+	full=$(git -C "$repo" rev-parse "$rev^{commit}")
+	sha=${full:0:12}
+	echo "$cmd $sha to ${AGENT_USER:+$AGENT_USER@}$HOST: $(git -C "$repo" log -1 --format=%s "$full")"
 	push_self
-	git -C "$repo" archive "$sha" | host receive "$sha"
+	# A push sends the objects the box lacks (the first one, the whole history: about 9 MB). The ref keeps them.
+	"${SSH[@]}" 'git init -q --bare ~/agent/src.git'
+	ssh_cmd="ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30"
+	if [[ -n ${AGENT_USER:-} ]]; then ssh_cmd+=" -l $AGENT_USER"; fi
+	GIT_SSH_COMMAND=$ssh_cmd \
+		git -C "$repo" push -q --force "$HOST:agent/src.git" "$full:refs/deploy/$sha"
+	echo "sent $sha ($((SECONDS - STARTED))s)"
 	host build "$sha"
-	host switch "$sha"
+	if [[ $cmd == deploy ]]; then
+		host switch "$sha"
+		echo "deployed $sha in $((SECONDS - STARTED))s"
+	else
+		echo "prebuilt $sha in $((SECONDS - STARTED))s"
+	fi
 	;;
 rollback | status | releases | start | stop | restart) push_self && host "$cmd" ;;
 logs) push_self && host logs "$@" ;;

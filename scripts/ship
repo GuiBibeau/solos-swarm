@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# Ship a pull request to the box, from the Mac: scripts/ship [--drain SECONDS | --no-drain] [--no-prebuild] PR
+#
+# It merges the pull request and deploys the merge to production. It waits for green CI first, and it is built to
+# make the whole path (PR open, CI green, merged, live) take under five minutes:
+#
+#   1. While CI runs, the box builds the PR's head (`agent-deploy prebuild`). The build is the slow part of a
+#      deploy, and it does not depend on CI's answer, so it is not waited for.
+#   2. It polls the `check` job of CI for that head every 5 s and stops, merging nothing, at the first red result,
+#      when the head moves, or after SHIP_WAIT_SECS (default 1200).
+#   3. On green it merges with a merge commit, as this repository does, naming the head it saw.
+#   4. It deploys the merge commit. When main had not moved, the merge commit has the head's tree, the build tree
+#      on the box is already at it, and cargo has nothing to do; otherwise it builds only what changed.
+#
+# `--drain SECONDS` and `--no-drain` go to the deploy (see agent-deploy). A busy agent makes the drain the one part
+# that can run past five minutes: by default it waits up to 90 s for running Assignments to report.
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+cd "$here" # gh and git find the repository from here, wherever this was run from
+STARTED=$SECONDS
+USAGE="usage: scripts/ship [--drain SECONDS | --no-drain] [--no-prebuild] PR"
+say() { printf '[%3ds] %s\n' $((SECONDS - STARTED)) "$*"; }
+die() { say "$*" >&2; exit 1; }
+
+drain=()
+prebuild=1
+pr=
+while (($#)); do
+	case $1 in
+	--no-drain) drain=(--no-drain) ;;
+	--drain)
+		[[ ${2:-} =~ ^[0-9]+$ ]] || { echo "$USAGE" >&2; exit 2; }
+		drain=(--drain "$2")
+		shift
+		;;
+	--no-prebuild) prebuild=0 ;;
+	-*) echo "$USAGE" >&2; exit 2 ;;
+	*) [[ -z $pr ]] || { echo "$USAGE" >&2; exit 2; }; pr=$1 ;;
+	esac
+	shift
+done
+[[ $pr =~ ^[0-9]+$ ]] || { echo "$USAGE" >&2; exit 2; }
+
+info=$(gh pr view "$pr" --json state,headRefOid,baseRefName,isDraft,isCrossRepository \
+	--jq '[.state, .headRefOid, .baseRefName, .isDraft, .isCrossRepository] | join(" ")') || die "cannot read #$pr"
+read -r state head base draft fork <<< "$info"
+[[ $state == OPEN ]] || die "#$pr is $state, not open"
+[[ $base == main ]] || die "#$pr targets $base, not main"
+[[ $draft == false ]] || die "#$pr is a draft"
+# The prebuild compiles the head on the production box before CI has judged it, and a build runs the code's build
+# scripts. This repository is public: a fork's code does not get that.
+[[ $fork == false ]] || die "#$pr comes from a fork; merge it by hand and run agent-deploy deploy"
+git fetch -q origin "pull/$pr/head"
+[[ $(git rev-parse FETCH_HEAD) == "$head" ]] || die "the head of #$pr moved while this started; run it again"
+say "#$pr head ${head:0:12}"
+
+prebuilt=
+if ((prebuild)); then
+	log=$(mktemp -t ship-prebuild.XXXXXX)
+	"$here/agent-deploy" prebuild "$head" > "$log" 2>&1 < /dev/null &
+	prebuilt=$!
+	say "building ${head:0:12} on the box while CI runs (log: $log)"
+fi
+
+deadline=$((SECONDS + ${SHIP_WAIT_SECS:-1200}))
+while :; do
+	if out=$(gh pr view "$pr" --json headRefOid,statusCheckRollup --jq \
+		'.headRefOid + " " + (([.statusCheckRollup[]? | select(.name == "check" and .workflowName == "ci")] | last) as $c
+			| if $c == null then "NONE" else ($c.status + "/" + ($c.conclusion // "")) end)'); then
+		read -r now ci <<< "$out"
+		[[ $now == "$head" ]] || die "the head of #$pr moved to ${now:0:12}; nothing was merged. Run it again"
+		case $ci in
+		COMPLETED/SUCCESS) break ;;
+		COMPLETED/*) die "CI is $ci on ${head:0:12}; nothing was merged (gh pr checks $pr)" ;;
+		esac
+	else
+		say "GitHub did not answer; trying again"
+	fi
+	((SECONDS < deadline)) || die "CI had not finished in time; nothing was merged"
+	sleep "${SHIP_POLL:-5}"
+done
+say "CI is green"
+
+gh pr merge "$pr" --merge --match-head-commit "$head" > /dev/null
+merged=
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+	merged=$(gh pr view "$pr" --json mergeCommit --jq '.mergeCommit.oid // ""') || merged=
+	[[ -n $merged ]] && break
+	sleep 1
+done
+[[ -n $merged ]] || die "#$pr merged, but GitHub has not said the merge commit; run agent-deploy deploy by hand"
+say "merged as ${merged:0:12}"
+until git cat-file -e "$merged^{commit}" 2> /dev/null; do
+	git fetch -q origin main || true
+	sleep 1
+done
+
+if [[ -n $prebuilt ]]; then
+	if wait "$prebuilt"; then
+		say "$(tail -1 "$log")"
+	else
+		say "the prebuild failed, so the deploy builds it again; its log:"
+		tail -5 "$log" >&2
+	fi
+fi
+"$here/agent-deploy" deploy "$merged" ${drain[@]+"${drain[@]}"}
+say "#$pr is live"
