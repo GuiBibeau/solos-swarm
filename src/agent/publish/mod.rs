@@ -10,6 +10,11 @@
 //! state directory, [`STATE_FILE`]: the hash of what each blob last held, so
 //! a restart uploads nothing that is already there. An upload is a put at a
 //! fixed pathname that replaces the blob, so doing one twice is harmless.
+//!
+//! One more thing is read, and it is not the Store: the file where the
+//! Watchdog keeps what it found about the external jobs it watches
+//! ([`external_jobs::STATE_FILE`]). It goes up as [`JOBS_PATH`] unchanged,
+//! when its content changes and on every heartbeat.
 
 mod blob;
 pub mod snapshot;
@@ -19,6 +24,7 @@ pub use blob::{API_VERSION, Backoff, BlobClient, BlobToken, Put, PutError};
 pub use source::{Built, ENDED_IN_INDEX, Source};
 
 use super::config::{AgentConfig, PublishConfig};
+use super::external_jobs;
 use crate::broker::now_ms;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -36,6 +42,8 @@ use std::time::Duration;
 pub const STATE_FILE: &str = "publish-state.json";
 /// The index's pathname in the Blob store.
 pub const INDEX_PATH: &str = "tickets/index.json";
+/// The external jobs' pathname: what [`external_jobs::State`] holds.
+pub const JOBS_PATH: &str = "jobs/index.json";
 const CONTENT_TYPE: &str = "application/json";
 /// A failing publisher waits longer between looks, up to this.
 const MAX_WAIT: Duration = Duration::from_secs(300);
@@ -119,6 +127,9 @@ struct State {
     hashes: BTreeMap<String, String>,
     /// When the index was last uploaded.
     index_ms: Ms,
+    /// When the external jobs were last uploaded.
+    #[serde(default)]
+    jobs_ms: Ms,
 }
 
 impl State {
@@ -178,6 +189,9 @@ pub struct Publisher {
     /// Uploads not done yet, kept across looks so a failure is retried even
     /// when the Store has not changed.
     queue: Vec<Upload>,
+    /// The hash of the external jobs the API refused, which are not sent
+    /// again until they change.
+    refused_jobs: Option<String>,
 }
 
 impl Publisher {
@@ -192,6 +206,7 @@ impl Publisher {
             source: None,
             built: None,
             queue: Vec::new(),
+            refused_jobs: None,
         })
     }
 
@@ -215,6 +230,7 @@ impl Publisher {
             report.unchanged = self.plan(&built, now);
             self.built = Some(built);
         }
+        self.plan_jobs(now);
         self.heartbeat(now);
         self.flush(now, &mut report).await?;
         Ok(report)
@@ -264,11 +280,31 @@ impl Publisher {
         }
     }
 
+    fn heartbeat_ms(&self) -> Ms {
+        u64::try_from(self.options.heartbeat.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Queue the Watchdog's external jobs when their content changed, and
+    /// again each heartbeat: the state says when the Watchdog last looked, so
+    /// the dashboard can tell a quiet Watchdog from a stopped one. Nothing is
+    /// queued where the Watchdog has written no state.
+    fn plan_jobs(&mut self, now: Ms) {
+        let Some(state) = external_jobs::State::load(&self.state_dir) else {
+            return;
+        };
+        let upload = jobs_upload(&state);
+        let changed = self.state.hashes.get(JOBS_PATH) != Some(&upload.hash);
+        let due = now.saturating_sub(self.state.jobs_ms) >= self.heartbeat_ms();
+        self.queue.retain(|queued| queued.path != JOBS_PATH);
+        if (changed || due) && self.refused_jobs.as_ref() != Some(&upload.hash) {
+            self.queue.push(upload);
+        }
+    }
+
     /// An index not uploaded for a heartbeat is uploaded again, so the
     /// dashboard can tell a quiet agent from a dead publisher.
     fn heartbeat(&mut self, now: Ms) {
-        let heartbeat = u64::try_from(self.options.heartbeat.as_millis()).unwrap_or(u64::MAX);
-        let due = now.saturating_sub(self.state.index_ms) >= heartbeat;
+        let due = now.saturating_sub(self.state.index_ms) >= self.heartbeat_ms();
         if !due || self.queue.iter().any(|upload| upload.index) {
             return;
         }
@@ -297,6 +333,9 @@ impl Publisher {
                     if upload.index {
                         self.state.index_ms = now;
                     }
+                    if upload.path == JOBS_PATH {
+                        self.state.jobs_ms = now;
+                    }
                     if let Err(err) = self.state.save(&state_path) {
                         self.queue.extend(uploads);
                         return Err(CycleError::Retry(err));
@@ -317,6 +356,9 @@ impl Publisher {
                 }
                 Err(PutError::Rejected(why)) => {
                     eprintln!("publish: {why}");
+                    if upload.path == JOBS_PATH {
+                        self.refused_jobs = Some(upload.hash);
+                    }
                     report.rejected.push(upload.path);
                 }
             }
@@ -341,6 +383,21 @@ fn index_upload(index: &Index, now: Ms) -> Upload {
         hash: hash(&serde_json::to_vec(&unstamped).unwrap_or_default()),
         body: serde_json::to_vec(&stamped).unwrap_or_default(),
         index: true,
+    }
+}
+
+/// The external jobs as they are uploaded. The time of the Watchdog's last
+/// look moves every minute, so the hash leaves it out.
+fn jobs_upload(state: &external_jobs::State) -> Upload {
+    let unstamped = external_jobs::State {
+        checked_ms: 0,
+        ..state.clone()
+    };
+    Upload {
+        path: JOBS_PATH.to_owned(),
+        hash: hash(&serde_json::to_vec(&unstamped).unwrap_or_default()),
+        body: serde_json::to_vec(state).unwrap_or_default(),
+        index: false,
     }
 }
 

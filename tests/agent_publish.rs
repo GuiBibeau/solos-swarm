@@ -17,11 +17,14 @@ use solos_agent_core::trail::{
     TrailAction, TrailKey, TrailOutcome,
 };
 use solos_agent_store::SqliteStore;
+use solos_swarm::agent::external_jobs::{
+    FORMAT as JOBS_FORMAT, Record, State as JobsState, Status,
+};
 use solos_swarm::agent::jsonl::{JsonlChannel, JsonlSource};
 use solos_swarm::agent::ports::{BoxFuture, Channel, Delivery, Executor, Fact, FactSink, Launch};
 use solos_swarm::agent::publish::{
-    API_VERSION, Backoff, BlobClient, BlobToken, Built, CycleError, INDEX_PATH, Options, Publisher,
-    PutError, STATE_FILE, Source, ticket_path,
+    API_VERSION, Backoff, BlobClient, BlobToken, Built, CycleError, INDEX_PATH, JOBS_PATH, Options,
+    Publisher, PutError, STATE_FILE, Source, ticket_path,
 };
 use solos_swarm::agent::scripted::{ScriptedExecutor, ScriptedRouter};
 use solos_swarm::agent::{Adapters, RunOptions, Runtime, STORE_FILE};
@@ -1472,4 +1475,225 @@ fn a_config_with_a_public_url_that_is_not_an_https_origin_is_refused() {
     let publish = loaded.web.unwrap().publish.unwrap();
     assert_eq!(publish.token_file, scratch.root.join("tokens/blob"));
     assert_eq!((publish.every_secs, publish.heartbeat_secs), (5, 300));
+}
+
+// -- the Watchdog's external jobs ----------------------------------------------------------------
+
+/// 2026-11-06T12:00:00Z, two hours before the dashboard fixtures' index was written.
+const JOBS_T0: u64 = 1_793_966_400_000;
+
+fn job_record(name: &str, check: &str, status: Status, detail: &str, since_ms: u64) -> Record {
+    Record {
+        name: name.into(),
+        check: check.into(),
+        status,
+        detail: detail.into(),
+        since_ms,
+    }
+}
+
+/// What the Watchdog wrote at `checked_ms`: a unit that is up and a tmux
+/// session in `trouble`.
+fn jobs_state(checked_ms: u64, trouble: Status) -> JobsState {
+    JobsState {
+        v: JOBS_FORMAT,
+        checked_ms,
+        jobs: vec![
+            job_record(
+                "l2book",
+                "systemd unit l2book-download.service",
+                Status::Up,
+                "active (running)",
+                JOBS_T0,
+            ),
+            job_record(
+                "build",
+                "tmux session data-build",
+                trouble,
+                "no tmux session data-build",
+                JOBS_T0 + 60_000,
+            ),
+        ],
+    }
+}
+
+#[tokio::test]
+async fn the_watchdogs_jobs_go_up_when_they_change_and_every_heartbeat_and_not_between() {
+    let scratch = Scratch::new("jobs");
+    SqliteStore::open(scratch.db()).unwrap();
+    let fake = Fake::start().await;
+    let mut publisher = scratch.publisher_with(&fake, TOKEN, Duration::from_millis(1_200));
+
+    // The Watchdog has written nothing: there are no jobs to show.
+    publisher.cycle().await.unwrap();
+    assert_eq!(paths(&fake.puts()), [INDEX_PATH]);
+    fake.clear_puts();
+
+    // Its first look: the jobs go up alone, as the Watchdog wrote them.
+    jobs_state(JOBS_T0, Status::Up)
+        .save(&scratch.state())
+        .unwrap();
+    let report = publisher.cycle().await.unwrap();
+    assert_eq!(report.uploaded, [JOBS_PATH.to_owned()]);
+    let blob = fake.blob(JOBS_PATH);
+    assert_eq!(blob["v"], 1);
+    assert_eq!(blob["checked_ms"], JOBS_T0);
+    assert_eq!(blob["jobs"][0]["name"], "l2book");
+    assert_eq!(
+        blob["jobs"][0]["check"],
+        "systemd unit l2book-download.service"
+    );
+    assert_eq!(blob["jobs"][1]["status"], "up");
+    fake.clear_puts();
+
+    // The same findings a minute later change nothing the page shows: no upload.
+    jobs_state(JOBS_T0 + 60_000, Status::Up)
+        .save(&scratch.state())
+        .unwrap();
+    assert!(publisher.cycle().await.unwrap().uploaded.is_empty());
+    assert!(fake.puts().is_empty());
+
+    // A job that goes down is shown at once.
+    jobs_state(JOBS_T0 + 120_000, Status::Down)
+        .save(&scratch.state())
+        .unwrap();
+    let report = publisher.cycle().await.unwrap();
+    assert_eq!(report.uploaded, [JOBS_PATH.to_owned()]);
+    assert_eq!(fake.blob(JOBS_PATH)["jobs"][1]["status"], "down");
+    fake.clear_puts();
+
+    // Once a heartbeat is due they go up again with the time of the latest
+    // look, so the page can tell a quiet Watchdog from a stopped one.
+    jobs_state(JOBS_T0 + 180_000, Status::Down)
+        .save(&scratch.state())
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
+    let report = publisher.cycle().await.unwrap();
+    assert_eq!(
+        report.uploaded,
+        [JOBS_PATH.to_owned(), INDEX_PATH.to_owned()],
+        "the jobs, then the index"
+    );
+    assert_eq!(fake.blob(JOBS_PATH)["checked_ms"], JOBS_T0 + 180_000);
+}
+
+#[tokio::test]
+async fn a_restart_does_not_upload_jobs_that_are_already_there() {
+    let scratch = Scratch::new("jobs-restart");
+    SqliteStore::open(scratch.db()).unwrap();
+    jobs_state(JOBS_T0, Status::Down)
+        .save(&scratch.state())
+        .unwrap();
+    let fake = Fake::start().await;
+    scratch.publisher(&fake).cycle().await.unwrap();
+    assert_eq!(paths(&fake.puts()), [JOBS_PATH, INDEX_PATH]);
+    fake.clear_puts();
+
+    let mut restarted = scratch.publisher(&fake);
+    assert!(restarted.cycle().await.unwrap().uploaded.is_empty());
+    assert!(fake.puts().is_empty());
+}
+
+#[tokio::test]
+async fn jobs_the_api_refuses_are_not_sent_again_until_they_change() {
+    let scratch = Scratch::new("jobs-refused");
+    SqliteStore::open(scratch.db()).unwrap();
+    jobs_state(JOBS_T0, Status::Up)
+        .save(&scratch.state())
+        .unwrap();
+    let fake = Fake::start().await;
+    let mut publisher = scratch.publisher(&fake);
+
+    fake.script([Scripted::Status(400)]);
+    let report = publisher.cycle().await.unwrap();
+    assert_eq!(report.rejected, [JOBS_PATH.to_owned()]);
+    assert_eq!(
+        report.uploaded,
+        [INDEX_PATH.to_owned()],
+        "the index is not held back"
+    );
+
+    let requests = fake.requests().len();
+    let quiet = publisher.cycle().await.unwrap();
+    assert!(
+        quiet.rejected.is_empty() && quiet.uploaded.is_empty(),
+        "{quiet:?}"
+    );
+    assert_eq!(fake.requests().len(), requests, "no request at all");
+
+    jobs_state(JOBS_T0 + 60_000, Status::Down)
+        .save(&scratch.state())
+        .unwrap();
+    let report = publisher.cycle().await.unwrap();
+    assert_eq!(report.uploaded, [JOBS_PATH.to_owned()]);
+}
+
+/// With `PUBLISH_FIXTURE_DIR` set, write what the dashboard reads for the
+/// jobs: `jobs.json`, with one job in each status.
+#[tokio::test]
+async fn the_jobs_blob_has_the_shape_the_dashboard_reads_and_feeds_its_fixtures() {
+    let scratch = Scratch::new("jobs-fixture");
+    SqliteStore::open(scratch.db()).unwrap();
+    let state = JobsState {
+        v: JOBS_FORMAT,
+        checked_ms: JOBS_T0 + 7_200_000,
+        jobs: vec![
+            job_record(
+                "l2book",
+                "systemd unit l2book-download.service",
+                Status::Up,
+                "active (running)",
+                JOBS_T0,
+            ),
+            job_record(
+                "data-build",
+                "tmux session data-build",
+                Status::Down,
+                "can't find session: data-build",
+                JOBS_T0 + 3_600_000,
+            ),
+            job_record(
+                "modal-wave-3",
+                "status command /home/agent/bin/wave-status",
+                Status::Stalled,
+                "no new shard for 40m",
+                JOBS_T0 + 4_800_000,
+            ),
+            job_record(
+                "l2book-archive",
+                "pid file /data/l2book/archive.pid",
+                Status::LowDisk,
+                "11.2 GB free on /data/l2book (floor 50.0 GB)",
+                JOBS_T0 + 6_000_000,
+            ),
+        ],
+    };
+    state.save(&scratch.state()).unwrap();
+    let fake = Fake::start().await;
+    scratch.publisher(&fake).cycle().await.unwrap();
+    let blob = fake.blob(JOBS_PATH);
+    let statuses: Vec<&str> = blob["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|job| job["status"].as_str().unwrap())
+        .collect();
+    assert_eq!(statuses, ["up", "down", "stalled", "low_disk"]);
+    let mut keys: Vec<&str> = blob["jobs"][0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["check", "detail", "name", "since_ms", "status"]);
+
+    if let Ok(dir) = std::env::var("PUBLISH_FIXTURE_DIR") {
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            PathBuf::from(dir).join("jobs.json"),
+            serde_json::to_string_pretty(&blob).unwrap() + "\n",
+        )
+        .unwrap();
+    }
 }

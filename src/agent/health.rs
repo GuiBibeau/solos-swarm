@@ -506,7 +506,7 @@ fn claude_check(login: &Result<ClaudeLogin>, now_ms: Ms) -> Result<String, Strin
     }
 }
 
-fn gb(bytes: u64) -> String {
+pub(super) fn gb(bytes: u64) -> String {
     format!("{:.1} GB", bytes as f64 / f64::from(1u32 << 30))
 }
 
@@ -644,7 +644,7 @@ pub fn hold_active(state_dir: &Path, now_secs: u64) -> bool {
         .is_some_and(|until| until > now_secs)
 }
 
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(super) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let temp = path.with_extension("tmp");
     let mut file = std::fs::OpenOptions::new()
         .write(true)

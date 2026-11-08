@@ -5,11 +5,16 @@
 //! inside `agent serve`, sends each new alert to the operator's channel once,
 //! and can retry a stalled Assignment once per Ticket through the runtime,
 //! which stays the Engine's one writer. It never widens a Mandate or a budget.
+//!
+//! It also looks at the external jobs the config lists (see
+//! [`external_jobs`]), which are not Tickets: a job that dies, stalls or runs
+//! its disk low is one alert, once, and a job that comes back is told once.
 
 use super::STORE_FILE;
 use super::broker::Account;
-use super::config::{AgentConfig, WatchdogConfig};
+use super::config::{AgentConfig, JobConfig, WatchdogConfig};
 use super::dream;
+use super::external_jobs::{self, Checker, Record, Recovered, Status};
 use super::links::TicketLinks;
 use super::ports::{Channel, Fact, FactSink, SendOptions, SendOutcome};
 use crate::broker::now_ms;
@@ -91,6 +96,8 @@ pub enum AlertKind {
     Spend,
     /// A pause has lasted.
     Paused,
+    /// An external job is down, stalled or low on disk.
+    Job,
 }
 
 impl AlertKind {
@@ -102,6 +109,7 @@ impl AlertKind {
             Self::Unavailable => "unavailable",
             Self::Spend => "spend",
             Self::Paused => "paused",
+            Self::Job => "job",
         }
     }
 }
@@ -163,6 +171,8 @@ pub struct Snapshot {
     /// When the Watchdog last saw a pause lift. Workers cannot call a model
     /// while the agent is paused, so their quiet time counts from here.
     pub unpaused_ms: Option<Ms>,
+    /// The external jobs, as the Watchdog last found them.
+    pub jobs: Vec<Record>,
 }
 
 /// One ledger account and what counts against its cap.
@@ -261,6 +271,7 @@ impl Snapshot {
             accounts,
             pause: read_pause(state_dir, known.configured_pause, now),
             unpaused_ms: None,
+            jobs: external_jobs::State::load(state_dir).map_or_else(Vec::new, |state| state.jobs),
         })
     }
 }
@@ -341,7 +352,54 @@ pub fn assess(snapshot: &Snapshot, now: Ms, limits: &Thresholds) -> Vec<Alert> {
             .as_ref()
             .and_then(|pause| paused_long(pause, now, limits)),
     );
+    alerts.extend(snapshot.jobs.iter().filter_map(job));
     alerts
+}
+
+/// What names one incident of a job: its status and when that began, so a job
+/// that comes back and fails again is a new alert.
+fn job_subject(record: &Record) -> String {
+    format!(
+        "job:{}:{}:{}",
+        record.name,
+        record.status.as_str(),
+        record.since_ms
+    )
+}
+
+/// The id of the alert for the incident `record` is in. The bucket is fixed,
+/// so a job is told once however long it stays down: `repeat` does not apply.
+fn job_alert_id(record: &Record) -> String {
+    alert_id(
+        AlertKind::Job,
+        &job_subject(record),
+        Some(record.since_ms),
+        0,
+        Ms::MAX,
+    )
+}
+
+fn job(record: &Record) -> Option<Alert> {
+    let what = match record.status {
+        Status::Up => return None,
+        Status::Down => "is down",
+        Status::Stalled => "has stalled",
+        Status::LowDisk => "is low on disk",
+    };
+    Some(Alert {
+        id: job_alert_id(record),
+        kind: AlertKind::Job,
+        subject: job_subject(record),
+        ticket: None,
+        since_ms: Some(record.since_ms),
+        text: format!(
+            "The job \"{}\" ({}) {what}: {}",
+            record.name,
+            record.check,
+            ending(&record.detail)
+        ),
+        stalled: None,
+    })
 }
 
 fn waiting(ticket: &Ticket, now: Ms, limits: &Thresholds) -> Option<Alert> {
@@ -749,6 +807,9 @@ pub struct Watchdog {
     unpaused_ms: Option<Ms>,
     /// Where a Ticket's page is, for the dream's digest.
     links: TicketLinks,
+    /// The external jobs to look at, and how.
+    jobs: Vec<JobConfig>,
+    checker: Checker,
 }
 
 /// How far back a dream that ended may still be told.
@@ -779,7 +840,17 @@ impl Watchdog {
             paused: false,
             unpaused_ms: None,
             links: TicketLinks::none(),
+            jobs: settings.jobs.clone(),
+            checker: Checker::default(),
         })
+    }
+
+    /// Look at the external jobs with `checker` instead of the host's
+    /// `systemctl` and `tmux`.
+    #[must_use]
+    pub fn with_checker(mut self, checker: Checker) -> Self {
+        self.checker = checker;
+        self
     }
 
     /// Link the dream's digest to Tickets' pages on the dashboard.
@@ -833,6 +904,40 @@ impl Watchdog {
         Ok(())
     }
 
+    /// Tell the operator that each job in `recovered` is back, once, if the
+    /// operator was told it was in trouble.
+    fn job_recoveries(&mut self, recovered: Vec<Recovered>, now: Ms) -> Result<()> {
+        for recovered in recovered {
+            if !self.store.has_alert(&job_alert_id(&recovered.was))? {
+                continue;
+            }
+            let subject = format!("{}:recovered", job_subject(&recovered.was));
+            let id = key("wd", &["job_up", &subject]);
+            let row = AlertRow {
+                id: id.clone(),
+                kind: "job_up".into(),
+                subject,
+                ticket: None,
+                retry: false,
+                raised_ms: now,
+                message: OutboundMessage {
+                    id: MessageId(id),
+                    channel: self.operator.clone(),
+                    kind: MessageKind::Result,
+                    text: recovered.text(now),
+                    ticket: None,
+                    ask: None,
+                },
+                sent_ms: None,
+            };
+            if self.store.record_alert(&row)? {
+                eprintln!("agent: watchdog: {}", row.message.text);
+                self.fresh.insert(row.id);
+            }
+        }
+        Ok(())
+    }
+
     /// Assess every `every`, the first time one interval after the start,
     /// once the runtime has recovered what the last run left. A failed tick
     /// is logged and the next one tries again.
@@ -856,6 +961,10 @@ impl Watchdog {
     /// yet, then retry what the action covers. Returns how many alerts the
     /// operator's channel took.
     pub async fn tick(&mut self, now: Ms) -> Result<usize> {
+        match self.checker.look(&self.jobs, &self.state_dir, now).await {
+            Ok(recovered) => self.job_recoveries(recovered, now)?,
+            Err(err) => eprintln!("agent: watchdog: the external jobs were not checked: {err:#}"),
+        }
         let mut snapshot =
             Snapshot::read(&self.store, &self.state_dir, now, self.known, &self.limits)?;
         let paused = snapshot.pause.is_some();
@@ -1016,6 +1125,7 @@ mod tests {
         Alert, AlertKind, Pause, Snapshot, Spending, Thresholds, alert_id, assess, duration,
         still_stalled, usd,
     };
+    use crate::agent::external_jobs::{Record, Status};
     use solos_agent_core::model::{
         Actor, Approval, Assignment, AssignmentId, AssignmentState, ChannelRef, Decision,
         DecisionId, DecisionKind, Effect, Input, InputBody, InputId, Mandate, MessageId,
@@ -1554,6 +1664,101 @@ mod tests {
             alert_id(AlertKind::Failing, "effect:7", None, 0, limits.repeat_ms),
             alert_id(AlertKind::Stalled, "effect:7", None, 0, limits.repeat_ms),
             "the kind is part of it"
+        );
+    }
+
+    fn job_record(name: &str, status: Status, since_ms: Ms) -> Record {
+        Record {
+            name: name.into(),
+            check: "systemd unit l2book-download.service".into(),
+            status,
+            detail: "inactive (dead)".into(),
+            since_ms,
+        }
+    }
+
+    fn with_jobs(jobs: Vec<Record>) -> Snapshot {
+        Snapshot {
+            jobs,
+            ..Snapshot::default()
+        }
+    }
+
+    #[test]
+    fn a_job_in_trouble_is_one_alert_for_as_long_as_the_trouble_lasts() {
+        let limits = limits();
+        let down = with_jobs(vec![job_record("l2book", Status::Down, T0)]);
+        let alerts = assess(&down, T0 + MIN, &limits);
+        assert_eq!(kinds(&alerts), [AlertKind::Job]);
+        assert_eq!(
+            alerts[0].text,
+            "The job \"l2book\" (systemd unit l2book-download.service) is down: inactive (dead)."
+        );
+        assert_eq!(
+            (alerts[0].since_ms, alerts[0].ticket.as_ref()),
+            (Some(T0), None)
+        );
+        assert_eq!(alerts[0].subject, format!("job:l2book:down:{T0}"));
+        for later in [HOUR, limits.repeat_ms, 100 * limits.repeat_ms] {
+            assert_eq!(
+                assess(&down, T0 + later, &limits)[0].id,
+                alerts[0].id,
+                "`repeat` does not tell a job again: it is told once an incident"
+            );
+        }
+
+        let again = with_jobs(vec![job_record("l2book", Status::Down, T0 + HOUR)]);
+        assert_ne!(
+            assess(&again, T0 + 2 * HOUR, &limits)[0].id,
+            alerts[0].id,
+            "a job that came back and failed again is a new alert"
+        );
+        let stalled = with_jobs(vec![job_record("l2book", Status::Stalled, T0)]);
+        assert_ne!(
+            assess(&stalled, T0 + MIN, &limits)[0].id,
+            alerts[0].id,
+            "a new kind of trouble is a new alert"
+        );
+        let other = with_jobs(vec![job_record("build", Status::Down, T0)]);
+        assert_ne!(assess(&other, T0 + MIN, &limits)[0].id, alerts[0].id);
+    }
+
+    #[test]
+    fn a_job_that_is_up_raises_nothing_and_each_kind_of_trouble_reads_plainly() {
+        let limits = limits();
+        let up = with_jobs(vec![job_record("l2book", Status::Up, T0)]);
+        assert!(assess(&up, T0 + 100 * HOUR, &limits).is_empty());
+        for (status, says) in [
+            (Status::Stalled, "has stalled: inactive (dead)."),
+            (Status::LowDisk, "is low on disk: inactive (dead)."),
+        ] {
+            let alerts = assess(
+                &with_jobs(vec![job_record("l2book", status, T0)]),
+                T0,
+                &limits,
+            );
+            assert!(alerts[0].text.ends_with(says), "{}", alerts[0].text);
+        }
+        let mut asked = job_record("l2book", Status::Down, T0);
+        asked.detail = "is it running?".into();
+        let alerts = assess(&with_jobs(vec![asked]), T0, &limits);
+        assert!(
+            alerts[0].text.ends_with("is down: is it running?"),
+            "{}",
+            alerts[0].text
+        );
+    }
+
+    #[test]
+    fn a_pause_does_not_hold_job_alerts() {
+        let mut snapshot = with_jobs(vec![job_record("l2book", Status::Down, T0)]);
+        snapshot.pause = Some(Pause {
+            by: "the PAUSE file".into(),
+            since_ms: None,
+        });
+        assert_eq!(
+            kinds(&assess(&snapshot, T0 + MIN, &limits())),
+            [AlertKind::Job]
         );
     }
 
