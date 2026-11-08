@@ -335,13 +335,23 @@ async fn a_question_about_a_repository_gets_a_worker_on_a_clone_it_reads_and_com
     assert_eq!(
         ticket.plan,
         Plan::Session {
-            harness: None,
+            harness: Some("pi".into()),
             environment: None,
             method: Some(Method {
                 deliverable: Deliverable::Change
             }),
         },
-        "the repository's owes, since the Router named none"
+        "the repository's owes, since the Router named none, and its worker upstream's harness"
+    );
+    assert_eq!(
+        ticket.mandate.upstream,
+        Some(solos_agent_core::model::UpstreamChoice {
+            name: "default".into(),
+            provider: "deepseek".into(),
+            model: "deepseek-flash".into(),
+            harness: "pi".into(),
+        }),
+        "the host picked the upstream and the Ticket records it"
     );
     assert_eq!(
         ticket.mandate.budget_microusd,
