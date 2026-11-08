@@ -209,7 +209,7 @@ export function ChatLive({
       .filter((message) => !said.has(message.text.trim()))
       .map((message): Item => ({ kind: "pending", at_ms: message.at_ms, message }));
     const agentNotes = notes
-      .filter((note) => note.kind === "ignore" || note.kind === "unavailable")
+      .filter((note) => note.kind === "ignore" || note.kind === "unavailable" || note.kind === "answered")
       .map((note): Item => ({ kind: "note", at_ms: note.at_ms, note }));
     return [...fromTicket, ...inFlight, ...agentNotes].sort((a, b) => a.at_ms - b.at_ms);
   }, [ticket, pending, notes]);
@@ -443,12 +443,18 @@ export function ChatLive({
                   <article className="turn agent note" key={`${item.at_ms}-${n}`}>
                     <div className="turn-head">
                       <strong>Agent</strong>
-                      <span>no ticket</span>
+                      <span>{item.note.kind === "answered" ? "replied" : "no ticket"}</span>
                       <When ms={item.at_ms} now={now} />
                     </div>
-                    <div className="prose">
-                      <p>{item.note.reason}</p>
-                    </div>
+                    {item.note.kind === "answered" && item.note.text ? (
+                      <div className="prose">
+                        <Markdown>{item.note.text}</Markdown>
+                      </div>
+                    ) : (
+                      <div className="prose">
+                        <p>{item.note.reason}</p>
+                      </div>
+                    )}
                   </article>
                 ) : (
                   <article className="turn person pending" key={`${item.at_ms}-${n}`}>

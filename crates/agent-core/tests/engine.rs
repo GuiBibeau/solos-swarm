@@ -272,6 +272,106 @@ fn a_declined_inferred_accept_tells_nobody() {
 }
 
 #[test]
+fn a_reply_answers_the_person_in_their_thread_and_starts_nothing() {
+    let mut w = World::new(policy());
+    let eval = w.receive_and_start_eval(slack(
+        "t1",
+        Actor::person("alice"),
+        Addressed::Mention,
+        "th1",
+        "@agent what are you working on?",
+    ));
+    w.effects();
+    let text = "Two tickets: one on the flaky test, one on the release notes.";
+    let decision = w
+        .engine
+        .decide(
+            &eval,
+            Verdict::Reply {
+                text: text.into(),
+                reason: "a question about the agent's own work".into(),
+            },
+        )
+        .unwrap();
+    let record = w.engine.repos().decisions[&decision].clone();
+    assert_eq!(record.kind, DecisionKind::Answered);
+    assert_eq!(record.ticket, None);
+    assert_eq!(record.reply.as_deref(), Some(text));
+    assert!(w.engine.repos().tickets.is_empty(), "no ticket");
+    let effects = w.effects();
+    assert!(launched(&effects).is_empty());
+    assert_eq!(sent(&effects), [(MessageKind::Result, text.to_owned())]);
+    let [Effect::Send(message)] = &effects[..] else {
+        panic!("one send: {effects:?}")
+    };
+    assert_eq!(message.ticket, None);
+    assert_eq!(message.channel.address["thread_ts"], "th1");
+
+    // The Eval is decided once, and no second message goes out.
+    assert!(
+        w.engine
+            .decide(
+                &eval,
+                Verdict::Reply {
+                    text: text.into(),
+                    reason: "again".into(),
+                }
+            )
+            .is_err()
+    );
+    assert!(w.effects().is_empty());
+}
+
+#[test]
+fn a_reply_to_an_inferred_candidate_is_refused_and_says_nothing() {
+    let mut w = World::new(policy());
+    let eval = w.receive_and_start_eval(slack(
+        "t1",
+        Actor::person("alice"),
+        Addressed::Unaddressed,
+        "th1",
+        "what is the deploy doing",
+    ));
+    w.effects();
+    let refused = w.engine.decide(
+        &eval,
+        Verdict::Reply {
+            text: "It is deploying.".into(),
+            reason: "status".into(),
+        },
+    );
+    assert_eq!(
+        refused,
+        Err(Error::Refused(
+            "only an explicit request is answered".into()
+        ))
+    );
+    assert!(w.engine.repos().decisions.is_empty(), "nothing recorded");
+    assert!(w.effects().is_empty());
+
+    // An empty reply is not an answer.
+    let explicit = w.receive_and_start_eval(slack(
+        "t2",
+        Actor::person("alice"),
+        Addressed::Mention,
+        "th2",
+        "@agent hello",
+    ));
+    w.effects();
+    assert!(matches!(
+        w.engine.decide(
+            &explicit,
+            Verdict::Reply {
+                text: "  ".into(),
+                reason: "chatter".into(),
+            }
+        ),
+        Err(Error::Invalid(_))
+    ));
+    assert!(w.effects().is_empty());
+}
+
+#[test]
 fn the_first_reply_is_a_natural_line_the_routers_own_words_or_nothing() {
     use solos_agent_core::model::STANDARD_ACKNOWLEDGEMENT;
     let first_reply = |acknowledge: Acknowledge| {

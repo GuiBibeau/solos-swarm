@@ -2,7 +2,7 @@
   "router": [
     {
       "name": "router_decide",
-      "description": "Decide one candidate by its eval id: accept it as work, ignore it, or stop one of the Tickets on its thread. Call it once per candidate. A refused decision comes back as an error that says why; correct the call and try again.",
+      "description": "Decide one candidate by its eval id: accept it as work, ignore it, stop one of the Tickets on its thread, or reply to the person yourself. Call it once per candidate. A refused decision comes back as an error that says why; correct the call and try again.",
       "input_schema": {
         "type": "object",
         "required": [
@@ -21,7 +21,8 @@
             "enum": [
               "accept",
               "ignore",
-              "stop"
+              "stop",
+              "reply"
             ]
           },
           "reason": {
@@ -91,6 +92,10 @@
           "ticket": {
             "type": "string",
             "description": "stop: the id of the Ticket to stop."
+          },
+          "text": {
+            "description": "reply: what the person reads, as a chat message: the answer first, in plain sentences and their tone, with no restated goal and no report headings. Only an explicit request is answered.",
+            "type": "string"
           }
         }
       }
@@ -117,6 +122,37 @@
               "memo"
             ],
             "description": "Which kind of id it is, when it could be more than one. memo: a memo id, global, or repo:<owner>/<name>."
+          }
+        }
+      }
+    },
+    {
+      "name": "router_status",
+      "description": "What the agent is doing: its open tickets with their stage, age, spend, waiting question and latest report, its recent decisions, and the alerts the Watchdog would raise now. Read-only. Call it before answering someone about the agent's own work, and before steering a ticket.",
+      "input_schema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "router_note",
+      "description": "Give one of the agent's tickets a fact its worker must know: a correction, a decision a person made, a pointer. The worker reads it as new input; it starts nothing, grants nothing and sends no message. Use it to steer work already running when a person's message changes it.",
+      "input_schema": {
+        "type": "object",
+        "required": [
+          "ticket",
+          "text"
+        ],
+        "properties": {
+          "ticket": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The id of a ticket from router_status or the candidate's thread."
+          },
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The fact its worker must know, complete on its own."
           }
         }
       }

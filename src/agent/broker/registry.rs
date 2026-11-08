@@ -20,6 +20,8 @@ pub enum PrincipalKind {
 pub enum RouterOp {
     Decide,
     Read,
+    Status,
+    Note,
 }
 
 /// The handler a worker tool runs.
@@ -81,9 +83,10 @@ pub(super) const ROUTER: &[Tool<RouterOp>] = &[
     Tool {
         name: "router_decide",
         op: RouterOp::Decide,
-        description: "Decide one candidate by its eval id: accept it as work, ignore it, or stop one \
-                      of the Tickets on its thread. Call it once per candidate. A refused decision \
-                      comes back as an error that says why; correct the call and try again.",
+        description: "Decide one candidate by its eval id: accept it as work, ignore it, stop one \
+                      of the Tickets on its thread, or reply to the person yourself. Call it once \
+                      per candidate. A refused decision comes back as an error that says why; \
+                      correct the call and try again.",
         input_schema: router_decide,
         repeatable: true,
     },
@@ -96,6 +99,26 @@ pub(super) const ROUTER: &[Tool<RouterOp>] = &[
                       or repo:<owner>/<name>.",
         input_schema: router_read,
         repeatable: true,
+    },
+    Tool {
+        name: "router_status",
+        op: RouterOp::Status,
+        description: "What the agent is doing: its open tickets with their stage, age, spend, \
+                      waiting question and latest report, its recent decisions, and the alerts the \
+                      Watchdog would raise now. Read-only. Call it before answering someone about \
+                      the agent's own work, and before steering a ticket.",
+        input_schema: router_status,
+        repeatable: true,
+    },
+    Tool {
+        name: "router_note",
+        op: RouterOp::Note,
+        description: "Give one of the agent's tickets a fact its worker must know: a correction, a \
+                      decision a person made, a pointer. The worker reads it as new input; it \
+                      starts nothing, grants nothing and sends no message. Use it to steer work \
+                      already running when a person's message changes it.",
+        input_schema: router_note,
+        repeatable: false,
     },
 ];
 
@@ -341,8 +364,9 @@ fn router_decide() -> Value {
         "required": ["eval", "decision", "reason"],
         "properties": {
             "eval": required_string("The eval id on the candidate's first line."),
-            "decision": {"type": "string", "enum": ["accept", "ignore", "stop"]},
+            "decision": {"type": "string", "enum": ["accept", "ignore", "stop", "reply"]},
             "reason": required_string("One sentence: why."),
+            "text": string("reply: what the person reads, as a chat message: the answer first, in plain sentences and their tone, with no restated goal and no report headings. Only an explicit request is answered."),
             "title": string("accept: a short title for the work."),
             "scope": string("accept: what the worker must do, in your words and complete on its own."),
             "plan": {
@@ -391,6 +415,21 @@ fn router_read() -> Value {
                 "enum": ["trigger", "thread", "ticket", "memo"],
                 "description": "Which kind of id it is, when it could be more than one. memo: a memo id, global, or repo:<owner>/<name>.",
             },
+        },
+    })
+}
+
+fn router_status() -> Value {
+    json!({"type": "object", "properties": {}})
+}
+
+fn router_note() -> Value {
+    json!({
+        "type": "object",
+        "required": ["ticket", "text"],
+        "properties": {
+            "ticket": required_string("The id of a ticket from router_status or the candidate's thread."),
+            "text": required_string("The fact its worker must know, complete on its own."),
         },
     })
 }

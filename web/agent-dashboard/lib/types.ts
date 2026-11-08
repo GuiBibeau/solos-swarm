@@ -209,7 +209,9 @@ export const NOTES_FORMAT = 1;
 export type Note = {
   thread: string;
   at_ms: number;
-  kind: "accept" | "ignore" | "stop" | "unavailable" | "declined";
+  kind: "accept" | "ignore" | "stop" | "unavailable" | "declined" | "answered";
   reason: string;
+  /** What the Router said when it answered the person itself. */
+  text?: string;
 };
 export type Notes = { v: number; generated_at?: string; notes: Note[] };

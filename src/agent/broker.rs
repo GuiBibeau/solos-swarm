@@ -23,6 +23,7 @@ use super::models::{ModelPolicy, Provider as ModelProvider, Role as ModelRole};
 use super::pi_executor::private_dir;
 use super::ports::{Applied, Fact, FactSink, Forge, Proposal, Refusal as Unadmitted, Workspace};
 use super::pstack::{self, Pstack, Reader};
+use super::utc;
 use super::watchdog::usd;
 use crate::broker::{FETCH_TOTAL_BYTES, FetchGuard, FetchRefused, fetch_guarded, now_ms};
 use crate::code::{CodeExecutor, Extras};
@@ -69,6 +70,14 @@ const READ_TEXT_CHARS: usize = 2_000;
 const READ_REPORT_CHARS: usize = 1_000;
 const READ_REASON_CHARS: usize = 300;
 const READ_RECENT: usize = 20;
+/// The most a Router's own reply in a chat keeps.
+const REPLY_TEXT_CHARS: usize = 2_000;
+/// The most a Router's status view lists.
+const STATUS_TICKETS: usize = 20;
+const STATUS_REPORT_CHARS: usize = 300;
+const STATUS_DECISIONS: usize = 10;
+/// The most a Router's note into a Ticket keeps.
+const NOTE_TEXT_CHARS: usize = 4_000;
 /// The most a Report's text keeps, which the host's own Reports keep too.
 pub(crate) const REPORT_TEXT_CHARS: usize = 8_000;
 const QUESTION_CHARS: usize = 1_000;
@@ -1873,6 +1882,8 @@ async fn router_call(broker: &AgentBroker, op: RouterOp, args: Value) -> Reply {
     match op {
         RouterOp::Decide => decide(broker, args).await,
         RouterOp::Read => read(broker, args).await,
+        RouterOp::Status => status(broker, args).await,
+        RouterOp::Note => note(broker, args).await,
     }
 }
 
@@ -1963,6 +1974,8 @@ enum Choice {
     Accept,
     Ignore,
     Stop,
+    /// The Router answers the person itself, in the chat: no worker.
+    Reply,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -2005,6 +2018,10 @@ struct DecideArgs {
     rules: Vec<String>,
     #[serde(default)]
     ticket: Option<TicketId>,
+    /// reply: what the person reads, written the way a colleague answers
+    /// in chat.
+    #[serde(default)]
+    text: Option<String>,
 }
 
 impl DecideArgs {
@@ -2049,6 +2066,14 @@ impl DecideArgs {
             Choice::Ignore => Verdict::Ignore { reason },
             Choice::Stop => Verdict::Stop {
                 ticket: self.ticket.ok_or("a stop names the ticket to stop")?,
+                reason,
+            },
+            Choice::Reply => Verdict::Reply {
+                text: self
+                    .text
+                    .map(|text| clip(text.trim(), REPLY_TEXT_CHARS).0)
+                    .filter(|text| !text.is_empty())
+                    .ok_or("a reply needs a text")?,
                 reason,
             },
             Choice::Accept => {
@@ -2248,6 +2273,13 @@ async fn decide(broker: &AgentBroker, args: Value) -> Reply {
     }
     let origin = broker.origin_source(&args.eval).await;
     let (strength, triggers) = broker.eval_context(&args.eval).await.map_err(failed)?;
+    if matches!(args.decision, Choice::Reply) && strength != Some(Strength::Explicit) {
+        return Err(refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "only an explicit request is answered: this candidate is inferred, so accept it as \
+             work or ignore it",
+        ));
+    }
     let (eval, verdict) = args
         .verdict(
             &broker.inner.decide,
@@ -2293,6 +2325,127 @@ async fn decide(broker: &AgentBroker, args: Value) -> Reply {
             Ok(Json(reply))
         }
         Ok(_) => Ok(Json(json!({"applied": true}))),
+        Err(why) => Err(refuse(StatusCode::CONFLICT, why)),
+    }
+}
+
+/// `router_status`: what the agent is doing, as the Router supervises it.
+/// The Store is read through its own read-only connection, as `agent status`
+/// does, so the view is safe while the agent serves.
+async fn status(broker: &AgentBroker, args: Value) -> Reply {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StatusArgs {}
+    let StatusArgs {} = arguments(args)?;
+    let dir = broker.inner.dir.clone();
+    let now = now_ms();
+    let read = tokio::task::spawn_blocking(move || super::status::read(&dir, None, now))
+        .await
+        .map_err(failed)?
+        .map_err(failed)?;
+    Ok(Json(supervision_view(&read)))
+}
+
+/// The agent's state as the Router reads it: who is working on what, how it
+/// is going, what waits for a person, and whether anything is wrong.
+fn supervision_view(status: &super::status::Status) -> Value {
+    use super::watchdog::{duration, plan_label, stage_name, usd};
+    let (tickets, more) = status
+        .tickets
+        .split_at(status.tickets.len().min(STATUS_TICKETS));
+    let tickets: Vec<Value> = tickets
+        .iter()
+        .map(|ticket| {
+            let report = ticket
+                .assignment
+                .as_ref()
+                .and_then(|assignment| assignment.last_report.as_ref())
+                .map(|report| {
+                    json!({
+                        "status": report.status,
+                        "at": utc::format(report.at_ms),
+                        "text": clip(&report.text, STATUS_REPORT_CHARS).0,
+                    })
+                });
+            json!({
+                "id": ticket.id,
+                "title": ticket.title,
+                "stage": stage_name(ticket.stage),
+                "age": duration(ticket.age_ms),
+                "plan": plan_label(&ticket.plan),
+                "committed_usd": usd(ticket.committed_microusd),
+                "waiting_question": ticket.attention,
+                "latest_report": report,
+                "asked_by": ticket.request.as_ref().map(|request| format!("{}:{}", request.source, request.actor.id)),
+                "thread": ticket.request.as_ref().and_then(|request| request.thread.as_ref()).map(ToString::to_string),
+            })
+        })
+        .collect();
+    let decisions: Vec<Value> = status
+        .decisions
+        .iter()
+        .take(STATUS_DECISIONS)
+        .map(|decision| {
+            json!({
+                "kind": decision.kind,
+                "thread": decision.thread,
+                "ticket": decision.ticket,
+                "reason": clip(&decision.reason, READ_REASON_CHARS).0,
+                "at": utc::format(decision.at_ms),
+            })
+        })
+        .collect();
+    let alerts: Vec<Value> = status
+        .alerts
+        .iter()
+        .map(|alert| {
+            json!({
+                "ticket": alert.ticket,
+                "since": alert.since_ms.map(utc::format),
+                "text": alert.text,
+            })
+        })
+        .collect();
+    json!({
+        "at": utc::format(status.at_ms),
+        "pause": status.pause.as_ref().map(|pause| json!({"by": pause.by, "since": pause.since_ms.map(utc::format)})),
+        "router_spend_today": usd(status.router.committed_today_microusd),
+        "open_tickets": status.tickets.len(),
+        "more_tickets": more.len(),
+        "tickets": tickets,
+        "decisions": decisions,
+        "alerts": alerts,
+    })
+}
+
+/// `router_note`: a fact one of the agent's Tickets reads as new input. It
+/// starts no work and grants nothing.
+async fn note(broker: &AgentBroker, args: Value) -> Reply {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct NoteArgs {
+        ticket: TicketId,
+        text: String,
+    }
+    let NoteArgs { ticket, text } = arguments(args)?;
+    let text = clip(text.trim(), NOTE_TEXT_CHARS).0;
+    if text.is_empty() {
+        return Err(refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a note needs a text",
+        ));
+    }
+    let answer = broker
+        .inner
+        .facts
+        .ask(Fact::Note {
+            ticket: ticket.clone(),
+            text,
+        })
+        .await
+        .map_err(failed)?;
+    match answer {
+        Ok(_) => Ok(Json(json!({"applied": true, "ticket": ticket}))),
         Err(why) => Err(refuse(StatusCode::CONFLICT, why)),
     }
 }
@@ -2771,6 +2924,7 @@ fn thread_summary(
                 "reason": clip(&decision.reason, READ_REASON_CHARS).0,
                 "ticket": decision.ticket,
                 "triggers": decision.triggers,
+                "reply": decision.reply.as_deref().map(|text| clip(text, READ_REPORT_CHARS).0),
             }));
         }
     }
@@ -2999,6 +3153,16 @@ mod tests {
                 reason: "asked".into()
             })
         );
+        assert_eq!(
+            verdict(
+                json!({"eval":"ev_1","decision":"reply","reason":"a status question",
+                           "text":"Two tickets are open."})
+            ),
+            Ok(Verdict::Reply {
+                text: "Two tickets are open.".into(),
+                reason: "a status question".into()
+            })
+        );
     }
 
     #[test]
@@ -3011,6 +3175,14 @@ mod tests {
             (
                 "stop without ticket",
                 json!({"eval":"ev_1","decision":"stop","reason":"r"}),
+            ),
+            (
+                "reply without text",
+                json!({"eval":"ev_1","decision":"reply","reason":"r"}),
+            ),
+            (
+                "reply with a blank text",
+                json!({"eval":"ev_1","decision":"reply","reason":"r","text":"  "}),
             ),
             (
                 "swarm without agents",

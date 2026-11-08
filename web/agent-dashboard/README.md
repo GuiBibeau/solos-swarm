@@ -22,8 +22,10 @@ The publisher is `solos-swarm agent publish` on the box
 never serves a request: a web message goes into `web/inbox.json` in the private store, the publisher turns it into a
 Trigger the agent already knows how to read (`kind: jsonl`), and the agent's replies come back in the published ticket
 snapshots. `notes/index.json` carries the Router's latest decisions on `web:` Threads, so the chat can show the agent's
-note (an Ignore's reason, for example) on a message that became no Ticket instead of leaving it without a reply. Discord
-and GitHub stay their own sources; the web chat is one more way in, not a replacement.
+note (an Ignore's reason, for example) on a message that became no Ticket instead of leaving it without a reply, and the
+Router's own `reply` — it answers conversation about its work itself, from `router_status`, with no worker and no Ticket;
+the decision's `answered` note carries the text. Discord and GitHub stay their own sources; the web chat is one more way
+in, not a replacement.
 
 The composer needs a signed-in, allowed person: the browser never holds the Blob token. `POST /api/chat` validates the
 thread and the text, writes the message with the server's token, and `GET /api/chat?t=<thread>` returns the thread's
@@ -36,7 +38,7 @@ JetBrains Mono for figures. An unlabelled rail on the left (a bottom bar on a ph
 
 | Path | What |
 |---|---|
-| `/` | **Chat, the home.** A live conversation with the agent: the selected thread in the middle, the recent web conversations on the left (each with an idle/working/needs-you mark), and what the swarm is doing on the right (the active Ticket's stage and worker, what needs you, the external jobs). It polls every 2 s, sends through the server, and keeps the thread in the address and in local storage. It shows each worker's reports, so the work is visible in the thread, and a message is always answered: `policy.answer_sources: [web]` turns an ignored message into a session, and an ignored one the host cannot answer appears as the agent's note. |
+| `/` | **Chat, the home.** A live conversation with the agent: the selected thread in the middle, the recent web conversations on the left (each with an idle/working/needs-you mark), and what the swarm is doing on the right (the active Ticket's stage and worker, what needs you, the external jobs). It polls every 2 s, sends through the server, and keeps the thread in the address and in local storage. It shows each worker's reports, so the work is visible in the thread, and a message is always answered: the Router replies about its own work itself (`answered` notes), `policy.answer_sources: [web]` turns an ignored message into a session, and only a decision the host cannot act on appears as a note with its reason. |
 | `/command` | **Command.** The full field (every Ticket a node, a running worker its satellite, the host at the centre), what needs you, the four numbers, and the latest tickets beside the external jobs. It warns when the index or the Watchdog is fifteen minutes old. It reloads every 20 s. |
 | `/tickets` | **Tickets.** Open and recently ended tickets; each row carries who asked and from where, its age or duration, its worker and its spend. |
 | `/tickets/<id>` | **One ticket.** The request, the conversation, the worker's reports, the scope, the facts and budget, the browser's pages, and the decisions; a link to the original Discord message or GitHub issue where one can be made. An open ticket reloads every 10 s. |

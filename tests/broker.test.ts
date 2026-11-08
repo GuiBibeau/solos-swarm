@@ -218,7 +218,7 @@ test("provider rejects malformed responses and handles denial and cancellation w
   }
 });
 
-const routerNames = ["router_decide", "router_read"];
+const routerNames = ["router_decide", "router_note", "router_read", "router_status"];
 
 test("the router tool set talks to the broker, takes its system prompt and sees a refused decision as a tool error", { timeout: 30_000 }, async (t) => {
   const dir = await mkdtemp(`${tmpdir()}/swarm-router-`);

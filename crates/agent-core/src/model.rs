@@ -657,6 +657,9 @@ pub enum DecisionKind {
     /// policy allows runs on this host. Nothing started, and on an explicit
     /// request the requester was told why.
     Declined,
+    /// The Router answered the person itself, in the chat: no Ticket, no
+    /// worker. `Decision.reply` holds what it said.
+    Answered,
 }
 
 /// The recorded result of an Eval, or of a gate that admitted nothing.
@@ -671,6 +674,10 @@ pub struct Decision {
     pub reason: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket: Option<TicketId>,
+    /// What the Router said to the person when it answered them itself
+    /// (`DecisionKind::Answered`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<String>,
     #[serde(default)]
     pub would_accept: bool,
     pub policy_version: String,
@@ -696,6 +703,13 @@ pub enum Verdict {
     Decline {
         reason: String,
         told: String,
+    },
+    /// The Router answers the person itself: `text` is what they read, once,
+    /// on the Trigger's own channels. No Ticket and no worker, so it costs no
+    /// session; only an explicit request is answered.
+    Reply {
+        text: String,
+        reason: String,
     },
 }
 
