@@ -1,11 +1,17 @@
 import Link from "next/link";
+import { Mark } from "@/components/rail";
 
 export default function NotFound() {
   return (
-    <>
-      <h1>Not found</h1>
-      <p className="muted">There is nothing at this address.</p>
-      <Link href="/">Back to the tickets</Link>
-    </>
+    <div className="standalone">
+      <span className="standalone-mark" aria-hidden="true">
+        <Mark />
+      </span>
+      <h1>Nothing here</h1>
+      <p className="sub">That address is not part of the command center.</p>
+      <Link className="button primary" href="/">
+        Back to the chat
+      </Link>
+    </div>
   );
 }
