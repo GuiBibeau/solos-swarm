@@ -5,7 +5,8 @@
 //! seat recorded, and refuses one it cannot find, before anything reaches the
 //! Engine or the review. Vault values are scrubbed from the text and from
 //! what is quoted. A memo the core does not make active at once (a person's
-//! own words) is proposed, and the review decides it (see `review`).
+//! whole message) is proposed: the review decides a model's (see
+//! `review`), and an external one waits for a person to write it.
 //!
 //! `read` serves the active memos under `/memos`, rendered from the Store as
 //! it is asked, so a forgotten memo's text is in no file; `router_read
@@ -413,7 +414,11 @@ pub(super) async fn propose(broker: &AgentBroker, seat: &Arc<WorkerSeat>, args: 
     let memo = memo.inspect_err(|_| {
         seat.proposed.fetch_sub(1, Ordering::SeqCst);
     })?;
-    let next = if memo.state == MemoState::Proposed {
+    let next = if memo.trust == MemoTrust::External {
+        "Proposed, and no review keeps it: it rests on outside text (a tool's output, or the \
+         words of someone you do not work for), so it reaches no prompt unless a person you \
+         work for adds it as their own memo. Go on with the ticket."
+    } else if memo.state == MemoState::Proposed {
         broker.review_soon(memo.id.clone());
         "Proposed. A separate review keeps it, rewrites it, merges it with a memo it repeats, or \
          drops it; you are not told which. Go on with the ticket."

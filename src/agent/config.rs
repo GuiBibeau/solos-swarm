@@ -90,7 +90,8 @@ pub struct AgentConfig {
     #[serde(default)]
     pub health: Option<HealthConfig>,
     /// Workers' memory: whether they propose memos, and the review that
-    /// decides each. On by default where workers run on Pi.
+    /// decides each one that is not outside text. On by default where workers
+    /// run on Pi.
     #[serde(default)]
     pub memory: MemoryConfig,
 }
@@ -179,7 +180,8 @@ impl Default for DreamConfig {
     }
 }
 
-/// `memory.review`: the separate model call that decides each proposal.
+/// `memory.review`: the separate model call that decides each proposal that
+/// is not outside text.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewConfig {

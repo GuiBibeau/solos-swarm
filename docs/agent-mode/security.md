@@ -111,17 +111,24 @@ The design is in [`vault-browser/`](vault-browser/rationale.md).
 - A memo is data in every prompt it reaches. Each line is `>`-quoted and labelled with its trust. No memo can grant a
   permission or change a budget, a tool or a rule: the core never reads memo text for a decision.
 - A worker writes no memo. It proposes one, with quotes that the broker finds or refuses, and the core derives its
-  trust from where the quotes came from. A person's words quoted whole are the only worker proposal that is active at
-  once.
-- Everything else waits for the review: a separate model call that is told to reject instruction-shaped memos and what
-  outside text asks for, and whose answer the host checks before the Engine applies it. A review that fails changes
-  nothing.
-- **Open.** The review is a model, so a hostile page that reads as a plain fact can still be kept, labelled `external`.
-  `agent memo retire` and `forget` take it back, and the dream checks memos against the transcripts.
+  trust from where the quotes came from. A person's whole message, quoted as the memo, is the only worker proposal that
+  is active at once. A part of a message is not, since a person can quote someone else's words.
+- Outside text never becomes an active memo without the owner. A stranger's or a bot's words, a page, a file, and any
+  tool's answer, a command's output included, make a memo `external`. The Engine refuses to activate an `external`
+  memo by any review decision, and the broker never sends one to the review. It waits, out of every prompt, until the
+  owner writes it as their own with `agent memo add`, or it expires after 7 days.
+- A `model` proposal waits for the review: a separate model call that sees the whole message a quote was cut from, is
+  told to reject instruction-shaped memos and what outside text asks for, and whose answer the host checks before the
+  Engine applies it. A review that fails changes nothing.
+- **Open.** The review is a model, so a person's message that quotes hostile text, or a worker's words that repeat a
+  hostile page, can still be kept as a `model` memo. `agent memo retire` and `forget` take it back.
 - The dream reads transcripts, which hold outside text. So it is told that text is data, holds no network tool, and
   can change memory only by citing lines that the host finds in the original transcripts by digest. What it stages is
-  a copy, so editing the copy gains nothing. Its proposals go through the review, and it can never supersede or retire
-  a person's memo.
+  a copy, so editing the copy gains nothing. A line that is a tool's answer or the prompt is `external`: it retires no
+  memo, and a correction that cites it is never reviewed. Its proposals go through the review, and it can never
+  supersede or retire a person's memo.
+- **Open.** The dream's `memo_retire` with `duplicate_of` cites no line. It retires a `model` or `external` memo in
+  favour of another active memo of the same scope, which a hostile transcript could talk the dream into.
 - Only the host makes a Trigger of the Source `dream`, and only the host judges one. The Router never sees it.
 
 ## GitHub

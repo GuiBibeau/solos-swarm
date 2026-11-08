@@ -6,8 +6,13 @@
 > graduation, is not built. The owner decisions below changed what was built:
 >
 > - No person clicks Keep. A separate review call, with DeepSeek's thinking on at `max` effort, keeps, rewrites, merges
->   or rejects every proposal that is not a person's own words. `Ask::Memo`, the Keep and Discard buttons,
->   `memory.auto_keep` and `memory.ask: dream` do not exist, and a proposal no review decides is retired after 7 days.
+>   or rejects every `model` proposal. `Ask::Memo`, the Keep and Discard buttons, `memory.auto_keep` and
+>   `memory.ask: dream` do not exist, and a proposal no review decides is retired after 7 days.
+> - Outside text never becomes an active memo by the review (2026-11-08). An `external` proposal is never reviewed, the
+>   Engine refuses to activate one by any review decision, and the owner adds it in their own words with
+>   `agent memo add` if it is right. `run_code` and job output are `external`, since a command can print anything a
+>   page or a file says. A person's message is `person` only when the memo is the whole message: a part of it is
+>   `model`. The dream's retirements cite a worker's own words, never a tool's answer or the prompt.
 > - The host, not the Router, asks for the dream and judges it, at `memory.dream.at` (03:30 UTC by default), and only
 >   when a Ticket ended since the last dream. The dream has no budget of its own. Its calls and the review's are held
 >   and settled on the ledger's `memory` account, capped by `memory.daily_microusd`. Its digest tells the owner what was
@@ -19,7 +24,7 @@
 > [Memory and the dream](../production.md#memory-and-the-dream).
 
 > **Owner decisions, 2026-11-07 (these override the text below where they differ).**
-> 1. **Promotion: fully autonomous, at high thinking effort.** No Keep click. Every memo is kept, rewritten, merged, retired or rejected by a separate review pass that runs the model with thinking on at its highest effort (the dream Ticket too). Host-checked quotes, provenance, data-not-instructions handling of external text, chained decisions and owner retire/forget stay. Wherever this document says "until a person clicks Keep", read "until the high-effort reviewer keeps it".
+> 1. **Promotion: fully autonomous, at high thinking effort.** No Keep click. Every memo is kept, rewritten, merged, retired or rejected by a separate review pass that runs the model with thinking on at its highest effort (the dream Ticket too). Host-checked quotes, provenance, data-not-instructions handling of external text, chained decisions and owner retire/forget stay. Wherever this document says "until a person clicks Keep", read "until the high-effort reviewer keeps it". Since 2026-11-08 this holds for `model` and `person` memos only: an `external` one waits for the owner to write it (see the status above).
 > 2. **Storage: a core table in agent.db** (as recommended).
 > 3. **Consolidation: a daily dream Ticket** (as recommended), run at high thinking effort.
 
@@ -188,10 +193,10 @@ pub enum MemoTrust { Person, Model, External }
 ```
 
 - **Trust is derived, not claimed.** The value is `Person` when the source is `Operator`, or when it is a `Trigger` by a
-  person the Policy admits explicitly (`allowed_person`) and the memo text *is* the quote. It is `External` when any
-  source is a Trigger by a bot, an unlisted person or a System, or a `Call` whose tool reads outside content (`read` of
-  a repository file, `fetch_url`, `browser_read`). Otherwise it is `Model`. This is swarm mode's
-  `trust(F) = min trust(S_i)` with three levels.
+  person the Policy admits explicitly (`allowed_person`) and the memo text *is* the quote and the quote is the
+  Trigger's whole text. It is `External` when any source is a Trigger by a bot, an unlisted person or a System, or any
+  `Call` (as built: `run_code` and job output too, since a command can print outside content). Otherwise it is
+  `Model`. This is swarm mode's `trust(F) = min trust(S_i)` with three levels.
 - **The gate.** A `Person` memo is `Active` at once (the owner already said it). `Model` and `External` memos are
   `Proposed` until a person on the approver list clicks Keep (`Ask::Memo { memo }`, the same machinery as the
   vault's Allow and Deny: `Fact::Command`, `Policy::may_approve`). Typed text never keeps a memo. `External`

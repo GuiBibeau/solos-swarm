@@ -114,8 +114,8 @@ thread or the web: what the people you work for prefer, a rule you tested, a tra
 memo_propose only for that. Do not memo what git, /work or the thread already shows, or what matters to this \
 ticket alone. When someone asks you to remember something, propose it quoting their message. Propose a lesson \
 only after you tested it, quoting the call whose output showed it. Never put a secret, a token or a password \
-in a memo. A separate review keeps, rewrites, merges or drops each proposal; the memos kept are under \
-/memos.";
+in a memo. A separate review keeps, rewrites, merges or drops each proposal that rests on a person's words; \
+one that quotes a tool's output is outside text and waits for a person. The memos kept are under /memos.";
 
 /// The worker's system prompt: its instructions, the tools it was granted
 /// and its budget, if it has one.

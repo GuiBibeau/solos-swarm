@@ -101,7 +101,7 @@ forge:
       about: solos-swarm, the agent's own code (Rust and TypeScript).
       base: main                           # no owes: it defaults to answer, so the agent only reads here
 memory:                                    # optional; these are the defaults
-  proposals: true                          # workers propose memos, and a review decides each
+  proposals: true                          # workers propose memos, and a review decides each that is not outside text
   review: {thinking: max}
   dream: {enabled: true, at: "03:30", thinking: max}   # UTC, before the 04:30 prune
   # daily_microusd: 500000                 # the review's and the dream's cap per UTC day; absent: no cap
@@ -395,8 +395,10 @@ removes a cache no Ticket has used for its `--keep-days`. What the mechanism tru
 ## Memory and the dream
 
 Memory is on by default wherever workers run on Pi. Workers propose memos, a review call at DeepSeek's highest thinking
-effort decides each one, and once a day the dream checks the memos against the transcripts of the Tickets that ended.
-How it works is in [Memory](runtime.md#memory) and [The dream](runtime.md#the-dream).
+effort decides each `model` one, and once a day the dream checks the memos against the transcripts of the Tickets that
+ended. A proposal that rests on outside text (`external`: a stranger, a page, any tool's output) is never reviewed and
+waits for you: `agent memo list` shows it, and `agent memo add` keeps what is right in your words. How it works is in
+[Memory](runtime.md#memory) and [The dream](runtime.md#the-dream).
 
 Operate it from the box:
 

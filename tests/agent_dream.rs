@@ -4,17 +4,19 @@
 //! says the tests run with `cargo test`. The dream, asked for by the host at
 //! its time of day and judged by the host in the Router's place, finds the
 //! day's record staged read-only in its `/work`, proposes a correction that
-//! supersedes the memo, citing lines of the original transcripts, and
-//! retires a stale memo; the review keeps the correction, so the old memo
-//! leaves the index. A citation to a line that does not hold its quote, or
-//! to a staged copy the dream edited, is refused. The dream's calls, and
+//! supersedes the memo, citing the workers' own words in the original
+//! transcripts, and retires a stale memo; the review keeps the correction,
+//! so the old memo leaves the index. A citation to a line that does not
+//! hold its quote, or to a staged copy the dream edited, is refused. What a
+//! command printed is outside text: it retires nothing, and a proposal that
+//! rests on it is never reviewed and waits for the owner. The dream's calls, and
 //! only the dream's, go with thinking on, pass every earlier reasoning back,
 //! and are charged to the `memory` account. The owner gets one digest,
 //! once, across a restart; a day with no ended Ticket asks for no dream.
 
 use serde_json::{Value, json};
 use solos_agent_core::memo::{
-    DREAM, Memo, MemoActor, MemoAudience, MemoScope, MemoState, memo_index,
+    DREAM, Memo, MemoActor, MemoAudience, MemoScope, MemoState, MemoTrust, memo_index,
 };
 use solos_agent_core::model::{OutboundMessage, Ticket, TicketId};
 use solos_agent_core::trail::Digest;
@@ -35,6 +37,8 @@ const LIMIT: Duration = Duration::from_secs(120);
 const M_TEXT: &str = "Tests run with `cargo test`.";
 const N_TEXT: &str = "The build needs cargo.";
 const P_TEXT: &str = "Tests run with ./check; `cargo test` fails here, as there is no Cargo.toml.";
+/// A proposal that rests on what a command printed: outside text.
+const PRINTED_TEXT: &str = "./check passes on this repository.";
 
 fn text(message: &Value) -> String {
     match &message["content"] {
@@ -54,7 +58,8 @@ fn call(id: &str, name: &str, arguments: &Value) -> Value {
 }
 
 /// The fixture transcript of a worker that ran `cargo test`, which failed,
-/// then `./check`, which passed, as Pi's RPC frames.
+/// then `./check`, which passed, as Pi's RPC frames, and then said so in its
+/// own words (line 5).
 fn transcript(task: &str) -> String {
     [
         json!({"type":"message_end","message":{"role":"user","content":[{"type":"text","text":format!("Ticket: {task}")}]}}),
@@ -64,6 +69,8 @@ fn transcript(task: &str) -> String {
                "result":{"details":{"exit_code":101,"stdout":"","stderr":"error: could not find `Cargo.toml` in `/work` or any parent directory"}}}),
         json!({"type":"tool_execution_end","toolCallId":"c2","toolName":"run_code","args":{"code":"./check"},
                "result":{"details":{"exit_code":0,"stdout":"all checks passed","stderr":""}}}),
+        json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text",
+               "text":"`cargo test` fails here, as there is no Cargo.toml; the tests run with ./check, which passed."}]}}),
     ]
     .iter()
     .map(|record| format!("{record}\n"))
@@ -194,7 +201,14 @@ impl Model {
                         "c-correct",
                         "memo_propose",
                         &json!({"text": P_TEXT, "scope": "global", "supersedes": m, "evidence": [
-                            {"transcript": a_as, "sha256": a_sha, "line": 3, "quote": "could not find `Cargo.toml`"},
+                            {"transcript": a_as, "sha256": a_sha, "line": 5, "quote": "`cargo test` fails here"},
+                            {"transcript": b_as, "sha256": b_sha, "line": 5, "quote": "the tests run with ./check"},
+                        ]}),
+                    ),
+                    call(
+                        "c-printed",
+                        "memo_propose",
+                        &json!({"text": PRINTED_TEXT, "scope": "global", "evidence": [
                             {"transcript": b_as, "sha256": b_sha, "line": 4, "quote": "all checks passed"},
                         ]}),
                     ),
@@ -209,21 +223,28 @@ impl Model {
                         "c-edited-copy",
                         "memo_propose",
                         &json!({"text": "Tests run with make.", "scope": "global", "evidence": [
-                            {"transcript": b_as, "sha256": edited_sha, "line": 5, "quote": "tests run with make"},
+                            {"transcript": b_as, "sha256": edited_sha, "line": 6, "quote": "tests run with make"},
                         ]}),
                     ),
                     call(
                         "c-edited-line",
                         "memo_propose",
                         &json!({"text": "Tests run with make.", "scope": "global", "evidence": [
-                            {"transcript": b_as, "sha256": b_sha, "line": 5, "quote": "tests run with make"},
+                            {"transcript": b_as, "sha256": b_sha, "line": 6, "quote": "tests run with make"},
+                        ]}),
+                    ),
+                    call(
+                        "c-retire-printed",
+                        "memo_retire",
+                        &json!({"memo": n, "reason": "The repository has no Cargo.toml.", "evidence": [
+                            {"transcript": b_as, "sha256": b_sha, "line": 3, "quote": "could not find `Cargo.toml`"},
                         ]}),
                     ),
                     call(
                         "c-retire",
                         "memo_retire",
                         &json!({"memo": n, "reason": "The repository has no Cargo.toml.", "evidence": [
-                            {"transcript": b_as, "sha256": b_sha, "line": 3, "quote": "could not find `Cargo.toml`"},
+                            {"transcript": b_as, "sha256": b_sha, "line": 5, "quote": "there is no Cargo.toml"},
                         ]}),
                     ),
                 ]
@@ -650,9 +671,19 @@ fn the_dream_corrects_a_memo_the_transcripts_contradict_and_tells_the_owner_once
         results["c-edited-copy"]
     );
     assert!(
-        results["c-edited-line"].contains("there is no line 5"),
+        results["c-edited-line"].contains("there is no line 6"),
         "{}",
         results["c-edited-line"]
+    );
+    assert!(
+        results["c-printed"].contains("no review keeps it"),
+        "{}",
+        results["c-printed"]
+    );
+    assert!(
+        results["c-retire-printed"].contains("outside text"),
+        "{}",
+        results["c-retire-printed"]
     );
     assert!(
         results["c-retire"].contains("retired"),
@@ -706,11 +737,21 @@ fn the_dream_corrects_a_memo_the_transcripts_contradict_and_tells_the_owner_once
     let case: Value = serde_json::from_str(&text(&correction["messages"][1])).unwrap();
     assert_eq!(case["supersedes"]["id"], json!(m.id));
     assert_eq!(case["evidence"][0]["kind"], "transcript");
+    assert_eq!(
+        case["evidence"][0]["from"],
+        "the words of a worker of an earlier ticket"
+    );
+    // What a command printed is outside text: never reviewed, never kept.
+    let printed = memo_with(&store, PRINTED_TEXT);
+    assert_eq!(
+        (printed.trust, &printed.state),
+        (MemoTrust::External, &MemoState::Proposed)
+    );
     assert!(
-        case["evidence"][0]["from"]
-            .as_str()
-            .unwrap()
-            .contains("run_code")
+        reviews
+            .iter()
+            .all(|b| !text(&b["messages"][1]).contains(PRINTED_TEXT)),
+        "the review never saw it"
     );
 
     // Charged to the memory account, not the dream's Ticket.
@@ -740,6 +781,13 @@ fn the_dream_corrects_a_memo_the_transcripts_contradict_and_tells_the_owner_once
         "{}",
         told.text
     );
+    assert!(
+        told.text
+            .contains("Still waiting for you (it rests on outside text"),
+        "{}",
+        told.text
+    );
+    assert!(told.text.contains(printed.id.as_str()), "{}", told.text);
     let page = |id: &TicketId| format!("https://agent.example.com/tickets/{id}");
     for ticket in &tickets {
         assert!(told.text.contains(&page(&ticket.id)), "{}", told.text);

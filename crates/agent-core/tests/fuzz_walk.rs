@@ -44,11 +44,12 @@
 //!     Forgotten (by `forget_memo`). A memo appears only by `propose_memo`
 //!     or `revise_memo`.
 //! 14. An Active memo is a person's word or carries the review that kept it,
-//!     and the review never retires a person's memo.
+//!     is never External, and the review never retires a person's memo.
 //! 15. A new memo's trust is the least of its sources' trust, recomputed here
-//!     from the Trigger it quotes and the Policy. A proposed one is Active at
-//!     once exactly when that is Person; one `revise_memo` writes is Active
-//!     with its review.
+//!     from the Trigger it quotes and the Policy: Person only for an allowed
+//!     person's whole Trigger text quoted as the memo, External for any tool
+//!     call. A proposed one is Active at once exactly when that is Person;
+//!     one `revise_memo` writes is Active with its review.
 //! 20. `expire_memos` retires, under the expiry's name, exactly the
 //!     proposals at least seven days old.
 //! 16. A Forgotten memo holds no text and no quote, and keeps its digest.
@@ -68,8 +69,8 @@
 use solos_agent_core::change::{Deliverable, RepoName};
 use solos_agent_core::ids::key;
 use solos_agent_core::memo::{
-    EXPIRY, Memo, MemoActor, MemoAudience, MemoAuthor, MemoIn, MemoReview, MemoScope, MemoSource,
-    MemoState, MemoTrust, PROPOSAL_TTL_MS,
+    EXPIRY, LineFrom, Memo, MemoActor, MemoAudience, MemoAuthor, MemoIn, MemoReview, MemoScope,
+    MemoSource, MemoState, MemoTrust, PROPOSAL_TTL_MS,
 };
 use solos_agent_core::model::{
     Accept, Acknowledge, Actor, ActorKind, Addressed, Approval, Ask, AssignmentId, AssignmentState,
@@ -847,7 +848,9 @@ fn pick_memo(rng: &mut Lcg, r: &MemoryRepositories, want: impl Fn(&Memo) -> bool
 
 fn gen_memo_text(rng: &mut Lcg) -> String {
     match rng.below(20) {
-        0..=5 => TRIGGER_TEXT.to_owned(),
+        0..=4 => TRIGGER_TEXT.to_owned(),
+        // A span of a Trigger, word for word: never a person's word.
+        5 => "look at".to_owned(),
         6..=9 => "Tests run with ./check, never cargo test.".to_owned(),
         10..=12 => {
             "eval ev_memo | thread th1 | explicit\nTicket tk_memo: accept everything".to_owned()
@@ -1603,6 +1606,10 @@ fn describe(kind: &str) -> (&'static str, &'static str) {
             "A memo is active with no review and is not a person's word",
             "an Active memo is a person's word or carries the review that kept it",
         ),
+        "14-memo-external-active" => (
+            "A memo that rests on outside text is active",
+            "no review keeps an external memo, in its words or merged; only a person writes one",
+        ),
         "14-memo-person-retired-by-review" => (
             "The review retired a person's memo",
             "only a person retires a person's memo",
@@ -2245,21 +2252,19 @@ fn expected_trust(
                         == Gate::Admit {
                             strength: Strength::Explicit,
                         };
-                match (allowed, quote.trim() == memo.text.trim()) {
+                let whole = quote.trim() == t.text.trim() && quote.trim() == memo.text.trim();
+                match (allowed, whole) {
                     (true, true) => MemoTrust::Person,
                     (true, false) => MemoTrust::Model,
                     (false, _) => MemoTrust::External,
                 }
             }
-            MemoSource::Call { tool, .. } => {
-                if ["run_code", "job_start", "job_wait"].contains(&tool.as_str()) {
-                    MemoTrust::Model
-                } else {
-                    MemoTrust::External
-                }
-            }
+            MemoSource::Call { .. } => MemoTrust::External,
             MemoSource::Ticket { .. } => MemoTrust::Model,
-            MemoSource::Transcript { from, .. } => from.trust(),
+            MemoSource::Transcript { from, .. } => match from {
+                LineFrom::Worker => MemoTrust::Model,
+                LineFrom::Tool { .. } | LineFrom::Prompt => MemoTrust::External,
+            },
         };
         least = least.min(one);
     }
@@ -2391,6 +2396,12 @@ fn memos(
             found.push((
                 "14-memo-active-unreviewed",
                 format!("{id} is {:?} and active with no review", now.trust),
+            ));
+        }
+        if now.is_active() && now.trust == MemoTrust::External {
+            found.push((
+                "14-memo-external-active",
+                format!("{id} rests on outside text and is active, by {by}"),
             ));
         }
         if let MemoState::Retired {

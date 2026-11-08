@@ -588,8 +588,9 @@ Spend per job is not watched here. The design for long-running work (#101, #102)
 
 Memos are what the agent learned on one Ticket that a later, different Ticket should know. The owner writes them with
 `solos-swarm agent memo add` or the MCP tool `agent_memo_add`, and they are active at once. Workers on Pi propose them
-too, and a review decides each one with no click. The design is [memory/design.md](memory/design.md). To manage memos,
-see [Manage the agent's memory](how-to/memory.md).
+too: a review decides each proposal that is not outside text, with no click, and one that rests on outside text waits
+for the owner. The design is [memory/design.md](memory/design.md). To manage memos, see [Manage the agent's
+memory](how-to/memory.md).
 
 **Where memos are shown.** Memos are quoted as data in the Router's system prompt (the global ones, within 1 KB) and in
 each worker's first prompt (the global ones and its repository's, within 3 KB). When the index in a prompt leaves memos
@@ -606,21 +607,24 @@ The broker keeps what each of the seat's calls answered and finds every quote, w
 taken as one. Otherwise it refuses the proposal with why, before anything reaches the Engine. Vault values in the text
 and the quotes become `[vault:<name>]`. An Assignment proposes at most 3 memos.
 
-**Trust.** The core derives a memo's trust from where its quotes came from:
+**Trust.** The core derives a memo's trust from where its quotes came from. The least trusted quote sets it:
 
-- A person's words quoted whole are `person`, and the memo is active at once.
-- The output of the worker's own `run_code` or jobs is `model`.
-- A stranger's or a bot's words, a page, a file, or any other tool's answer make it `external`.
+- A person's whole message, quoted word for word as the memo, is `person`, and the memo is active at once. Only
+  people that `policy.people` names count.
+- A part of a person's message, or a paraphrase of it, is `model`, even word for word: the part may be words the
+  person quoted from someone else.
+- A stranger's or a bot's words, a page, a file, and any tool's answer make it `external`. That includes the output
+  of `run_code` and of jobs, since a command can print a file, a page or whatever a worker was told to echo.
 
-**The review.** Every other proposal goes to a separate model call with `thinking: {type: enabled}` and
+**The review.** A `model` proposal goes to a separate model call with `thinking: {type: enabled}` and
 `reasoning_effort: max`, DeepSeek's documented highest (see
 [thinking mode](https://api-docs.deepseek.com/guides/thinking_mode)). The call gets fixed instructions, the proposal
-with its quotes and where each came from, and the active memos of its scope, all as data. It answers one JSON
-decision:
+with its quotes, where each came from and the whole message a quote was cut from, and the active memos of its scope,
+all as data. It answers one JSON decision:
 
 - `keep`.
 - `rewrite`: its words become a new memo that cites the same evidence, and the proposal is retired naming it.
-- `merge`: one new memo replaces the proposal and a `model` or `external` memo it repeats, and both are retired.
+- `merge`: one new memo replaces the proposal and a `model` memo it repeats, and both are retired.
 - `reject`.
 
 Its instructions reject what is instruction-shaped (permissions, tools, budgets, targets) and what outside text asks
@@ -628,6 +632,12 @@ for. The host checks the answer and applies it through the Engine. Any other ans
 refusal leaves the proposal proposed, never active. Reviews run in the background, one at a time, each proposal at most
 once per run. A start reviews what the last run left proposed, and a proposal that no review decides is retired as
 `expiry` after 7 days. The calls are held and settled on the ledger's `memory` account.
+
+**Outside text.** An `external` proposal is never reviewed, and the Engine refuses to make one active by any review
+decision: a keep, a rewrite, or a merge whose sources would make the new memo `external`. It stays proposed, out of
+every prompt, until it expires after 7 days. If it is right, the owner adds it in their own words with
+`agent memo add` (see [Manage the agent's memory](how-to/memory.md)). This is the one exception to the fully
+autonomous review: `model` and `person` memos still become active with no click.
 
 **Reading.** `read` serves `/memos/global.md` and `/memos/repo/<owner>/<name>.md`: every active memo of the scope, with
 who kept it, why, and its evidence, every model or outside line quoted. The files are rendered from the Store as they
@@ -675,20 +685,25 @@ tools needs. Every other session's and swarm mode's request bodies are unchanged
 the original transcript that the host keeps, never the copy in `/work`. It checks that the transcript's whole digest is
 the cited `sha256` and that the line says the quote, and it records who wrote the line:
 
-- The worker: `model`.
-- A tool's answer: `model` for the worker's own commands, `external` for any other tool.
+- The worker's own words (what it said, or the command it ran): `model`.
+- A tool's answer, a command's output included: `external`.
 - The prompt: `external`.
 
 An edited copy, a wrong digest, or a line that does not hold the quote is refused. The dream may not cite Triggers or
 its own calls.
 
 **Changes.** `memo_propose` with `supersedes: <memo>` proposes a correction. The review decides it like any proposal,
-and keeping it in any form retires the old memo, naming the new one (`replaced_by`).
-`memo_retire {memo, reason, evidence | duplicate_of}` retires a `model` or `external` memo at once, citing the lines
-that show it is wrong or stale, or the active memo that already says it. The dream never supersedes or retires a
-person's memo. A dream makes at most 10 proposals and 10 retirements.
+and keeping it in any form retires the old memo, naming the new one (`replaced_by`). A correction that cites an
+`external` line is outside text: no review decides it, and the old memo stands.
+`memo_retire {memo, reason, evidence | duplicate_of}` retires a `model` or `external` memo at once, citing the lines in
+which a worker's own words show it is wrong or stale, or the active memo that already says it. An `external` line
+retires nothing: transcripts hold whatever a page, an issue or a command printed. `duplicate_of` cites no line, and
+stays as it was. The dream never supersedes or retires a person's memo. A dream makes at most 10 proposals and 10
+retirements.
 
 **The digest.** Once the dream has ended and the review has decided what it proposed, or 30 minutes have passed, the
-Watchdog tells its operator once what was kept and in place of what, what was rejected, and what was retired. It links
-each Ticket's page where `web.public_url` is set. The digest's id names the dream, so a restart neither repeats it nor
-loses it. Without a `watchdog:` section there is no digest, and the dream's Ticket and the memos still say what it did.
+Watchdog tells its operator once what was kept and in place of what, what was rejected, and what was retired. A
+proposal that rests on outside text does not hold the digest back: it is listed as waiting for the owner, who can add
+it with `agent memo add`. The digest links each Ticket's page where `web.public_url` is set. Its id names the dream, so
+a restart neither repeats it nor loses it. Without a `watchdog:` section there is no digest, and the dream's Ticket and
+the memos still say what it did.

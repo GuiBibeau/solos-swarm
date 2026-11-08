@@ -890,10 +890,11 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
 
     /// Propose a memo and return its id. Its trust is derived from its
     /// sources, never from its author's word, and a person's own memo (the
-    /// operator's, or a person's message quoted word for word) is active at
-    /// once. Anything else waits for the review's decision
-    /// ([`Engine::activate_memo`]). A live memo with the same scope and text
-    /// is refused, naming it.
+    /// operator's, or a person's whole message quoted word for word) is
+    /// active at once. A model's waits for the review's decision
+    /// ([`Engine::activate_memo`]), and an external one for a person, who
+    /// writes it as their own. A live memo with the same scope and text is
+    /// refused, naming it.
     pub fn propose_memo(&mut self, proposal: MemoIn) -> Result<MemoId, Error> {
         self.run(|tx, policy| {
             let MemoIn {
@@ -979,16 +980,20 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
         })
     }
 
-    /// The review keeps a proposed memo: from now on it is in the index.
-    /// This is the one way a model's or an external memo becomes active.
+    /// The review keeps a proposed model's memo: from now on it is in the
+    /// index. This is the one way a model's memo becomes active. An
+    /// external one never does, by its trust as proposed or as its sources
+    /// give it now: outside text becomes a memo only in a person's words.
     pub fn activate_memo(&mut self, memo: &MemoId, review: MemoReview) -> Result<(), Error> {
-        self.run(|tx, _| {
+        self.run(|tx, policy| {
             memo::check_name("a review's name", &review.by).map_err(Error::Invalid)?;
             memo::check_reason(&review.reason).map_err(Error::Invalid)?;
             let mut m = tx.require_memo(memo)?;
             if m.state != MemoState::Proposed {
                 return Err(Error::Refused(format!("{memo} is {}", m.state.name())));
             }
+            let now = tx.memo_trust(policy, &m.sources, &m.text, &m.author)?;
+            outside_text(memo, m.trust.min(now))?;
             tx.event(DomainEvent::MemoActivated {
                 memo: memo.clone(),
                 by: review.by.clone(),
@@ -1015,8 +1020,10 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
     /// cites the proposal's sources (and the merged memo's), its trust
     /// derived from them and `text` anew. The proposal and the merged memo
     /// are retired in the same commit, each naming the new one. A person's
-    /// memo is merged into nothing: only a person changes it. Returns the
-    /// new memo's id.
+    /// memo is merged into nothing: only a person changes it. Words whose
+    /// sources make them external are refused, as
+    /// [`activate_memo`](Self::activate_memo) refuses them. Returns the new
+    /// memo's id.
     pub fn revise_memo(
         &mut self,
         memo: &MemoId,
@@ -1065,6 +1072,10 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
                 }
             };
             let trust = tx.memo_trust(policy, &sources, &text, &proposal.author)?;
+            let least = merged
+                .iter()
+                .fold(trust.min(proposal.trust), |least, m| least.min(m.trust));
+            outside_text(memo, least)?;
             let replaced =
                 |id: &MemoId| *id == proposal.id || merged.as_ref().is_some_and(|m| m.id == *id);
             if let Some(held) = tx
@@ -1178,9 +1189,10 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
     }
 
     /// [`retire_memo`](Self::retire_memo), with what the retirement rests
-    /// on. The dream must cite: lines of transcripts that show the memo is
-    /// wrong or stale, or the active memo of the same scope that already
-    /// says it. It acts only while its Assignment runs.
+    /// on. The dream must cite: lines of transcripts in which a worker's own
+    /// words show the memo is wrong or stale (never outside text, which an
+    /// attacker could plant), or the active memo of the same scope that
+    /// already says it. It acts only while its Assignment runs.
     pub fn retire_memo_citing(
         &mut self,
         memo: &MemoId,
@@ -1229,12 +1241,22 @@ impl<R: Repositories, P: Policy, C: Clock> Engine<R, P, C> {
                         )));
                     }
                     for source in &evidence {
-                        if !matches!(source, MemoSource::Transcript { .. }) {
+                        let MemoSource::Transcript {
+                            assignment, line, ..
+                        } = source
+                        else {
                             return Err(Error::Invalid(
                                 "a retirement cites lines of transcripts".into(),
                             ));
+                        };
+                        let trust = memo::source_trust(source, "", &m.author, None)
+                            .map_err(Error::Invalid)?;
+                        if trust == MemoTrust::External {
+                            return Err(Error::Refused(format!(
+                                "line {line} of {assignment} is outside text (a tool's answer or \
+                                 the prompt), which retires no memo: cite a worker's own words"
+                            )));
                         }
-                        memo::source_trust(source, "", &m.author, None).map_err(Error::Invalid)?;
                     }
                     (None, evidence)
                 }
@@ -1318,6 +1340,18 @@ fn memo_actor(policy: &impl Policy, by: &MemoActor) -> Result<(), Error> {
         // Checked against its Ticket where it acts.
         MemoActor::Dream { .. } => Ok(()),
     }
+}
+
+/// The review never makes `memo` active when `trust` is external: outside
+/// text becomes a memo only when a person writes it as their own.
+fn outside_text(memo: &MemoId, trust: MemoTrust) -> Result<(), Error> {
+    if trust == MemoTrust::External {
+        return Err(Error::Refused(format!(
+            "{memo} rests on outside text, which the review never keeps: only a person adds it, \
+             in their own words"
+        )));
+    }
+    Ok(())
 }
 
 /// What a memo's retirement rests on, beside its reason.

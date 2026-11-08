@@ -40,17 +40,6 @@ pub const DREAM: &str = "dream";
 /// The pieces of evidence a dream's retirement may cite.
 pub const MAX_RETIRE_EVIDENCE: usize = 4;
 
-/// The tools whose results come from the worker's own commands. A memo that
-/// cites a call to any other tool (`read`, `fetch_url`, the browser, or a
-/// tool this list does not know) quotes outside text, so it is external.
-const OWN_WORK_TOOLS: [&str; 3] = ["run_code", "job_start", "job_wait"];
-
-/// Whether what a call of `tool` answered is the worker's own command's
-/// output, rather than outside text.
-pub fn own_work(tool: &str) -> bool {
-    OWN_WORK_TOOLS.contains(&tool)
-}
-
 /// Where a memo applies: every session, or work on one repository.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -106,11 +95,15 @@ impl std::fmt::Display for MemoScope {
 #[serde(rename_all = "snake_case")]
 pub enum MemoTrust {
     /// It quotes text from outside: a bot, a person nobody listed, a page,
-    /// an issue, a repository file.
+    /// an issue, a repository file, or any tool's answer. A command's output
+    /// is outside text too, since a command can print any of those. The
+    /// review never makes such a memo active; a person can write it
+    /// themselves.
     External,
-    /// The agent concluded it from its own work.
+    /// The agent concluded it: its reading of a person's words, or a
+    /// worker's own words.
     Model,
-    /// A person the agent works for said it, in these words.
+    /// A person the agent works for said it: their whole message is the memo.
     Person,
 }
 
@@ -132,8 +125,11 @@ pub enum MemoSource {
     /// author is that person may cite it.
     Operator,
     /// A Trigger's words. The core checks that the quote is in its text.
+    /// Only its whole text, quoted as the memo, is a person's word.
     Trigger { trigger: TriggerId, quote: String },
-    /// A tool call in an Assignment's transcript. The host checks the quote
+    /// A tool call in an Assignment's transcript: outside text, whatever the
+    /// tool, since a command can print a file, a page or whatever a worker
+    /// was told to echo. The host checks the quote
     /// against what the call answered before it is cited. `transcript` is
     /// the digest of that answer, its compact JSON as the transcript holds
     /// it for the call's result, so the quote can be checked again later.
@@ -174,12 +170,11 @@ pub enum LineFrom {
 }
 
 impl LineFrom {
-    /// Its trust: the worker's words and its own commands' output are the
-    /// agent's; any other tool's answer, and a prompt, are outside text.
+    /// Its trust: the worker's own words are the agent's; any tool's answer,
+    /// a command's output included, and a prompt are outside text.
     pub fn trust(&self) -> MemoTrust {
         match self {
             Self::Worker => MemoTrust::Model,
-            Self::Tool { tool } if own_work(tool) => MemoTrust::Model,
             Self::Tool { .. } | Self::Prompt => MemoTrust::External,
         }
     }
@@ -529,7 +524,10 @@ pub fn source_trust(
                 return Err(format!("trigger {id} does not say what the quote says"));
             }
             let person = trigger.actor.kind == ActorKind::Person && allowed;
-            Ok(match (person, text.trim() == quote.trim()) {
+            // A span of a person's message may be words they quoted from
+            // someone else, so only the whole message is theirs.
+            let whole = quote.trim() == trigger.text.trim() && text.trim() == quote.trim();
+            Ok(match (person, whole) {
                 (true, true) => MemoTrust::Person,
                 (true, false) => MemoTrust::Model,
                 (false, _) => MemoTrust::External,
@@ -541,11 +539,7 @@ pub fn source_trust(
             check_name("a call", call)?;
             check_name("a tool", tool)?;
             bounded("a quote", quote, MAX_QUOTE_CHARS)?;
-            Ok(if own_work(tool) {
-                MemoTrust::Model
-            } else {
-                MemoTrust::External
-            })
+            Ok(MemoTrust::External)
         }
         MemoSource::Ticket { .. } => Ok(MemoTrust::Model),
         MemoSource::Transcript {
