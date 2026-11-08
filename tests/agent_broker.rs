@@ -34,11 +34,12 @@ use solos_swarm::agent::watchdog::usd;
 use solos_swarm::agent::{Adapters, AgentConfig, RunOptions, Runtime, STORE_FILE};
 use solos_swarm::browse::fake::FakeCdp;
 use solos_swarm::browse::{BrowserConfig, Browsers, Launcher, TrailSigner};
-use solos_swarm::code::{OutputBounds, Started};
+use solos_swarm::code::{CodeConfig, CodeExecutor, OutputBounds, Started};
 use solos_swarm::gateway::{Dispatch, PriceTable, Provider, Temperature, Upstream, upstream_body};
 use solos_swarm::vault::{SandboxView, Vault, VaultConfig};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -2658,6 +2659,10 @@ async fn a_seat_may_call_exactly_the_tools_it_is_offered() {
             let refused = status == 403
                 && [
                     Some("run_code is not available on this host"),
+                    Some(
+                        "this ticket's /work is on the machine its run_code runs on: change \
+                         files there with run_code",
+                    ),
                     Some("no browser where this ticket runs"),
                     Some("only the dream retires a memo"),
                 ]
@@ -2708,20 +2713,26 @@ async fn every_tool_has_a_handler() {
     let scratch = Scratch::new("handlers");
     let (_runtime, served, _fake) = serve_with_a_node_a_vault_and_a_browser(&scratch);
     let (here, there) = (served.listed(HERE).await, served.listed(THERE).await);
+    // The file tools need run_code on this host, which that one lacks.
+    let coding = Scratch::new("handlers_code");
+    let (_coding_runtime, with_code, _) = serve_with_run_code(&coding);
+    let coder = with_code.listed(CODER).await;
+    let offers = |listed: &[String], tool: &str| listed.iter().any(|name| name == tool);
 
     for kind in [PrincipalKind::Router, PrincipalKind::Worker] {
         for tool in registry::tools(kind) {
-            let token = match kind {
-                PrincipalKind::Router => TOKEN,
-                PrincipalKind::Worker if tool.name == "memo_retire" => DREAM,
-                PrincipalKind::Worker if there.iter().any(|name| name == tool.name) => THERE,
+            let (served, token) = match kind {
+                PrincipalKind::Router => (&served, TOKEN),
+                PrincipalKind::Worker if tool.name == "memo_retire" => (&served, DREAM),
+                PrincipalKind::Worker if offers(&there, tool.name) => (&served, THERE),
+                PrincipalKind::Worker if offers(&here, tool.name) => (&served, HERE),
                 PrincipalKind::Worker => {
                     assert!(
-                        here.iter().any(|name| name == tool.name),
+                        offers(&coder, tool.name),
                         "{} is offered nowhere",
                         tool.name
                     );
-                    HERE
+                    (&with_code, CODER)
                 }
             };
             let (status, reply) = served
@@ -2734,6 +2745,237 @@ async fn every_tool_has_a_handler() {
             );
         }
     }
+}
+
+const CODER: &str = "worker-coder";
+
+/// A broker whose host has run_code, and `CODER`, a worker on it, with its
+/// `/work`. No sandbox starts: `/usr/bin/true` stands in for prlimit and
+/// bwrap, so a command does nothing and exits 0, after its files are written.
+fn serve_with_run_code(scratch: &Scratch) -> (Runtime, Served, PathBuf) {
+    let runtime = scratch.runtime(Arc::new(Holding::default()), true);
+    let tickets = scratch.state().join("tickets");
+    let mut code = CodeConfig::new(tickets.clone(), Vec::new());
+    code.bwrap = PathBuf::from("/usr/bin/true");
+    code.prlimit = PathBuf::from("/usr/bin/true");
+    let mut parts = workers(None, None);
+    parts.code = Some(Arc::new(CodeExecutor::from_config(code).unwrap()));
+    let served = serve_on(
+        scratch,
+        Scripted::new(),
+        runtime.facts(),
+        1_000_000,
+        TERMS,
+        Nodes::default(),
+        parts,
+        None,
+    );
+    let work = tickets.join("tk_files").join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let seat = WorkerSeat::new(
+        TicketId::new("tk_files"),
+        AssignmentId::new("as_1"),
+        work.clone(),
+        500_000,
+    );
+    served
+        .broker
+        .admit_worker(CODER.into(), seat, "You are a worker.".into())
+        .unwrap();
+    (runtime, served, work)
+}
+
+#[tokio::test]
+async fn a_worker_writes_and_edits_a_file_in_its_work_with_no_shell_to_quote_it() {
+    let scratch = Scratch::new("files");
+    let (_runtime, served, work) = serve_with_run_code(&scratch);
+    let call = async |tool: &str, args: Value| {
+        served
+            .post(&format!("tool/{tool}"), Some(CODER), args)
+            .await
+    };
+    assert_eq!(
+        served.listed(CODER).await,
+        [
+            "worker_report",
+            "worker_handback",
+            "run_code",
+            "job_start",
+            "job_wait",
+            "job_stop",
+            "fetch_url",
+            "write_file",
+            "edit_file"
+        ]
+    );
+
+    // What a heredoc or a python one-liner would have to quote.
+    let source =
+        "fn main() {\n    let s = \"it's $HOME `pwd` \\\\n\";\n    println!(\"{s}\");\n}\nEOF\n";
+    let (status, reply) = call(
+        "write_file",
+        json!({"path": "src/bin/main.rs", "content": source}),
+    )
+    .await;
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(
+        reply,
+        json!({"path": "/work/src/bin/main.rs", "bytes": source.len(), "created": true})
+    );
+    let file = work.join("src/bin/main.rs");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), source);
+
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (status, reply) = call(
+        "edit_file",
+        json!({
+            "path": "/work/src/bin/main.rs",
+            "old": "    println!(\"{s}\");\n",
+            "new": "    eprintln!(\"{s}\");\n",
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{reply}");
+    let edited = source.replace("println!", "eprintln!");
+    assert_eq!(
+        reply,
+        json!({"path": "/work/src/bin/main.rs", "bytes": edited.len(), "line": 3})
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), edited);
+    let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o755, "an edit keeps the file's mode");
+
+    let (status, reply) = call(
+        "write_file",
+        json!({"path": "/work/src/bin/main.rs", "content": "fn main() {}\n"}),
+    )
+    .await;
+    assert_eq!((status, &reply["created"]), (200, &json!(false)), "{reply}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "fn main() {}\n");
+    let names: Vec<String> = std::fs::read_dir(file.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(names, ["main.rs"], "no temporary file is left");
+
+    // run_code's files map goes through the same writer.
+    let (status, reply) = call(
+        "run_code",
+        json!({"code": "true", "files": {"notes/plan.md": "ship it\n"}}),
+    )
+    .await;
+    assert_eq!((status, &reply["exit_code"]), (200, &json!(0)), "{reply}");
+    assert_eq!(
+        std::fs::read_to_string(work.join("notes/plan.md")).unwrap(),
+        "ship it\n"
+    );
+}
+
+#[tokio::test]
+async fn edit_file_refuses_old_that_is_missing_or_there_twice_and_leaves_the_file() {
+    let scratch = Scratch::new("edit_refused");
+    let (_runtime, served, work) = serve_with_run_code(&scratch);
+    let text = "a = 1\nb = 1\n";
+    std::fs::write(work.join("conf.toml"), text).unwrap();
+    let edit = |old: &str| {
+        let args = json!({"path": "conf.toml", "old": old, "new": "c = 2"});
+        served.post("tool/edit_file", Some(CODER), args)
+    };
+    for (old, says) in [
+        ("c = 1", "/work/conf.toml: old is not in it."),
+        (" = 1", "/work/conf.toml: old is in it 2 times."),
+        ("", "old is empty"),
+    ] {
+        let (status, reply) = edit(old).await;
+        assert_eq!(status, 422, "{old:?}: {reply}");
+        let error = reply["error"].as_str().unwrap();
+        assert!(error.starts_with(says), "{old:?}: {error}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(work.join("conf.toml")).unwrap(),
+        text
+    );
+
+    let args = json!({"path": "missing.toml", "old": "a", "new": "b"});
+    let (status, reply) = served.post("tool/edit_file", Some(CODER), args).await;
+    assert_eq!(status, 404, "{reply}");
+    assert!(!work.join("missing.toml").exists());
+}
+
+/// The worker can make links in its `/work`, and the broker writes as the
+/// host: no link there, on the way or at the end, takes a write outside.
+#[tokio::test]
+async fn a_path_through_or_to_a_link_in_work_is_refused_and_nothing_is_written_outside() {
+    let scratch = Scratch::new("files_links");
+    let (_runtime, served, work) = serve_with_run_code(&scratch);
+    let outside = scratch.root.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret"), "keep").unwrap();
+    std::os::unix::fs::symlink(&outside, work.join("escape")).unwrap();
+    // `work` is `<root>/state/tickets/tk_files/work`.
+    std::os::unix::fs::symlink("../../../..", work.join("up")).unwrap();
+    std::os::unix::fs::symlink(outside.join("secret"), work.join("secret")).unwrap();
+
+    for path in [
+        "escape/secret",
+        "escape/new",
+        "escape/deeper/new",
+        "/work/up/outside/secret",
+        "up/outside/new",
+        "secret",
+    ] {
+        for (tool, args) in [
+            ("write_file", json!({"path": path, "content": "pwned"})),
+            (
+                "edit_file",
+                json!({"path": path, "old": "keep", "new": "pwned"}),
+            ),
+        ] {
+            let (status, reply) = served
+                .post(&format!("tool/{tool}"), Some(CODER), args)
+                .await;
+            assert_eq!(status, 403, "{tool} {path}: {reply}");
+            let error = reply["error"].as_str().unwrap();
+            assert!(error.contains(" is a link"), "{tool} {path}: {error}");
+        }
+    }
+    for path in [
+        "../outside/secret",
+        "/work/../outside/secret",
+        "/etc/hostname",
+        "/work",
+        "/work/",
+        "a\u{0}b",
+    ] {
+        for (tool, args) in [
+            ("write_file", json!({"path": path, "content": "pwned"})),
+            (
+                "edit_file",
+                json!({"path": path, "old": "keep", "new": "pwned"}),
+            ),
+        ] {
+            let (status, reply) = served
+                .post(&format!("tool/{tool}"), Some(CODER), args)
+                .await;
+            assert_eq!(status, 422, "{tool} {path:?}: {reply}");
+        }
+    }
+    let args = json!({"code": "true", "files": {"escape/secret": "pwned"}});
+    let (status, reply) = served.post("tool/run_code", Some(CODER), args).await;
+    assert_eq!(status, 422, "run_code's files: {reply}");
+    assert!(
+        reply["error"]
+            .as_str()
+            .unwrap()
+            .contains("/work/escape is a link"),
+        "{reply}"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(outside.join("secret")).unwrap(),
+        "keep"
+    );
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1);
 }
 
 /// On a host with only a pstack, a seat holds `read` and the tools that need

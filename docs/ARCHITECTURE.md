@@ -146,6 +146,7 @@ the Goal's rates.
 | `src/harness.rs`, `src/harness/` | The `AgentHarness` port and its Pi, Claude Code and scripted adapters |
 | `src/bwrap.rs`, `src/exposure.rs` | The one bwrap builder, and what each sandbox can see |
 | `src/code.rs` | `run_code`'s sandbox and receipts |
+| `src/beneath.rs` | The one writer beneath a directory: a path is walked a name at a time with `O_NOFOLLOW`, so no link, `..` or swap carries a write outside it |
 | `src/sealed.rs` | The AES-256-GCM envelope of the vault and the artifact store |
 
 ### Agent mode
@@ -161,7 +162,7 @@ the Goal's rates.
 | `crates/agent-store/src/` | `SqliteStore`, the Effect queue (`queue.rs`), the ledger (`ledger.rs`), the chain (`chain.rs`), the Watchdog's record (`watchdog.rs`) and the schema (`schema.rs`) |
 | `src/agent/mod.rs`, `src/agent/runtime.rs` | `agent serve`: wiring, and the loop that owns the Engine |
 | `src/agent/config.rs`, `src/agent/config/` | `agent.yaml`, with unknown fields refused |
-| `src/agent/broker.rs`, `src/agent/broker/` | The agent broker: accounts, holds, the tool registry (`registry.rs`), the repeat guard (`repeat.rs`), vault use (`secrets.rs`), the browser tools (`browser.rs`), memos and their review (`memory.rs`, `review.rs`), and the Messages facade (`messages.rs`) |
+| `src/agent/broker.rs`, `src/agent/broker/` | The agent broker: accounts, holds, the tool registry (`registry.rs`), the repeat guard (`repeat.rs`), the file tools (`files.rs`), vault use (`secrets.rs`), the browser tools (`browser.rs`), memos and their review (`memory.rs`, `review.rs`), and the Messages facade (`messages.rs`) |
 | `src/agent/pi_router.rs` | The Router as one long-lived Pi session |
 | `src/agent/pi_executor.rs`, `src/agent/jobs.rs` | Worker sessions, their prompts and turns, and background jobs |
 | `src/agent/swarm_executor.rs`, `src/agent/goal_template.rs` | Swarm Tickets and their Goal templates |

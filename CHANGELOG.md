@@ -285,6 +285,14 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   `CARGO_HOME` of its own, so `cargo build` and `cargo test` run in `run_code` with no network. A lockfile that names
   another source, and a manifest with a `git` or `registry` dependency or a `[patch]` table, is refused. New docs:
   "Build a Rust repository offline".
+- Agent mode, worker file tools (the loop #106 describes): `write_file` creates or replaces one file in a Ticket's
+  `/work`, and `edit_file` replaces the one place a text is in one, so a worker no longer quotes a file into a heredoc
+  or a `python3` one-liner.
+  A path is relative to `/work` or absolute under it, at most 1 MiB, and a link, a `..` part, an absolute path outside
+  it or a directory is refused. Both write through `src/beneath.rs`, which walks a path one name at a time from `/work`
+  opened once with `O_NOFOLLOW` and renames a fresh `O_CREAT | O_EXCL` file over its target, so a link the worker made
+  cannot take a write outside; `run_code`'s `files` use the same writer. The worker's system prompt tells it to use the
+  tools rather than a heredoc.
 
 ### Changed
 

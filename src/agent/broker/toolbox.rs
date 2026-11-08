@@ -29,6 +29,8 @@ pub const DREAM_TOOLS: [&str; 5] = [
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Resource {
     RunCode,
+    /// `run_code`'s `/work` on this host.
+    Work,
     Browser,
     Vault,
     Read,
@@ -41,6 +43,10 @@ impl Resource {
     pub const fn unavailable(self) -> &'static str {
         match self {
             Self::RunCode => "run_code is not available on this host",
+            Self::Work => {
+                "this ticket's /work is on the machine its run_code runs on: change files there \
+                 with run_code"
+            }
             Self::Browser => "no browser where this ticket runs",
             Self::Vault => "no vault on this host",
             Self::Read => "this ticket has neither pstack nor a repository to read",
@@ -164,6 +170,9 @@ pub(super) fn router() -> Toolbox<RouterOp> {
 /// The host resources one seat's environment gives it.
 struct Resources {
     code: Option<Env>,
+    /// The seat's commands run on this host, so `run_code`'s `/work` is its
+    /// directory here.
+    local: bool,
     vault: Option<Arc<VaultParts>>,
     browser: Option<Arc<BrowserParts>>,
     reader: Option<Arc<Reader>>,
@@ -176,6 +185,13 @@ struct Resources {
 impl Resources {
     fn run_code(&self) -> Result<Env, Resource> {
         self.code.clone().ok_or(Resource::RunCode)
+    }
+
+    /// What `write_file` and `edit_file` change: the `/work` that `run_code`
+    /// sees, where that is this host's directory.
+    fn work(&self) -> Result<(), Resource> {
+        self.run_code()?;
+        self.local.then_some(()).ok_or(Resource::Work)
     }
 
     fn vault(&self) -> Result<Arc<VaultParts>, Resource> {
@@ -231,6 +247,9 @@ pub enum WorkerCall {
         files: Option<Arc<Reader>>,
         memos: bool,
     },
+    /// `write_file` and `edit_file` on the seat's `work_dir`.
+    WriteFile,
+    EditFile,
     MemoPropose,
     MemoRetire,
 }
@@ -263,6 +282,14 @@ impl WorkerCall {
             }
             WorkerOp::BrowserRead => Self::Browser(BrowserTool::Read, host.browse()?),
             WorkerOp::ReadPath => host.read()?,
+            WorkerOp::WriteFile => {
+                host.work()?;
+                Self::WriteFile
+            }
+            WorkerOp::EditFile => {
+                host.work()?;
+                Self::EditFile
+            }
             WorkerOp::MemoPropose => {
                 host.memory()?;
                 Self::MemoPropose
@@ -307,7 +334,8 @@ impl AgentBroker {
 
     /// The worker tools a worker whose Plan names `environment` holds on this
     /// host: run_code and the job tools where that environment offers
-    /// run_code, the browser where it is this host, `browser_login` with a
+    /// run_code, `write_file` and `edit_file` where that is this host's
+    /// sandbox, the browser where it is this host, `browser_login` with a
     /// vault too, `fetch_url` wherever its own resource is, and `read` where
     /// the seat has a `reader`. The dream holds only [`DREAM_TOOLS`]: it
     /// reads, greps and changes memos, and reaches nothing outside.
@@ -321,6 +349,7 @@ impl AgentBroker {
         let unknown = environments.get(environment).err();
         let host = Resources {
             code: environments.get(environment).ok().flatten().cloned(),
+            local: environments.is_local(environment),
             vault: self.inner.vault.clone(),
             browser: self
                 .inner

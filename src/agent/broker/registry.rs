@@ -38,6 +38,8 @@ pub enum WorkerOp {
     BrowserLogin,
     BrowserRead,
     ReadPath,
+    WriteFile,
+    EditFile,
     MemoPropose,
     MemoRetire,
 }
@@ -238,6 +240,31 @@ pub(super) const WORKER: &[Tool<WorkerOp>] = &[
                       limit for the rest. A path outside these, a link that leads out of one, and \
                       a binary file are refused.",
         input_schema: read,
+        repeatable: false,
+    },
+    Tool {
+        name: "write_file",
+        op: WorkerOp::WriteFile,
+        description: "Create or replace one file in /work, your ticket's directory as run_code \
+                      sees it, with content, making the directories above it. Write files with \
+                      it, never with a heredoc or echo in run_code. The path is relative to \
+                      /work or absolute under it, such as src/main.rs or /work/src/main.rs. A \
+                      path through a link or to one, a .. part, and a directory are refused. At \
+                      most 1 MiB. Returns {path,bytes,created}.",
+        input_schema: write_file,
+        repeatable: false,
+    },
+    Tool {
+        name: "edit_file",
+        op: WorkerOp::EditFile,
+        description: "Change one file in /work: replace the one place old is in it with new. \
+                      Change part of a file with it, never with sed -i, a heredoc or a python \
+                      replace in run_code. old must be in the file exactly once: copy it \
+                      exactly, white space included and without read's line numbers, and when \
+                      it is there more than once, include more of the lines around it. Paths \
+                      are as write_file's. Returns {path,bytes,line}, line being where new \
+                      starts.",
+        input_schema: edit_file,
         repeatable: false,
     },
     Tool {
@@ -541,6 +568,35 @@ fn read() -> Value {
     })
 }
 
+fn file_path() -> Value {
+    required_string(
+        "The file, relative to /work or absolute under it: src/main.rs or /work/src/main.rs.",
+    )
+}
+
+fn write_file() -> Value {
+    json!({
+        "type": "object",
+        "required": ["path", "content"],
+        "properties": {
+            "path": file_path(),
+            "content": string("The whole file, at most 1 MiB."),
+        },
+    })
+}
+
+fn edit_file() -> Value {
+    json!({
+        "type": "object",
+        "required": ["path", "old", "new"],
+        "properties": {
+            "path": file_path(),
+            "old": required_string("Text that is in the file exactly once, copied exactly, white space included."),
+            "new": string("What replaces it. Empty deletes it."),
+        },
+    })
+}
+
 /// One piece of evidence: a trigger, a call or, for the dream, a line of an
 /// original transcript.
 fn evidence_item() -> Value {
@@ -636,6 +692,8 @@ mod tests {
                 "browser_login",
                 "browser_read",
                 "read",
+                "write_file",
+                "edit_file",
                 "memo_propose",
                 "memo_retire",
             ]

@@ -108,12 +108,34 @@ Router's account is untouched.
 | `browser_open`, `browser_act`, `browser_read` | Drive a headless browser. See [The browser](#the-browser). | a browser is configured |
 | `browser_login` | Signs in with a vault login. | a browser and a vault are configured |
 | `read` | Reads files: `/pstack`, a repository Ticket's `/work` and `/host`, and `/memos`. | pstack, a repository or memo proposals |
+| `write_file` | Creates or replaces one file in the Ticket's `/work`, making the directories above it. See [Files](#files). | `executor.run_code` is set and the Ticket runs on this host |
+| `edit_file` | Replaces the one place a text is in a file in `/work`. See [Files](#files). | as `write_file` |
 | `memo_propose` | Proposes a memo. See [Memory](#memory). | `memory.proposals` |
 
 **pstack.** With a `pstack:` section, every worker's first prompt enters the `pstack.entry` skill (`poteto-mode` by
 default), its system prompt carries the solos-swarm adapter (`docs/harness/solos-swarm.md`), and it may `read` the
 vendored tree at `/pstack`. The vendored tree is pinned by its `MANIFEST`. The design is in
 [pstack/rationale.md](pstack/rationale.md).
+
+### Files
+
+`write_file {path, content}` and `edit_file {path, old, new}` change files in the Ticket's `/work` without a shell. A
+worker that wrote files through `run_code` quoted them into heredocs and `python3` one-liners, and looped on the
+quoting: the Ticket #106 describes ran the same heredoc and `python3` edits of one file for about five minutes and
+failed with no result. The worker's system prompt tells it to write and change files with these two tools.
+
+- A path is relative to `/work` or absolute under it: `src/main.rs` or `/work/src/main.rs`.
+- `write_file` makes the directories above the file, and replaces a regular file there.
+- `edit_file` replaces `old` with `new` and answers the line where `new` starts. It refuses an `old` that is not in the
+  file, or is in it more than once, and leaves the file as it was.
+- A file is at most 1 MiB, the limit of a file in `run_code`'s `files`. A replaced file keeps its mode.
+
+**Links.** The broker writes as the host, outside the sandbox, and the worker can put a link anywhere in its `/work`.
+So `src/beneath.rs` never resolves a path by name. It opens `/work` once, then opens each directory on the way relative
+to the one before with `O_NOFOLLOW`, and makes a missing one with `mkdirat`. It writes a fresh file with
+`O_CREAT | O_EXCL` and moves it over the old one with `renameat`, which does not follow a link either. A link on the
+way or at the end, a `..` part, an absolute path outside `/work` and anything that is not a regular file are refused,
+and nothing is written outside `/work`. `run_code` writes its `files` through the same code.
 
 ### What a worker is told
 
@@ -373,7 +395,7 @@ Each Claude Code worker runs in bwrap with:
   rather than translating them. See [executor.wire](configuration.md#executorwire).
 - **A read-only view.** A tmpfs home and `/tmp`. The Claude Code install, the solos-swarm binary, the MCP config and
   the token file are read-only. The Ticket's `work` directory is read-only as `/work`, and files change through
-  `run_code`.
+  `run_code`, `write_file` and `edit_file`.
 - **Only the broker's tools.** The command line is
   `claude --print --input-format stream-json --output-format stream-json --verbose --bare --model <model> --tools ""
   --strict-mcp-config --mcp-config /runtime/mcp.json --permission-mode dontAsk --allowedTools mcp__swarm__<each grant>
@@ -437,7 +459,8 @@ own.
 **Both harnesses.** A worker's grants and its `GET /tools` come from `AgentBroker::worker_tools(environment)`, so a
 Claude Code worker on a Ticket bound to a node lists and calls `run_code` and the job tools through `solos-swarm mcp`
 as a Pi worker does, and they run on that node. Its read-only `/work` is then this host's empty Ticket directory, since
-the node's is its own.
+the node's is its own. For the same reason, a worker on a node has no `write_file` or `edit_file`, and changes files
+with `run_code` there.
 
 **Bounds.** The connection is TLS 1.3 (ALPN `solos-node/1`) with each side's certificate pinned. Frames are a 4-byte
 length and JSON, at most 16 MiB. A larger frame ends the connection before it is read, and a request too large for one

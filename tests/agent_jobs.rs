@@ -352,13 +352,16 @@ async fn get_tools_lists_run_code_and_the_job_tools_on_a_host_with_run_code_and_
         "job_wait",
         "job_stop",
         "fetch_url",
+        "write_file",
+        "edit_file",
     ];
     let mut specs = registry::tools(PrincipalKind::Worker);
     specs.retain(|tool| with_run_code.contains(&tool.name));
     assert_eq!(
         listed["tools"],
         serde_json::to_value(specs).unwrap(),
-        "the registry's specs for the tools this host gives: run_code, the job tools and fetch_url"
+        "the registry's specs for the tools this host gives: run_code, the job tools, fetch_url \
+         and the file tools on its /work"
     );
     let names: Vec<&str> = listed["tools"]
         .as_array()
