@@ -144,6 +144,7 @@ impl Op {
             Op::Decide(_, Verdict::Accept(_)) => "decide(accept)",
             Op::Decide(_, Verdict::Ignore { .. }) => "decide(ignore)",
             Op::Decide(_, Verdict::Stop { .. }) => "decide(stop)",
+            Op::Decide(_, Verdict::Decline { .. }) => "decide(decline)",
             Op::Approve(..) => "approve",
             Op::Note(_) => "note",
             Op::StopTicket(_) => "stop_ticket",
@@ -354,6 +355,7 @@ fn gen_accept(rng: &mut Lcg) -> Accept {
             .chance(40)
             .then(|| RepoName::try_from("acme/widgets".to_owned()).unwrap()),
         forge: None,
+        upstream: None,
     }
 }
 

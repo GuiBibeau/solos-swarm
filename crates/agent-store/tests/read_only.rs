@@ -46,7 +46,7 @@ fn a_read_only_store_reads_everything_and_writes_nothing() {
     let before = std::fs::read(&db.path).unwrap();
 
     let store = SqliteStore::open_read_only(&db.path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 10);
+    assert_eq!(store.schema_version().unwrap(), 11);
     assert_eq!(store.open_tickets().unwrap().len(), 2);
     assert!(!store.pending_effects().unwrap().is_empty());
     let refused = store.mark_alert_sent("wd_x", 1).unwrap_err();

@@ -152,6 +152,7 @@ fn accept(rules: Vec<String>) -> Verdict {
         rules,
         repo: None,
         forge: None,
+        upstream: None,
     })
 }
 fn ignore() -> Verdict {

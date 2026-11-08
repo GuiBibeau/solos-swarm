@@ -159,6 +159,7 @@ fn accept(budget: u64, rules: Vec<String>) -> Verdict {
         rules,
         repo: None,
         forge: None,
+        upstream: None,
     })
 }
 

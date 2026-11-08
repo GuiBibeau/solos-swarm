@@ -24,7 +24,11 @@ The Engine (`crates/agent-core`) decides everything, does no I/O, and leaves ext
 - **Evals.** A Thread has at most one Eval at a time. Triggers that arrive meanwhile join the next batch. Evals are
   batched by strength: weaker Triggers wait, unless a new Ticket adopts them. Triggers the gate rejected stay out of the
   Router's view.
-- **Verdicts.** The Router accepts, ignores or stops. Only a Trigger of explicit strength can stop work.
+- **Verdicts.** The Router accepts, ignores or stops; the host may decline. Only a Trigger of explicit strength can stop
+  work. A decline means no upstream here may run the repository's workers: the Engine records a declined Decision and,
+  on an explicit request, sends the host's sentence to the request's channel once. The Router's tool result says the
+  person was told, or that nobody was. The accept's upstream and harness come from the repository's policy, never from
+  the Router's words.
 - **Budgets.** A budget above the approval threshold waits for an approver, and is checked at every launch against the
   current threshold.
 - **Work.** Assignments, Reports, resumes, handbacks and retries are Engine commands. A handed-back Trigger is judged
@@ -89,6 +93,13 @@ as one keyless worker session in bwrap. A `Plan::Swarm` Assignment goes through 
 **The Ticket's directory.** A worker has its Ticket's directory, `<state>/tickets/<ticket>/`, whose `work/` is
 `run_code`'s `/work`. An optional `executor.prepare` command runs there once per Ticket. At most `max_workers` sessions
 live at once, and a launch past it waits for a slot.
+
+**The upstream check.** Before the clone, and whatever the environment, the executor asks the repository's model policy
+whether the Ticket's upstream may run its workers now. A Ticket whose upstream is no longer admitted — because the
+policy changed, or because it was accepted before this build with no recorded upstream and the repository does not
+admit `default` — fails its Assignment with a Report that names the policy, and nothing of the repository is read. The
+Plan's harness is the one the accepted upstream named, so a repository on a `claude-code` upstream runs Claude Code
+whatever `executor.harness` is.
 
 **The account.** The agent broker admits the worker as a `Worker` principal on the account `ticket:<id>`, which every
 Assignment of the Ticket shares. So a retry spends from the same budget, a call past the budget is refused, and the

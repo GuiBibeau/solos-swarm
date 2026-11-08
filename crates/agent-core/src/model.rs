@@ -294,6 +294,22 @@ pub struct Mandate {
     /// a model's words.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forge: Option<ForgeTerms>,
+    /// What it was accepted to run on, fixed at accept from the repository's
+    /// `models` policy and never from a model's words. `None` for a Ticket
+    /// with no repository, and for one accepted before this build: the launch
+    /// then checks `default`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<UpstreamChoice>,
+}
+
+/// The upstream a Ticket was accepted to run on: its name, the provider that
+/// reads its text, the model, and the harness its sessions run on.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpstreamChoice {
+    pub name: String,
+    pub provider: String,
+    pub model: String,
+    pub harness: String,
 }
 
 /// Whether a person has to approve the Ticket's budget before it launches.
@@ -637,6 +653,10 @@ pub enum DecisionKind {
     Ignore,
     Stop,
     Unavailable,
+    /// The host would not take the work here: no upstream the repository's
+    /// policy allows runs on this host. Nothing started, and on an explicit
+    /// request the requester was told why.
+    Declined,
 }
 
 /// The recorded result of an Eval, or of a gate that admitted nothing.
@@ -670,6 +690,13 @@ pub enum Verdict {
         ticket: TicketId,
         reason: String,
     },
+    /// The host will not take this work here: no upstream the repository's
+    /// policy allows runs on this host. `told` is the sentence the requester
+    /// hears, once, when the Eval is explicit; nothing starts.
+    Decline {
+        reason: String,
+        told: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -693,6 +720,12 @@ pub struct Accept {
     /// repository's config for any deliverable above an answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forge: Option<ForgeTerms>,
+    /// The upstream its worker runs on, chosen by the host from the
+    /// repository's `models` policy. `None` for an accept that names no
+    /// repository, and for a scripted Router, which names none. Boxed so a
+    /// `Verdict` stays small on its way from the Router to the Engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<Box<UpstreamChoice>>,
 }
 
 /// What `Acknowledge::Standard` says. It is one short line a person would

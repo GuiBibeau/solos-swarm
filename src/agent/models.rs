@@ -13,6 +13,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer};
 use solos_agent_core::change::RepoName;
+use solos_agent_core::model::UpstreamChoice;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Who receives the text and bills for it. The policy keys on this alone:
@@ -36,7 +37,7 @@ impl Provider {
         }
     }
 
-    fn named(name: &str) -> Result<Self> {
+    pub(crate) fn named(name: &str) -> Result<Self> {
         match name {
             "deepseek" => Ok(Self::Deepseek),
             "venice" => Ok(Self::Venice),
@@ -182,13 +183,33 @@ impl PerRole {
     }
 }
 
+/// What one upstream here holds: the provider that reads its text, the model
+/// it asks for, and the harness its sessions run on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpstreamInfo {
+    pub provider: Provider,
+    pub model: String,
+    pub harness: HarnessKind,
+}
+
+impl UpstreamInfo {
+    /// The choice a Ticket records, in the core's terms.
+    fn choice(&self, name: &UpstreamName) -> UpstreamChoice {
+        UpstreamChoice {
+            name: name.to_string(),
+            provider: self.provider.as_str().to_owned(),
+            model: self.model.clone(),
+            harness: self.harness.as_str().to_owned(),
+        }
+    }
+}
+
 /// The policy every read path asks. Built once from config.
-#[derive(Debug)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModelPolicy {
     repos: BTreeMap<RepoName, PerRole>,
-    /// Every upstream here by name, `default` included, and the provider it
-    /// runs on.
-    upstreams: BTreeMap<UpstreamName, Provider>,
+    /// Every upstream here by name, `default` included.
+    upstreams: BTreeMap<UpstreamName, UpstreamInfo>,
     /// Each repository's worker upstream, or `None` where no upstream here
     /// is allowed: its Tickets have no upstream to run on.
     workers: BTreeMap<RepoName, Option<UpstreamName>>,
@@ -211,7 +232,7 @@ impl ModelPolicy {
         };
         let candidates: Vec<(UpstreamName, Provider)> = upstreams
             .iter()
-            .map(|(name, provider)| (name.clone(), *provider))
+            .map(|(name, info)| (name.clone(), info.provider))
             .collect();
         for (repo, settings) in forge.repos() {
             let models = settings.models.as_ref().with_context(|| {
@@ -236,9 +257,11 @@ impl ModelPolicy {
 
     /// The named upstreams and the default one, checked, where the executor
     /// is Pi.
-    fn upstreams(config: &super::AgentConfig) -> Result<BTreeMap<UpstreamName, Provider>> {
+    fn upstreams(config: &super::AgentConfig) -> Result<BTreeMap<UpstreamName, UpstreamInfo>> {
         let ExecutorConfig::Pi {
             provider,
+            model,
+            harness,
             upstreams,
             claude,
             ..
@@ -253,9 +276,20 @@ impl ModelPolicy {
                 "executor.upstreams names `default`, which is the executor's own upstream"
             );
             validate_upstream(name, upstream, claude.is_some())?;
-            checked.insert(name.clone(), upstream.provider);
+            checked.insert(
+                name.clone(),
+                UpstreamInfo {
+                    provider: upstream.provider,
+                    model: upstream.model.clone(),
+                    harness: upstream.harness,
+                },
+            );
         }
-        let default = Provider::named(provider)?.upstream_here()?;
+        let default = UpstreamInfo {
+            provider: Provider::named(provider)?.upstream_here()?,
+            model: model.clone(),
+            harness: *harness,
+        };
         checked.insert(UpstreamName::default_upstream(), default);
         Ok(checked)
     }
@@ -284,7 +318,63 @@ impl ModelPolicy {
 
     /// The provider an upstream runs on, `default` included.
     pub fn upstream_provider(&self, upstream: &UpstreamName) -> Option<Provider> {
-        self.upstreams.get(upstream).copied()
+        self.upstreams.get(upstream).map(|info| info.provider)
+    }
+
+    /// The upstream `repo`'s workers run on, as the Ticket records it: name,
+    /// provider, model and harness. `None` where no upstream here is allowed.
+    pub fn worker_choice(&self, repo: &RepoName) -> Option<UpstreamChoice> {
+        let name = self.worker_upstream(repo)?;
+        self.upstreams.get(name).map(|info| info.choice(name))
+    }
+
+    /// What the person who asked is told when `repo`'s Tickets are declined
+    /// here: its worker role names providers, and this host runs none of them.
+    pub fn decline_sentence(&self, repo: &RepoName) -> String {
+        let allowed = self.allowed(repo, Role::Worker);
+        if allowed.is_none_or(BTreeSet::is_empty) {
+            format!(
+                "I can't work on {repo} here: its config lets no provider read its code. Nothing \
+                 was started."
+            )
+        } else {
+            let allowed = names(allowed.expect("a non-empty set"));
+            format!(
+                "I can't work on {repo} here: its code may go only to {allowed}, and this agent \
+                 runs no {allowed} model. Nothing was started."
+            )
+        }
+    }
+
+    /// Why `repo`'s Ticket cannot launch on `upstream` now, or `None` when it
+    /// may. `upstream` is what the Ticket recorded at accept; a Ticket from
+    /// before this build recorded none, and its launch checks `default`.
+    pub fn launch_refusal(
+        &self,
+        repo: &RepoName,
+        upstream: Option<&UpstreamChoice>,
+    ) -> Option<String> {
+        let named = upstream
+            .map(|upstream| upstream.name.clone())
+            .unwrap_or_else(|| UpstreamName::DEFAULT.to_owned());
+        let name = UpstreamName(named);
+        let Some(info) = self.upstreams.get(&name) else {
+            return Some(format!(
+                "the policy here names no upstream {name}, and its ticket was accepted to run on \
+                 it"
+            ));
+        };
+        if self.admits(Some(repo), Role::Worker, info.provider) {
+            return None;
+        }
+        let allowed = self
+            .allowed(repo, Role::Worker)
+            .map_or_else(|| "none".to_owned(), names);
+        Some(format!(
+            "the policy for {repo} here no longer admits {} for its workers: its code may go \
+             only to {allowed}. Nothing was cloned",
+            info.provider
+        ))
     }
 
     /// What `agent serve` says at start: each repository's allowed providers
@@ -312,6 +402,33 @@ impl ModelPolicy {
             })
             .collect()
     }
+}
+
+/// A policy for unit tests outside this module: `acme/widgets` with `models`
+/// under it, and the executor's `upstreams` when given.
+#[cfg(test)]
+pub(crate) fn test_policy(models: &str, upstreams: &str) -> ModelPolicy {
+    let yaml = format!(
+        "policy: {{people: [slack:alice]}}
+sources: [{{kind: jsonl, path: triggers.jsonl}}]
+channels: [{{kind: jsonl, source: slack, path: outbox.jsonl}}]
+router: {{kind: scripted}}
+executor:
+  kind: pi
+  provider: deepseek
+  model: deepseek-flash
+  prices: {{input_microusd_per_million: 300000, output_microusd_per_million: 1200000}}
+  run_code: {{}}
+{upstreams}forge:
+  kind: local
+  remote: remotes
+  identity: {{name: solos-bot, email: bot@example.com}}
+  repos:
+    acme/widgets: {{about: Widgets., base: main, models: {models}}}
+"
+    );
+    let config: super::AgentConfig = serde_yaml::from_str(&yaml).unwrap();
+    ModelPolicy::from_config(&config).unwrap()
 }
 
 fn validate_upstream(name: &UpstreamName, upstream: &UpstreamConfig, claude: bool) -> Result<()> {
@@ -411,6 +528,19 @@ fn providers(allowed: &BTreeSet<Provider>) -> String {
             .map(|provider| provider.as_str())
             .collect::<Vec<_>>()
             .join(", ")
+    }
+}
+
+/// The providers as a sentence names them: `a`, `a and b`, `a, b and c`.
+fn names(allowed: &BTreeSet<Provider>) -> String {
+    let mut names: Vec<&str> = allowed.iter().map(|provider| provider.as_str()).collect();
+    match names.len() {
+        0 => "none".to_owned(),
+        1 => names.remove(0).to_owned(),
+        _ => {
+            let last = names.pop().expect("a non-empty list");
+            format!("{} and {last}", names.join(", "))
+        }
     }
 }
 
@@ -573,6 +703,77 @@ executor:
         .unwrap();
         assert_eq!(policy.worker_upstream(&widgets), None);
         assert!(policy.start_report()[0].contains("no upstream here may run its workers"));
+    }
+
+    #[test]
+    fn a_repository_with_no_allowed_upstream_here_is_declined_in_one_sentence() {
+        let policy = build(
+            "    acme/widgets: {about: Widgets., base: main, models: {allow: [anthropic]}}",
+            "",
+        )
+        .unwrap();
+        assert_eq!(
+            policy.decline_sentence(&repo("acme/widgets")),
+            "I can't work on acme/widgets here: its code may go only to anthropic, and this \
+             agent runs no anthropic model. Nothing was started."
+        );
+        let empty = build(
+            "    acme/widgets: {about: Widgets., base: main, models: {allow: []}}",
+            "",
+        )
+        .unwrap();
+        assert_eq!(
+            empty.decline_sentence(&repo("acme/widgets")),
+            "I can't work on acme/widgets here: its config lets no provider read its code. \
+             Nothing was started."
+        );
+    }
+
+    #[test]
+    fn the_worker_choice_names_the_upstream_and_its_harness() {
+        let policy = build(
+            "    acme/widgets: {about: Widgets., base: main, models: {allow: [deepseek]}}",
+            "",
+        )
+        .unwrap();
+        let choice = policy.worker_choice(&repo("acme/widgets")).unwrap();
+        assert_eq!(
+            (
+                choice.name.as_str(),
+                choice.provider.as_str(),
+                choice.model.as_str(),
+                choice.harness.as_str()
+            ),
+            ("default", "deepseek", "deepseek-flash", "pi")
+        );
+        assert_eq!(
+            policy.launch_refusal(&repo("acme/widgets"), Some(&choice)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_launch_refusal_names_the_policy_and_the_upstream() {
+        let policy = build(
+            "    acme/widgets: {about: Widgets., base: main, models: {allow: [anthropic]}}",
+            "",
+        )
+        .unwrap();
+        let widgets = repo("acme/widgets");
+        let said = policy.launch_refusal(&widgets, None).unwrap();
+        assert!(
+            said.contains("the policy for acme/widgets here no longer admits deepseek")
+                && said.contains("its code may go only to anthropic"),
+            "{said}"
+        );
+        let gone = solos_agent_core::model::UpstreamChoice {
+            name: "claude".into(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-5-5".into(),
+            harness: "claude-code".into(),
+        };
+        let said = policy.launch_refusal(&widgets, Some(&gone)).unwrap();
+        assert!(said.contains("names no upstream claude"), "{said}");
     }
 
     #[test]

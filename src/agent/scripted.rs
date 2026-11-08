@@ -78,6 +78,7 @@ impl ScriptedRouter {
             rules: Vec::new(),
             repo: None,
             forge: None,
+            upstream: None,
         })
     }
 }

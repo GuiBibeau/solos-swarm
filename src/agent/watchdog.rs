@@ -1126,6 +1126,7 @@ mod tests {
                 budget_microusd: Some(1_000_000),
                 repo: None,
                 forge: None,
+                upstream: None,
             },
             plan: Plan::Session {
                 harness: None,

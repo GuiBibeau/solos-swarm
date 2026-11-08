@@ -72,6 +72,7 @@ fn accept(plan: Plan, budget: u64) -> Verdict {
         rules: Vec::new(),
         repo: None,
         forge: None,
+        upstream: None,
     })
 }
 

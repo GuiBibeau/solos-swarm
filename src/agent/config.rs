@@ -958,6 +958,14 @@ impl HarnessKind {
             _ => None,
         }
     }
+
+    /// What a Plan or a Ticket records.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pi => "pi",
+            Self::ClaudeCode => "claude-code",
+        }
+    }
 }
 
 /// The `claude-code` harness's install. Every path is absolute.

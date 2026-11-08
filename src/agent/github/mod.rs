@@ -57,6 +57,16 @@ pub fn thread(repo: &str, number: u64) -> ThreadKey {
     ThreadKey::new(format!("{SOURCE}:{repo}#{number}"))
 }
 
+/// The repository a Thread of this Source names: `github:owner/name#123`.
+pub fn thread_repo(key: &ThreadKey) -> Option<RepoName> {
+    let rest = key.as_str().strip_prefix(SOURCE)?.strip_prefix(':')?;
+    let (repo, number) = rest.split_once('#')?;
+    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    RepoName::try_from(repo.to_owned()).ok()
+}
+
 /// Where a comment on an issue or pull request goes.
 pub fn reply_to(repo: &str, number: u64) -> ChannelRef {
     ChannelRef {
@@ -503,8 +513,27 @@ fn links(headers: &HeaderMap, base: &str) -> BTreeMap<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{links, valid_repo};
+    use super::{links, thread, thread_repo, valid_repo};
     use reqwest::header::{HeaderMap, HeaderValue, LINK};
+    use solos_agent_core::model::ThreadKey;
+
+    #[test]
+    fn a_thread_names_its_repository_only_for_a_github_issue_or_pull_request() {
+        let key = thread("acme/widgets", 42);
+        assert_eq!(
+            thread_repo(&key).map(|repo| repo.to_string()),
+            Some("acme/widgets".to_owned())
+        );
+        for other in [
+            "slack:acme/widgets#42",
+            "github:acme/widgets",
+            "github:acme/widgets#",
+            "github:acme/widgets#x",
+            "github:../../etc#1",
+        ] {
+            assert_eq!(thread_repo(&ThreadKey::new(other)), None, "{other}");
+        }
+    }
 
     #[test]
     fn repository_names_cannot_reach_other_paths() {

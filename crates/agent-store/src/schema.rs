@@ -1,7 +1,7 @@
 use crate::StoreError;
 use rusqlite::{Connection, TransactionBehavior};
 
-pub(crate) const LATEST: u32 = 10;
+pub(crate) const LATEST: u32 = 11;
 
 /// Aggregates are JSON in `body`; the other columns index the port's queries.
 const V1: &str = "
@@ -159,8 +159,15 @@ const V9: &str = "";
 /// never reminded.
 const V10: &str = "";
 
+/// No new table. A file whose Tickets remember the upstream they were
+/// accepted on (`Mandate.upstream`), and whose decisions can be `declined`,
+/// is one an older build refuses to open, instead of dropping the upstream
+/// when it rewrites a Ticket or failing on a decision it cannot read. A
+/// version 10 Ticket reads as one accepted before there were upstreams.
+const V11: &str = "";
+
 /// Migration `n` is `MIGRATIONS[n - 1]`.
-const MIGRATIONS: [&str; LATEST as usize] = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10];
+const MIGRATIONS: [&str; LATEST as usize] = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11];
 
 /// Applies the migrations the file lacks. The write lock makes a second
 /// process that opens the file at the same time wait, then find nothing to do.
@@ -197,7 +204,7 @@ pub(crate) fn version(conn: &Connection) -> Result<u32, StoreError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LATEST, V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, migrate, version};
+    use super::{LATEST, V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, migrate, version};
     use rusqlite::Connection;
 
     #[test]
@@ -221,6 +228,7 @@ mod tests {
         conn.execute_batch(V8).unwrap();
         conn.execute_batch(V9).unwrap();
         conn.execute_batch(V10).unwrap();
+        conn.execute_batch(V11).unwrap();
     }
 
     #[test]
@@ -382,6 +390,46 @@ mod tests {
             [],
         );
         assert!(odd.is_err(), "a state outside the four is refused");
+    }
+
+    #[test]
+    fn a_v10_file_opens_at_the_latest_version_and_keeps_its_tickets() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY NOT NULL) STRICT;",
+        )
+        .unwrap();
+        for (version, sql) in (1..).zip([V1, V2, V3, V4, V5, V6, V7, V8, V9, V10]) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_version (version) VALUES (?1)",
+                [version],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO tickets (id, open, body) VALUES ('tk1', 1, '{}')",
+            [],
+        )
+        .unwrap();
+        let applied: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_version WHERE version = 11",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(applied, 0, "a V10 file has not run migration 11");
+
+        migrate(&mut conn).unwrap();
+
+        assert_eq!(version(&conn).unwrap(), LATEST);
+        let kept: String = conn
+            .query_row("SELECT body FROM tickets WHERE id = 'tk1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(kept, "{}");
     }
 
     #[test]

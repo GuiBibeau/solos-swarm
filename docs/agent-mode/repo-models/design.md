@@ -1,9 +1,13 @@
 # A model policy per repository
 
-> **Status, 2026-11-08.** PR 1 of [the plan](#5-pr-plan) is built: `forge.repos.<repo>.models` and
-> `executor.upstreams` load and are checked, and `src/agent/models.rs` holds the policy. The rest is design only, for
-> [#103](https://github.com/GuiBibeau/solos-swarm/issues/103). Grounded in `main` at `7ea26d2`. The [sketch](sketch/)
-> holds types and signatures, not compiled.
+> **Status, 2026-11-08.** PRs 1 and 2 of [the plan](#5-pr-plan) are built. PR 1: `forge.repos.<repo>.models` and
+> `executor.upstreams` load and are checked, and `src/agent/models.rs` holds the policy. PR 2: the host fills
+> `Mandate.upstream` and the Plan's harness at accept from the repository's policy, declines a repository no upstream
+> here may run (telling an explicit requester once), refuses an accept from a restricted repository's GitHub thread that
+> does not name it, checks the upstream again before the clone, and takes Store schema 11 (10 went to
+> `fix/memo-trust`). The rest is design only, for
+> [#103](https://github.com/GuiBibeau/solos-swarm/issues/103). Grounded in `main` at `7ea26d2`; the model policy landed
+> after it. The [sketch](sketch/) holds types and signatures, not compiled.
 
 ## 0. In one paragraph
 

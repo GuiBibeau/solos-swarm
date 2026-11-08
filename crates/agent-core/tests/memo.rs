@@ -73,6 +73,7 @@ impl World {
             rules: Vec::new(),
             repo: repo.map(|r| RepoName::try_from(r.to_owned()).unwrap()),
             forge: None,
+            upstream: None,
         });
         let decision = self.engine.decide(&eval, accept).unwrap();
         let ticket = self.engine.repos().decisions[&decision]
@@ -1036,6 +1037,7 @@ impl World {
             rules: Vec::new(),
             repo: None,
             forge: None,
+            upstream: None,
         });
         let decision = self.engine.decide(&eval, accept).unwrap();
         let ticket = self.engine.repos().decisions[&decision]

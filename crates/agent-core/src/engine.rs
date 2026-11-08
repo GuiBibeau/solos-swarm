@@ -1529,6 +1529,9 @@ fn validate(accept: &Accept) -> Result<(), Error> {
         (_, None) if accept.forge.is_some() => Err(Error::Invalid(
             "forge terms are for an accept that names a repository".into(),
         )),
+        (_, None) if accept.upstream.is_some() => Err(Error::Invalid(
+            "an upstream is for an accept that names a repository".into(),
+        )),
         _ => Ok(()),
     }
 }
@@ -2184,6 +2187,32 @@ impl<R: Repositories> Tx<'_, R> {
                 decision.reason = reason;
                 decision.ticket = Some(ticket);
             }
+            Verdict::Decline { reason, told } => {
+                decision.kind = DecisionKind::Declined;
+                decision.reason = reason;
+                // An outsider's follow-up is judged inferred, and the agent
+                // never posts on someone else's word. An explicit request is
+                // the person who asked, once: no Ticket exists to retry the
+                // Send, and its id comes from the Decision.
+                if current.strength == Strength::Explicit
+                    && let Some(primary) = self.trigger(&current.primary)
+                {
+                    for (n, channel) in primary.reply_to.iter().enumerate() {
+                        let id = MessageId(key(
+                            "ms",
+                            &[decision.id.as_str(), "declined", &n.to_string()],
+                        ));
+                        self.effect(Effect::Send(OutboundMessage {
+                            id,
+                            channel: channel.clone(),
+                            kind: MessageKind::Result,
+                            text: told.clone(),
+                            ticket: None,
+                            ask: None,
+                        }));
+                    }
+                }
+            }
             Verdict::Accept(accept) => {
                 validate(&accept)?;
                 if current.strength == Strength::Inferred && !policy.admits_inferred(&accept.rules)
@@ -2243,6 +2272,7 @@ impl<R: Repositories> Tx<'_, R> {
                 budget_microusd: accept.budget_microusd,
                 repo: accept.repo,
                 forge: accept.forge,
+                upstream: accept.upstream.map(|upstream| *upstream),
             },
             plan: accept.plan,
             channels: primary.reply_to,

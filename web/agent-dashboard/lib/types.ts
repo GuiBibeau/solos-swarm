@@ -106,7 +106,7 @@ export type Turn = {
 
 export type DecisionView = {
   id: string;
-  kind: "accept" | "ignore" | "stop" | "unavailable";
+  kind: "accept" | "ignore" | "stop" | "unavailable" | "declined";
   reason: string;
   at_ms: number;
   at: string;

@@ -1076,6 +1076,7 @@ impl Runtime {
                     plan,
                     budget_microusd,
                     repo: found.mandate.repo,
+                    upstream: found.mandate.upstream,
                     recovery: recovery || repeat,
                     inputs,
                     earlier,
@@ -1508,6 +1509,7 @@ mod tests {
             rules: Vec::new(),
             repo: None,
             forge: None,
+            upstream: None,
         });
         let decision = runtime.engine.decide(&eval, accept).unwrap();
         let ticket = runtime.engine.repos().decision(&decision).unwrap().ticket;

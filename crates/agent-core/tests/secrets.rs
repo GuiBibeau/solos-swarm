@@ -73,6 +73,7 @@ impl World {
             rules: Vec::new(),
             repo: None,
             forge: None,
+            upstream: None,
         });
         let decision = engine.decide(&eval, accept).unwrap();
         let ticket = engine.repos().decisions[&decision].ticket.clone().unwrap();

@@ -1155,6 +1155,7 @@ mod tests {
                     repo("The handbook.", None, Deliverable::Answer),
                 ),
             ]),
+            ..DecideTerms::default()
         };
 
         let prompt = system_prompt(None, &AllowlistPolicy::default(), &BTreeMap::new(), &decide);
