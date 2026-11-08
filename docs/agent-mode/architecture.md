@@ -196,7 +196,8 @@ Messages API, such as Claude Code, runs under the same governance as Pi. It take
 `x-api-key`), accounts, holds, settlement, model contract and 503 pause as `/model`, through the same `Call`: the model
 limit, the pause before any hold, the contract, the overrun stop, and a hold and a settlement on the token's account.
 
-`gateway::anthropic` (`src/gateway/anthropic.rs`) translates each way, so swarm mode could reuse it:
+The executor's `wire` chooses how a request reaches the provider. On `chat` (the default), `gateway::anthropic`
+(`src/gateway/anthropic.rs`) translates each way, so swarm mode could reuse it:
 
 - `system`, a string or text blocks, becomes the system message. A message's text blocks join into one.
 - An assistant's `tool_use` blocks become `tool_calls`, with the input as their JSON arguments. A user's `tool_result`
@@ -215,6 +216,24 @@ otherwise. `usage` puts prompt cache hits in `cache_read_input_tokens`, apart fr
 With `stream: true`, the broker writes the settled reply as server-sent events after the call settled:
 `message_start`, then per block a `content_block_start`, one `content_block_delta` (`text_delta` or
 `input_json_delta`) and a `content_block_stop`, then `message_delta` and `message_stop`.
+
+On `anthropic` (`src/gateway/forward.rs`), the broker forwards the request to the provider's own Messages endpoint
+(`https://api.deepseek.com/anthropic/v1/messages`), with the broker's key and `anthropic-version: 2023-06-01`:
+
+- `Forward::admit` refuses what `/model` refuses: a model other than the executor's (the `[1m]` long-context suffix
+  names the same model), no message, a tool that is not a granted client tool, or a server tool. The only server tool
+  a forwarded call may carry is the web search the broker adds itself.
+- The fields sent upstream are `messages`, `system`, `tools`, `tool_choice`, `stop_sequences`, `thinking` and
+  `output_config` as the session wrote them, plus the broker's `model`, `stream`, the lower `max_tokens`, and
+  `temperature` where the call does not think. `metadata`, `mcp_servers`, `container` and every other field drop.
+- A streamed reply passes back to the session byte for byte as the provider frames it. The broker reads the events
+  only for the message's id and final usage, skipping content events unread; a session that hangs up still has its
+  call read to the end for its usage.
+- The call settles from the reply's `usage`: `input_tokens` and `cache_creation_input_tokens` at the input rate,
+  `cache_read_input_tokens` at the cache-hit rate, and each `server_tool_use.tool_search` search at its price. A
+  reply over the call's `max_tokens`, a reply that cannot be read, a stream cut before its usage, or a timeout charges
+  the hold as an unknown cost. A provider refusal releases the hold and is a 403 that names the provider's reason.
+  A whole reply gains `swarm_cost_microusd`; a streamed one is settled when it ends.
 
 A refusal is an Anthropic error body with the broker's reason. A pause also keeps `paused` and `retry_after_s` and sets
 `Retry-After`. A settled reply that cannot be translated is a 502 with `x-should-retry: false`, since a retry would pay

@@ -366,6 +366,11 @@ Each Claude Code worker runs in bwrap with:
 - **No provider key.** `ANTHROPIC_BASE_URL=http://127.0.0.1:41300`, `ANTHROPIC_API_KEY` set to the session's bearer
   token, and `ANTHROPIC_DEFAULT_HAIKU_MODEL` set to the session's model, so background calls pass the contract. Also
   `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, `DISABLE_AUTOUPDATER`, `DISABLE_TELEMETRY` and `DISABLE_ERROR_REPORTING`.
+- **DeepSeek's settings on its own wire.** With `executor.wire: anthropic`, the session's model with `[1m]` is also
+  `ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_OPUS_MODEL` and `ANTHROPIC_DEFAULT_SONNET_MODEL`; `CLAUDE_CODE_SUBAGENT_MODEL`
+  is the plain model; `CLAUDE_CODE_EFFORT_LEVEL=max`; and `CLAUDE_CODE_AUTO_COMPACT_WINDOW` is DeepSeek's 786,432
+  tokens, or less where `max_input_bytes` is smaller. The broker forwards the calls to DeepSeek's Messages endpoint
+  rather than translating them. See [executor.wire](configuration.md#executorwire).
 - **A read-only view.** A tmpfs home and `/tmp`. The Claude Code install, the solos-swarm binary, the MCP config and
   the token file are read-only. The Ticket's `work` directory is read-only as `/work`, and files change through
   `run_code`.
@@ -392,7 +397,9 @@ broker answers 200), and `POST /v1/messages?beta=true` with `stream: true`, once
   Pi worker waits the pause out.
 - Claude Code reports any 403, such as the Ticket's budget being reached, as "Failed to authenticate. API Error: 403"
   followed by the broker's reason. The worker fails with that text.
-- Images, documents and server tools are not carried. `tool_choice` and sampling settings are not forwarded.
+- On the chat wire, images, documents and server tools are not carried, and `tool_choice` and sampling settings are
+  not forwarded. On the Anthropic wire, images, documents, `tool_choice` and sampling settings are carried, but a
+  server tool other than the web search the broker adds itself is still refused.
 - The Router stays a Pi session, and `router_decide` cannot name a harness yet.
 
 ## Remote nodes

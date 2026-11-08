@@ -88,6 +88,12 @@ pub struct Receipt {
 impl Receipt {
     pub fn read(response: &Value, max_output_tokens: u64) -> Result<Self> {
         let usage = completion_usage(&response["usage"])?;
+        Self::within(usage, &response["id"], max_output_tokens)
+    }
+
+    /// The receipt of `usage` under request id `id`, refused past the
+    /// request's contract.
+    pub fn within(usage: Usage, id: &Value, max_output_tokens: u64) -> Result<Self> {
         let input = usage.input_tokens;
         let output = usage.output_tokens;
         let cached = usage.cached_input_tokens;
@@ -95,7 +101,7 @@ impl Receipt {
             input <= 1_000_000 && output <= max_output_tokens,
             "provider usage exceeds contract"
         );
-        let request_id = response["id"]
+        let request_id = id
             .as_str()
             .filter(|v| !v.is_empty())
             .context("missing provider receipt")?

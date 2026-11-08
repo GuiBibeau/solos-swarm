@@ -73,7 +73,7 @@ The shell ports are async and live in the root crate.
 | `Forge` | `src/agent/ports.rs` | `GithubForge` and `LocalForge` (`src/agent/forge/`) |
 | `ExecutionEnvironment` | `src/agent/environment.rs` | `Local` (bwrap on this host), `RemoteNode` (`src/remote/listener.rs`) |
 | `AgentHarness` | `src/harness.rs` | `PiHarness`, `ClaudeCodeHarness` (`src/harness/claude_code.rs`), `ScriptedHarness` (`src/harness/scripted.rs`) |
-| `Provider` (model upstream) | `src/gateway/upstream.rs` | `OpenAiCompatible`, for DeepSeek and Venice |
+| `Provider` (model upstream) | `src/gateway/upstream.rs` | `OpenAiCompatible`, chat completions for DeepSeek and Venice; `BothWires`, adding DeepSeek's own Anthropic Messages endpoint |
 
 [agent-mode/architecture.md](agent-mode/architecture.md#ports) gives each port's shape.
 
@@ -81,7 +81,7 @@ The shell ports are async and live in the root crate.
 
 | Piece | Code | Swarm mode | Agent mode |
 |---|---|---|---|
-| Model gateway | `src/gateway/`: `pricing.rs`, `upstream.rs`, `pause.rs`, `anthropic.rs` | The swarm broker (`src/broker.rs`) prices, sends and pauses every call through it | The agent broker (`src/agent/broker.rs`) does the same for the Router, workers, the memory review and the dream. `anthropic.rs` serves Claude Code workers |
+| Model gateway | `src/gateway/`: `pricing.rs`, `upstream.rs`, `pause.rs`, `anthropic.rs`, `forward.rs` | The swarm broker (`src/broker.rs`) prices, sends and pauses every call through it | The agent broker (`src/agent/broker.rs`) does the same for the Router, workers, the memory review and the dream. `anthropic.rs` translates Claude Code workers' Messages calls onto chat; `forward.rs` forwards them to DeepSeek's own Messages endpoint |
 | Harness | `src/harness.rs` | `PiHarness` launches each swarm agent | The Router and every worker session |
 | Sandbox builder | `src/bwrap.rs`, with the binds from `src/exposure.rs` | The Pi launch and `run_code` | The same, plus the browser and the dependency builds. `exposure.rs` also decides which paths a vault, key or token may not sit under |
 | `run_code` | `src/code.rs` (`CodeExecutor`) | A swarm agent's `run_code` grant | A worker's `run_code` and background jobs, on this host or a node |
@@ -142,7 +142,7 @@ the Goal's rates.
 
 | Module | Responsibility |
 |---|---|
-| `src/gateway/` | Prices, holds and settlements (`pricing.rs`), the admitted upstreams and the request (`upstream.rs`), the pause gate (`pause.rs`), and the Anthropic Messages facade (`anthropic.rs`) |
+| `src/gateway/` | Prices, holds and settlements (`pricing.rs`), the admitted upstreams and the request (`upstream.rs`), the pause gate (`pause.rs`), and the Anthropic Messages facade: translated onto chat (`anthropic.rs`) or forwarded to DeepSeek's endpoint (`forward.rs`) |
 | `src/harness.rs`, `src/harness/` | The `AgentHarness` port and its Pi, Claude Code and scripted adapters |
 | `src/bwrap.rs`, `src/exposure.rs` | The one bwrap builder, and what each sandbox can see |
 | `src/code.rs` | `run_code`'s sandbox and receipts |

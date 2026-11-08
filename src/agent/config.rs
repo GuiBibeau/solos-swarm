@@ -27,7 +27,8 @@ use super::trail::TrailStoreConfig;
 use super::{discord, github, mcp, pstack, slack};
 use crate::browse::BrowserConfig;
 use crate::code::{self, Mount};
-use crate::gateway::{PriceTable, Temperature, upstream_profile};
+use crate::gateway::forward::WebSearch;
+use crate::gateway::{PriceTable, Temperature, Wire, endpoint, upstream_profile};
 use crate::vault::VaultConfig;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -843,6 +844,15 @@ pub enum ExecutorConfig {
         /// Where Claude Code is. Without it no session runs on Claude Code.
         #[serde(default)]
         claude: Option<Box<ClaudeConfig>>,
+        /// How a Claude Code session's Messages calls reach `provider`:
+        /// translated onto its chat completions, or forwarded to its own
+        /// Messages endpoint.
+        #[serde(default)]
+        wire: Wire,
+        /// The provider's own web search, which the broker adds to every
+        /// call it forwards. Absent: no search.
+        #[serde(default)]
+        web_search: Option<WebSearch>,
         /// Where a session's commands run when its Plan names nowhere: a
         /// node in `nodes.allow`, or `local` (the default).
         #[serde(default)]
@@ -1557,12 +1567,29 @@ impl AgentConfig {
             swarm,
             harness,
             claude,
+            wire,
+            web_search,
             ..
         } = &self.executor
         else {
             return Ok(());
         };
         upstream_profile(provider, model).context("executor")?;
+        if *wire == Wire::Anthropic {
+            endpoint(provider, *wire).context("executor.wire")?;
+            ensure!(
+                claude.is_some(),
+                "executor.wire anthropic carries Claude Code's model calls, so it needs \
+                 executor.claude"
+            );
+        }
+        if let Some(search) = web_search {
+            ensure!(
+                *wire == Wire::Anthropic,
+                "executor.web_search needs executor.wire anthropic"
+            );
+            search.validate().context("executor")?;
+        }
         prices.validate().context("executor.prices")?;
         ensure!(
             (1..=16_777_216).contains(max_input_bytes) && (1..=393_216).contains(max_output_tokens),
@@ -1669,6 +1696,17 @@ impl AgentConfig {
             .collect()
     }
 
+    /// How Claude Code sessions' Messages calls reach the provider, and the
+    /// web search the broker adds to the ones it forwards.
+    pub fn messages_wire(&self) -> (Wire, Option<WebSearch>) {
+        match &self.executor {
+            ExecutorConfig::Pi {
+                wire, web_search, ..
+            } => (*wire, *web_search),
+            _ => (Wire::Chat, None),
+        }
+    }
+
     /// The provider and model whose credential `--credential-file` holds:
     /// the Pi Router's, else the Pi workers'. `None` when nothing is Pi.
     pub fn pi_upstream(&self) -> Option<(&str, &str)> {
@@ -1770,6 +1808,8 @@ mod tests {
         ExecutorConfig, ForgeConfig, GithubConfig, HarnessKind, JobLimits, RepoConfig,
         RouterConfig, SourceConfig,
     };
+    use crate::gateway::Wire;
+    use crate::gateway::forward::WebSearch;
     use solos_agent_core::change::{Deliverable, RepoName};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -2807,6 +2847,73 @@ forge:
             ),
         ] {
             assert!(parse(&yaml).is_err(), "{case}: accepted\n{yaml}");
+        }
+    }
+
+    #[test]
+    fn claude_codes_calls_take_the_chat_wire_unless_the_anthropic_wire_is_named() {
+        let with = |lines: &str| {
+            workers(|yaml| {
+                yaml.replace("  max_workers: 3\n", &format!("  max_workers: 3\n{lines}"))
+            })
+        };
+        let claude = "  claude: {binary: /opt/claude/2.1.231}\n";
+        assert_eq!(
+            parse(&with(claude)).unwrap().messages_wire(),
+            (Wire::Chat, None),
+            "the default is today's"
+        );
+        assert_eq!(parse(VALID).unwrap().messages_wire(), (Wire::Chat, None));
+        let anthropic = parse(&with(&format!("{claude}  wire: anthropic\n"))).unwrap();
+        assert_eq!(anthropic.messages_wire(), (Wire::Anthropic, None));
+        let searching = parse(&with(&format!(
+            "{claude}  wire: anthropic\n  web_search: {{max_uses: 2}}\n"
+        )))
+        .unwrap();
+        assert_eq!(
+            searching.messages_wire(),
+            (
+                Wire::Anthropic,
+                Some(WebSearch {
+                    max_uses: 2,
+                    microusd_per_search: 750,
+                    result_tokens: 131_072
+                })
+            )
+        );
+        for (case, yaml, why) in [
+            (
+                "no Claude Code",
+                with("  wire: anthropic\n"),
+                "needs executor.claude",
+            ),
+            (
+                "search on the chat wire",
+                with(&format!("{claude}  web_search: {{}}\n")),
+                "executor.web_search needs executor.wire anthropic",
+            ),
+            (
+                "too many searches",
+                with(&format!(
+                    "{claude}  wire: anthropic\n  web_search: {{max_uses: 9}}\n"
+                )),
+                "web_search.max_uses is 1 to 8",
+            ),
+            (
+                "an unknown wire",
+                with(&format!("{claude}  wire: responses\n")),
+                "unknown variant `responses`",
+            ),
+            (
+                "a provider with no Anthropic wire",
+                with(&format!("{claude}  wire: anthropic\n"))
+                    .replace("provider: deepseek", "provider: venice")
+                    .replace("model: deepseek-flash", "model: zai-org-glm-5"),
+                "provider venice has no Anthropic wire",
+            ),
+        ] {
+            let error = format!("{:#}", parse(&yaml).unwrap_err());
+            assert!(error.contains(why), "{case}: {error}\n{yaml}");
         }
     }
 
