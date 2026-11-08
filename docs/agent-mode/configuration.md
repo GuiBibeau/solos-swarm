@@ -510,6 +510,7 @@ source, or `token_file` or `identity` on `forge: github`) fails to load with a s
 |---|---|---|
 | `public_url` | required | The dashboard's origin: `https://`, no trailing slash, no login, query or fragment. A path is allowed. A Ticket's page is `{public_url}/tickets/{id}`, and replies link to it. |
 | `publish` | none | What `solos-swarm agent publish` uploads with. Without it, `agent publish` has nothing to do. |
+| `chat` | none | The dashboard's chat inbox, which `agent publish` reads and spools as Trigger JSON lines. Needs `publish`: the inbox is read with the same Blob token. |
 
 `publish`:
 
@@ -519,6 +520,42 @@ source, or `token_file` or `identity` on `forge: github`) fails to load with a s
 | `every_secs` | `5` | How often the Store is looked at, 1 to 3600. An upload happens only for a snapshot whose content changed. |
 | `heartbeat_secs` | `300` | The index is uploaded again after this long, so the dashboard can tell a quiet agent from a dead publisher. From `every_secs` to 86400. |
 | `api_url` | `https://vercel.com/api/blob` | For tests. `http` only for a loopback address. |
+
+`chat`:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `inbox` | required | The inbox's pathname in the private Blob store: `web/inbox.json` by the dashboard's contract. |
+| `people` | required | The authors whose messages may become Triggers, by the email the dashboard signs them in with. Anyone else's message is logged without its text and skipped. |
+| `spool` | `<state>/web/triggers.jsonl` | Where Trigger JSON lines are appended: one write per look, then `fsync`. A relative path is relative to the config's directory. |
+
+With `chat`, the config also needs the Source that follows the spool, the Channel that answers as `web`, and the person
+on the Policy:
+
+```yaml
+sources:
+  - kind: jsonl
+    path: state/web/triggers.jsonl
+channels:
+  - kind: jsonl
+    source: web
+    path: state/web/replies.jsonl
+policy:
+  people: [web:g.bibeaulaviolette@gmail.com]
+  approvers: [web:g.bibeaulaviolette@gmail.com]
+```
+
+A web message's principal is `web:<author email>`, so `policy.people` must name the same address as `web.chat.people`.
+The two lists are separate checks on purpose: the publisher refuses an author not on its list before any text reaches
+the spool, and the core's Policy refuses `web:<author>` again if the first list is wrong. The trust boundary is the
+private Blob store: its read-write token can read and write everything in it and is held by the publisher's unit, never
+by the agent's. The dashboard's server writes the inbox after its own sign-in check; the message text is data and can
+never change a permission, a budget or a Policy.
+
+A fresh cursor treats every message in the inbox as new, and the dashboard keeps the last 200, so the first run after
+turning this on can spool up to 200 Triggers. What was read is remembered in `<state>/web/cursor.json`; a restart never
+turns the same message into a second Trigger. See [production.md](production.md#chat-from-the-web) for the exact
+production block.
 
 `agent serve` ignores the section except for `public_url`. Setup and rotation:
 [production.md](production.md#dashboard).

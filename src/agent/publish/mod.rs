@@ -15,15 +15,25 @@
 //! Watchdog keeps what it found about the external jobs it watches
 //! ([`external_jobs::STATE_FILE`]). It goes up as [`JOBS_PATH`] unchanged,
 //! when its content changes and on every heartbeat.
+//!
+//! With `web.chat`, each look also reads the dashboard's inbox from the same
+//! private store ([`chat`]) and spools new messages as Trigger JSON lines in
+//! the state directory, for the agent's `kind: jsonl` Source to follow. The
+//! inbox is the one blob read; nothing else is downloaded, and the spool is
+//! never uploaded.
 
 mod blob;
+mod chat;
 pub mod snapshot;
 mod source;
 
-pub use blob::{API_VERSION, Backoff, BlobClient, BlobToken, Put, PutError};
+pub use blob::{
+    API_VERSION, Backoff, BlobClient, BlobToken, GetError, Put, PutError, check_pathname,
+};
+pub use chat::{ChatBridge, ChatOptions, SOURCE as CHAT_SOURCE};
 pub use source::{Built, ENDED_IN_INDEX, Source};
 
-use super::config::{AgentConfig, PublishConfig};
+use super::config::{AgentConfig, WebConfig};
 use super::external_jobs;
 use crate::broker::now_ms;
 use anyhow::{Context, Result, bail};
@@ -70,16 +80,36 @@ pub struct Options {
     pub heartbeat: Duration,
     pub api_url: String,
     pub backoff: Backoff,
+    /// The dashboard's chat inbox, when `web.chat` is set.
+    pub chat: Option<ChatOptions>,
+    /// Test seam: where private blobs are read. `None` is
+    /// `https://<storeId>.private.blob.vercel-storage.com`.
+    pub private_base: Option<String>,
 }
 
 impl Options {
-    pub fn of(config: &PublishConfig) -> Self {
-        Self {
-            every: Duration::from_secs(config.every_secs),
-            heartbeat: Duration::from_secs(config.heartbeat_secs),
-            api_url: config.api_url.clone(),
+    /// The publisher's options, or `None` when the config has no
+    /// `web.publish`.
+    pub fn of(web: &WebConfig, state_dir: &Path) -> Option<Self> {
+        let publish = web.publish.as_ref()?;
+        let chat = web.chat.as_ref().map(|chat| ChatOptions {
+            inbox: chat.inbox.clone(),
+            people: chat.people.clone(),
+            spool: chat
+                .spool
+                .clone()
+                .unwrap_or_else(|| state_dir.join("web/triggers.jsonl")),
+            cursor: state_dir.join("web/cursor.json"),
+            public_url: web.public_url.clone(),
+        });
+        Some(Self {
+            every: Duration::from_secs(publish.every_secs),
+            heartbeat: Duration::from_secs(publish.heartbeat_secs),
+            api_url: publish.api_url.clone(),
             backoff: Backoff::default(),
-        }
+            chat,
+            private_base: None,
+        })
     }
 }
 
@@ -115,6 +145,9 @@ pub struct Report {
     /// Pathnames the API refused, which are not tried again until their
     /// content changes.
     pub rejected: Vec<String>,
+    /// Trigger lines the dashboard's chat inbox added to the spool.
+    #[serde(default)]
+    pub spooled: usize,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -192,12 +225,20 @@ pub struct Publisher {
     /// The hash of the external jobs the API refused, which are not sent
     /// again until they change.
     refused_jobs: Option<String>,
+    /// The dashboard's chat inbox, when `web.chat` is set.
+    chat: Option<ChatBridge>,
 }
 
 impl Publisher {
     pub fn new(state_dir: &Path, token: BlobToken, options: Options) -> Result<Self> {
         let state = State::load(&state_dir.join(STATE_FILE), token.store_id());
-        let client = BlobClient::new(&options.api_url, token, options.backoff)?;
+        let client = match &options.private_base {
+            Some(base) => {
+                BlobClient::with_private_base(&options.api_url, base, token, options.backoff)?
+            }
+            None => BlobClient::new(&options.api_url, token, options.backoff)?,
+        };
+        let chat = options.chat.clone().map(ChatBridge::new);
         Ok(Self {
             state_dir: state_dir.to_owned(),
             client,
@@ -207,6 +248,7 @@ impl Publisher {
             built: None,
             queue: Vec::new(),
             refused_jobs: None,
+            chat,
         })
     }
 
@@ -232,6 +274,23 @@ impl Publisher {
         }
         self.plan_jobs(now);
         self.heartbeat(now);
+        if let Some(chat) = self.chat.as_mut() {
+            match chat.poll(&self.client).await {
+                Ok(spooled) => report.spooled = spooled,
+                Err(GetError::Unauthorized(why)) => {
+                    return Err(CycleError::Fatal(anyhow::anyhow!(
+                        "the Blob token was refused while reading the chat inbox ({why}); \
+                         replace it and restart the publisher"
+                    )));
+                }
+                Err(GetError::Transient(why)) => {
+                    return Err(CycleError::Retry(anyhow::anyhow!(why)));
+                }
+                // `poll` answers a missing inbox itself.
+                Err(GetError::Missing(_)) => {}
+                Err(GetError::Rejected(why)) => eprintln!("publish: web.chat: {why}"),
+            }
+        }
         self.flush(now, &mut report).await?;
         Ok(report)
     }
@@ -416,11 +475,16 @@ pub async fn run_until(
     stop: impl Future<Output = ()>,
 ) -> Result<()> {
     let config = AgentConfig::load(config)?;
-    let Some(publish) = config.web.as_ref().and_then(|web| web.publish.as_ref()) else {
+    let Some(web) = config.web.as_ref() else {
+        bail!("the agent config has no web.publish section: there is nothing to publish to");
+    };
+    let Some(publish) = web.publish.as_ref() else {
         bail!("the agent config has no web.publish section: there is nothing to publish to");
     };
     let token = BlobToken::take(&publish.token_file).context("web.publish.token_file")?;
-    let mut publisher = Publisher::new(state_dir, token, Options::of(publish))?;
+    let options = Options::of(web, state_dir)
+        .context("the agent config has no web.publish section: there is nothing to publish to")?;
+    let mut publisher = Publisher::new(state_dir, token, options)?;
     let every = publisher.options.every;
     if once {
         let report = publisher.cycle().await?;

@@ -7,6 +7,7 @@
 use anyhow::{Result, ensure};
 use serde::Deserialize;
 use solos_agent_core::model::TicketId;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 /// The dashboard's own address and what publishes to it.
@@ -20,6 +21,31 @@ pub struct WebConfig {
     /// made, by whatever serves `public_url`).
     #[serde(default)]
     pub publish: Option<PublishConfig>,
+    /// The dashboard's chat inbox, which `agent publish` reads and spools as
+    /// Trigger lines. Needs `publish`: the inbox is read with the same Blob
+    /// token. Without it, nothing is read.
+    #[serde(default)]
+    pub chat: Option<ChatConfig>,
+}
+
+/// `web.chat`: where the hosted dashboard writes what people type, and who
+/// may become a Trigger.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatConfig {
+    /// The inbox's pathname in the private Blob store, `web/inbox.json` by
+    /// the dashboard's contract.
+    pub inbox: String,
+    /// The authors whose messages may become Triggers, by the email the
+    /// dashboard signs them in with. Anyone else's message is logged without
+    /// its text and skipped. This is not the same list as `policy.people`:
+    /// the agent's Policy checks `web:<author>` again.
+    pub people: BTreeSet<String>,
+    /// Where Trigger JSON lines are appended. Defaults to
+    /// `<state>/web/triggers.jsonl`; a path here is relative to the config's
+    /// directory, like every other path in it.
+    #[serde(default)]
+    pub spool: Option<PathBuf>,
 }
 
 /// `web.publish`: what `agent publish` uploads with.
@@ -70,6 +96,33 @@ impl WebConfig {
         check_public_url(&self.public_url)?;
         if let Some(publish) = &self.publish {
             publish.validate()?;
+        }
+        if let Some(chat) = &self.chat {
+            ensure!(
+                self.publish.is_some(),
+                "web.chat needs web.publish: the inbox is read with the same Blob token"
+            );
+            chat.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl ChatConfig {
+    fn validate(&self) -> Result<()> {
+        crate::agent::publish::check_pathname(&self.inbox)
+            .map_err(|err| anyhow::anyhow!("web.chat.inbox is not a Blob pathname: {err:#}"))?;
+        ensure!(
+            !self.people.is_empty(),
+            "web.chat.people names nobody, so no message would ever become a Trigger"
+        );
+        for person in &self.people {
+            ensure!(
+                !person.is_empty()
+                    && person.contains('@')
+                    && !person.chars().any(char::is_whitespace),
+                "web.chat.people must hold the authors' email addresses: {person:?}"
+            );
         }
         Ok(())
     }
@@ -214,6 +267,67 @@ publish:
         assert!(
             web("publish: {token_file: t}").is_err(),
             "public_url is required"
+        );
+    }
+
+    #[test]
+    fn the_chat_inbox_loads_beside_the_publisher() {
+        let config = web("
+public_url: https://agent.guibibeau.com
+publish:
+  token_file: blob.token
+chat:
+  inbox: web/inbox.json
+  people: [g.bibeaulaviolette@gmail.com]
+")
+        .unwrap();
+        let chat = config.chat.unwrap();
+        assert_eq!(chat.inbox, "web/inbox.json");
+        assert_eq!(
+            chat.people.iter().collect::<Vec<_>>(),
+            ["g.bibeaulaviolette@gmail.com"]
+        );
+        assert_eq!(chat.spool, None, "the state directory fills the default");
+    }
+
+    #[test]
+    fn the_chat_inbox_needs_a_publisher_people_and_a_pathname() {
+        let with = |chat: &str| {
+            web(&format!(
+                "public_url: https://a.example\npublish:\n  token_file: t\nchat:\n{chat}"
+            ))
+        };
+        assert!(with("  inbox: web/inbox.json\n  people: [a@b]").is_ok());
+        assert!(
+            with("  inbox: web/inbox.json\n  people: [a@b]\n  spool: state/web/t.jsonl").is_ok()
+        );
+        // No publisher: no token to read the inbox with.
+        assert!(
+            web("public_url: https://a.example\nchat: {inbox: web/inbox.json, people: [a@b]}")
+                .is_err()
+        );
+        assert!(with("  people: [a@b]").is_err(), "the inbox is required");
+        assert!(
+            with("  inbox: web/inbox.json").is_err(),
+            "people are required"
+        );
+        assert!(
+            with("  inbox: web/inbox.json\n  people: []").is_err(),
+            "an empty list would never Trigger"
+        );
+        for bad in ["", "/web/inbox.json", "web//inbox.json"] {
+            assert!(
+                with(&format!("  inbox: '{bad}'\n  people: [a@b]")).is_err(),
+                "{bad:?} was accepted"
+            );
+        }
+        assert!(
+            with("  inbox: web/inbox.json\n  people: [not-an-email]").is_err(),
+            "people are emails"
+        );
+        assert!(
+            with("  inbox: web/inbox.json\n  people: [a@b]\n  inbx: x").is_err(),
+            "unknown fields are refused"
         );
     }
 }

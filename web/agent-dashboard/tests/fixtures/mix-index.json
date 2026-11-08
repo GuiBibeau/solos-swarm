@@ -4,8 +4,9 @@
   "tickets": [
     {
       "asker": {
-        "id": "alice",
-        "kind": "person"
+        "id": "g.bibeaulaviolette@gmail.com",
+        "kind": "person",
+        "name": "Gui"
       },
       "assignment": {
         "report": "blocked",
@@ -13,16 +14,17 @@
         "state": "running"
       },
       "budget_microusd": 500000,
-      "created_at": "2026-11-06T14:11:03Z",
-      "created_ms": 1793974263620,
-      "id": "tk_1ab8791d90e319f3",
+      "created_at": "2026-11-08T21:35:31Z",
+      "created_ms": 1794173731568,
+      "id": "tk_bce17d50234a4e85",
       "open": true,
-      "source": "slack",
+      "source": "web",
+      "source_url": "https://agent.guibibeau.com/?t=wc_cccccccccccccccccccccccccccccccc",
       "spent_microusd": 0,
       "stage": "answer",
       "title": "Rotate the staging keys",
-      "updated_at": "2026-11-06T14:11:03Z",
-      "updated_ms": 1793974263622,
+      "updated_at": "2026-11-08T21:35:31Z",
+      "updated_ms": 1794173731570,
       "waiting_for": "Which staging environment should I rotate: eu or us?"
     },
     {
@@ -36,9 +38,9 @@
         "state": "ended"
       },
       "budget_microusd": 500000,
-      "created_at": "2026-11-06T14:11:03Z",
-      "created_ms": 1793974263619,
-      "duration_ms": 5,
+      "created_at": "2026-11-08T21:35:31Z",
+      "created_ms": 1794173731567,
+      "duration_ms": 4,
       "id": "tk_22d7139fa2e02429",
       "open": false,
       "outcome": "completed",
@@ -46,8 +48,8 @@
       "spent_microusd": 0,
       "stage": "ended",
       "title": "Read my notifications",
-      "updated_at": "2026-11-06T14:11:03Z",
-      "updated_ms": 1793974263624
+      "updated_at": "2026-11-08T21:35:31Z",
+      "updated_ms": 1794173731571
     },
     {
       "asker": {
@@ -60,8 +62,8 @@
         "state": "ended"
       },
       "budget_microusd": 500000,
-      "created_at": "2026-11-06T14:11:03Z",
-      "created_ms": 1793974263618,
+      "created_at": "2026-11-08T21:35:31Z",
+      "created_ms": 1794173731566,
       "duration_ms": 3,
       "id": "tk_426b5e800d1c8491",
       "open": false,
@@ -70,8 +72,8 @@
       "spent_microusd": 0,
       "stage": "ended",
       "title": "Summarise the incident report",
-      "updated_at": "2026-11-06T14:11:03Z",
-      "updated_ms": 1793974263621
+      "updated_at": "2026-11-08T21:35:31Z",
+      "updated_ms": 1794173731569
     }
   ],
   "v": 1
