@@ -7,7 +7,7 @@ import { Markdown } from "@/components/markdown";
 import { When } from "@/components/time";
 import { duration, usd } from "@/lib/format";
 import { THREAD_RE, threadOf } from "@/lib/threads";
-import type { ChatMessage, Index, IndexRow, Jobs, TicketSnapshot, Turn } from "@/lib/types";
+import type { ChatMessage, Index, IndexRow, Jobs, Note, TicketSnapshot, Turn } from "@/lib/types";
 
 const THREAD_KEY = "solos-web-thread";
 const POLL_MS = 2000;
@@ -33,7 +33,8 @@ const KIND_LABEL: Record<Turn["kind"], string> = {
 type Item =
   | { kind: "turn"; at_ms: number; turn: Turn }
   | { kind: "report"; at_ms: number; status: string; text: string; question?: string }
-  | { kind: "pending"; at_ms: number; message: ChatMessage };
+  | { kind: "pending"; at_ms: number; message: ChatMessage }
+  | { kind: "note"; at_ms: number; note: Note };
 
 function who(turn: Turn): string {
   if (turn.from === "agent") return "Agent";
@@ -74,18 +75,21 @@ export function ChatLive({
   initialTicket,
   initialIndex,
   initialJobs,
+  initialNotes,
   initialNow,
 }: {
   initialThread: string | null;
   initialTicket: TicketSnapshot | null;
   initialIndex: Index | null;
   initialJobs: Jobs | null;
+  initialNotes: Note[];
   initialNow: number;
 }) {
   const [thread, setThread] = useState<string | null>(initialThread);
   const [ticket, setTicket] = useState<TicketSnapshot | null>(initialTicket);
   const [index, setIndex] = useState<Index | null>(initialIndex);
   const [jobs, setJobs] = useState<Jobs | null>(initialJobs);
+  const [notes, setNotes] = useState<Note[]>(initialNotes);
   const [pending, setPending] = useState<ChatMessage[]>([]);
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
@@ -131,11 +135,13 @@ export function ChatLive({
           ticket: TicketSnapshot | null;
           index: Index | null;
           jobs: Jobs | null;
+          notes?: Note[];
         };
         if (stopped) return;
         setTicket(data.ticket);
         setIndex(data.index);
         setJobs(data.jobs);
+        setNotes(data.notes ?? []);
         setNow(Date.now());
       } catch {
         // a poll that fails leaves the last state on screen
@@ -162,8 +168,11 @@ export function ChatLive({
     const inFlight = pending
       .filter((message) => !said.has(message.text.trim()))
       .map((message): Item => ({ kind: "pending", at_ms: message.at_ms, message }));
-    return [...fromTicket, ...inFlight].sort((a, b) => a.at_ms - b.at_ms);
-  }, [ticket, pending]);
+    const agentNotes = notes
+      .filter((note) => note.kind === "ignore" || note.kind === "unavailable")
+      .map((note): Item => ({ kind: "note", at_ms: note.at_ms, note }));
+    return [...fromTicket, ...inFlight, ...agentNotes].sort((a, b) => a.at_ms - b.at_ms);
+  }, [ticket, pending, notes]);
 
   const scroll = useCallback(() => {
     const el = transcriptRef.current;
@@ -387,11 +396,22 @@ export function ChatLive({
                       ) : null}
                     </div>
                   </article>
+                ) : item.kind === "note" ? (
+                  <article className="turn agent note" key={`${item.at_ms}-${n}`}>
+                    <div className="turn-head">
+                      <strong>Agent</strong>
+                      <span>no ticket</span>
+                      <When ms={item.at_ms} now={now} />
+                    </div>
+                    <div className="prose">
+                      <p>{item.note.reason}</p>
+                    </div>
+                  </article>
                 ) : (
                   <article className="turn person pending" key={`${item.at_ms}-${n}`}>
                     <div className="turn-head">
                       <strong>You</strong>
-                      <span>sending</span>
+                      <span>{notes.some((note) => note.at_ms >= item.message.at_ms) ? "sent" : "sending"}</span>
                       <When ms={item.at_ms} now={now} />
                     </div>
                     <div className="prose">

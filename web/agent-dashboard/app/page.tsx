@@ -1,7 +1,8 @@
 import { ChatLive } from "@/components/chat-live";
-import { readIndex, readJobs, readTicket } from "@/lib/blob";
+import { readIndex, readJobs, readNotes, readTicket } from "@/lib/blob";
 import { nowMs } from "@/lib/clock";
 import { threadOf } from "@/lib/threads";
+import type { Note } from "@/lib/types";
 import { requireViewer } from "@/lib/viewer";
 
 export const dynamic = "force-dynamic";
@@ -24,6 +25,13 @@ export default async function ChatPage({ searchParams }: Props) {
   } catch (error) {
     console.error(error);
   }
+  let threadNotes: Note[] = [];
+  try {
+    const notes = await readNotes(viewer);
+    threadNotes = t ? (notes?.notes ?? []).filter((note) => note.thread === `web:${t}`) : [];
+  } catch (error) {
+    console.error(error);
+  }
   let ticket = null;
   if (t) {
     const row = index?.tickets.find((candidate) => threadOf(candidate) === t);
@@ -41,6 +49,7 @@ export default async function ChatPage({ searchParams }: Props) {
       initialTicket={ticket}
       initialIndex={index}
       initialJobs={jobs}
+      initialNotes={threadNotes}
       initialNow={nowMs()}
     />
   );

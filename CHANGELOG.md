@@ -343,6 +343,9 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   beacon field), the empty chat leads with what waits on the person and one-line commands instead of suggestion cards,
   the activity rail shows the active ticket's last worker report instead of a miniature field, and the field labels its
   rings and tickets; the Swarm field is sized so the workers land on the first screen.
+- Agent dashboard, chat notes (#137): a web message the Router decides to ignore (or cannot take) appears in the chat as
+  the agent's note with its reason, instead of sending forever; the publisher carries the recent decisions for web
+  threads as `notes/index.json`.
 - Agent mode, the dashboard's web chat (#135): `web.chat` makes `agent publish` read `web/inbox.json` from the private
   Blob store each look and spool new messages from `web.chat.people` as Trigger JSON lines in
   `state/web/triggers.jsonl`, which the agent's `kind: jsonl` Source follows; a cursor in `state/web/cursor.json` keeps

@@ -3,7 +3,7 @@
 // browser never holds the Blob token.
 
 import { appendMessage, ChatStoreError, MAX_TEXT, messageFrom } from "@/lib/chat";
-import { readIndex, readJobs, readTicket } from "@/lib/blob";
+import { readIndex, readJobs, readNotes, readTicket } from "@/lib/blob";
 import { THREAD_RE, threadOf } from "@/lib/threads";
 import { currentViewer } from "@/lib/viewer";
 
@@ -29,6 +29,13 @@ export async function GET(request: Request): Promise<Response> {
   } catch (error) {
     console.error(error);
   }
+  let notes = null;
+  try {
+    notes = await readNotes(viewer);
+  } catch (error) {
+    console.error(error);
+  }
+  const threadNotes = thread ? (notes?.notes ?? []).filter((note) => note.thread === `web:${thread}`) : [];
   let ticket = null;
   if (thread) {
     const row = index?.tickets.find((candidate) => threadOf(candidate) === thread);
@@ -40,7 +47,7 @@ export async function GET(request: Request): Promise<Response> {
       }
     }
   }
-  return ok({ thread, ticket, index, jobs, author: viewer.email });
+  return ok({ thread, ticket, index, jobs, notes: threadNotes, author: viewer.email });
 }
 
 export async function POST(request: Request): Promise<Response> {
