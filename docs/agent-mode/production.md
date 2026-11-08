@@ -782,7 +782,8 @@ Leave out `solos-agent-publish` if you never turned on the dashboard.
 ### 4. Copy the data
 
 On the box, as a user with sudo. Copy `agent.yaml`, the tokens, the state and the backups. Do not copy `releases/`,
-`current`, `previous` or `target/`: the links are absolute paths into the old home, and the new user builds its own.
+`current`, `previous`, `target/`, `src/` or `src.git/`: the links are absolute paths into the old home, and the new
+user builds its own.
 
 ```sh
 sudo install -d -m 0700 -o solos-agent -g solos-agent /home/solos-agent/agent
