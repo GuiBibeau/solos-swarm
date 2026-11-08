@@ -224,10 +224,18 @@ reclaimed login looks like, is the actor `alice#99`, which no Policy lists, so i
 A listed login whose lookup failed is not admitted until it is pinned. To list someone who recreated their account,
 delete their entry from the file.
 
-**Suspension.** If the App is suspended, every GitHub call waits five minutes and tries again, and the agent logs once
-per change of state. Nothing crashes, and a `serve` started while the App is suspended keeps running. Unsuspending, or
-reinstalling (which makes a new installation id that the agent finds again), resumes the work without a restart. Only a
-key that GitHub rejects stops the `github` source, with a log line, and the rest of the agent keeps running.
+**Suspension.** If the App is suspended on a repository, or not installed on it, every GitHub call for that repository
+waits five minutes and tries again, and the agent logs once per change of state. Nothing crashes, and a `serve` started
+while the App is suspended keeps running. Unsuspending, or reinstalling (which makes a new installation id that the
+agent finds again), resumes the work without a restart.
+
+**One repository at a time.** The wait is that repository's alone. The `github` source leaves the repository out of its
+polls, asks about it again when the wait is over, and reads every other repository at `github.poll_secs` meanwhile, so
+a repository listed in `forge.repos` before the App is installed on it holds nothing back. Rate limits, a 5xx and a
+network failure are not tied to one repository, so they still pause the whole poll. A repository whose own `GET
+/repos/<repo>` GitHub refuses (403 or 404) at start is logged once and left out until a restart; if none can be read,
+the source stops. Only a key that GitHub rejects, or no readable repository, stops the `github` source, with a log
+line, and the rest of the agent keeps running.
 
 Pull request review events, other CI apps' check runs and commit statuses, and webhooks are not built.
 

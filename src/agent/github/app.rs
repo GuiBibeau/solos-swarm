@@ -17,8 +17,7 @@
 //! repositories, no `workflows`, no `administration`; GitHub keeps several
 //! keys per App, so it rotates without downtime.
 
-use super::{Fatal, Got, Transport, suspended};
-use crate::agent::ports::RetryAfter;
+use super::{Absent, Fatal, Got, Transport, suspended};
 use crate::agent::utc;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::Engine as _;
@@ -403,8 +402,8 @@ struct Slot {
 ///
 /// A suspended installation (403 on the mint, or `suspended_at` on the
 /// lookup), an App not installed on the repository (404), or a repository
-/// that left the installation (422 naming it) is `Err(RetryAfter)`, logged
-/// once per change of state.
+/// that left the installation (422 naming it) is `Err(Absent)`, a `RetryAfter`
+/// too, logged once per change of state.
 pub struct Minter {
     config: MinterConfig,
     key: AppKey,
@@ -661,7 +660,7 @@ impl Minter {
                 wait.as_secs()
             );
         }
-        anyhow::Error::new(RetryAfter(wait)).context(why)
+        Absent::new(why, wait).into()
     }
 
     /// The App's slug, from `GET /app`, which only its JWT can ask.

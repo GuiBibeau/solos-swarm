@@ -2,9 +2,13 @@
 //! request review comments and workflow runs, oldest first, `since` a cursor
 //! kept in the state directory. First pages carry their `ETag`, so a quiet
 //! repository costs 304s, which GitHub does not count against the rate limit.
+//!
+//! One repository never holds back the others: where the App is missing or
+//! suspended, or cannot read the repository, that repository is left out and
+//! the rest are read at the usual rate.
 
 use super::{
-    Bot, Fatal, GithubApi, Got, Identities, InstallState, MARKER_PREFIX, SOURCE, is_fatal,
+    Bot, Fatal, GithubApi, Got, Identities, InstallState, MARKER_PREFIX, SOURCE, absent, is_fatal,
     reply_to, retry_after, thread,
 };
 use crate::agent::ports::{BoxFuture, FactSink, Source, TriggerSink};
@@ -20,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Listings are read again this far behind the cursor, for items GitHub
 /// lists late and for clock skew. The Trigger ids sent within it are kept
@@ -85,7 +89,7 @@ impl GithubSource {
 
 impl Source for GithubSource {
     /// A failure waiting cannot mend (GitHub refuses the App's key, or the
-    /// App cannot read a configured repository) stops this Source and says
+    /// App cannot read any configured repository) stops this Source and says
     /// so; the rest of the agent keeps running.
     fn run(self: Box<Self>, sink: TriggerSink, _: FactSink) -> BoxFuture<'static, Result<()>> {
         Box::pin(async move {
@@ -281,9 +285,36 @@ enum Listing {
     Refused(StatusCode, String),
 }
 
+/// Repositories left out of a poll. The Minter says once why, as the App's
+/// standing there changes.
+#[derive(Default)]
+struct Skipped {
+    /// The App is missing or suspended: asked about again when the wait the
+    /// Minter named is over.
+    waiting: BTreeMap<RepoName, Instant>,
+    /// GitHub refused the App on the repository itself, which waiting cannot
+    /// mend: left out until the agent restarts.
+    refused: BTreeSet<RepoName>,
+}
+
+impl Skipped {
+    fn skips(&self, repo: &RepoName) -> bool {
+        self.refused.contains(repo)
+            || self
+                .waiting
+                .get(repo)
+                .is_some_and(|until| Instant::now() < *until)
+    }
+
+    fn wait(&mut self, repo: &RepoName, wait: Duration) {
+        self.waiting.insert(repo.clone(), Instant::now() + wait);
+    }
+}
+
 impl GithubSource {
     async fn serve(&self, sink: &TriggerSink) -> Result<()> {
-        let bot = self.begin().await?;
+        let mut skipped = Skipped::default();
+        let bot = self.begin(&mut skipped).await?;
         let cursor = Cursor::load(&self.cursor, &self.repos, now_ms())?;
         let mut saved = cursor.clone();
         let mut state = State {
@@ -296,7 +327,7 @@ impl GithubSource {
             // The read moves the position only once its batch is handed on.
             let mut next = state.clone();
             self.pin_missing().await;
-            match self.poll(&bot, &mut next).await {
+            match self.poll(&bot, &mut next, &mut skipped).await {
                 Ok(batch) => {
                     failures = 0;
                     if !batch.is_empty() && sink.send(batch).await.is_err() {
@@ -340,7 +371,10 @@ impl GithubSource {
             return Err(err);
         }
         if let Some(wait) = retry_after(&err) {
-            eprintln!("agent: github: {err:#}");
+            // A missing or suspended App was said once, when it changed.
+            if absent(&err).is_none() {
+                eprintln!("agent: github: {err:#}");
+            }
             return Ok(wait);
         }
         if !self.follow {
@@ -354,11 +388,11 @@ impl GithubSource {
         Ok(wait)
     }
 
-    /// The agent's account, once the App reads every configured repository.
-    async fn begin(&self) -> Result<Bot> {
+    /// The agent's account, once the App reads a configured repository.
+    async fn begin(&self, skipped: &mut Skipped) -> Result<Bot> {
         let mut failures = 0;
         loop {
-            let err = match self.start().await {
+            let err = match self.start(skipped).await {
                 Ok(bot) => return Ok(bot),
                 Err(err) => err,
             };
@@ -368,16 +402,36 @@ impl GithubSource {
         }
     }
 
-    async fn start(&self) -> Result<Bot> {
+    /// A repository the App is missing from or suspended on, or cannot read,
+    /// is left out; the others do not wait for it. Only when none can be read
+    /// at all does the Source stop.
+    async fn start(&self, skipped: &mut Skipped) -> Result<Bot> {
         let bot = self.api.bot().await?;
         self.preflight().await?;
         self.pin_missing().await;
         for repo in &self.repos {
-            let url = self.api.url(&format!("repos/{repo}"));
-            if let Got::Refused { status, message } = self.api.get(repo, &url, None).await? {
-                let why = format!("the GitHub App cannot read {repo}: HTTP {status}: {message}");
-                return Err(Fatal(why).into());
+            if skipped.skips(repo) {
+                continue;
             }
+            let url = self.api.url(&format!("repos/{repo}"));
+            match self.api.get(repo, &url, None).await {
+                Ok(Got::Refused { status, message }) => {
+                    eprintln!(
+                        "agent: github: the GitHub App cannot read {repo}: HTTP {status}: \
+                         {message}; {repo} is left out until the agent restarts"
+                    );
+                    skipped.refused.insert(repo.clone());
+                }
+                Ok(_) => {}
+                Err(err) => match absent(&err) {
+                    Some(wait) => skipped.wait(repo, wait),
+                    None => return Err(err),
+                },
+            }
+        }
+        if skipped.refused.len() == self.repos.len() {
+            let why = "the GitHub App cannot read any repository of forge.repos";
+            return Err(Fatal(why.to_owned()).into());
         }
         Ok(bot)
     }
@@ -432,69 +486,98 @@ impl GithubSource {
     }
 
     /// One read of every listing: the new Triggers, oldest first. `state`
-    /// moves past what was read.
-    async fn poll(&self, bot: &Bot, state: &mut State) -> Result<Vec<Trigger>> {
-        let identities = self.api.identities().as_ref();
+    /// moves past what was read. A repository the App is missing from or
+    /// suspended on is left out until its wait is over; any other error is
+    /// the whole poll's, since it may be GitHub's or the network's.
+    async fn poll(
+        &self,
+        bot: &Bot,
+        state: &mut State,
+        skipped: &mut Skipped,
+    ) -> Result<Vec<Trigger>> {
         let mut etags = BTreeMap::new();
         let mut batch = Vec::new();
         for repo in &self.repos {
-            // Open pull requests by head commit, read once a run needs them.
-            let mut pulls = None;
-            for feed in Feed::ALL {
-                if feed == Feed::Runs && state.no_runs.contains(repo) {
-                    continue;
-                }
-                let since = state
-                    .cursor
-                    .position(repo, feed)
-                    .at
-                    .saturating_sub(OVERLAP_MS);
-                let items = match self
-                    .list(repo, feed, since, &state.etags, &mut etags)
-                    .await?
-                {
-                    Listing::Items(items) => items,
-                    Listing::Unchanged => continue,
-                    Listing::Refused(status, message) => {
-                        let what = feed.key();
-                        eprintln!("agent: github: cannot read {repo} {what}: {status}: {message}");
-                        if feed == Feed::Runs {
-                            eprintln!("agent: github: CI results from {repo} are off");
-                            state.no_runs.insert(repo.clone());
-                        }
-                        continue;
-                    }
-                };
-                for item in &items {
-                    // Older items were read before, or predate the first read.
-                    let time = feed.time(item).filter(|time| *time >= since);
-                    let trigger = match feed {
-                        _ if time.is_none() => None,
-                        Feed::Issues => opened(repo.as_str(), item, bot, identities),
-                        Feed::Comments => commented(repo.as_str(), item, bot, identities, false),
-                        Feed::ReviewComments => {
-                            commented(repo.as_str(), item, bot, identities, true)
-                        }
-                        Feed::Runs => self.failed(repo, item, &mut pulls).await?,
-                    };
-                    let position = state.cursor.position(repo, feed);
-                    if let Some(updated) = item["updated_at"].as_str().and_then(utc::parse) {
-                        position.at = position.at.max(updated);
-                    }
-                    if let (Some(time), Some(trigger)) = (time, trigger)
-                        && position.seen.insert(trigger.id.to_string(), time).is_none()
-                    {
-                        batch.push(trigger);
-                    }
-                }
-                let position = state.cursor.position(repo, feed);
-                let floor = position.at.saturating_sub(OVERLAP_MS);
-                position.seen.retain(|_, time| *time >= floor);
+            if skipped.skips(repo) {
+                continue;
+            }
+            let read = self
+                .poll_repo(repo, bot, state, &mut etags, &mut batch)
+                .await;
+            match read {
+                Ok(()) => {}
+                Err(err) => match absent(&err) {
+                    Some(wait) => skipped.wait(repo, wait),
+                    None => return Err(err),
+                },
             }
         }
         state.etags = etags;
         batch.sort_by_key(|trigger| trigger.at_ms);
         Ok(batch)
+    }
+
+    /// The new Triggers of one repository, added to `batch`. What was read
+    /// before an error stays read: the position moves only past what was
+    /// handled.
+    async fn poll_repo(
+        &self,
+        repo: &RepoName,
+        bot: &Bot,
+        state: &mut State,
+        etags: &mut BTreeMap<String, String>,
+        batch: &mut Vec<Trigger>,
+    ) -> Result<()> {
+        let identities = self.api.identities().as_ref();
+        // Open pull requests by head commit, read once a run needs them.
+        let mut pulls = None;
+        for feed in Feed::ALL {
+            if feed == Feed::Runs && state.no_runs.contains(repo) {
+                continue;
+            }
+            let since = state
+                .cursor
+                .position(repo, feed)
+                .at
+                .saturating_sub(OVERLAP_MS);
+            let items = match self.list(repo, feed, since, &state.etags, etags).await? {
+                Listing::Items(items) => items,
+                Listing::Unchanged => continue,
+                Listing::Refused(status, message) => {
+                    let what = feed.key();
+                    eprintln!("agent: github: cannot read {repo} {what}: {status}: {message}");
+                    if feed == Feed::Runs {
+                        eprintln!("agent: github: CI results from {repo} are off");
+                        state.no_runs.insert(repo.clone());
+                    }
+                    continue;
+                }
+            };
+            for item in &items {
+                // Older items were read before, or predate the first read.
+                let time = feed.time(item).filter(|time| *time >= since);
+                let trigger = match feed {
+                    _ if time.is_none() => None,
+                    Feed::Issues => opened(repo.as_str(), item, bot, identities),
+                    Feed::Comments => commented(repo.as_str(), item, bot, identities, false),
+                    Feed::ReviewComments => commented(repo.as_str(), item, bot, identities, true),
+                    Feed::Runs => self.failed(repo, item, &mut pulls).await?,
+                };
+                let position = state.cursor.position(repo, feed);
+                if let Some(updated) = item["updated_at"].as_str().and_then(utc::parse) {
+                    position.at = position.at.max(updated);
+                }
+                if let (Some(time), Some(trigger)) = (time, trigger)
+                    && position.seen.insert(trigger.id.to_string(), time).is_none()
+                {
+                    batch.push(trigger);
+                }
+            }
+            let position = state.cursor.position(repo, feed);
+            let floor = position.at.saturating_sub(OVERLAP_MS);
+            position.seen.retain(|_, time| *time >= floor);
+        }
+        Ok(())
     }
 
     /// The items of one listing since `since`, following its pages.
