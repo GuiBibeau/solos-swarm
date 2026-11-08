@@ -112,11 +112,12 @@ impl Exposure {
         }
         visible.extend(host.state_dir.as_ref().map(|state| state.join(TICKETS_DIR)));
         // The repositories' installed dependencies, which a Ticket's run_code
-        // mounts, and the package manager that built them and that it runs.
+        // mounts, and the package manager that built them and that it runs (a
+        // toolchain's whole directory, for cargo).
         visible.extend(host.state_dir.as_ref().map(|state| state.join(DEPS_DIR)));
         if let Some(forge) = &config.forge {
             let binaries = forge.repos().values().filter_map(|repo| repo.deps.as_ref());
-            visible.extend(binaries.filter_map(DepsConfig::binary_path));
+            visible.extend(binaries.filter_map(DepsConfig::mounted_path));
         }
         visible.extend(host.node.as_deref().map(|node| node_root(node).to_owned()));
         visible.extend(host.pi_root.clone());

@@ -22,7 +22,9 @@ Once per box:
 2. Install the build tools for the user that runs the agent: rustup with toolchain 1.96.0 under `~/.cargo/bin`, `npm`,
    and Node 24.18.0 at `~/.local/opt/node-v24.18.0-linux-x64/`.
 3. Install `bwrap` and `prlimit`, which the sandboxes need. For a repository with `deps`
-   ([below](#install-a-repositorys-dependencies-and-require-evidence)), also install `bun` at `~/.bun/bin/bun`.
+   ([below](#install-a-repositorys-dependencies-and-require-evidence)), also install `bun` at `~/.bun/bin/bun`, or for
+   `kind: cargo` the toolchain from step 2 (the repository's `deps.binary` names its `cargo`) and `cc` from
+   `build-essential`.
 4. Turn on lingering for that user (`loginctl enable-linger <user>`), so its units start at boot with nobody logged in.
 5. Write `~/agent/agent.yaml` ([the production config](#the-production-config)) and store the tokens it names
    ([Store a token](#store-a-token)). A deploy refuses to switch without the config. A deploy makes
@@ -391,6 +393,11 @@ forge:
 The box needs `bun`, `bwrap` and `prlimit`. Keep `state/` off a tmpfs, because a cache holds many files. `agent prune`
 removes a cache no Ticket has used for its `--keep-days`. What the mechanism trusts and what it leaves to CI is in
 [Install dependencies and require evidence](how-to/repositories.md#install-dependencies-and-require-evidence).
+
+A Rust repository, `GuiBibeau/solos-swarm` here, asks for `deps: {kind: cargo, binary: <toolchain>/bin/cargo}` instead,
+and its Tickets then build and test offline. The box needs the toolchain, `cc`, `bwrap` and `prlimit`, and no
+`run_code.mounts` entry:
+[Build a Rust repository offline](how-to/repositories.md#build-a-rust-repository-offline).
 
 ## Memory and the dream
 

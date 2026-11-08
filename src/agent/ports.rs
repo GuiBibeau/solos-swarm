@@ -3,7 +3,7 @@
 //! Adapters never write state: they report facts, and the runtime applies
 //! them as Engine commands.
 
-use super::config::EvidenceConfig;
+use super::config::{DepsKind, EvidenceConfig};
 use crate::code::Extras;
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -380,6 +380,8 @@ pub enum Dependencies {
     Ready {
         /// What the cache is keyed by, for the worker's prompt and the log.
         key: String,
+        /// Which package manager built it, for what the worker is told.
+        kind: DepsKind,
         extras: Extras,
     },
     /// The build could not run, in one line the worker reads. The Ticket goes

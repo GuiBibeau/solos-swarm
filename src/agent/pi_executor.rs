@@ -7,7 +7,7 @@
 //! and a launch past that waits for a slot.
 
 use super::broker::{self, AgentBroker, ModelFailure, WorkerSeat, browser, clip};
-use super::config::{EvidenceConfig, HarnessKind};
+use super::config::{DepsKind, EvidenceConfig, HarnessKind};
 use super::dream;
 use super::earlier;
 use super::environment::{self, Launchable};
@@ -314,7 +314,10 @@ fn repository_text(workspace: &Workspace, owes: Deliverable, deps: &Dependencies
 fn dependencies_text(deps: &Dependencies) -> Option<String> {
     match deps {
         Dependencies::None => None,
-        Dependencies::Ready { .. } => Some(
+        Dependencies::Ready {
+            kind: DepsKind::Bun,
+            ..
+        } => Some(
             "Dependencies: the repository's are installed, read-only, in /work/node_modules and in \
              each workspace's node_modules (the host built them from the lockfile at the base \
              commit). `bun` and `node` are on PATH, and both are the host's bun, so the \
@@ -324,10 +327,24 @@ fn dependencies_text(deps: &Dependencies) -> Option<String> {
              command ends."
                 .to_owned(),
         ),
+        Dependencies::Ready {
+            kind: DepsKind::Cargo,
+            ..
+        } => Some(
+            "Dependencies: the repository's crates are vendored, read-only, from the lockfile at \
+             the base commit, and cargo is set to build from them offline. `cargo` and `rustc` \
+             are on PATH (the host's toolchain), so `cargo build`, `cargo test` and `cargo check` \
+             run in /work with run_code. Output goes to /work/target, which git ignores. A build \
+             of a big crate takes minutes, so start it with job_start and wait for it: a run_code \
+             call stops at 300 seconds. The sandbox is offline: a dependency you add, or a \
+             lockfile change that needs a crate the host did not vendor, cannot be fetched, and \
+             cargo says so. HOME is a temporary directory that is gone when the command ends."
+                .to_owned(),
+        ),
         Dependencies::Unavailable { why } => Some(format!(
             "Dependencies: the host could not install the repository's ({why}). The sandbox is \
-             offline, so scripts that need node_modules cannot run here: do not claim checks you \
-             could not run, and say so when you report."
+             offline, so a command that needs them cannot run here: do not claim checks you could \
+             not run, and say so when you report."
         )),
     }
 }
@@ -1233,10 +1250,10 @@ async fn failed(
 mod tests {
     use super::{
         MEMORY, PREPARED, PiExecutor, PiExecutorParts, QUIET_TURN, WORK_DIR, WORKER_INSTRUCTIONS,
-        assignment_text, delivery_text, repository_text, system_prompt,
+        assignment_text, delivery_text, dependencies_text, repository_text, system_prompt,
     };
     use crate::agent::broker::{AgentBroker, BrokerParts, DecideTerms, ModelTerms, WorkerParts};
-    use crate::agent::config::{EvidenceConfig, HarnessKind};
+    use crate::agent::config::{DepsKind, EvidenceConfig, HarnessKind};
     use crate::agent::environment::{ExecutionEnvironment, Nodes, Offline, Work};
     use crate::agent::jobs::JobLimits;
     use crate::agent::ports::{
@@ -1787,6 +1804,7 @@ mod tests {
         });
         let ready = Dependencies::Ready {
             key: "k".repeat(64),
+            kind: DepsKind::Bun,
             extras: crate::code::Extras::default(),
         };
         let down = Dependencies::Unavailable {
@@ -1815,6 +1833,29 @@ mod tests {
             assert!(installed.contains(told), "{told}: {installed}");
         }
         assert!(!installed.contains("must carry evidence"));
+
+        let vendored = Dependencies::Ready {
+            key: "k".repeat(64),
+            kind: DepsKind::Cargo,
+            extras: crate::code::Extras::default(),
+        };
+        let crates = repository_text(&widgets(None), Deliverable::PullRequest, &vendored);
+        for told in [
+            "crates are vendored, read-only, from the lockfile at the base commit",
+            "`cargo` and `rustc` are on PATH",
+            "start it with job_start",
+            "the sandbox is offline",
+        ] {
+            assert!(
+                crates.to_lowercase().contains(&told.to_lowercase()),
+                "{told}: {crates}"
+            );
+        }
+        let cargo_deps = dependencies_text(&vendored).unwrap();
+        assert!(
+            !cargo_deps.contains("node_modules") && !cargo_deps.contains("bun"),
+            "the cargo dependencies note does not speak of bun: {cargo_deps}"
+        );
 
         let failed = repository_text(&widgets(None), Deliverable::PullRequest, &down);
         assert!(

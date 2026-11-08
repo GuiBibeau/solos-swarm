@@ -18,12 +18,13 @@ forge:
       about: The agent's own code, Rust and TypeScript.   # the Router reads this
       base: main                           # each clone starts at its tip
       budget_microusd: 3000000             # an accept that names no budget gets this
-      notes: Rust is at /rust/bin and its crates at /cargo; build offline.   # the worker reads this
+      notes: Tests run with cargo test -p solos-agent-core --offline.   # the worker reads this
       owes: pull_request                   # answer (the default), change or pull_request
       # protected: [".github/**"]          # paths no commit may change (a merge by its own edits)
       # max_pushes: 6                      # heads published for one Ticket, review rounds included
       # max_change_bytes: 5000000          # the largest change a ready is admitted with
       # deps: {kind: bun}                  # install the base's dependencies for every Ticket's run_code
+      #                                    # (kind: cargo, with a binary, vendors a Rust repository's crates)
       # evidence: {command: "bun run solos dev verify --scope unit --json"}
 ```
 
@@ -43,6 +44,10 @@ credential of its own. Its mirror fetches with a read token that the App mints f
 
 `run_code` has no network, so a build must work offline. Mount the toolchains a repository needs with
 `executor.run_code.mounts`, and say where they are in the repository's `notes`.
+
+A Rust repository needs neither: `deps: {kind: cargo}` mounts the toolchain it names and the crates, read-only, into
+that repository's Tickets and no others ([Build a Rust repository offline](#build-a-rust-repository-offline)). Do not
+mount `~/.cargo` for it: it holds registry credentials.
 
 ## Choose what a Ticket owes
 
@@ -94,6 +99,55 @@ forge:
 How the cache is built and mounted, and what the evidence gate checks:
 [Installed dependencies](../repository-tickets.md#installed-dependencies) and
 [Evidence](../repository-tickets.md#evidence).
+
+## Build a Rust repository offline
+
+A worker's sandbox has no network and no Rust toolchain, so it could not compile or test a change to a Rust repository,
+and the first build of what it wrote was CI's. `deps: {kind: cargo}` lets a worker run `cargo build` and `cargo test`
+in `run_code`, offline. The host runs `cargo vendor --locked` for the base branch's `Cargo.lock` once per lockfile, in
+a sandbox that has the network, crates.io only, and no build script. Every Ticket on the repository mounts the crates
+and the toolchain read-only, and cargo is set to the vendored sources and to offline.
+
+```yaml
+# agent.yaml
+forge:
+  repos:
+    GuiBibeau/solos-swarm:
+      about: solos-swarm, the agent's own code (Rust and TypeScript).
+      base: main
+      owes: pull_request
+      deps:
+        kind: cargo
+        # Required, and the cargo of one toolchain, not rustup's proxy at ~/.cargo/bin/cargo.
+        binary: /home/debian/.rustup/toolchains/1.96.0-x86_64-unknown-linux-gnu/bin/cargo
+        # memory_bytes: 17179869184   # the address space of `rustc` in run_code; 16 GiB by default, 6 GiB is enough
+      notes: Test a crate with `cargo test -p solos-agent-core --offline`. Build the root crate with job_start.
+```
+
+- The host needs the toolchain, `cc` (`build-essential`), `bwrap` and `prlimit`. `rustup which cargo --toolchain 1.96.0`
+  prints the path for `binary`. The toolchain is the one the repository's CI uses, so a worker's build is CI's.
+- The toolchain comes in through `deps.binary`, not `executor.run_code.mounts`: the whole directory of the toolchain
+  (833 MiB for 1.96.0) is bound read-only into the build and into this repository's Tickets, with `cargo` and `rustc` on
+  `PATH`, and into no other Ticket. Do not mount `~/.cargo` or `~/.rustup` for it: `~/.cargo` holds registry
+  credentials. `notes` does not need to say where Rust is.
+- Crates go in `<state>/deps/<owner>/<name>/<key>/vendor`. For `solos-swarm` that is 476 crates, 374 MiB and about 23,500
+  files, built in a few seconds. Keep `<state>` off a tmpfs.
+- A Ticket builds into `/work/target`, in its clone, on disk. A full debug build of `solos-swarm` with every test
+  target takes about 1 GiB there (the sandbox turns debug info off). The host puts `/target/` in the clone's
+  `.git/info/exclude`, so `git add -A` and `git status` ignore it.
+- A lockfile that names a git dependency or a private registry, and a manifest with a `git` or `registry` key or a
+  `[patch]` table, is refused, and the worker is told. Everything the host fetches is from crates.io.
+- A worker cannot add a dependency: the sandbox is offline, and the host vendored what `Cargo.lock` names. Cargo says
+  `no matching package named ... found` and the worker reports it.
+- `run_code` stops a command at 300 s, and a process may use 300 s of CPU. The worker's prompt tells it to start long
+  builds with `job_start`, which runs up to `executor.run_code.job_max_secs`.
+- The sandbox's file limit is 256 MiB. The sandbox sets `CARGO_INCREMENTAL=0` and `CARGO_PROFILE_DEV_DEBUG=0` so that
+  a big crate stays under it: the library of `solos-swarm` is 235 MB, and a crate whose single output passes 256 MiB is
+  killed with `signal: 25`. If one grows to that, the smallest fix is a per-repository file size limit beside
+  `deps.memory_bytes`, not a bigger limit for every sandbox.
+
+How it works and what it trusts: [Cargo](../repository-tickets.md#cargo). The fields:
+[configuration](../configuration.md#repository-settings).
 
 ## Keep `prepare` away from repository code
 

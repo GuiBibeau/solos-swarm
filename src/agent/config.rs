@@ -363,19 +363,26 @@ impl Default for RepoConfig {
 
 /// `forge.repos.<repo>.deps`: the host builds, from the base branch's
 /// lockfile and package manifests alone, a directory of installed dependencies,
-/// and each Ticket's `run_code` mounts it read-only at the repository's
-/// `node_modules` paths. The build runs in its own sandbox that reaches the
-/// network (the only place on the host's behalf that does besides the
-/// browser), with no home, token, vault or agent state, no lifecycle script
-/// (so no code of the repository runs), and the default npm registry only: a
-/// repository's `bunfig.toml` and `.npmrc` are never read.
+/// and each Ticket's `run_code` mounts it read-only: at the repository's
+/// `node_modules` paths for `bun`, as the source of every crate for `cargo`.
+/// The build runs in its own sandbox that reaches the network (the only place
+/// on the host's behalf that does besides the browser), with no home, token,
+/// vault or agent state, no lifecycle or build script (so no code of the
+/// repository runs), and the default registry only (npm's, or crates.io): a
+/// repository's `bunfig.toml`, `.npmrc` and `.cargo/config.toml` are never
+/// read.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DepsConfig {
     pub kind: DepsKind,
     /// The package manager's executable, an absolute path. For `bun`, by
-    /// default `$HOME/.bun/bin/bun`. It is bound read-only into the build
-    /// sandbox and, as `bun` and as `node`, into every Ticket's.
+    /// default `$HOME/.bun/bin/bun`; it is bound read-only into the build
+    /// sandbox and, as `bun` and as `node`, into every Ticket's. For `cargo`,
+    /// required: the `cargo` of one toolchain, such as
+    /// `~/.rustup/toolchains/1.96.0-x86_64-unknown-linux-gnu/bin/cargo` (not
+    /// rustup's proxy). That toolchain's directory is bound read-only into the
+    /// build sandbox and into every Ticket's, with `cargo`, `rustc` and the
+    /// rest on `PATH`.
     #[serde(default)]
     pub binary: Option<PathBuf>,
     /// The longest a build may run.
@@ -388,7 +395,8 @@ pub struct DepsConfig {
     /// The address space the repository's commands may use in a Ticket's
     /// `run_code`, in place of `executor.run_code.memory_bytes` where that is
     /// lower: bun (JavaScriptCore) reserves a great deal of it and aborts
-    /// under about 8 GiB. A cap on address space, not on memory used, and
+    /// under about 8 GiB, and `rustc` fails to allocate while it compiles a
+    /// big crate under 4 GiB. A cap on address space, not on memory used, and
     /// only for Tickets on this repository.
     #[serde(default = "deps_memory_bytes")]
     pub memory_bytes: u64,
@@ -401,12 +409,16 @@ pub struct DepsConfig {
 pub enum DepsKind {
     /// `bun install --frozen-lockfile --ignore-scripts` from `bun.lock`.
     Bun,
+    /// `cargo vendor --locked` from `Cargo.lock`: every crate of the lockfile,
+    /// as the directory source that a Ticket's offline `cargo` builds from.
+    Cargo,
 }
 
 impl DepsKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Bun => "bun",
+            Self::Cargo => "cargo",
         }
     }
 }
@@ -429,8 +441,8 @@ fn deps_memory_bytes() -> u64 {
 }
 
 impl DepsConfig {
-    /// The package manager's executable: `binary`, or its usual place under
-    /// `$HOME`.
+    /// The package manager's executable: `binary`, or for `bun` its usual
+    /// place under `$HOME`.
     pub fn binary_path(&self) -> Option<PathBuf> {
         if let Some(binary) = &self.binary {
             return Some(binary.clone());
@@ -438,6 +450,17 @@ impl DepsConfig {
         let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
         match self.kind {
             DepsKind::Bun => Some(PathBuf::from(home).join(".bun/bin/bun")),
+            DepsKind::Cargo => None,
+        }
+    }
+
+    /// The host path a sandbox sees of the package manager: bun's file, a
+    /// toolchain's whole directory.
+    pub fn mounted_path(&self) -> Option<PathBuf> {
+        let binary = self.binary_path()?;
+        match self.kind {
+            DepsKind::Bun => Some(binary),
+            DepsKind::Cargo => binary.parent()?.parent().map(Path::to_owned),
         }
     }
 
@@ -445,7 +468,8 @@ impl DepsConfig {
         let binary = self.binary_path();
         ensure!(
             binary.as_ref().is_some_and(|binary| binary.is_absolute()),
-            "binary must be an absolute path (it defaults to $HOME/.bun/bin/bun, and HOME is not set)"
+            "binary must be an absolute path (bun's defaults to $HOME/.bun/bin/bun, and HOME is not \
+             set; cargo's has no default, so name the cargo of a toolchain)"
         );
         ensure!(
             DEPS_TIMEOUT_RANGE.contains(&self.timeout_secs),
@@ -2474,6 +2498,52 @@ forge:
                 "bun's usual place"
             );
         }
+    }
+
+    #[test]
+    fn a_cargo_repository_names_the_cargo_of_a_toolchain_and_has_no_default_for_it() {
+        let cargo = "/opt/rust/toolchains/1.96.0/bin/cargo";
+        let deps = |binary: &str| {
+            parse(&forged(|yaml| {
+                yaml.replace(
+                    "owes: pull_request",
+                    &format!("owes: pull_request\n      deps: {{kind: cargo{binary}}}"),
+                )
+            }))
+        };
+
+        let config = deps(&format!(", binary: {cargo}")).unwrap();
+
+        let repos = config.forge.unwrap();
+        let found = repos.repos()[&RepoName::try_from("acme/widgets".to_owned()).unwrap()]
+            .deps
+            .clone()
+            .unwrap();
+        assert_eq!(found.kind, DepsKind::Cargo);
+        assert_eq!(found.kind.as_str(), "cargo");
+        assert_eq!(found.binary_path(), Some(PathBuf::from(cargo)));
+        assert_eq!(
+            found.mounted_path(),
+            Some(PathBuf::from("/opt/rust/toolchains/1.96.0")),
+            "a sandbox sees the toolchain's whole directory, which the secret-path checks judge"
+        );
+        let bun = DepsConfig {
+            kind: DepsKind::Bun,
+            ..found
+        };
+        assert_eq!(
+            bun.mounted_path(),
+            Some(PathBuf::from(cargo)),
+            "and bun's only the file"
+        );
+        let why = format!("{:#}", deps("").unwrap_err());
+        assert!(
+            why.contains("forge.repos.acme/widgets.deps: binary must be an absolute path")
+                && why.contains("cargo's has no default"),
+            "{why}"
+        );
+        let why = format!("{:#}", deps(", binary: cargo").unwrap_err());
+        assert!(why.contains("binary must be an absolute path"), "{why}");
     }
 
     #[test]

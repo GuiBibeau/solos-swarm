@@ -809,15 +809,18 @@ fn open_without_links(path: &Path) -> std::io::Result<std::fs::File> {
 /// Keep what the dependency cache puts in the clone out of its commits and
 /// its `git status`: `node_modules` is mounted over the clone, and a tool the
 /// package manager runs may leave its own directory in `/work` (a dirty tree
-/// fails a repository's evidence check, and `git add -A` would commit it). The
-/// host writes this before any sandbox has touched the clone.
+/// fails a repository's evidence check, and `git add -A` would commit it): bun's
+/// `.bun`, cargo's `target`, which a repository that does not ignore it would
+/// otherwise commit by the gigabyte. The host writes this before any sandbox has
+/// touched the clone.
 fn exclude_installed(work: &Path, kind: DepsKind) -> Result<()> {
     let info = work.join(".git/info");
     std::fs::create_dir_all(&info).with_context(|| format!("cannot make {}", info.display()))?;
     let own = match kind {
-        DepsKind::Bun => "/.bun/\n",
+        DepsKind::Bun => "node_modules/\n/.bun/\n",
+        DepsKind::Cargo => "/target/\n",
     };
-    let text = format!("# solos-swarm: the host's dependency cache\nnode_modules/\n{own}");
+    let text = format!("# solos-swarm: the host's dependency cache\n{own}");
     std::fs::write(info.join("exclude"), text)
         .with_context(|| format!("cannot write {}", info.join("exclude").display()))
 }
