@@ -278,6 +278,13 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   free-disk floors. It tells the operator once an incident, keeps `state/watchdog-jobs.json`, and tells the same
   conversation once when the job is back. `agent publish` uploads the file as `jobs/index.json`, and the dashboard
   lists the jobs above the tickets.
+- Agent mode, Rust dependencies for a repository's workers (#127): `deps: {kind: cargo, binary:
+  <toolchain>/bin/cargo}` has the host run `cargo vendor --locked` for the base branch's `Cargo.lock`, once per
+  lockfile, in a bwrap sandbox that reaches crates.io and nothing else and compiles nothing. Every Ticket on the
+  repository mounts the vendored crates and the toolchain read-only and builds against them offline, with
+  `CARGO_HOME` of its own, so `cargo build` and `cargo test` run in `run_code` with no network. A lockfile that names
+  another source, and a manifest with a `git` or `registry` dependency or a `[patch]` table, is refused. New docs:
+  "Build a Rust repository offline".
 
 ### Changed
 
