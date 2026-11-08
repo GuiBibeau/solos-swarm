@@ -86,7 +86,9 @@ base. These checks apply:
 
 - The head descends from the commit the clone started from.
 - Every commit's author and committer is the bot, exactly.
-- No commit in the range changes a `protected` path, an intermediate commit included.
+- No commit in the range changes a `protected` path, an intermediate commit included. A merge commit counts by the
+  paths it changes itself (where it differs from every parent), and the range's net change from where the head forked
+  from the base counts too.
 - The change is within `max_change_bytes` and 2,000 files.
 
 Commits of a newer base that the worker merged in are the base's, and are not judged. A refusal is the

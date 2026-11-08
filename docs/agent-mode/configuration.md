@@ -329,7 +329,7 @@ Each entry of `forge.repos`, keyed `<owner>/<name>`:
 | `budget_microusd` | none | What an accept that names this repository and no budget gets. Above `policy.auto_approve_microusd`, it needs someone who can approve. |
 | `notes` | none | What the worker's prompt says about working in it, such as where its toolchain is. |
 | `owes` | `answer` | `answer`, `change` or `pull_request`: what a Ticket owes when the Router names nothing, and the most it may owe. `pull_request` needs `forge: github` and `github.writes: true`. |
-| `protected` | `[".github/**"]` | Paths no commit of the agent may change, as globs. ASCII case is ignored. |
+| `protected` | `[".github/**"]` | Paths no commit of the agent may change, as globs. A merge commit counts by the paths it changes itself. ASCII case is ignored. |
 | `max_pushes` | `6` | Heads the agent publishes for one Ticket, review rounds included. At least 1. |
 | `max_change_bytes` | `5000000` | The largest change a `ready` is admitted with, 1 to 50000000. |
 | `merge` | `ask` | `off`, `ask` or `auto`. Recorded in the Ticket's terms. Merging is not built yet. `auto` needs `ci: expected` and an approver. |

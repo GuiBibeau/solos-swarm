@@ -338,7 +338,7 @@ impl Mirrors {
         // The agent's own range: reachable from the head and from nothing on
         // the base, so a newer base merged in is not judged.
         let branch_tip = format!("refs/heads/{}^{{commit}}", proposal.base);
-        let on_base = run(
+        let tip = run(
             git_in(
                 mirror,
                 ["rev-parse", "--verify", "--quiet", branch_tip.as_str()],
@@ -346,9 +346,9 @@ impl Mirrors {
             "rev-parse",
         )
         .await
-        .is_ok();
+        .ok();
         let mut range = vec![head.to_owned(), "--not".into(), base.to_string()];
-        if on_base {
+        if tip.is_some() {
             range.push(format!("refs/heads/{}", proposal.base));
         }
         let listed = run_bytes(git_range(mirror, ["rev-list"], &range), "rev-list", None).await?;
@@ -408,17 +408,11 @@ impl Mirrors {
                 }));
             }
         }
-        // Per-commit changed paths, any commit in the range: GitHub judges
-        // the push, and a reviewer reads commit by commit. Merge commits show
-        // no paths here, as in `git log`; GitHub refuses a workflow file
-        // whatever commit carries it, since the App holds no such permission.
-        let plain = run_bytes(
-            git_range(mirror, ["rev-list", "--no-merges"], &range),
-            "rev-list",
-            None,
-        )
-        .await?;
-        let touched = run_bytes(
+        // What each commit in the range changes, as a reviewer reads it commit
+        // by commit, and as GitHub judges a push. A merge commit counts by its
+        // own edits (`-c`: the paths where it differs from every parent), so
+        // what it takes from the base is the base's and what it adds is not.
+        let mut touched = changed_paths(
             git_in(
                 mirror,
                 [
@@ -428,19 +422,40 @@ impl Mirrors {
                     "--name-only",
                     "-z",
                     "--no-renames",
+                    "--ignore-submodules=none",
                     "--root",
                     "--no-commit-id",
+                    "-c",
                 ],
             ),
-            "diff-tree",
-            Some(plain),
+            Some(listed.clone()),
         )
         .await?;
-        let touched: BTreeSet<String> = touched
-            .split(|b| *b == 0)
-            .filter(|path| !path.is_empty())
-            .map(|path| String::from_utf8_lossy(path).into_owned())
-            .collect();
+        // And what the range changes as a whole, from where the head forked
+        // from the base branch: the pull request's "Files changed". A merge
+        // that takes an older version of a path from a parent has no edit of
+        // its own there, and this is where it shows.
+        for fork in fork_points(mirror, base, head, tip.as_deref()).await? {
+            touched.extend(
+                changed_paths(
+                    git_in(
+                        mirror,
+                        [
+                            "diff-tree",
+                            "-r",
+                            "--name-only",
+                            "-z",
+                            "--no-renames",
+                            "--ignore-submodules=none",
+                            fork.as_str(),
+                            head,
+                        ],
+                    ),
+                    None,
+                )
+                .await?,
+            );
+        }
         let protected: Vec<String> = touched
             .iter()
             .filter(|path| paths::any(&terms.protected, path))
@@ -665,6 +680,46 @@ impl Mirrors {
             Err(why) => bail!("the staged bundle of {head} no longer fetches: {why}"),
         }
     }
+}
+
+/// The paths a `git diff-tree --name-only -z` lists. A rename is listed as
+/// the path it left and the path it entered, since rename detection is off.
+async fn changed_paths(diff: Command, stdin: Option<Vec<u8>>) -> Result<BTreeSet<String>> {
+    let listed = run_bytes(diff, "diff-tree", stdin).await?;
+    Ok(listed
+        .split(|b| *b == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect())
+}
+
+/// The commits the head forked from the base branch at: the best common
+/// ancestors of the branch's tip in the mirror and the head. It is the clone's
+/// base when the mirror has no such branch, or the branch was rewritten since.
+async fn fork_points(
+    mirror: &Path,
+    base: &CommitSha,
+    head: &str,
+    tip: Option<&str>,
+) -> Result<Vec<String>> {
+    let own = vec![base.to_string()];
+    let Some(tip) = tip else { return Ok(own) };
+    match status_of(git_in(mirror, ["merge-base", tip, head]), "merge-base").await? {
+        0 => {}
+        1 => return Ok(own),
+        other => bail!("git merge-base exited {other}"),
+    }
+    let found = run_bytes(
+        git_in(mirror, ["merge-base", "--all", tip, head]),
+        "merge-base",
+        None,
+    )
+    .await?;
+    let forks: Vec<String> = String::from_utf8_lossy(&found)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    Ok(if forks.is_empty() { own } else { forks })
 }
 
 /// `refs/solos/<ticket>/<head>`: the cache of one staged bundle in the mirror.

@@ -329,6 +329,11 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
 - Agent mode, `fetch_url` (#81): keyed and unkeyed, it goes through swarm mode's guard (`FetchGuard::open`), so
   loopback, private, link-local (cloud metadata) and CGNAT addresses are refused on every hop.
   `executor.fetch.allow_private_networks` turns the check off. The unkeyed fetch no longer uses proxy variables.
+- Agent mode, admission of merge commits (#121): the protected-path check read only non-merge commits, so a merge
+  commit could carry a change to `.github/actions/**`, `CODEOWNERS` or an owner's own `protected` globs and be
+  admitted. `Forge::admit` now reads every commit with `diff-tree -c`, so a merge commit counts by the paths it
+  changes itself, and checks the range's net diff from where the head forked from the base, which catches a merge
+  that puts an older protected file back.
 
 ## 2026-10-28
 

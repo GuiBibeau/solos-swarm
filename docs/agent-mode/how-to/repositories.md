@@ -20,7 +20,7 @@ forge:
       budget_microusd: 3000000             # an accept that names no budget gets this
       notes: Rust is at /rust/bin and its crates at /cargo; build offline.   # the worker reads this
       owes: pull_request                   # answer (the default), change or pull_request
-      # protected: [".github/**"]          # paths no commit of the agent may change
+      # protected: [".github/**"]          # paths no commit may change (a merge by its own edits)
       # max_pushes: 6                      # heads published for one Ticket, review rounds included
       # max_change_bytes: 5000000          # the largest change a ready is admitted with
       # deps: {kind: bun}                  # install the base's dependencies for every Ticket's run_code

@@ -237,7 +237,8 @@ pub enum Refusal {
         expected: String,
         base: CommitSha,
     },
-    /// Commits in the range change a protected path.
+    /// A commit in the range, or the range as a whole, changes a protected
+    /// path. A merge commit counts by its own edits.
     Protected {
         paths: Vec<String>,
         globs: Vec<String>,
@@ -286,10 +287,12 @@ impl Refusal {
                     String::new()
                 };
                 format!(
-                    "Not accepted: your commits change {}{more}, which is protected ({}). Nothing \
-                     was published. Rewrite history so no commit in {base}..HEAD touches it, for \
-                     example `git reset --soft {base}`, then `git restore --source={base} \
-                     --staged --worktree -- {}`, then `git commit`, and report ready again.",
+                    "Not accepted: your commits change {}{more}, which is protected ({}). A merge \
+                     commit counts by what it changes itself, and the change as a whole counts \
+                     too. Nothing was published. Rewrite history so no commit in {base}..HEAD \
+                     touches it, for example `git reset --soft {base}`, then `git restore \
+                     --source={base} --staged --worktree -- {}`, then `git commit`, and report \
+                     ready again.",
                     shown.join(", "),
                     globs.join(", "),
                     shown.first().copied().unwrap_or("<path>")

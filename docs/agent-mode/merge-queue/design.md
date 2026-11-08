@@ -63,20 +63,22 @@ All of the GitHub App's forge work is delivery. None of it merges.
   (`docs/agent-mode/how-to/mcp.md:69-70`).
 - **Schema.** `agent.db` is at version 9 (`crates/agent-store/src/schema.rs:4`).
 
-### A gap in today's admission
+### The gap in admission, closed
 
-The protected-path check reads `rev-list --no-merges` over the range (`src/agent/forge/mirror.rs:415-420`). It never
-asks what a merge commit changes beyond its parents, and only the file count reads the net diff (`:456-485`). A
-hostile worker can therefore change a protected path inside a merge commit's own tree: merge two of its own branches
+The protected-path check read `rev-list --no-merges` over the range (`src/agent/forge/mirror.rs:415-420`). It never
+asked what a merge commit changes beyond its parents, and only the file count read the net diff (`:456-485`). A
+hostile worker could therefore change a protected path inside a merge commit's own tree: merge two of its own branches
 with `--no-commit`, edit a protected file, and commit. Every commit in the range is by the bot, and no non-merge commit
-touches the path, so the bundle is admitted. `repository-tickets.md:89` says otherwise.
+touches the path, so the bundle was admitted. `repository-tickets.md:89` said otherwise.
 
-GitHub's missing `workflows` permission still stops `.github/workflows/**`. It does not stop the other paths that
+GitHub's missing `workflows` permission still stopped `.github/workflows/**`. It did not stop the other paths that
 `protected` exists for: `.github/actions/**` (composite actions that CI runs), `CODEOWNERS`, or an owner's own globs
-such as `vendor/**`. The test that admits a worker's merge of a newer base (`tests/agent_github.rs:5152-5183`) passes
-whatever the merge commit itself changes.
+such as `vendor/**`. The test that admitted a worker's merge of a newer base (`tests/agent_github.rs:5152-5183`)
+passed whatever the merge commit itself changed.
 
-A merge queue makes merge commits its main path, so this design closes the gap first, for every Ticket (Q0 in §7).
+Q0 (in §7) closed it for every Ticket, before any merge queue: admission reads each commit with `diff-tree -c`, so
+a merge commit counts by the paths where it differs from every parent, and it also checks the range's net diff from
+the head's fork point on the base branch, which catches a merge that puts an older protected file back.
 
 ## 3. What must stay true
 
@@ -280,10 +282,12 @@ conflicts }`.
   - H is an ancestor of the head (`NotDescendant`, `:330-337`), so no commit of the person's is rewritten or dropped;
   - every commit's author and committer is the bot (`:368-410`), so the person's name cannot be put on the worker's
     code;
-  - no non-merge commit touches a protected path (`:411-455`).
-- **New: merge commits are judged on what they themselves change** (Q0, every Ticket). For each merge commit in the
-  range, the host computes `git merge-tree --write-tree` of its parents in the mirror and diffs the commit's tree
-  against it. That diff is the merge's own edits. `protected` applies to it.
+  - no commit touches a protected path: a merge commit counts by what it changes itself, and the range's net change
+    from the fork point counts too.
+- **Merge commits are judged on what they themselves change** (Q0, every Ticket, landed). Admission reads each
+  commit with `diff-tree -c`, so a merge commit counts by the paths where it differs from every parent; the range's
+  net diff from the base fork is checked too. A later round may tighten this with `merge_edits`
+  (`sketch/02_forge.rs`).
 - **New, for a round:**
   - the round's first merge commit has exactly the parents `[H, B]`;
   - its own edits touch only `conflicts`, so a merge commit cannot carry a quiet change to a file that merged cleanly;
@@ -613,7 +617,7 @@ run on the remote box.
 
 | # | PR | Adds | The check |
 |---|---|---|---|
-| Q0 | **Admission judges merge commits** (a fix for every Ticket, landable now) | In `judge`, the merge-tree diff of each merge commit in the range against its parents, checked against `protected`. A `git >= 2.38` line in `agent github check`. The correction to `repository-tickets.md:89`. | Test 4. Every existing `agent_github` and `agent_forge` test passes unedited. |
+| Q0 | **Admission judges merge commits** (a fix for every Ticket, landed) | In `judge`, each commit is read with `diff-tree -c`, so a merge commit is judged by its own edits, and the range's net diff from the base fork is checked too. The correction to `repository-tickets.md:89`. | Test 4, plus the merge cases in `tests/agent_github.rs`: a merge that edits, adds, renames, links or submodules a protected path is refused, and so is one that puts an older protected file back. |
 | Q1 | **Watch** (GitHub App PR 3, re-planned) | As planned: `EventFeed`/`RestFeed`, the reconcile pass, `Observed::Seen`, `MessageKind::Status`, bounded CI repair for the bot's own PRs. Plus `observe(repo, pr)`, and the watched set fed from open Changes (queue entries join in Q3). V10. | PR 3's tests as planned. A completed run on a watched branch is one Nudge and no Trigger. Recipe `github-repair.md` as planned. |
 | Q2 | **Merge** (GitHub App PR 5, re-planned) | As planned: `merge_gate`, `Verdicts`, `Ask::Merge`, `Order::Merge`, `Engine::merge_verdict`, `outsiders`, `Forge::execute(Merge)`. Plus `PullView`, `pr` on the merge types, the full head in buttons, and the read-back's parent check. V11. | PR 5's gate table and tests as planned, plus test 5 for the bot's own PR. Recipe `github-ship.md` as planned. |
 | Q3 | **Queue, clean path** (usable: "merge #41, #42, #43" lands a stack that needs no resolution) | `queue:` config and `QueueTerms`; `router_decide`'s `plan: queue`; `Plan::Queue`, `Ticket.queue`, `queue_step`; preflight; `ForgeJob::Update` with the host merge; `PrBranch`; the watched set and the active-entry beat; `Withheld::Queued`; Continue and Stop; the per-PR report, `agent status` and the dashboard row; docs. Every conflict stops with a question. V12. | Tests 1, 2 (the `resolve: stop` half), 5, 6, 7 and 8. This PR meets #108's acceptance. Recipe `github-queue.md`. |
