@@ -123,9 +123,9 @@ pub trait MirrorAdditions {
 
     /// For each merge commit in the range: its tree against
     /// `merge-tree --write-tree` of its parents. The paths that differ are
-    /// the merge's own edits. Q0 runs this inside today's `judge` for every
-    /// Ticket and checks them against `protected`; a round also checks them
-    /// against its conflicts.
+    /// the merge's own edits. Q0 landed in today's `judge` with `diff-tree
+    /// -c` and the range's net diff, which needs no git >= 2.38; this is for
+    /// a round, which also checks the edits against its conflicts.
     fn merge_edits(
         &self,
         mirror: &Path,

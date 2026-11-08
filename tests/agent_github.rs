@@ -5466,9 +5466,10 @@ async fn a_bundle_whose_objects_are_malformed_is_refused_by_the_fsck_not_taken()
 }
 
 #[tokio::test]
-async fn a_conflict_repair_that_merged_a_newer_base_is_judged_on_its_own_commits_alone() {
+async fn a_conflict_repair_that_merged_a_newer_base_is_judged_on_its_own_commits_and_edits_alone() {
     let f = Forged::new("repair", |_| {}).await;
     let clone = f.clone_for("tk_1").await;
+    let rewriting = f.clone_for("tk_rewriting").await;
 
     // Meanwhile people land commits on main, one under `.github/`, as Alice.
     std::fs::create_dir_all(f.upstream.join(".github/workflows")).unwrap();
@@ -5497,6 +5498,265 @@ async fn a_conflict_repair_that_merged_a_newer_base_is_judged_on_its_own_commits
         .expect("the base's commits are the base's, not the agent's");
 
     assert_eq!(admitted.commits, 2, "its own commit and its own merge");
+
+    // The same merge, which also rewrites the protected file it took in: that
+    // edit is the worker's own.
+    as_worker(
+        &rewriting.work,
+        &["fetch", "-q", f.bare().to_str().unwrap(), "main"],
+    );
+    f.commit(&rewriting, "mine.txt", "mine");
+    as_worker(
+        &rewriting.work,
+        &["merge", "-q", "--no-commit", "--no-ff", "FETCH_HEAD"],
+    );
+    std::fs::write(
+        rewriting.work.join(".github/workflows/ci.yml"),
+        "on: pull_request_target\n",
+    )
+    .unwrap();
+    as_worker(&rewriting.work, &["add", "--", ".github/workflows/ci.yml"]);
+    as_worker(&rewriting.work, &["commit", "-q", "-m", "merge main"]);
+    let Err(Refusal::Protected { paths, .. }) = f.admit(&rewriting).await else {
+        panic!("a merge that rewrote a protected file was admitted")
+    };
+    assert_eq!(paths, [".github/workflows/ci.yml"]);
+}
+
+/// The worker's line and a side branch both grow from the clone's base, and the
+/// side is merged into the line. `edit` stages what the merge commit adds of
+/// its own, and `who` is the `-c` options of whoever commits it. The merge's id.
+fn merge_side(
+    f: &Forged,
+    clone: &Cloned,
+    edit: impl FnOnce(&std::path::Path),
+    who: &[&str],
+) -> String {
+    as_worker(&clone.work, &["checkout", "-q", "-b", "side"]);
+    f.commit(clone, "side.txt", "side");
+    as_worker(&clone.work, &["checkout", "-q", "main"]);
+    f.commit(clone, "mine.txt", "mine");
+    as_worker(
+        &clone.work,
+        &["merge", "-q", "--no-commit", "--no-ff", "side"],
+    );
+    edit(&clone.work);
+    let commit = [who, ["commit", "-q", "-m", "merge side"].as_slice()].concat();
+    as_worker(&clone.work, &commit);
+    as_worker(&clone.work, &["rev-parse", "HEAD"])
+}
+
+/// A repository whose base holds a protected file, in two versions.
+async fn forged_with_protected_files(name: &str) -> Forged {
+    let f = Forged::new(name, |terms| {
+        terms.protected = vec![".github/**".to_owned(), "vendor/**".to_owned()];
+    })
+    .await;
+    for (file, text, message) in [
+        (".github/CODEOWNERS", "* @alice\n", "owners"),
+        ("vendor/lib.txt", "lib\n", "vendor"),
+        (".github/CODEOWNERS", "* @alice @bob\n", "more owners"),
+    ] {
+        let path = f.upstream.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, text).unwrap();
+        git(&f.upstream, &["add", "-A"]);
+        git(&f.upstream, &["commit", "--quiet", "-m", message]);
+    }
+    git(
+        &f.upstream,
+        &["push", "--quiet", f.bare().to_str().unwrap(), "main"],
+    );
+    f
+}
+
+#[tokio::test]
+async fn a_merge_commit_is_judged_by_what_it_changes_itself() {
+    let f = forged_with_protected_files("merge-own-edits").await;
+
+    // A clean merge changes nothing of its own.
+    let clean = f.clone_for("tk_clean").await;
+    merge_side(&f, &clean, |_| {}, &[]);
+    let admitted = f.admit(&clean).await.expect("a clean merge is admitted");
+    assert_eq!(admitted.commits, 3, "the side, the line and the merge");
+
+    // The merge adds a file under `.github/` (not a workflow, which GitHub
+    // refuses by itself), with attributes in the tree that say to hide diffs
+    // and to filter what is staged.
+    let adds = f.clone_for("tk_adds").await;
+    f.commit(
+        &adds,
+        ".gitattributes",
+        ".github/** binary -diff -merge -text filter=hide\n",
+    );
+    merge_side(
+        &f,
+        &adds,
+        |work| {
+            let path = work.join(".github/actions/x/action.yml");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "runs: {using: node20, main: x.js}\n").unwrap();
+            as_worker(work, &["add", "--", ".github/actions/x/action.yml"]);
+        },
+        &[],
+    );
+    let refused = f.admit(&adds).await;
+    let Err(Refusal::Protected { paths, globs, .. }) = &refused else {
+        panic!("a merge that added a protected file was admitted: {refused:?}")
+    };
+    assert_eq!(paths, &[".github/actions/x/action.yml"]);
+    assert_eq!(globs, &[".github/**", "vendor/**"]);
+    let said = refused.unwrap_err().tell();
+    assert!(
+        said.contains(".github/actions/x/action.yml") && said.contains("A merge commit counts"),
+        "{said}"
+    );
+
+    // The merge edits a protected file that the base holds.
+    let edits = f.clone_for("tk_edits").await;
+    merge_side(
+        &f,
+        &edits,
+        |work| {
+            std::fs::write(work.join(".github/CODEOWNERS"), "* @mallory\n").unwrap();
+            as_worker(work, &["add", "--", ".github/CODEOWNERS"]);
+        },
+        &[],
+    );
+    let Err(Refusal::Protected { paths, .. }) = f.admit(&edits).await else {
+        panic!("a merge that edited CODEOWNERS was admitted")
+    };
+    assert_eq!(paths, [".github/CODEOWNERS"]);
+
+    // However the path is spelled.
+    let cased = f.clone_for("tk_cased").await;
+    merge_side(
+        &f,
+        &cased,
+        |work| {
+            let path = work.join(".GITHUB/Actions/y.yml");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "y\n").unwrap();
+            as_worker(work, &["add", "--", ".GITHUB/Actions/y.yml"]);
+        },
+        &[],
+    );
+    let Err(Refusal::Protected { paths, .. }) = f.admit(&cased).await else {
+        panic!("a merge that added .GITHUB/Actions was admitted")
+    };
+    assert_eq!(paths, [".GITHUB/Actions/y.yml"]);
+
+    // A protected file that becomes a link, and a submodule where there was none.
+    let linked = f.clone_for("tk_linked").await;
+    merge_side(
+        &f,
+        &linked,
+        |work| {
+            as_worker(work, &["rm", "-q", "--", ".github/CODEOWNERS"]);
+            std::fs::create_dir_all(work.join(".github")).unwrap();
+            std::os::unix::fs::symlink("../src/owners", work.join(".github/CODEOWNERS")).unwrap();
+            as_worker(work, &["add", "--", ".github/CODEOWNERS"]);
+        },
+        &[],
+    );
+    let Err(Refusal::Protected { paths, .. }) = f.admit(&linked).await else {
+        panic!("a merge that made CODEOWNERS a link was admitted")
+    };
+    assert_eq!(paths, [".github/CODEOWNERS"]);
+    let module = f.clone_for("tk_module").await;
+    merge_side(
+        &f,
+        &module,
+        |work| {
+            let at = format!("160000,{},vendor/mod", "1".repeat(40));
+            as_worker(work, &["update-index", "--add", "--cacheinfo", &at]);
+        },
+        &[],
+    );
+    let Err(Refusal::Protected { paths, .. }) = f.admit(&module).await else {
+        panic!("a merge that added a submodule under vendor/ was admitted")
+    };
+    assert_eq!(paths, ["vendor/mod"]);
+
+    // A rename into a protected path, and one out of it, both through a merge.
+    let into = f.clone_for("tk_into").await;
+    as_worker(&into.work, &["checkout", "-q", "-b", "side"]);
+    f.commit(&into, "docs/owners.txt", "* @mallory\n");
+    as_worker(&into.work, &["checkout", "-q", "main"]);
+    f.commit(&into, "mine.txt", "mine");
+    as_worker(
+        &into.work,
+        &["merge", "-q", "--no-commit", "--no-ff", "side"],
+    );
+    as_worker(&into.work, &["mv", "docs/owners.txt", ".github/owners.txt"]);
+    as_worker(&into.work, &["commit", "-q", "-m", "merge side"]);
+    let Err(Refusal::Protected { paths, .. }) = f.admit(&into).await else {
+        panic!("a merge that renamed a file into .github/ was admitted")
+    };
+    assert_eq!(paths, [".github/owners.txt"]);
+    let out = f.clone_for("tk_out").await;
+    merge_side(
+        &f,
+        &out,
+        |work| {
+            as_worker(work, &["mv", ".github/CODEOWNERS", "docs-owners.txt"]);
+        },
+        &[],
+    );
+    let Err(Refusal::Protected { paths, .. }) = f.admit(&out).await else {
+        panic!("a merge that renamed a file out of .github/ was admitted")
+    };
+    assert_eq!(paths, [".github/CODEOWNERS"]);
+}
+
+#[tokio::test]
+async fn a_merge_that_takes_an_older_protected_file_from_a_parent_is_refused() {
+    let f = forged_with_protected_files("merge-older").await;
+    let clone = f.clone_for("tk_older").await;
+    let older = git(&f.upstream, &["rev-parse", "HEAD~2"]);
+    f.commit(&clone, "mine.txt", "mine");
+    // Its own edits are nil: the file is as one of its parents has it. Only
+    // the change as a whole, against the base, shows it.
+    as_worker(
+        &clone.work,
+        &["checkout", "-q", &older, "--", ".github/CODEOWNERS"],
+    );
+    let tree = as_worker(&clone.work, &["write-tree"]);
+    let merge = as_worker(
+        &clone.work,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            "HEAD",
+            "-p",
+            &older,
+            "-m",
+            "merge",
+        ],
+    );
+    as_worker(&clone.work, &["reset", "-q", "--hard", &merge]);
+
+    let Err(Refusal::Protected { paths, .. }) = f.admit(&clone).await else {
+        panic!("a merge that put an older CODEOWNERS back was admitted")
+    };
+
+    assert_eq!(paths, [".github/CODEOWNERS"]);
+}
+
+#[tokio::test]
+async fn a_merge_commit_by_someone_else_is_refused_like_any_commit() {
+    let f = Forged::new("merge-identity", |_| {}).await;
+    let clone = f.clone_for("tk_gui").await;
+    let who = ["-c", "user.name=Gui", "-c", "user.email=gui@example.com"];
+
+    let merge = merge_side(&f, &clone, |_| {}, &who);
+
+    let Err(Refusal::Identity { commit, found, .. }) = f.admit(&clone).await else {
+        panic!("a merge commit by Gui was admitted")
+    };
+    assert_eq!(commit.as_str(), merge);
+    assert_eq!(found, "Gui <gui@example.com> as its author");
 }
 
 #[tokio::test]

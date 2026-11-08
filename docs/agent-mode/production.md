@@ -329,8 +329,9 @@ What `owes` allows on each repository of `forge.repos`:
 - `change`: the worker's commits stay in the Ticket's clone.
 - `pull_request`: a worker's `ready` opens a pull request as the bot, ready for review, on a branch
   `solos/<ticket>/<slug>` that only the agent writes. No commit may touch a path in `protected` (default
-  `.github/**`). Nothing merges. The config accepts `merge`, `ci`, `max_repairs` and `github.reconcile_secs`, and no
-  release acts on them yet. A config with `owes: pull_request` and `github.writes: false` does not load.
+  `.github/**`), a merge commit counting by the paths it changes itself. Nothing merges. The config accepts `merge`,
+  `ci`, `max_repairs` and `github.reconcile_secs`, and no release acts on them yet. A config with `owes:
+  pull_request` and `github.writes: false` does not load.
 
 To rotate the key, generate a second key in the App's settings, store it with `scripts/agent-deploy token
 github-app.pem`, run `scripts/agent-deploy restart`, then delete the first key on GitHub.
