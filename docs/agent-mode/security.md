@@ -28,6 +28,16 @@ open. The open items are marked **Open**.
 - `fetch_url` reaches the public internet only, unless `executor.fetch.allow_private_networks` is on
   ([What fetch_url can reach](runtime.md#what-fetch_url-can-reach)).
 
+## The host's own user
+
+A worker that escapes its sandbox, and anything the host runs on a repository's behalf (`git`, the dependency install),
+runs as the agent's user, with whatever that user can do. In production two things limit it. The units take away
+privilege escalation (`NoNewPrivileges`), dangerous system calls and socket families, and every write outside
+`~/agent/state` ([Hardening the units](production.md#hardening-the-units)). And the agent should run as a user of its own,
+with no sudo, no extra groups and no other services, so that there is nothing else to reach
+([Run the agent as its own user](production.md#run-the-agent-as-its-own-user)). The units limit what the user's
+processes do; only a dedicated user limits what the user owns.
+
 ## Operators over MCP
 
 `solos-swarm mcp --socket` adds no authority: the broker checks every call against the token's grants. With

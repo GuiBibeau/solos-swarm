@@ -23,7 +23,26 @@ Nice=19
 IOSchedulingClass=idle
 CPUWeight=5
 IOWeight=5
+# Hardening for a user unit, as in solos-agent.service. This unit runs no bwrap, so it also takes the options that
+# break one (RestrictSUIDSGID, ProtectKernelTunables, RestrictNamespaces=yes). It writes only the state directory and
+# its runtime directory.
 NoNewPrivileges=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallFilter=~@cpu-emulation @obsolete @raw-io @reboot @swap
+SystemCallErrorNumber=EPERM
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+ProtectClock=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/agent/state
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=solos-agent-prune

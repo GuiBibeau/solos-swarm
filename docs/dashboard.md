@@ -31,8 +31,9 @@ ssh remote-ai 'systemctl --user daemon-reload'
 
 The box has no source checkout, so the unit runs `dashboard_server.py` from a deployed candidate. Put
 `DASHBOARD_CANDIDATE=<candidate id>` in `~/.config/solos-swarm/dashboard.env` on the box. Use any candidate that
-holds `scripts/dashboard_server.py`. The unit only reads it. The port is 4173 unless that file also sets
-`DASHBOARD_PORT`.
+holds `scripts/dashboard_server.py`. The unit only reads it, and its systemd sandboxing keeps the whole file system
+read-only for it ([Hardening the units](agent-mode/production.md#hardening-the-units)). The port is 4173 unless that
+file also sets `DASHBOARD_PORT`.
 
 On the Mac:
 

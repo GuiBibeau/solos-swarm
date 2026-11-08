@@ -20,6 +20,10 @@
 # emergency rollback should; AGENT_DRAIN_SECS sets the default. The pause is lifted once the agent is healthy.
 #
 # The box (AGENT_HOST, default remote-ai) keeps everything under ~/agent; see scripts/systemd/solos-agent.service.
+# The agent runs as the user that SSH logs in as: the one AGENT_HOST names in your ssh config, or AGENT_USER when set
+# (AGENT_USER=solos-agent scripts/agent-deploy status). Nothing here assumes a user name or uid; the units' runtime
+# directories are /run/user/<that user's uid>/..., which agent.yaml must name. "Run the agent as its own user" in
+# docs/agent-mode/production.md moves an agent from one user to another.
 # When ~/agent/agent.yaml has a web.publish section (block style, as docs/agent-mode/production.md writes it), the
 # dashboard publisher, scripts/systemd/solos-agent-publish.service, is installed, enabled and restarted with the
 # agent by switch, rollback, start, stop and restart. It only reads agent.db, so it is stopped while agent.db is
@@ -37,7 +41,14 @@ PRUNE=solos-agent-prune
 # How long a command waits for running Assignments to reach a Report before it stops the agent anyway.
 DRAIN_SECS=${AGENT_DRAIN_SECS:-90}
 
-SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 "$HOST")
+if [[ -n ${AGENT_USER:-} && ! $AGENT_USER =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+	echo "AGENT_USER must be a user name, not $AGENT_USER" >&2
+	exit 2
+fi
+SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30)
+# -l beats the ssh config's User for this host, so one alias can serve the old user and the new one.
+if [[ -n ${AGENT_USER:-} ]]; then SSH+=(-l "$AGENT_USER"); fi
+SSH+=("$HOST")
 # This script runs on the box too: each command first installs it as ~/agent/.agent-deploy, so stdin stays free
 # for data (a release archive, a token).
 push_self() { "${SSH[@]}" "mkdir -p -m 0700 ~/agent && cat > ~/agent/.agent-deploy" < "$0"; }
@@ -50,6 +61,9 @@ if [[ ${1:-} == --on-host ]]; then
 	A=$HOME/agent
 	NODE=$HOME/.local/opt/node-v24.18.0-linux-x64/bin/node
 	export PATH=$HOME/.cargo/bin:$HOME/.local/opt/node-v24.18.0-linux-x64/bin:/usr/local/bin:/usr/bin:/bin
+	# `systemctl --user` finds the user's manager here. sshd's PAM sets it for a user with lingering; without it,
+	# the failure would be "Failed to connect to bus".
+	export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
 	sc() { systemctl --user "$@"; }
 	publishing() { # 0 when agent.yaml has web.publish: a `web:` block with a `publish:` key, or one on the web: line
 		awk '/^web:/ { inweb = 1; if ($0 ~ /publish:/) found = 1; next }
@@ -181,6 +195,7 @@ if [[ ${1:-} == --on-host ]]; then
 	}
 	switch() { # point current at release $1, remembering the old one as previous
 		local old
+		mkdir -p "$HOME/.config/systemd/user" # a user's first deploy has none
 		old=$(readlink "$A/current" 2>/dev/null || true)
 		ln -sfn "$1" "$A/current.new" && mv -T "$A/current.new" "$A/current"
 		[[ -n $old && $old != "$1" ]] && ln -sfn "$old" "$A/previous.new" && mv -T "$A/previous.new" "$A/previous"
@@ -223,6 +238,17 @@ if [[ ${1:-} == --on-host ]]; then
 		rel=$A/releases/$1
 		[[ -f $rel/.complete ]] || { echo "no built release $1" >&2; exit 1; }
 		[[ -f $A/agent.yaml ]] || { echo "no $A/agent.yaml: write the config first" >&2; exit 1; }
+		# The units' runtime directory is /run/user/<uid>/..., and agent.yaml names it. Another user's uid there
+		# means the agent would not find its tokens, so refuse before stopping a working agent.
+		uid=$(id -u)
+		other=$(grep -oE '/run/user/[0-9]+' "$A/agent.yaml" | grep -vx "/run/user/$uid" | sort -u | tr '\n' ' ' || true)
+		[[ -z $other ]] || {
+			echo "$A/agent.yaml names ${other}but this user (uid $uid) has /run/user/$uid: change token_file and key_file there" >&2
+			exit 1
+		}
+		# solos-agent.service can write only this directory (ReadWritePaths=), and a unit whose ReadWritePaths is
+		# missing does not start.
+		mkdir -p -m 0700 "$A/state"
 		hold_on
 		trap hold_off EXIT
 		drain "$DRAIN_SECS"
@@ -287,6 +313,7 @@ if [[ ${1:-} == --on-host ]]; then
 		fi
 		;;
 	status)
+		echo "user: $(id -un) (uid $(id -u))"
 		echo "release: $(basename "$(readlink "$A/current" 2>/dev/null || echo none)") (previous: $(basename "$(readlink "$A/previous" 2>/dev/null || echo none)"))"
 		sc status $UNIT --no-pager -n 0 | sed -n 1,5p || true
 		[[ -f $A/state/agent.db ]] && "$A/current/bin/solos-swarm" agent status --state-dir "$A/state" --config "$A/agent.yaml" || true
@@ -392,7 +419,7 @@ deploy)
 	repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 	git -C "$repo" fetch -q origin
 	sha=$(git -C "$repo" rev-parse --short=12 "$rev^{commit}")
-	echo "deploying $sha: $(git -C "$repo" log -1 --format=%s "$sha")"
+	echo "deploying $sha to ${AGENT_USER:+$AGENT_USER@}$HOST: $(git -C "$repo" log -1 --format=%s "$sha")"
 	push_self
 	git -C "$repo" archive "$sha" | host receive "$sha"
 	host build "$sha"
