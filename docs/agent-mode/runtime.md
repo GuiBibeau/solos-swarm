@@ -504,6 +504,8 @@ so it needs no account. To set it up, see [Get alerts from the Watchdog](how-to/
   with no cap raises nothing.
 - A pause that the state directory's `control.json` or `PAUSE` has held for 1h, timed from the file. A pause set in
   agent.yaml, or the peak window, raises nothing.
+- An external job (`watchdog.jobs`) that is down, stalled or low on disk. It is not a Ticket, and a pause does not hold
+  it. See [External jobs](#external-jobs).
 
 **Alert ids.** An id is `wd_` and a hash of the kind, the subject and a bucket of `repeat` (6h). The subject holds the
 problem's start where the Store has one: the launch or Report a stall counts from, the Report or step a wait counts
@@ -522,10 +524,58 @@ told again, so a restart tells nothing new, and an unsent row goes out at the ne
 working one, with the Reports the Watchdog saw, then calls `Engine::retry`, which spends from the same Ticket budget.
 It acts once per Ticket, and a second stall of the same Ticket is only told. It never widens a Mandate or a budget.
 
-**Status.** `solos-swarm agent status` shows the alerts `assess` would raise now, next to what is running and why.
+**Status.** `solos-swarm agent status` shows the alerts `assess` would raise now, next to what is running and why. The
+alerts for external jobs come from what the Watchdog last found, in `state/watchdog-jobs.json`: `agent status` checks
+nothing itself.
 
 The Watchdog runs inside `agent serve`, so it cannot tell anyone that `serve` is down. `agent health` does that from
 outside ([Check the agent from outside it](how-to/operate.md#check-the-agent-from-outside-it)).
+
+### External jobs
+
+The box runs work that agent mode does not own: a downloader as a systemd user unit, a data build in tmux, a training
+run that a script reports on. `watchdog.jobs` in agent.yaml lists them ([configuration.md](configuration.md#watchdog)),
+and the Watchdog looks at each one on every look, before it assesses. The code is `src/agent/external_jobs.rs`.
+
+**Status.** A job is `up`, or it is in one kind of trouble:
+
+- `down`: it does not run. A unit is not `active` or `reloading`, or is not loaded at all (a transient unit that ended
+  is gone). A tmux session does not exist. A pid file is missing, holds no number, or names a process that is not
+  running or is a zombie. A status command exits with anything but `0` or `2`, is killed by a signal, cannot be run or
+  does not finish within its `timeout`.
+- `stalled`: it runs, but its status command exits `2`, or its `progress.file` has not changed for `stalled_after`, or
+  does not exist. The detail names the time the file last changed, so it reads the same for as long as the job stays
+  stalled.
+- `low_disk`: it runs and makes progress, but the disk of `disk.path` has less than `min_free_gb` free, or its free
+  space cannot be read.
+
+Down outranks stalled, which outranks low on disk. A job that is down is not asked for its progress or its disk.
+
+**What runs.** The checks run on the host, as the agent's user, outside any sandbox, and only what agent.yaml names. A
+unit and a session are checked by validated names through `systemctl --user show` and `tmux has-session -t =NAME`. A
+`command` is a list that the owner wrote: no shell reads it, so no text is ever interpolated into a command line, and
+nothing a model wrote reaches one. Each program gets no input, an environment of only `PATH`, `HOME`, `USER`, `LOGNAME`,
+`LANG`, `LC_ALL`, `TMUX_TMPDIR`, `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR`, and its own process group. Past its
+timeout the whole group is killed. Of its output only the first 4 KB are kept, the detail is one line of at most 200
+characters, and control characters are dropped. All jobs are checked at once, so a job that hangs delays the look by
+its own timeout and no more. A command that leaves a background process holding its output counts as not finishing.
+
+**Incidents.** The Watchdog keeps `state/watchdog-jobs.json`: for each job, its status, its detail and when that
+status began, and when it last looked. That start is what makes an incident. A job's alert id hashes its name, its
+status and that start, with no `repeat` bucket, so one incident is one alert for as long as it lasts, a restart tells
+nothing new, and a job that comes back and fails again, or goes from down to stalled, is a new alert. When a job that
+the operator was told about is `up` again, the operator is told once more: `The job "l2book" (systemd unit
+l2book-download.service) is back up. It had been down for 12m.` That message is a `job_up` row in `watchdog_alerts`,
+and a job that was never told about has none. Flapping makes an alert and a recovery each time, because there is no
+hold-down. The state is written before the alerts are recorded, so a crash between the two can lose a recovery message
+and cannot repeat an alert.
+
+**The dashboard.** `agent publish` uploads that file as `jobs/index.json`, when its content changes and on every
+heartbeat, and the dashboard lists the jobs on its home page above the tickets
+([production.md](production.md#dashboard)). Without jobs, the file is not written and nothing is uploaded. A registry
+that is emptied leaves a file with no jobs, which clears the page.
+
+Spend per job is not watched here. The design for long-running work (#101, #102) owns it.
 
 ## Memory
 

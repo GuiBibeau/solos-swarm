@@ -5,10 +5,11 @@
 // Every function here takes a Viewer, which only a signed-in, allowed person's request can make (viewer.ts).
 
 import { get } from "@vercel/blob";
-import { FORMAT, type Index, type TicketSnapshot } from "./types";
+import { FORMAT, JOBS_FORMAT, type Index, type Jobs, type TicketSnapshot } from "./types";
 import type { Viewer } from "./viewer-core";
 
 export const INDEX_PATH = "tickets/index.json";
+export const JOBS_PATH = "jobs/index.json";
 
 /** Ticket ids are `tk_` and hex; anything else is not a path into the store. */
 export function validTicketId(id: string): boolean {
@@ -47,6 +48,17 @@ export async function readIndex(viewer: Viewer): Promise<Index | null> {
     throw new StoreError(`${INDEX_PATH} is in a format this dashboard does not know`);
   }
   return json as unknown as Index;
+}
+
+/** The external jobs, or null when the Watchdog has none to show (or the publisher has not uploaded them). */
+export async function readJobs(viewer: Viewer): Promise<Jobs | null> {
+  void viewer;
+  const json = await readJson(JOBS_PATH);
+  if (json === null) return null;
+  if (!isRecord(json) || json.v !== JOBS_FORMAT || !Array.isArray(json.jobs)) {
+    throw new StoreError(`${JOBS_PATH} is in a format this dashboard does not know`);
+  }
+  return json as unknown as Jobs;
 }
 
 /** One ticket's snapshot, or null when there is none (yet) or the id is not one. */

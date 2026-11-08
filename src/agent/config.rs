@@ -10,7 +10,9 @@ mod web;
 pub use health::HealthConfig;
 pub use nodes::{AllowedNode, NodesConfig};
 pub use sources::{Interval, ReplyTo, ScheduleConfig, TimeOfDay};
-pub use watchdog::{OperatorConfig, ThresholdsConfig, WatchdogConfig};
+pub use watchdog::{
+    DiskFloor, JobCheck, JobConfig, OperatorConfig, Progress, ThresholdsConfig, WatchdogConfig,
+};
 pub use web::{DEFAULT_API_URL, PublishConfig, WebConfig};
 
 use super::broker::ModelTerms;

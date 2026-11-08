@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const get = vi.fn();
 vi.mock("@vercel/blob", () => ({ get }));
 
-const { readIndex, readTicket, validTicketId, StoreError } = await import("@/lib/blob");
+const { readIndex, readJobs, readTicket, validTicketId, StoreError } = await import("@/lib/blob");
 import type { Viewer } from "@/lib/viewer-core";
 
 const viewer = { email: "g.bibeaulaviolette@gmail.com" } as Viewer;
@@ -57,5 +57,21 @@ describe("reading the published snapshots", () => {
     await expect(readIndex(viewer)).rejects.toThrow(StoreError);
     get.mockResolvedValueOnce({ statusCode: 200, stream: new Response("not json").body, blob: {} });
     await expect(readIndex(viewer)).rejects.toThrow(/not JSON/);
+  });
+
+  it("reads the external jobs from their own blob, and not from the cache", async () => {
+    const jobs = { v: 1, checked_ms: 5, jobs: [] };
+    get.mockResolvedValueOnce(found(jobs));
+    expect(await readJobs(viewer)).toEqual(jobs);
+    expect(get).toHaveBeenCalledWith("jobs/index.json", { access: "private", useCache: false });
+  });
+
+  it("answers null when no jobs were published, and refuses a jobs file in a format it does not know", async () => {
+    get.mockResolvedValueOnce(null);
+    expect(await readJobs(viewer)).toBeNull();
+    get.mockResolvedValueOnce(found({ v: 2, jobs: [] }));
+    await expect(readJobs(viewer)).rejects.toBeInstanceOf(StoreError);
+    get.mockResolvedValueOnce(found({ v: 1, checked_ms: 1 }));
+    await expect(readJobs(viewer)).rejects.toBeInstanceOf(StoreError);
   });
 });

@@ -1,7 +1,8 @@
 # agent-dashboard
 
 A web dashboard of [agent mode](../../docs/agent-mode/README.md)'s tickets, for one person on a phone or a laptop:
-what the agent is working on, what it was asked, everything it replied, and what it spent. It is a Next.js app (App
+what the agent is working on, what it was asked, everything it replied, and what it spent. It also lists the external
+jobs the Watchdog checks. It is a Next.js app (App
 Router, TypeScript) on Vercel at `https://agent.guibibeau.com`, behind **Sign in with Vercel**. It is not part of the
 Rust build.
 
@@ -11,6 +12,7 @@ the box (accepts no inbound connection)           Vercel
  solos-agent-publish --reads (read-only)-->        private Blob store  <--reads (server side)--  this app  <--  you
    builds JSON snapshots, uploads the ones          tickets/index.json                           Sign in with Vercel,
    whose content changed, over HTTPS                tickets/<ticket id>.json                     one allowed email
+                                                    jobs/index.json
 ```
 
 The publisher is `solos-swarm agent publish` on the box
@@ -21,9 +23,16 @@ uploaded. Nothing here can reach the box, and the box never serves a request.
 
 | Path | What |
 |---|---|
-| `/` | Open tickets first, then the latest ended: title, stage, who asked and from where, age, spend, the worker's state, and what a ticket waits for. It says when it was last synced and warns when the index is fifteen minutes old. It reloads its data every 20 s. |
+| `/` | The external jobs, if any (see below), then open tickets, then the latest ended: title, stage, who asked and from where, age, spend, the worker's state, and what a ticket waits for. It says when it was last synced and warns when the index is fifteen minutes old. It reloads its data every 20 s. |
 | `/tickets/<id>` | The request, the conversation in order (what was said to the ticket and every reply the agent sent, rendered as markdown), the worker's reports, the browser's pages, the decisions, the budget, and a link to the original Discord message or GitHub issue where one can be made. An open ticket reloads every 10 s. |
 | `/login` | "Sign in with Vercel". |
+
+**External jobs.** With `watchdog.jobs` in agent.yaml, the home page has an "External jobs" section above the tickets.
+Each job shows its name, how it is checked, a badge (`up`, `down`, `stalled` or `low on disk`), how long it has had that
+status, and what the last check found. Jobs in trouble come first. It says when the Watchdog last looked and warns when
+that was fifteen minutes ago, since then the statuses may be old. Without jobs, or before the publisher uploads them,
+the section is not there. The data is `jobs/index.json`, the Watchdog's `state/watchdog-jobs.json` as it is
+([runtime.md, External jobs](../../docs/agent-mode/runtime.md#external-jobs)).
 
 Discord replies link to ticket pages: `https://agent.guibibeau.com/tickets/<id>`. A link opened before the publisher
 has uploaded that ticket says so and checks again by itself.
@@ -167,5 +176,6 @@ from a store a scripted agent made, so they are what `agent publish` really buil
 PUBLISH_FIXTURE_DIR=web/agent-dashboard/tests/fixtures cargo test --test agent_publish -- fixtures
 ```
 
-`lib/types.ts` is the TypeScript side of `src/agent/publish/snapshot.rs`. Both carry the format version `v`, and the
-app refuses a file whose version it does not know.
+`lib/types.ts` is the TypeScript side of `src/agent/publish/snapshot.rs`, and, for the jobs, of `src/agent/external_jobs.rs`.
+Both carry the format version `v`, and the app refuses a file whose version it does not know. `tests/fixtures/jobs.json`
+is written by the same command.

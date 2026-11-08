@@ -1,0 +1,6 @@
+watchdog:
+  operator: {source: mcp, address: {operator: verifier, thread: ops}}
+  every: 5s
+  jobs:
+    - {name: verify-unit, unit: verify-job.service}
+    - {name: verify-tmux, tmux: verify-job}

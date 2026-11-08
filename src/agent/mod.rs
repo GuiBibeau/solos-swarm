@@ -10,6 +10,7 @@ pub mod discord;
 pub mod dream;
 mod earlier;
 pub mod environment;
+pub mod external_jobs;
 pub mod forge;
 pub mod github;
 pub mod goal_template;

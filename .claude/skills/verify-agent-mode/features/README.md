@@ -52,8 +52,9 @@ recipe is a plan.
 | [The owner's memory shapes later work](./memo-owner.md) | not yet | not yet |
 | [Workers remember, and the review decides](./memo-remember.md) | not yet | not yet |
 | [The daily dream checks memory against the transcripts](./dream.md) | not yet | not yet |
+| [Watch jobs that are not Tickets](./external-jobs.md) | not yet | not yet |
 
 These parts of agent mode have no recipe yet: swarm Tickets (`executor.swarm`, the Router choosing `Plan::Swarm`),
-schedules, remote nodes (`node serve`), Claude Code workers, the Watchdog's alerts, Slack, `agent bench`,
+schedules, remote nodes (`node serve`), Claude Code workers, the Watchdog's alerts about Tickets, Slack, `agent bench`,
 `agent health`, `agent prune`, `agent stop`, and `agent publish` with the web dashboard. Swarm mode itself
 (`solos-swarm run`) is verified by the repository's `skills/verify-solos-swarm`, not here.
