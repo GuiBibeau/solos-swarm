@@ -209,7 +209,7 @@ export const NOTES_FORMAT = 1;
 export type Note = {
   thread: string;
   at_ms: number;
-  kind: "accept" | "ignore" | "stop" | "unavailable";
+  kind: "accept" | "ignore" | "stop" | "unavailable" | "declined";
   reason: string;
 };
 export type Notes = { v: number; generated_at?: string; notes: Note[] };
