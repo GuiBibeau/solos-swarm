@@ -38,6 +38,8 @@ export type IndexRow = {
   updated_at: string;
   duration_ms?: number;
   source: string;
+  /** The conversation's address, when its source makes one (a web thread, a Discord message, a GitHub issue). */
+  source_url?: string;
   asker: Person;
   spent_microusd: number;
   budget_microusd?: number;
@@ -190,4 +192,14 @@ export type TicketSnapshot = {
   decisions: DecisionView[];
   assignments: AssignmentView[];
   browser?: BrowserView;
+};
+
+/** One message the dashboard wrote for the agent, in the private Blob inbox (`web/inbox.json`). */
+export type ChatMessage = {
+  id: string;
+  at_ms: number;
+  author: string;
+  name?: string;
+  text: string;
+  thread: string;
 };

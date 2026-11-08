@@ -9,15 +9,22 @@ Rust build.
 ```text
 the box (accepts no inbound connection)           Vercel
  solos-agent  --writes-->  agent.db
- solos-agent-publish --reads (read-only)-->        private Blob store  <--reads (server side)--  this app  <--  you
-   builds JSON snapshots, uploads the ones          tickets/index.json                           Sign in with Vercel,
-   whose content changed, over HTTPS                tickets/<ticket id>.json                     one allowed email
-                                                    jobs/index.json
+ solos-agent-publish --reads (read-only)-->        private Blob store  <--reads/writes (server side)--  this app  <--  you
+   builds JSON snapshots, uploads the ones          tickets/index.json                               Sign in with Vercel,
+   whose content changed, over HTTPS                tickets/<ticket id>.json                         one allowed email
+   and carries the web chat's inbox into the        jobs/index.json
+   agent's state (web/inbox.json --> triggers)      web/inbox.json
 ```
 
 The publisher is `solos-swarm agent publish` on the box
-([production.md, Dashboard](../../docs/agent-mode/production.md#dashboard)). This app only reads what the publisher
-uploaded. Nothing here can reach the box, and the box never serves a request.
+([production.md, Dashboard](../../docs/agent-mode/production.md#dashboard)). The app never reaches the box and the box
+never serves a request: a web message goes into `web/inbox.json` in the private store, the publisher turns it into a
+Trigger the agent already knows how to read (`kind: jsonl`), and the agent's replies come back in the published ticket
+snapshots. Discord and GitHub stay their own sources; the web chat is one more way in, not a replacement.
+
+The composer needs a signed-in, allowed person: the browser never holds the Blob token. `POST /api/chat` validates the
+thread and the text, writes the message with the server's token, and `GET /api/chat?t=<thread>` returns the thread's
+ticket and the command state for the 2-second poll.
 
 ## Pages
 
@@ -26,8 +33,8 @@ JetBrains Mono for figures. An unlabelled rail on the left (a bottom bar on a ph
 
 | Path | What |
 |---|---|
-| `/` | **Command.** The field (every Ticket a node, a running worker its satellite, the host at the centre), what needs you, the four numbers, and the latest tickets beside the external jobs. It says when it was last synced and warns when the index or the Watchdog is fifteen minutes old. It reloads every 20 s. |
-| `/chat` | **Chat.** The latest conversations in order, including each worker's reports, in a list beside the selected thread. The agent reads its configured channels, not this page, so the composer is a link to the source thread. |
+| `/` | **Chat, the home.** A live conversation with the agent: the selected thread in the middle, the recent web conversations on the left, and what the swarm is doing on the right (the field, the active Ticket's stage and worker, what needs you, the external jobs). It polls every 2 s, sends through the server, and keeps the thread in the address and in local storage. It also shows each worker's reports, so the work is visible in the thread. |
+| `/command` | **Command.** The full field (every Ticket a node, a running worker its satellite, the host at the centre), what needs you, the four numbers, and the latest tickets beside the external jobs. It warns when the index or the Watchdog is fifteen minutes old. It reloads every 20 s. |
 | `/tickets` | **Tickets.** Open and recently ended tickets; each row carries who asked and from where, its age or duration, its worker and its spend. |
 | `/tickets/<id>` | **One ticket.** The request, the conversation, the worker's reports, the scope, the facts and budget, the browser's pages, and the decisions; a link to the original Discord message or GitHub issue where one can be made. An open ticket reloads every 10 s. |
 | `/swarm` | **Swarm.** The full field and every worker, with the numbers. |

@@ -7,22 +7,22 @@ import { usePathname } from "next/navigation";
 const ITEMS = [
   {
     href: "/",
+    label: "Chat",
+    icon: (
+      <svg viewBox="0 0 18 18" fill="none" aria-hidden="true">
+        <path d="M2.5 3.5h13v8.6h-7.2L4.6 15v-2.9H2.5z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
+        <path d="M5.5 7h7M5.5 9.6h4.6" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+      </svg>
+    ),
+  },
+  {
+    href: "/command",
     label: "Command",
     icon: (
       <svg viewBox="0 0 18 18" fill="none" aria-hidden="true">
         <circle cx="9" cy="9" r="6.5" stroke="currentColor" strokeWidth="1.2" />
         <circle cx="9" cy="9" r="2" fill="currentColor" />
         <path d="M9 1v2.4M9 14.6V17M1 9h2.4M14.6 9H17" stroke="currentColor" strokeWidth="1.2" />
-      </svg>
-    ),
-  },
-  {
-    href: "/chat",
-    label: "Chat",
-    icon: (
-      <svg viewBox="0 0 18 18" fill="none" aria-hidden="true">
-        <path d="M2.5 3.5h13v8.6h-7.2L4.6 15v-2.9H2.5z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" />
-        <path d="M5.5 7h7M5.5 9.6h4.6" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
       </svg>
     ),
   },
