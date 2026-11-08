@@ -292,6 +292,9 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   `AGENT_USER`, makes the unit and state directories a user's first deploy needs, and refuses a config that names
   another uid's `/run/user` directory. `docs/agent-mode/production.md` gains "Hardening the units" and "Run the agent
   as its own user", a migration with rollback.
+- Verify skill (#120): `bin/launch.sh` takes `--keep-state`, which skips the `rm -rf` of a run's `state/`, so a crash
+  restart or a second start on the same day keeps its tickets, threads, memos and dream slot. `SKILL.md`'s restart
+  recipe uses it, and the feature docs that said a relaunch always empties `state/` say how to keep it.
 
 ### Fixed
 
