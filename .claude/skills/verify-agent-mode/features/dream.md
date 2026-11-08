@@ -6,7 +6,9 @@ host stages into its `/work`, read-only, a digest of each Ticket that ended, cop
 every live memo. Its model calls go with DeepSeek's thinking on at `max` effort and are charged to the `memory`
 account. It corrects a memo the transcripts contradict (`memo_propose` with `supersedes`), merges duplicates, retires
 stale memos (`memo_retire`) and proposes lessons that showed in two Tickets or more, each citing transcript lines that
-the host checks against the original files. The review decides its proposals, and the Watchdog's operator gets one
+the host checks against the original files. Only a worker's own words count: a line that is a tool's answer (a
+command's output included) or the prompt is outside text, which retires nothing, and a proposal that cites one is
+never reviewed and waits for the owner. The review decides its other proposals, and the Watchdog's operator gets one
 digest of what changed.
 
 ## Sub-features
@@ -14,8 +16,9 @@ digest of what changed.
 - `asked`: a day with an ended Ticket gets a `dream:<slot>` trigger and a Ticket whose mandate source and requester are `dream`. A day with none gets no trigger and no Ticket.
 - `staged`: the dream's `/work` holds `tickets/index.json`, one `tickets/<ticket>.json` per ended Ticket, `transcripts/<ticket>/<assignment>.rpc.jsonl`, and `memos/index.json`, each file mode `0444`. Each staged transcript's `sha256` in the index matches `sha256sum` of the original under `state/tickets/<ticket>/`.
 - `thinks`: the dream's transcript shows `thinking` blocks. The `memory` account has its spend rows. The dream's own `ticket:` account has none, and no other Ticket's calls went with thinking on.
-- `same-trap`: two real Tickets that hit the same trap (for example a `cargo test` in a repository whose tests run another way) lead the dream to propose one memo naming the trap. The memo cites a transcript line from each Ticket, with sources of kind `transcript`. The review keeps it, and the next Ticket's first prompt shows it.
+- `same-trap`: two real Tickets that hit the same trap (for example a `cargo test` in a repository whose tests run another way) lead the dream to propose one memo naming the trap. The memo cites a line from each Ticket in which the worker says it in its own words, with sources of kind `transcript` and trust `model`. The review keeps it, and the next Ticket's first prompt shows it.
 - `corrects`: an active memo the transcripts contradict ends `retired` with `replaced_by` naming the dream's kept correction, whose `supersedes` names it.
+- `output-waits`: a dream proposal that cites only a command's output is `external`, gets no `the review` line in `serve.log`, stays `proposed`, and the digest lists it as `Still waiting for you`. A `memo_retire` that cites such a line is refused with `outside text`.
 - `digest`: the Watchdog's operator conversation gets exactly one `Memory, <day>: ...` message per dream, with links to the Tickets it read. Restarting the agent the same day sends no second message and starts no second dream.
 
 ## How to get to it (user POV)
@@ -42,6 +45,7 @@ command: the queries below use the `q` helper in SKILL.md.
 
 - No Ticket ended since the last dream means no dream: the slot is noted in `state/dream-slot` and nothing is asked until the next day. Set `at` after your requests end.
 - A run with `--until-idle` never dreams.
+- `same-trap` needs workers that say what they found, not only commands that print it. A worker that ran `cargo test` and moved on without a word leaves the dream only command output to cite, which is `external`: the lesson then waits for the owner. That is the rule working, not a broken dream.
 - The dream may decide nothing needs changing. That is a valid outcome. Check its report (`agent status`) and transcript before calling the feature broken.
 - At `max` effort each of the dream's calls may take minutes. The Watchdog may report it `stalled` ("has gone quiet") if it sends no report for 30 minutes.
 - The digest waits up to 30 minutes for the review of the dream's proposals, then lists any proposal still waiting.

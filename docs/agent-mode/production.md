@@ -395,8 +395,10 @@ removes a cache no Ticket has used for its `--keep-days`. What the mechanism tru
 ## Memory and the dream
 
 Memory is on by default wherever workers run on Pi. Workers propose memos, a review call at DeepSeek's highest thinking
-effort decides each one, and once a day the dream checks the memos against the transcripts of the Tickets that ended.
-How it works is in [Memory](runtime.md#memory) and [The dream](runtime.md#the-dream).
+effort decides each `model` one, and once a day the dream checks the memos against the transcripts of the Tickets that
+ended. A proposal that rests on outside text (`external`: a stranger, a page, any tool's output) is never reviewed and
+waits for you: `agent memo list` shows it, and `agent memo add` keeps what is right in your words. How it works is in
+[Memory](runtime.md#memory) and [The dream](runtime.md#the-dream).
 
 Operate it from the box:
 

@@ -28,6 +28,11 @@ solos-swarm agent memo list --state-dir DIR [--all] [--json]
 `list` reads the Store and writes nothing. It shows the proposed and active memos, with who wrote each and how far it is
 trusted. `--all` adds the retired and forgotten ones.
 
+A proposal whose trust is `external` rests on outside text: a stranger's or a bot's words, a page, a file, or a tool's
+output, `run_code`'s included. No review makes it active. If it is right, write it as your own with `agent memo add`,
+and it is active at once. While the proposal is live, a memo with the same words and scope is refused, so use your own
+words or retire the proposal first. A proposal no one adds is retired as `expiry` after 7 days.
+
 ## Retire a memo
 
 ```sh

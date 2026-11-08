@@ -250,6 +250,9 @@ thinking effort, with host-checked quotes and provenance, instead of waiting for
   review call at DeepSeek's highest thinking effort keeps, rewrites, merges or rejects each one. `/memos` and
   `router_read {kind: memo}` read them.
 - PR 4 (#86): a daily dream Ticket checks memos against the day's transcripts (schema 9).
+- Outside text never becomes an active memo by the review: an `external` proposal (a stranger, a page, any tool's
+  output, `run_code`'s included) is never reviewed and waits for the owner; only a person's whole message is `person`;
+  the dream retires memos only on a worker's own words.
 - PR 5, forgetting and review, is not built.
 
 See [Memory](runtime.md#memory) and [Manage the agent's memory](how-to/memory.md).
