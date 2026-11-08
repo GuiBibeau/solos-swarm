@@ -425,6 +425,12 @@ which is how the dashboard tells a quiet agent from a dead publisher. Its only f
 `state/publish-state.json`, the hash of each blob it last uploaded to the store its token names. A different store gets
 everything again. The web app is [web/agent-dashboard](../../web/agent-dashboard/README.md).
 
+With `watchdog.jobs` in agent.yaml, the Watchdog writes `state/watchdog-jobs.json`, and the publisher reads that file
+(the one thing it reads besides `agent.db`) and uploads it as `jobs/index.json`: when its content changes, which leaves
+out the time of the Watchdog's last look, and again every `heartbeat_secs`, so the dashboard can tell a quiet Watchdog
+from a stopped one. The home page lists the jobs above the tickets and warns when the Watchdog has not looked for 15
+minutes ([External jobs](runtime.md#external-jobs)).
+
 ### Turn on the dashboard
 
 1. Set up the Vercel side first: the project, the private Blob store, the Sign in with Vercel app, the environment

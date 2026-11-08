@@ -242,6 +242,24 @@ Neither may be `0`.
 
 What each signal means: [The Watchdog](runtime.md#the-watchdog).
 
+`jobs` lists external jobs for the Watchdog to check on every look: work that runs outside agent mode and is not a
+Ticket. It is under `watchdog`, not a section of its own, because the Watchdog checks the jobs and tells the same
+`operator`. Each entry is a `name` and exactly one way to check it, with optional checks beside it. A setup with an
+example: [Watch jobs that are not Tickets](how-to/operate.md#watch-jobs-that-are-not-tickets).
+
+| Field | Meaning |
+|---|---|
+| `name` | Names the job in alerts and on the dashboard. 1 to 64 letters, digits, `-`, `_` or `.`, starting with a letter or digit, and unique. |
+| `unit` | A systemd user unit, such as `l2book-download.service`. Up while `systemctl --user show` says it is `active` or `reloading`. |
+| `tmux` | A tmux session name of letters, digits, `-` and `_`. Up while `tmux has-session -t =NAME` succeeds. |
+| `pid_file` | An absolute path. Up while the file's first number is a process that is alive and not a zombie. Linux only: it reads `/proc`. |
+| `command` | The absolute path of a program and its arguments, as a list. No shell reads it. Exit `0` is healthy, exit `2` is stalled, and any other exit, a signal or a timeout is down. The first line of its output is the detail. |
+| `timeout` | With `command` only: how long it may run, `10s` by default and at most `2m`. |
+| `progress` | `{file, stalled_after}`: an absolute path the job writes as it works, and how long it may stay unchanged, such as `20m`. A running job whose file is older than that, or missing, is stalled. |
+| `disk` | `{path, min_free_gb}`: an absolute path, and the free space in GB that its disk must keep. A running job below it is low on disk. |
+
+At most 64 jobs. Every path is absolute, because the agent's working directory is not where an owner would look.
+
 ### nodes
 
 Needs `executor: {kind: pi}`. Setup: [Run commands on your own machine](how-to/nodes.md).

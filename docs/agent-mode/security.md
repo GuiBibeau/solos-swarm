@@ -45,6 +45,17 @@ processes do; only a dedicated user limits what the user owns.
 directory can file requests under any name, just as anyone who can write the state directory can already do anything.
 Treat `mcp:` entries in `policy.people` as local operators.
 
+## External jobs
+
+`watchdog.jobs` makes the agent's host run commands, outside every sandbox, as the agent's user, once a look. What runs
+is only what the owner wrote in agent.yaml. A unit or session name is validated before it reaches `systemctl` or `tmux`,
+and a status `command` is a list run with no shell, so no Trigger text and no model output is ever part of a command
+line. Each program gets no input, a short environment without the agent's credentials, a timeout that kills its whole
+process group, and 4 KB of output that reaches only the alert and the dashboard, as one clipped line.
+
+The command itself is as trusted as the agent's own binary: it can do anything the agent's user can. Anyone who can
+write agent.yaml can run a command as that user, as they could already by changing `executor`.
+
 ## Remote nodes
 
 - Each side pins the other's certificate, with no CA, and the agent admits a node only under the name its certificate

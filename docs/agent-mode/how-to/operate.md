@@ -36,6 +36,44 @@ after is not posted again.
 
 What each alert means is in [The Watchdog](../runtime.md#the-watchdog).
 
+## Watch jobs that are not Tickets
+
+Work that runs outside agent mode, such as a downloader, a data build or a training run, can be listed under
+`watchdog.jobs`. The Watchdog checks each one every `every`, the dashboard lists them, and the operator hears once
+when one dies, stalls or runs its disk low, and once when it is back.
+
+```yaml
+watchdog:
+  operator: {source: discord, address: {channel: "123456789012345678"}}
+  jobs:
+    - name: l2book                              # a systemd user unit (systemd-run --user --unit l2book-download ...)
+      unit: l2book-download.service
+      progress: {file: /data/l2book/progress.log, stalled_after: 20m}   # stalled if it stops writing this
+      disk: {path: /data/l2book, min_free_gb: 50}                       # low on disk below 50 GB free
+    - name: data-build                          # a tmux session
+      tmux: data-build
+    - name: wave-4                              # a pid file
+      pid_file: /home/agent/jobs/wave-4.pid
+      progress: {file: /home/agent/jobs/wave-4.log, stalled_after: 30m}
+    - name: modal-training                      # a status command: exit 0 healthy, 2 stalled, else down
+      command: [/home/agent/bin/modal-status, --app, training]
+      timeout: 20s
+```
+
+Restart `agent serve` after you edit the list. Remove a job from it when it finishes on purpose, or its end is told as
+a death. To see what the Watchdog found without waiting for an alert, open the dashboard, or read
+`state/watchdog-jobs.json`.
+
+- A status command prints one line, which is the job's detail: `wave 3 of 8, 41%`. It runs as the agent's user with no
+  shell and a short environment, so use an absolute path and put anything else in the program itself.
+- A pid file that holds a number the system gave to another process since reads as up. Add a `progress` file to catch
+  that, or use a unit.
+- A tmux session counts as up while it exists. A session that keeps a shell after its program ends is still up, so
+  start the program as the session's command (`tmux new -d -s data-build 'make data'`), or add `progress`.
+- Alerts are told once an incident, so `thresholds.repeat` does not apply to jobs. The field list is in
+  [configuration.md](../configuration.md#watchdog), and how a check and an incident work is in
+  [External jobs](../runtime.md#external-jobs).
+
 ## See what is running and why
 
 ```sh

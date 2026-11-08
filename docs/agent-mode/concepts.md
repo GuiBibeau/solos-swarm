@@ -45,7 +45,7 @@ Agent mode uses the prototype's words, so its documents carry over:
 | Mandate | `Mandate` | What an accept grants, including `budget_microusd`. Fixed at accept time. |
 | (new) Approval | `Approval` | A budget above `auto_approve_microusd` waits for a person on the approver list. |
 | Report | `Report` | `progress` and `waiting` are quiet. `ready` sends the result. A question, `blocked` or `failed` asks a person. |
-| Watchdog | The Watchdog | A separate control loop over the Store: waits, stalls, failing Effects, Router failures, spend and pauses. |
+| Watchdog | The Watchdog | A separate control loop over the Store: waits, stalls, failing Effects, Router failures, spend and pauses. It also watches external jobs that are not Tickets. |
 | Compute, state and execution separation | The Store, the Effect queue and remote nodes | Durable state and Effects in SQLite, and commands that can run on another machine. |
 
 An Eval is one Router judgment of a batch of Triggers on a Thread. A Ticket is the accepted work, and an Assignment is
