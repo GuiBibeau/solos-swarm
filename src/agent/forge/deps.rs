@@ -1,21 +1,28 @@
 //! The dependency cache of a repository (`forge.repos.<repo>.deps`).
 //!
-//! A worker's sandbox has no network and its clone has no `node_modules`, so
-//! the repository's own scripts cannot run. The host installs the dependencies
-//! once per lockfile and every Ticket's `run_code` mounts them read-only:
+//! A worker's sandbox has no network and its clone has no `node_modules` or
+//! crates, so the repository's own scripts cannot run. The host installs the
+//! dependencies once per lockfile and every Ticket's `run_code` mounts them
+//! read-only:
 //!
 //! - The inputs are the files of the **base commit in the host's mirror**: the
 //!   lockfile, the root `package.json`, the workspaces' `package.json` files and
-//!   the files `patchedDependencies` names. Never a worker's branch, never `/work`.
-//!   `bunfig.toml` and `.npmrc` are not inputs: the install reads no registry,
-//!   scope or token setting the repository chose, and fetches from the default
-//!   npm registry only. A text lockfile that names any other host is refused.
+//!   the files `patchedDependencies` names (for `bun`), or `Cargo.lock` and every
+//!   `Cargo.toml` (for `cargo`). Never a worker's branch, never `/work`.
+//!   `bunfig.toml`, `.npmrc` and `.cargo/config.toml` are not inputs: the install
+//!   reads no registry, scope or token setting the repository chose, and fetches
+//!   from the default registry only (npm's, or crates.io). A lockfile that names
+//!   any other host is refused.
 //! - The key is the SHA-256 of those files, so a lockfile or manifest change at
-//!   the base is a new cache and an unrelated commit is the same one.
-//! - The build is `bun install --frozen-lockfile --ignore-scripts` in a bwrap
-//!   sandbox of its own: the host's network, and nothing else of the host's (no
-//!   home, no token, no vault, no agent state: a scratch directory, the package
-//!   manager read-only and the system's `/usr`). No lifecycle script runs, so no
+//!   the base is a new cache and an unrelated commit is the same one. For
+//!   `cargo` it is the SHA-256 of `Cargo.lock` alone: `--locked` makes the
+//!   crates a function of it, so a manifest edit that leaves the lockfile as it
+//!   was is the same cache.
+//! - The build is `bun install --frozen-lockfile --ignore-scripts`, or `cargo
+//!   vendor --locked`, in a bwrap sandbox of its own: the host's network, and
+//!   nothing else of the host's (no home, no token, no vault, no agent state: a
+//!   scratch directory, the package manager or the toolchain read-only and the
+//!   system's `/usr`). No lifecycle script runs and cargo builds nothing, so no
 //!   code of the repository runs. It has a time limit and a disk cap.
 //! - The result is written whole in a scratch directory and renamed to
 //!   `<state>/deps/<owner>/<name>/<key>`, so a directory with a `manifest.json`
@@ -29,6 +36,14 @@
 //! as a fresh tmpfs, because tools write into it (Vite makes
 //! `node_modules/.vite-temp`), and what they write is gone with the command. The
 //! shared cache is never writable, so no Ticket can plant a file for another.
+//!
+//! Cargo's cache is the crates themselves, the directory `cargo vendor` makes,
+//! and a `config.toml` that replaces crates.io with it (see [`cargo_config`]).
+//! A Ticket mounts both read-only, and the toolchain beside them, and sets
+//! `CARGO_HOME` to a directory of its own that holds the config, so cargo
+//! writes its `.package-cache` lock there and not in the cache. Its output goes
+//! to `/work/target`, in the clone. The host's toolchain is the one `deps.binary`
+//! names, in the build and in every Ticket.
 
 use super::mirror::{git_in, run_bytes};
 use super::paths;
@@ -77,6 +92,13 @@ const MAX_FIND_DEPTH: usize = 8;
 /// The only registry a build fetches from.
 const REGISTRY: &str = "https://registry.npmjs.org/";
 const REGISTRY_HOST: &str = "registry.npmjs.org";
+/// What a `Cargo.lock` may name after `://`: crates.io, as the lockfile spells
+/// it for both of cargo's protocols.
+const CRATES_IO: [&str; 3] = [
+    "github.com/rust-lang/crates.io-index",
+    "index.crates.io/",
+    "index.crates.io",
+];
 
 /// How often a running build is looked at, for its clock and its disk use.
 const POLL: Duration = Duration::from_secs(2);
@@ -111,6 +133,21 @@ const ETC_BINDS: [&str; 6] = [
 /// which the repository's own evidence check calls a dirty tree.
 const TOOLS: &str = "/runtime/bun";
 const HOME: &str = "/tmp/home";
+
+/// Where a Ticket's `run_code` finds a cargo cache: the vendored crates under
+/// `/runtime/cargo`, the toolchain under `/runtime/rust`, and a `CARGO_HOME` of
+/// its own, a directory of the sandbox's `/tmp` that holds the cache's config
+/// and that cargo may write its lock in.
+const CARGO_CACHE: &str = "/runtime/cargo";
+const RUST: &str = "/runtime/rust";
+const CARGO_HOME: &str = "/tmp/cargo";
+/// What a cargo cache holds: the crates, and the config that makes them the
+/// only source.
+const VENDOR: &str = "vendor";
+const CARGO_CONFIG: &str = "config.toml";
+/// How many `rustc` a Ticket's cargo runs at once. The sandbox sees all of the
+/// host's cores, and several Tickets build at once beside the agent's own work.
+const CARGO_JOBS: &str = "16";
 
 /// The files of the base commit an install reads, by path.
 #[derive(Debug, Default)]
@@ -171,13 +208,18 @@ pub(super) async fn read_inputs(mirror: &Path, commit: &str, kind: DepsKind) -> 
     )
     .await?;
     let tree = parse_tree(&listed)?;
-    let root = tree
-        .get("package.json")
-        .with_context(|| format!("the repository has no package.json at {commit}"))?;
-    let root = fetch(mirror, &[("package.json", root)]).await?;
-    let manifest: Value =
-        serde_json::from_slice(&root[0]).context("the root package.json is not JSON")?;
-    let paths = select(kind, &tree, &manifest)?;
+    let paths = match kind {
+        DepsKind::Bun => {
+            let root = tree
+                .get("package.json")
+                .with_context(|| format!("the repository has no package.json at {commit}"))?;
+            let root = fetch(mirror, &[("package.json", root)]).await?;
+            let manifest: Value =
+                serde_json::from_slice(&root[0]).context("the root package.json is not JSON")?;
+            select_bun(&tree, &manifest)?
+        }
+        DepsKind::Cargo => select_cargo(&tree)?,
+    };
     let mut total = 0;
     for path in &paths {
         let size = tree[path].size;
@@ -198,8 +240,12 @@ pub(super) async fn read_inputs(mirror: &Path, commit: &str, kind: DepsKind) -> 
     let contents = fetch(mirror, &wanted).await?;
     let files: BTreeMap<String, Vec<u8>> = paths.into_iter().zip(contents).collect();
     for (path, bytes) in &files {
-        if path == "bun.lock" {
-            registry_only(std::str::from_utf8(bytes).context("bun.lock is not UTF-8")?)?;
+        let text = || std::str::from_utf8(bytes).with_context(|| format!("{path} is not UTF-8"));
+        match kind {
+            DepsKind::Bun if path == "bun.lock" => registry_only(text()?)?,
+            DepsKind::Cargo if path == "Cargo.lock" => crates_io_only(text()?)?,
+            DepsKind::Cargo => manifest_names_no_other_source(path, text()?)?,
+            DepsKind::Bun => {}
         }
     }
     Ok(Inputs { files })
@@ -240,13 +286,6 @@ async fn fetch(mirror: &Path, blobs: &[(&str, &Blob)]) -> Result<Vec<Vec<u8>>> {
         at = body + size + 1;
     }
     Ok(found)
-}
-
-/// Which files of `tree` an install of `kind` reads.
-fn select(kind: DepsKind, tree: &Tree, manifest: &Value) -> Result<BTreeSet<String>> {
-    match kind {
-        DepsKind::Bun => select_bun(tree, manifest),
-    }
 }
 
 fn select_bun(tree: &Tree, manifest: &Value) -> Result<BTreeSet<String>> {
@@ -345,11 +384,99 @@ fn registry_only(lock: &str) -> Result<()> {
     Ok(())
 }
 
+fn is_manifest(path: &str) -> bool {
+    path == "Cargo.toml" || path.ends_with("/Cargo.toml")
+}
+
+/// What `cargo vendor --locked` reads: the root lockfile, and every manifest
+/// in the repository, since a path dependency may sit anywhere. A manifest
+/// below `target` or `node_modules` is some tool's, not the repository's.
+fn select_cargo(tree: &Tree) -> Result<BTreeSet<String>> {
+    ensure!(
+        tree.contains_key("Cargo.toml"),
+        "the repository has no Cargo.toml at its root"
+    );
+    ensure!(
+        tree.contains_key("Cargo.lock"),
+        "the repository has no Cargo.lock at its root, which `cargo vendor --locked` needs"
+    );
+    let mut paths = BTreeSet::from(["Cargo.lock".to_owned()]);
+    for path in tree.keys() {
+        let tools = path
+            .split('/')
+            .any(|part| part == "target" || part == "node_modules");
+        if is_manifest(path) && !tools {
+            paths.insert(path.clone());
+        }
+    }
+    ensure!(
+        paths.len() <= MAX_FILES,
+        "a vendoring would read {} files, over the {MAX_FILES} a build takes",
+        paths.len()
+    );
+    Ok(paths)
+}
+
+/// Refused: the lockfile names a source other than crates.io. A git
+/// dependency or a private registry is a URL there, and the build would fetch
+/// it on the host's network.
+fn crates_io_only(lock: &str) -> Result<()> {
+    let mut rest = lock;
+    while let Some(at) = rest.find("://") {
+        let after = &rest[at + 3..];
+        let end = after
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | '}' | ']' | '#'))
+            .unwrap_or(after.len());
+        let source = &after[..end];
+        ensure!(
+            CRATES_IO.contains(&source),
+            "the lockfile names {source:?}, and a build fetches from crates.io only"
+        );
+        rest = &after[end..];
+    }
+    Ok(())
+}
+
+/// Refused: a manifest with a `git`, `registry` or `registry-index` key, or a
+/// `[patch]` or `[replace]` table. The lockfile names the sources that are in
+/// use, but cargo reads a patch and a new dependency before it sees that the
+/// lockfile would change, and fetches them. This is a plain scan, not a TOML
+/// parser, and it refuses a comment that has the text too: a manifest that
+/// spells a key to get past it is not one the host will read.
+fn manifest_names_no_other_source(path: &str, text: &str) -> Result<()> {
+    let word = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-');
+    for key in ["git", "registry", "registry-index"] {
+        for (at, _) in text.match_indices(key) {
+            let alone = !text[..at].chars().next_back().is_some_and(word);
+            let after = text[at + key.len()..]
+                .trim_start_matches(['"', '\''])
+                .trim_start();
+            ensure!(
+                !(alone && after.starts_with('=')),
+                "{path} has a `{key}` key, and a build fetches from crates.io only"
+            );
+        }
+    }
+    let squeezed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    for table in ["[patch", "[replace"] {
+        ensure!(
+            !squeezed.contains(table),
+            "{path} has a {table}] table, and a build fetches from crates.io only"
+        );
+    }
+    Ok(())
+}
+
 /// The cache key of `inputs`: a SHA-256 of what the install reads.
 pub(super) fn key(kind: DepsKind, inputs: &Inputs) -> String {
     let mut hasher = Sha256::new();
     hasher.update(format!("solos-deps/{VERSION}\nkind:{}\n", kind.as_str()));
     for (path, bytes) in &inputs.files {
+        // `cargo vendor --locked` makes the crates a function of the lockfile:
+        // a manifest edit that leaves it as it was changes none of them.
+        if kind == DepsKind::Cargo && path != "Cargo.lock" {
+            continue;
+        }
         hasher.update(path.as_bytes());
         hasher.update([0]);
         hasher.update((bytes.len() as u64).to_be_bytes());
@@ -370,7 +497,8 @@ struct Manifest {
     dirs: Vec<Dir>,
 }
 
-/// One `node_modules` directory, by its path from the repository's root.
+/// One `node_modules` directory, by its path from the repository's root; for
+/// cargo, the one `vendor` directory of the cache.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mount", rename_all = "snake_case")]
 enum Dir {
@@ -414,6 +542,13 @@ impl Manifest {
             self.dirs.len() <= MAX_DIRS,
             "the manifest has too many directories"
         );
+        if self.kind == DepsKind::Cargo.as_str() {
+            ensure!(
+                matches!(&self.dirs[..], [Dir::Tree { path, .. }] if path == VENDOR),
+                "the manifest of a cargo cache names the {VENDOR} directory and nothing else"
+            );
+            return Ok(());
+        }
         for dir in &self.dirs {
             ensure!(
                 below(dir.path()) && dir.path().rsplit('/').next() == Some("node_modules"),
@@ -435,11 +570,32 @@ impl Manifest {
     }
 }
 
-/// What a Ticket's `run_code` adds to have the cache at `dir`: each tree
-/// read-only and each links directory made again, under `/work`; the package
-/// manager read-only as `bun` and `node`, first on `PATH`; a throwaway home;
-/// and the address space the package manager needs.
-fn extras(dir: &Path, manifest: &Manifest, binary: &Path, memory_bytes: u64) -> Extras {
+/// What a Ticket's `run_code` adds to have the cache at `dir`.
+fn extras(
+    kind: DepsKind,
+    dir: &Path,
+    manifest: &Manifest,
+    binary: &Path,
+    memory_bytes: u64,
+) -> Extras {
+    match kind {
+        DepsKind::Bun => bun_extras(dir, manifest, binary, memory_bytes),
+        DepsKind::Cargo => cargo_extras(dir, binary, memory_bytes),
+    }
+}
+
+/// The toolchain a cargo is part of: its `bin/cargo` is `binary`.
+fn toolchain_of(binary: &Path) -> &Path {
+    binary
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or(Path::new("/"))
+}
+
+/// Each tree read-only and each links directory made again, under `/work`; the
+/// package manager read-only as `bun` and `node`, first on `PATH`; a throwaway
+/// home; and the address space the package manager needs.
+fn bun_extras(dir: &Path, manifest: &Manifest, binary: &Path, memory_bytes: u64) -> Extras {
     let mut binds = vec![
         Bind::ReadOnly {
             source: binary.to_owned(),
@@ -483,11 +639,72 @@ fn extras(dir: &Path, manifest: &Manifest, binary: &Path, memory_bytes: u64) -> 
     }
 }
 
+/// The toolchain read-only, first on `PATH`; the vendored crates read-only, and
+/// the config that makes them cargo's only source, as the one file of a
+/// `CARGO_HOME` that is otherwise the sandbox's own `/tmp` (cargo writes its
+/// `.package-cache` lock there, never in the cache); a throwaway home; and the
+/// address space `rustc` needs. The variables are what a build has to agree to:
+/// no network, no incremental cache (its `dep-graph.bin` passes the sandbox's
+/// 256 MiB file size limit on a big crate, and a fresh clone has nothing to
+/// reuse), no debug info (a big crate's library passes the same limit with it),
+/// and a bounded number of `rustc` at once.
+fn cargo_extras(dir: &Path, binary: &Path, memory_bytes: u64) -> Extras {
+    let cache = Path::new(CARGO_CACHE);
+    let var = |name: &str, value: &str| (name.to_owned(), value.to_owned());
+    Extras {
+        binds: vec![
+            Bind::ReadOnly {
+                source: toolchain_of(binary).to_owned(),
+                target: PathBuf::from(RUST),
+            },
+            Bind::ReadOnly {
+                source: dir.join(VENDOR),
+                target: cache.join(VENDOR),
+            },
+            Bind::ReadOnly {
+                source: dir.join(CARGO_CONFIG),
+                target: Path::new(CARGO_HOME).join(CARGO_CONFIG),
+            },
+            Bind::Links {
+                dir: PathBuf::from(HOME),
+                links: Vec::new(),
+            },
+        ],
+        path: vec![Path::new(RUST).join("bin")],
+        env: vec![
+            var("HOME", HOME),
+            var("CARGO_HOME", CARGO_HOME),
+            var("CARGO_NET_OFFLINE", "true"),
+            var("CARGO_INCREMENTAL", "0"),
+            var("CARGO_PROFILE_DEV_DEBUG", "0"),
+            var("CARGO_BUILD_JOBS", CARGO_JOBS),
+        ],
+        memory_bytes: Some(memory_bytes),
+    }
+}
+
+/// The config a cargo cache holds: crates.io is the vendored directory.
+fn cargo_config() -> String {
+    format!(
+        "# solos-swarm: the crates of Cargo.lock, vendored by the host\n\
+         [source.crates-io]\n\
+         replace-with = \"vendored-sources\"\n\
+         \n\
+         [source.vendored-sources]\n\
+         directory = \"{CARGO_CACHE}/{VENDOR}\"\n\
+         \n\
+         [net]\n\
+         offline = true\n"
+    )
+}
+
 /// The bwrap sandbox of one build, as the argument vector that starts it.
 /// Every input is a distinct mount or variable: the host's network (the one
 /// thing this sandbox shares), `/usr` and the TLS and DNS files, the package
-/// manager read-only, and `scratch`, a directory made for it, writable at `/s`.
+/// manager (or toolchain) read-only, and `scratch`, a directory made for it,
+/// writable at `/s`.
 pub(super) struct Build<'a> {
+    pub kind: DepsKind,
     pub prlimit: &'a Path,
     pub bwrap: &'a Path,
     pub binary: &'a Path,
@@ -511,16 +728,52 @@ impl Build<'_> {
             .symlink("usr/sbin", "/sbin")
             .proc("/proc")
             .dev("/dev")
-            .tmpfs_sized(TMPFS_BYTES, "/tmp")
-            .ro_bind(self.binary, Path::new(TOOLS).join("bun"))
+            .tmpfs_sized(TMPFS_BYTES, "/tmp");
+        let scratch = |dir: &str| format!("{SCRATCH}/{dir}");
+        let (sandbox, path, own, program, args) = match self.kind {
+            DepsKind::Bun => (
+                sandbox.ro_bind(self.binary, Path::new(TOOLS).join("bun")),
+                "/usr/bin:/bin".to_owned(),
+                vec![
+                    ("BUN_TMPDIR", scratch("tmp")),
+                    ("BUN_INSTALL_CACHE_DIR", scratch("cache")),
+                ],
+                Path::new(TOOLS).join("bun"),
+                [
+                    "install",
+                    "--frozen-lockfile",
+                    "--ignore-scripts",
+                    "--no-progress",
+                    "--registry",
+                    REGISTRY,
+                ]
+                .map(str::to_owned)
+                .to_vec(),
+            ),
+            // Cargo needs `rustc` on its `PATH` even to vendor.
+            DepsKind::Cargo => (
+                sandbox.ro_bind(toolchain_of(self.binary), RUST),
+                format!("{RUST}/bin:/usr/bin:/bin"),
+                vec![
+                    ("CARGO_HOME", scratch("cache")),
+                    ("CARGO_REGISTRIES_CRATES_IO_PROTOCOL", "sparse".to_owned()),
+                ],
+                Path::new(RUST).join("bin/cargo"),
+                vec!["vendor".to_owned(), "--locked".to_owned(), scratch(VENDOR)],
+            ),
+        };
+        let sandbox = sandbox
             .bind(self.scratch, SCRATCH)
-            .chdir(format!("{SCRATCH}/src"))
+            .chdir(scratch("src"))
             .clearenv()
-            .setenv("PATH", "/usr/bin:/bin")
-            .setenv("HOME", format!("{SCRATCH}/home"))
-            .setenv("TMPDIR", format!("{SCRATCH}/tmp"))
-            .setenv("BUN_TMPDIR", format!("{SCRATCH}/tmp"))
-            .setenv("BUN_INSTALL_CACHE_DIR", format!("{SCRATCH}/cache"))
+            .setenv("PATH", path)
+            .setenv("HOME", scratch("home"))
+            .setenv("TMPDIR", scratch("tmp"));
+        let sandbox = own
+            .into_iter()
+            .fold(sandbox, |sandbox, (name, value)| {
+                sandbox.setenv(name, value)
+            })
             .setenv("CI", "1")
             .setenv("NO_COLOR", "1")
             .setenv("DO_NOT_TRACK", "1");
@@ -533,17 +786,7 @@ impl Build<'_> {
             "--".into(),
             self.bwrap.as_os_str().to_owned(),
         ];
-        line.extend(sandbox.exec(
-            Path::new(TOOLS).join("bun"),
-            [
-                "install",
-                "--frozen-lockfile",
-                "--ignore-scripts",
-                "--no-progress",
-                "--registry",
-                REGISTRY,
-            ],
-        ));
+        line.extend(sandbox.exec(program, args));
         line
     }
 }
@@ -603,12 +846,21 @@ impl Cache {
             .canonicalize()
             .with_context(|| format!("{} is not there", binary.display()))?;
         ensure!(binary.is_file(), "{} is not a file", binary.display());
+        if config.kind == DepsKind::Cargo {
+            let root = toolchain_of(&binary);
+            ensure!(
+                root.join("bin/rustc").is_file() && root.join("lib/rustlib").is_dir(),
+                "{} is not the cargo of a toolchain (no rustc and lib/rustlib beside it); name \
+                 <toolchain>/bin/cargo, not rustup's proxy",
+                binary.display()
+            );
+        }
         let repo_dir = self.dir.join(repo.owner()).join(repo.name());
         let at = repo_dir.join(key);
         match load(&at, key) {
             Ok(Some(manifest)) => {
                 touch(&at);
-                return Ok(ready(key, &at, &manifest, &binary, config.memory_bytes));
+                return Ok(ready(config, key, &at, &manifest, &binary));
             }
             Ok(None) => {}
             Err(err) => {
@@ -648,7 +900,7 @@ impl Cache {
                     manifest.bytes,
                     &key[..12]
                 );
-                Ok(ready(key, &at, &manifest, &binary, config.memory_bytes))
+                Ok(ready(config, key, &at, &manifest, &binary))
             }
             Err(err) => {
                 self.failed
@@ -683,21 +935,25 @@ impl Cache {
             private_dir(&sandboxed.join(dir))?;
         }
         private_dir(&scratch.join("out"))?;
-        write_inputs(&sandboxed.join("src"), inputs)?;
+        write_inputs(&sandboxed.join("src"), inputs, config.kind)?;
         let sandbox = Build {
+            kind: config.kind,
             prlimit: &self.prlimit,
             bwrap: &self.bwrap,
             binary,
             scratch: &sandboxed,
         };
         run_install(&sandbox.argv(), scratch, config).await?;
-        let src = sandboxed.join("src");
         let out = scratch.join("out");
-        let (dirs, bytes) = tokio::task::spawn_blocking(move || harvest(&src, &out))
-            .await
-            .context("the harvest of the install did not finish")??;
+        let kind = config.kind;
+        let (dirs, bytes) = tokio::task::spawn_blocking(move || match kind {
+            DepsKind::Bun => harvest(&sandboxed.join("src"), &out),
+            DepsKind::Cargo => keep_crates(&sandboxed, &out),
+        })
+        .await
+        .context("the harvest of the install did not finish")??;
         ensure!(
-            !dirs.is_empty(),
+            kind != DepsKind::Bun || !dirs.is_empty(),
             "the install made no node_modules directory (does the repository have dependencies?)"
         );
         let manifest = Manifest {
@@ -728,10 +984,17 @@ impl Cache {
     }
 }
 
-fn ready(key: &str, dir: &Path, manifest: &Manifest, binary: &Path, memory: u64) -> Dependencies {
+fn ready(
+    config: &DepsConfig,
+    key: &str,
+    dir: &Path,
+    manifest: &Manifest,
+    binary: &Path,
+) -> Dependencies {
     Dependencies::Ready {
         key: key.to_owned(),
-        extras: extras(dir, manifest, binary, memory),
+        kind: config.kind,
+        extras: extras(config.kind, dir, manifest, binary, config.memory_bytes),
     }
 }
 
@@ -754,6 +1017,12 @@ fn load(dir: &Path, key: &str) -> Result<Option<Manifest>> {
             ensure!(meta.is_dir(), "{path} is not a directory");
         }
     }
+    if manifest.kind == DepsKind::Cargo.as_str() {
+        ensure!(
+            dir.join(CARGO_CONFIG).is_file(),
+            "the cache has no {CARGO_CONFIG}"
+        );
+    }
     Ok(Some(manifest))
 }
 
@@ -767,7 +1036,10 @@ fn touch(dir: &Path) {
     }
 }
 
-fn write_inputs(src: &Path, inputs: &Inputs) -> Result<()> {
+/// Write the inputs where the build runs. Cargo refuses a manifest with no
+/// target, and no source file is an input, so each manifest gets an empty
+/// `src/lib.rs`: enough for `cargo vendor`, which compiles nothing.
+fn write_inputs(src: &Path, inputs: &Inputs, kind: DepsKind) -> Result<()> {
     for (path, bytes) in &inputs.files {
         ensure!(below(path), "{path:?} is not a path inside the repository");
         let at = src.join(path);
@@ -775,6 +1047,14 @@ fn write_inputs(src: &Path, inputs: &Inputs) -> Result<()> {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&at, bytes).with_context(|| format!("cannot write {}", at.display()))?;
+        if kind == DepsKind::Cargo
+            && let Some(package) = at.parent().filter(|_| is_manifest(path))
+        {
+            let stub = package.join("src/lib.rs");
+            std::fs::create_dir_all(package.join("src"))?;
+            std::fs::write(&stub, "")
+                .with_context(|| format!("cannot write {}", stub.display()))?;
+        }
     }
     Ok(())
 }
@@ -872,6 +1152,26 @@ fn dir_bytes(root: &Path, limit: u64) -> u64 {
         }
     }
     total
+}
+
+/// What `cargo vendor` left in the sandbox's scratch `s`: its `vendor` directory
+/// is moved to `out`, with the config that makes it the only source. A
+/// repository with no crate to vendor gets an empty directory, which is still
+/// a cache: the Ticket has the toolchain.
+fn keep_crates(s: &Path, out: &Path) -> Result<(Vec<Dir>, u64)> {
+    let to = out.join(VENDOR);
+    match std::fs::rename(s.join(VENDOR), &to) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(&to)?,
+        Err(err) => return Err(err).context("cannot keep the vendored crates"),
+    }
+    std::fs::write(out.join(CARGO_CONFIG), cargo_config())
+        .with_context(|| format!("cannot write {CARGO_CONFIG}"))?;
+    let dirs = vec![Dir::Tree {
+        path: VENDOR.to_owned(),
+        bytes: dir_bytes(&to, u64::MAX),
+    }];
+    Ok((dirs, dir_bytes(out, u64::MAX)))
 }
 
 /// What an install left under `src`: the `node_modules` directories that hold

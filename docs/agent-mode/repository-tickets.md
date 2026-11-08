@@ -187,7 +187,58 @@ The Pi session's own sandbox holds none of this. Its `/work` is a tmpfs for Pi's
 in it runs repository code: every command goes through `run_code`, and `read` is the broker's. The Claude Code harness
 is the same, with its tools off.
 
-`kind` is the one variant, `bun`. npm or pnpm would be new variants.
+`kind` is `bun` or `cargo`. npm or pnpm would be new variants.
+
+### Cargo
+
+`deps: {kind: cargo, binary: <toolchain>/bin/cargo}` does the same for a Rust repository, so a worker can run `cargo
+build` and `cargo test` offline.
+
+**What the cache is built from.** The mirror at the base commit again: the root `Cargo.lock` and every `Cargo.toml`
+(a path dependency may sit anywhere), except those below `target` or `node_modules`. `.cargo/config.toml`,
+`rust-toolchain.toml` and every file of source are not read. The build fetches from crates.io only. A `Cargo.lock` that
+names any other source (a git dependency, a private registry) is refused, and so is a manifest with a `git`,
+`registry` or `registry-index` key or a `[patch]` or `[replace]` table, because cargo reads a patch or a new dependency
+before it sees that the lockfile would change, and would fetch them. That check is a plain scan of the text, not a
+TOML parser: it also refuses a comment, or a crate named `git` or `registry`, that spells one of them.
+
+**The key** is the SHA-256 of `Cargo.lock` alone. `cargo vendor --locked` makes the crates a function of the lockfile
+(it fails when the manifests and the lockfile disagree), so a manifest edit that leaves the lockfile as it was is the
+same cache.
+
+**The build** is `cargo vendor --locked` in the same kind of bwrap sandbox, with the network and `/usr` and nothing of
+the host's, the toolchain read-only, and `cargo`'s home in the scratch directory. Cargo refuses a manifest with no
+target, and no source file is an input, so each manifest gets an empty `src/lib.rs` in the build's copy. Nothing is
+compiled and no build script runs, so no code of the repository or of a crate runs on the host. The result is the
+`vendor` directory and a `config.toml` that makes it the only source.
+
+**What a Ticket's `run_code` sees.**
+
+- The toolchain, the whole directory that `deps.binary` is in, read-only at `/runtime/rust`, with `/runtime/rust/bin`
+  first on `PATH`: `cargo`, `rustc`, `rustdoc`, `rustfmt` and `cargo clippy` where the toolchain has them. A Ticket
+  needs no `executor.run_code.mounts` entry for Rust. `/usr/bin/cc` links, so the host needs a C toolchain.
+- The crates read-only at `/runtime/cargo/vendor`, and the config as the one file of `CARGO_HOME=/tmp/cargo`. The rest
+  of that directory is the sandbox's `/tmp`, so cargo writes its `.package-cache` lock there and not in the cache, and
+  what it writes is gone when the command ends.
+- `CARGO_NET_OFFLINE=true`, and `net.offline = true` in the config. The sandbox has no network either way.
+- `CARGO_INCREMENTAL=0` and `CARGO_PROFILE_DEV_DEBUG=0`. A `run_code` command may write no file over 256 MiB, and a
+  big crate passes that with its incremental cache (`dep-graph.bin`) or with debug info (the library of `solos-swarm`
+  is 667 MB with it). Over the limit, the writing program dies with `signal: 25` (SIGXFSZ). With both off the biggest
+  file of `solos-swarm` is 235 MB, so a crate that grows much past it needs a limit of its own.
+- `CARGO_BUILD_JOBS=16`, because the sandbox sees all the host's cores. A worker may pass `-j`.
+- Output goes to `/work/target`, in the clone, which is on disk. The clone gets `/target/` in its `.git/info/exclude`,
+  so `git add -A` and `git status` ignore it.
+- `deps.memory_bytes` as the address space, 16 GiB by default. `rustc` fails with `memory allocation of 56 bytes
+  failed` under 4 GiB while it compiles the `solos-swarm` crate, and builds it at 6 GiB.
+
+**What a Ticket cannot do.** Fetch. A dependency a worker adds, or a lockfile change that needs a crate the host did not
+vendor, fails with cargo's own message (`no matching package named ... found`, `location searched: directory sources`),
+and the worker is told that the sandbox is offline. A change that picks among the versions already in the lockfile
+works. Crates' build scripts and procedural macros do run, in the Ticket's sandbox, like the worker's own code.
+
+**Time.** A `run_code` call stops at 300 seconds, and each process of it may use 300 seconds of CPU. A cold build of
+`solos-swarm` takes about a minute and a half on the box, so the worker's prompt tells it to start long builds with
+`job_start`, whose limit is `executor.run_code.job_max_secs`.
 
 ## Evidence
 

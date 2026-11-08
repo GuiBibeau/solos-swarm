@@ -633,6 +633,114 @@ echo "lock: $(cat bun.lock)" > node_modules/.facts/seen.txt
         assert!(!w.root.join("deps").exists(), "nothing was built");
     }
 
+    /// A toolchain stand-in: its cargo vendors one crate and writes down the
+    /// lockfile it was given.
+    const FAKE_CARGO: &str = r#"#!/bin/sh
+set -eu
+mkdir -p /s/vendor/x-1.0.0
+echo "lock: $(cat Cargo.lock)" > /s/vendor/x-1.0.0/seen.txt
+"#;
+
+    fn with_cargo(root: &Path, terms: &mut BTreeMap<RepoName, RepoConfig>) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(root.join("toolchain/bin")).unwrap();
+        std::fs::create_dir_all(root.join("toolchain/lib/rustlib")).unwrap();
+        std::fs::write(root.join("toolchain/bin/rustc"), "").unwrap();
+        let cargo = root.join("toolchain/bin/cargo");
+        std::fs::write(&cargo, FAKE_CARGO).unwrap();
+        std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        terms.get_mut(&widgets()).unwrap().deps = Some(DepsConfig {
+            kind: DepsKind::Cargo,
+            binary: Some(cargo),
+            timeout_secs: 60,
+            max_bytes: 1 << 30,
+            memory_bytes: 16 << 30,
+        });
+    }
+
+    #[tokio::test]
+    async fn crates_are_vendored_from_the_base_commits_lockfile_and_the_clone_ignores_target() {
+        if !sandbox() {
+            return;
+        }
+        let w = World::with("cargo", with_cargo);
+        w.push_files(&[
+            ("Cargo.toml", "[workspace]\nmembers = [\"core\"]\n"),
+            ("Cargo.lock", "lock one"),
+            ("core/Cargo.toml", "[package]\nname = \"core\"\n"),
+        ]);
+        let first = w.prepare(&widgets(), "tk_1").await.unwrap();
+
+        let found = w.forge.dependencies(&first).await;
+
+        let Dependencies::Ready { key, kind, extras } = &found else {
+            panic!("{found:?}")
+        };
+        assert_eq!(*kind, DepsKind::Cargo);
+        let cache = w.root.join("deps/acme/widgets").join(key);
+        let seen = std::fs::read_to_string(cache.join("vendor/x-1.0.0/seen.txt")).unwrap();
+        assert_eq!(seen.trim(), "lock: lock one");
+        assert!(
+            extras.binds.iter().any(|bind| matches!(
+                bind,
+                crate::code::Bind::ReadOnly { source, target }
+                    if *source == cache.join("vendor") && target == Path::new("/runtime/cargo/vendor")
+            )),
+            "{extras:?}"
+        );
+        let work = w.root.join("tk_1/work");
+        let exclude = std::fs::read_to_string(work.join(".git/info/exclude")).unwrap();
+        assert!(
+            exclude.lines().any(|line| line == "/target/")
+                && !exclude.lines().any(|line| line == "node_modules/"),
+            "the build output stays out of the clone's commits, and a cargo repository is not \
+             given bun's exclusions: {exclude}"
+        );
+
+        // The worker changes the lockfile in its clone and commits it on a branch.
+        std::fs::write(work.join("Cargo.lock"), "lock BY THE WORKER").unwrap();
+        git(&work, &["checkout", "--quiet", "-b", "worker"]);
+        git(&work, &["commit", "--quiet", "-am", "the worker's"]);
+        std::fs::remove_dir_all(w.root.join("deps")).unwrap();
+        let again = w.forge.dependencies(&first).await;
+        assert_eq!(again, found, "the same base commit, the same key");
+        assert_eq!(
+            std::fs::read_to_string(cache.join("vendor/x-1.0.0/seen.txt"))
+                .unwrap()
+                .trim(),
+            "lock: lock one",
+            "a build reads the mirror, not the worker's lockfile"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cargo_repository_with_a_git_dependency_is_unavailable_in_words_and_still_clones() {
+        let w = World::with("cargo-git", with_cargo);
+        w.push_files(&[
+            ("Cargo.toml", "[package]\nname = \"x\"\n"),
+            (
+                "Cargo.lock",
+                "[[package]]\nname = \"y\"\nsource = \"git+https://github.com/a/y?rev=abc#def\"\n",
+            ),
+        ]);
+
+        let workspace = w.prepare(&widgets(), "tk_1").await.unwrap();
+        let found = w.forge.dependencies(&workspace).await;
+
+        let Dependencies::Unavailable { why } = found else {
+            panic!("{found:?}")
+        };
+        assert!(
+            why.contains("github.com/a/y?rev=abc") && why.contains("crates.io only"),
+            "{why}"
+        );
+        assert!(
+            w.root.join("tk_1/work/Cargo.toml").is_file(),
+            "the Ticket has its clone"
+        );
+        assert!(!w.root.join("deps").exists(), "nothing was built");
+    }
+
     #[tokio::test]
     async fn a_repository_that_asks_for_no_dependencies_gets_none_and_a_clone_as_before() {
         let w = World::new("nodeps");

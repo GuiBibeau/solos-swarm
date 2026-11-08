@@ -168,7 +168,8 @@ its Ticket's budget:
 | `job_max_secs` | `1800` | The longest a job may run, and the default and most of `job_start`'s `timeout_s`. 300 to 86400. |
 | `job_output_bytes` | `65536` | What a job keeps of each output stream until it is read, 1 KiB to 1 MiB. |
 
-A `run_code` command has no network and at most 300 s of CPU time.
+A `run_code` command has no network, at most 300 s of CPU time per process and no file over 256 MiB. A Rust
+repository gets its toolchain from `forge.repos.<repo>.deps`, not from `mounts` ([deps](#forge)).
 
 #### executor.fetch
 
@@ -401,11 +402,17 @@ Each entry of `forge.repos`, keyed `<owner>/<name>`:
 
 | Field | Default | Meaning |
 |---|---|---|
-| `kind` | required | `bun`. |
-| `binary` | `$HOME/.bun/bin/bun` | The package manager, an absolute path. |
+| `kind` | required | `bun`, installed from `bun.lock`, or `cargo`, vendored from `Cargo.lock`. |
+| `binary` | `$HOME/.bun/bin/bun` for `bun`; none for `cargo` | The package manager, an absolute path. For `cargo`, required: the `cargo` of one toolchain, such as `~/.rustup/toolchains/1.96.0-x86_64-unknown-linux-gnu/bin/cargo`, not rustup's proxy at `~/.cargo/bin/cargo`. The toolchain's whole directory is bound read-only into the build and into every Ticket's `run_code` on this repository, with `cargo` and `rustc` on `PATH`, so `executor.run_code.mounts` needs no entry for Rust. |
 | `timeout_secs` | `600` | The longest a build may run, 10 to 3600. |
 | `max_bytes` | 8 GiB | The most disk a build may use, scratch included, 1 MiB to 64 GiB. |
-| `memory_bytes` | 16 GiB | The address space of this repository's `run_code`, used in place of `executor.run_code.memory_bytes` where that is lower. 256 MiB to 16 GiB. |
+| `memory_bytes` | 16 GiB | The address space of this repository's `run_code`, used in place of `executor.run_code.memory_bytes` where that is lower. 256 MiB to 16 GiB. Bun needs about 8 GiB. `rustc` fails to allocate under 4 GiB on the `solos-swarm` crate and builds it at 6 GiB. |
+
+With `cargo`, a Ticket's `run_code` also has `CARGO_NET_OFFLINE=true`, `CARGO_INCREMENTAL=0`,
+`CARGO_PROFILE_DEV_DEBUG=0` and `CARGO_BUILD_JOBS=16`, builds into `/work/target`, and finds the vendored crates in
+`/runtime/cargo/vendor`. A lockfile that names a source other than crates.io is refused. The host needs the toolchain,
+`cc`, `bwrap` and `prlimit`. See [Build a Rust repository offline](how-to/repositories.md#build-a-rust-repository-offline)
+and [Cargo](repository-tickets.md#cargo).
 
 `evidence`:
 

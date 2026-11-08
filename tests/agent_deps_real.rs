@@ -9,9 +9,12 @@
 //! ```
 //!
 //! where `owner/name.git` is a bare repository under `SOLOS_DEPS_REMOTE`.
-//! `SOLOS_DEPS_BUN` names bun (by default `$HOME/.bun/bin/bun`) and
-//! `SOLOS_DEPS_COMMAND` the command (by default
-//! `bun run solos dev verify --scope unit --json`).
+//! `SOLOS_DEPS_KIND` is `bun` (the default) or `cargo`. `SOLOS_DEPS_BINARY`
+//! names the package manager: bun (by default `$HOME/.bun/bin/bun`, and
+//! `SOLOS_DEPS_BUN` is the older name for it) or, for cargo, the `cargo` of a
+//! toolchain (no default). `SOLOS_DEPS_COMMAND` is the command: by default
+//! `bun run solos dev verify --scope unit --json`, or for cargo
+//! `cargo test -p solos-agent-core --offline`.
 
 use serde_json::{Value, json};
 use solos_agent_core::change::RepoName;
@@ -25,13 +28,26 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[tokio::test]
-#[ignore = "needs bun, bwrap, prlimit, the network and a bare repository (see the module docs)"]
+#[ignore = "needs bun or a Rust toolchain, bwrap, prlimit, the network and a bare repository (see the module docs)"]
 async fn a_real_install_of_a_real_repository_runs_its_command_offline_in_a_ticket_sandbox() {
     let remote = PathBuf::from(std::env::var("SOLOS_DEPS_REMOTE").expect("SOLOS_DEPS_REMOTE"));
     let repo =
         RepoName::try_from(std::env::var("SOLOS_DEPS_REPO").expect("SOLOS_DEPS_REPO")).unwrap();
-    let command = std::env::var("SOLOS_DEPS_COMMAND")
-        .unwrap_or_else(|_| "bun run solos dev verify --scope unit --json".into());
+    let kind = match std::env::var("SOLOS_DEPS_KIND").as_deref() {
+        Ok("cargo") => DepsKind::Cargo,
+        Ok("bun") | Err(_) => DepsKind::Bun,
+        Ok(other) => panic!("SOLOS_DEPS_KIND is bun or cargo, not {other}"),
+    };
+    let command = std::env::var("SOLOS_DEPS_COMMAND").unwrap_or_else(|_| {
+        match kind {
+            DepsKind::Bun => "bun run solos dev verify --scope unit --json",
+            DepsKind::Cargo => "cargo test -p solos-agent-core --offline",
+        }
+        .into()
+    });
+    let binary = std::env::var_os("SOLOS_DEPS_BINARY")
+        .or_else(|| std::env::var_os("SOLOS_DEPS_BUN"))
+        .map(PathBuf::from);
     // On disk, not in /tmp: a repository's node_modules is hundreds of
     // thousands of files, and /tmp is often a tmpfs with an inode limit.
     let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
@@ -43,8 +59,8 @@ async fn a_real_install_of_a_real_repository_runs_its_command_offline_in_a_ticke
         about: "A real repository.".into(),
         base: "main".into(),
         deps: Some(DepsConfig {
-            kind: DepsKind::Bun,
-            binary: std::env::var_os("SOLOS_DEPS_BUN").map(PathBuf::from),
+            kind,
+            binary,
             timeout_secs: 900,
             max_bytes: 16 << 30,
             memory_bytes: 16 << 30,
@@ -77,7 +93,7 @@ async fn a_real_install_of_a_real_repository_runs_its_command_offline_in_a_ticke
     let started = Instant::now();
     let found = forge.dependencies(&workspace).await;
     let built = started.elapsed();
-    let Dependencies::Ready { key, extras } = found else {
+    let Dependencies::Ready { key, extras, .. } = found else {
         panic!("the dependencies are not ready: {found:?}")
     };
     let again = Instant::now();
