@@ -130,11 +130,12 @@ forge:
   (833 MiB for 1.96.0) is bound read-only into the build and into this repository's Tickets, with `cargo` and `rustc` on
   `PATH`, and into no other Ticket. Do not mount `~/.cargo` or `~/.rustup` for it: `~/.cargo` holds registry
   credentials. `notes` does not need to say where Rust is.
-- Crates go in `<state>/deps/<owner>/<name>/<key>/vendor`. For `solos-swarm` that is 476 crates, 374 MiB and about 23,500
-  files, built in a few seconds. Keep `<state>` off a tmpfs.
-- A Ticket builds into `/work/target`, in its clone, on disk. A full debug build of `solos-swarm` with every test
-  target takes about 1 GiB there (the sandbox turns debug info off). The host puts `/target/` in the clone's
-  `.git/info/exclude`, so `git add -A` and `git status` ignore it.
+- Crates go in `<state>/deps/<owner>/<name>/<key>/vendor`. For `solos-swarm` that is 476 crates, about 390 MiB and
+  28,000 files, built in a few seconds. Keep `<state>` off a tmpfs.
+- A Ticket builds into `/work/target`, in its clone, on disk: a full debug build of `solos-swarm` with every test
+  target takes about 3.9 GiB there (the sandbox turns debug info off, so without that it would be more). The host puts
+  `/target/` in the clone's `.git/info/exclude`, so `git add -A` and `git status` ignore it, but keep room on the state
+  disk: `target` goes only when `agent prune` removes the Ticket's clone.
 - A lockfile that names a git dependency or a private registry, and a manifest with a `git` or `registry` key or a
   `[patch]` table, is refused, and the worker is told. Everything the host fetches is from crates.io.
 - A worker cannot add a dependency: the sandbox is offline, and the host vendored what `Cargo.lock` names. Cargo says
