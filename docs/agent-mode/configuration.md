@@ -49,6 +49,7 @@ The allowlist Policy (`AllowlistPolicy` in `crates/agent-core/src/policy.rs`). A
 | `bots` | empty | Bots whose messages may become inferred candidates, never requests. |
 | `approvers` | empty | Who may approve a budget above `auto_approve_microusd`, and a vault item's first use when the item names nobody. |
 | `accept_mode` | `observe` | `off` takes explicit requests only. `observe` judges inferred candidates and records "would accept", and starts nothing. `auto` starts work for an inferred candidate that matches an enabled rule. |
+| `answer_sources` | empty | Sources whose explicit messages always get an answer: where the Router would ignore one, the host starts a session with the message as its scope and its first line as its title. Set `[web]` for a one-to-one chat, where silence is not an answer. |
 | `rules` | empty | The enabled proactive rules, by name. Their text is `router.rules`. |
 | `auto_approve_microusd` | `2000000` | A budget above this waits for an approver's click. |
 | `eval_timeout_ms` | `120000` | How long an Eval waits for the Router. A Pi Router's model call is dropped after half of it. |

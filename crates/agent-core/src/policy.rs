@@ -36,6 +36,10 @@ pub struct AllowlistPolicy {
     /// People who may approve a budget above `auto_approve_microusd`.
     #[serde(default)]
     pub approvers: BTreeSet<String>,
+    /// Sources whose explicit messages always get an answer: where the Router would ignore one,
+    /// the host starts a session instead. For a one-to-one chat, silence is not an answer.
+    #[serde(default)]
+    pub answer_sources: BTreeSet<String>,
     #[serde(default)]
     pub accept_mode: AcceptMode,
     /// Enabled proactive rules, by name; their text is Router prompt.
@@ -61,6 +65,7 @@ impl Default for AllowlistPolicy {
             people: BTreeSet::new(),
             bots: BTreeSet::new(),
             approvers: BTreeSet::new(),
+            answer_sources: BTreeSet::new(),
             accept_mode: AcceptMode::default(),
             rules: BTreeSet::new(),
             auto_approve_microusd: default_auto_approve(),

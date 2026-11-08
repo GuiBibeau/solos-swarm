@@ -213,6 +213,8 @@ describe("the chat page", () => {
     expect(out).toContain("Move the release notes");
     expect(out).toContain("Looking into it.");
     expect(out).toContain("<strong>retry test</strong>");
+    // The delivered result and the worker's ready report carry the same text; the chat shows it once.
+    expect(out.split("<strong>retry test</strong>").length - 1).toBe(1);
     expect(out).toContain("What&#x27;s happening");
     expect(out).toContain("Message the swarm…");
     for (const bad of ["<script", "<img", "onerror"]) expect(out, bad).not.toContain(bad);

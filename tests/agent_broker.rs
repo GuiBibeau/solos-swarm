@@ -64,6 +64,7 @@ fn decide_terms() -> DecideTerms {
         max_budget_microusd: Some(2_000_000),
         approval_sources: BTreeSet::new(),
         auto_approve_microusd: 0,
+        answer_sources: BTreeSet::new(),
         swarm: None,
         repos: BTreeMap::new(),
         models: solos_swarm::agent::models::ModelPolicy::default(),
