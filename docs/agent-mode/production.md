@@ -118,7 +118,9 @@ Read these before you change it:
 - There is no `budgets:` section, so a session Ticket and the Router have no cap. A swarm's budget comes from the Router
   or from `executor.swarm.default_budget_microusd`. To cap them, add
   `budgets: {session_microusd: 500000, router_daily_microusd: 3000000}` ([Budgets](concepts.md#budgets)).
-- A Ticket from GitHub, MCP or a schedule has no Approve button, so its budget is capped at `auto_approve_microusd`.
+- A Ticket from GitHub, MCP or a schedule has no Approve button. With no `budgets.session_microusd` a session
+  Ticket has no budget at all, so there is nothing to cap. Where a budget applies (a swarm's, or a repository's
+  `budget_microusd`), an accept from one of those Sources may name at most `auto_approve_microusd`.
 - `watchdog.operator` is where the Watchdog's alerts, the dream's daily digest and the health check's posts go. The
   health check posts only to a `source: discord` operator.
 - Write `web.publish` in block style, as above. `scripts/agent-deploy` looks for a `publish:` line under `web:` to know
@@ -142,8 +144,8 @@ A deploy does these steps, in order:
 1. It fetches `origin`, resolves the revision to a 12-digit sha, and sends `git archive` of it to the box. The box skips
    the build when that release is already built.
 2. It refuses to build with less than 30 GB free.
-3. It builds on the box: `npm ci`, then `cargo build --locked --release` with toolchain 1.96.0 and the build cache
-   `~/agent/target`. It runs `doctor` on the new release and makes the release read-only.
+3. It builds on the box: `npm ci --ignore-scripts`, then `cargo build --locked --release` with toolchain 1.96.0 and
+   the build cache `~/agent/target`. It runs `doctor` on the new release and makes the release read-only.
 4. It [drains](#drain-running-work) the agent, stops the publisher and the agent, and copies `agent.db*` into
    `backups/`.
 5. It points `current` at the new release (the old one becomes `previous`), installs and enables the units from the

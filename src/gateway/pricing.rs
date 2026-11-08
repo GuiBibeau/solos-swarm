@@ -7,8 +7,9 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 /// Bytes added to a request's UTF-8 size before it is priced as input tokens.
-/// UTF-8 bytes plus chat framing overbounds byte-BPE input; usage above this
-/// bound is refused at settlement.
+/// UTF-8 bytes plus chat framing overbounds byte-BPE input, so reported usage
+/// usually settles below the hold. Usage above the hold is not refused: the
+/// ledger keeps the provider's cost, and only a capped account stops there.
 pub const REQUEST_FRAMING_BYTES: u64 = 4096;
 
 /// Prices in microusd per million tokens.
