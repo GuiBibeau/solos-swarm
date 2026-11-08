@@ -401,6 +401,77 @@ fn an_unlisted_person_never_reaches_the_router() {
     assert!(w.effects().iter().all(|e| !matches!(e, Effect::Assess(_))));
 }
 
+/// What the gate said about one trigger, from the Ignore Decision it recorded.
+fn gated(w: &World, trigger: &str) -> Option<String> {
+    w.engine
+        .repos()
+        .decisions
+        .values()
+        .filter(|d| d.eval.is_none())
+        .find(|d| d.triggers.iter().any(|t| t.as_str() == trigger))
+        .map(|d| d.reason.clone())
+}
+
+#[test]
+fn an_unlisted_person_on_a_thread_whose_ticket_ended_costs_no_router_call() {
+    let mut w = World::new(policy());
+    let (ticket, assignment) = started_ticket(&mut w, "th1");
+    w.engine
+        .report(&ticket, &assignment, report(ReportStatus::Ready))
+        .unwrap();
+    w.effects();
+    assert!(w.engine.repos().tickets[&ticket].ended.is_some());
+
+    w.engine
+        .receive(slack(
+            "m1",
+            Actor::person("mallory"),
+            Addressed::Mention,
+            "th1",
+            "@agent do something else",
+        ))
+        .unwrap();
+    assert!(w.engine.evaluate_due().unwrap().is_empty());
+    assert!(w.effects().iter().all(|e| !matches!(e, Effect::Assess(_))));
+    let why = gated(&w, "m1").expect("the gate recorded it");
+    assert!(why.contains("m1: not_listed"), "{why}");
+}
+
+#[test]
+fn an_unlisted_person_on_a_thread_with_an_open_ticket_is_still_judged_as_inferred() {
+    let mut w = World::new(policy());
+    let (ticket, _) = started_ticket(&mut w, "th1");
+    assert!(w.engine.repos().tickets[&ticket].ended.is_none());
+
+    w.engine
+        .receive(slack(
+            "m1",
+            Actor::person("mallory"),
+            Addressed::Mention,
+            "th1",
+            "@agent do something else",
+        ))
+        .unwrap();
+    let judged = w.engine.evaluate_due().unwrap();
+    assert_eq!(judged.len(), 1, "one eval starts: {judged:?}");
+    let assessed: Vec<_> = w
+        .effects()
+        .into_iter()
+        .filter_map(|e| match e {
+            Effect::Assess(c) => Some(c),
+            _ => None,
+        })
+        .collect();
+    let [candidate] = &assessed[..] else {
+        panic!("one assessment: {assessed:?}")
+    };
+    assert_eq!(
+        candidate.strength,
+        solos_agent_core::model::Strength::Inferred
+    );
+    assert!(gated(&w, "m1").is_none());
+}
+
 #[test]
 fn triggers_that_arrive_during_an_eval_form_the_next_batch() {
     let mut w = World::new(policy());

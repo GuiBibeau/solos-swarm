@@ -96,7 +96,9 @@ commit by someone else, it says to run `git rebase --exec 'git commit --amend --
 **Publish.** The Effect is committed with the admission, so a crash anywhere leaves it queued, and the runtime runs it
 again. Each step is an "ensure":
 
-1. The host names the branch `solos/<ticket>/<slug of the title>` and runs `ls-remote`. A branch that already holds the
+1. The host names the branch `solos/<ticket>/<slug of the title>` and runs `ls-remote`. The worker is told this, and
+   that the branch it committed on stays in its clone, so its report, which becomes the pull request's description,
+   does not name one. A branch that already holds the
    head is done. A branch that holds the last head the host confirmed is pushed with `--force-with-lease` against
    that head. Anything else is someone else's branch, and is never overwritten: the Change is `Withheld`, and one
    question goes to a person. The token is a write token for the one repository, in the mirror git's environment

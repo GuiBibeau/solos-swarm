@@ -120,7 +120,10 @@ vendored tree at `/pstack`. The vendored tree is pinned by its `MANIFEST`. The d
 The first prompt of an Assignment holds the title, the scope, the matched rules, every Input so far, the memos for its
 scope, and how to report. A relaunched Assignment also gets the Ticket's earlier replies (see
 [Follow-ups](channels.md#how-the-agent-talks)). With `recovery`, the prompt adds a note to check `/work` before
-repeating any outside action. After the first prompt, the worker gets each later batch of Inputs between turns.
+repeating any outside action. After the first prompt, the worker gets each later batch of Inputs between turns. A batch that holds only
+context from someone the Policy does not allow (a stranger's or a bot's comment, labelled `context only`) starts no
+turn, since a turn can cost up to 250 model calls. It waits and comes in the prompt of the next turn that an allowed
+person's message or a Note starts.
 
 **Reports.** `progress` and `waiting` are quiet. `ready` sends the result. A question, `blocked` or `failed` asks a
 person. A turn that ends with no Report, or with `progress` only, counts as `waiting`, except in the two cases below. A
