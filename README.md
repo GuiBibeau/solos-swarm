@@ -15,6 +15,29 @@ so no agent holds a key. It holds each call's cost against a budget in integer m
 provider's reported usage, and refuses calls while the operator pauses. Agents run in bubblewrap sandboxes, and every
 event goes to a hash-chained log. One Rust workspace builds one binary, `solos-swarm`, with two modes on that kernel.
 
+## Try it
+
+You need Linux or a Linux VM, and Rust 1.96.0. The `smoke` command needs no key, no network and no sandbox.
+
+```sh
+cargo build --locked --release
+./target/release/solos-swarm smoke --dir work/smoke
+```
+
+The second command prints one JSON line with `"verdict":"PASS"` and `"live_spend":0`. Every entry in `checks` has
+`"ok":true`: `claim`, `settle_once`, `no_held_budget`, `pause_refuses_model`, `unpause_admits`, `drain_settles`,
+`drain_holds_nothing` and `resume_keeps_ledger`. It runs the binary's own broker, ledger, pause gate, drain and resume
+against a scripted provider.
+
+## Numbers
+
+<p align="center">
+  <a href="docs/BENCHMARKS.md"><img src="docs/assets/numbers.svg" alt="Bar chart of one live 10-agent run: it settled $0.017438 of a $1.00 cap, finished 10 of 10 workers in 124.78 seconds, made 22 provider calls, held no cost at the end and leaked no keys" width="100%" /></a>
+</p>
+
+A recorded live run from 2026-04-12 on `deepseek-chat` (run `live-20260412-132831`), not a target. Source:
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
 ## Two modes
 
 **Swarm mode** (`solos-swarm run`) is a batch run: one Goal, 1 to 30 sandboxed Pi agents, a deadline and one
@@ -183,6 +206,15 @@ a snapshot of each Ticket to a private Vercel Blob store that the app reads. Set
 | [`skills/verify-solos-swarm/SKILL.md`](skills/verify-solos-swarm/SKILL.md) | Release qualification for immutable candidates and 10-worker runs. |
 | [`.claude/skills/verify-agent-mode/SKILL.md`](.claude/skills/verify-agent-mode/SKILL.md) | Live verification of agent mode on the remote box, one recipe per feature. |
 | [`CHANGELOG.md`](CHANGELOG.md) | Every merged pull request since #6. |
+
+## Star history
+
+[![Star history chart for GuiBibeau/solos-swarm](https://api.star-history.com/svg?repos=GuiBibeau/solos-swarm&type=Date)](https://star-history.com/#GuiBibeau/solos-swarm&Date)
+
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before you open a pull request. Report security issues privately, as
+[SECURITY.md](SECURITY.md) says.
 
 ## License
 
