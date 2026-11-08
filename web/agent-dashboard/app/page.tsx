@@ -1,195 +1,206 @@
 import Link from "next/link";
-import { JobBadge, StageBadge } from "@/components/badge";
+import { StageBadge } from "@/components/badge";
+import { Field } from "@/components/field";
 import { Refresh } from "@/components/refresh";
+import { JobRow as JobRowView, TicketRow } from "@/components/rows";
 import { When } from "@/components/time";
 import { readIndex, readJobs } from "@/lib/blob";
 import { nowMs } from "@/lib/clock";
 import { duration, usd } from "@/lib/format";
-import type { Index, IndexRow, JobRow, Jobs } from "@/lib/types";
 import { requireViewer } from "@/lib/viewer";
 
 export const dynamic = "force-dynamic";
-export const metadata = { title: "Tickets" };
+export const metadata = { title: "Command" };
 
 /** The publisher re-uploads the index every five minutes whether or not anything changed. */
 const STALE_MS = 15 * 60 * 1000;
 
-function Row({ row, now }: { row: IndexRow; now: number }) {
-  const asker = row.asker.name ?? row.asker.id;
-  return (
-    <li>
-      <Link href={`/tickets/${row.id}`} className="row">
-        <div className="row-title">
-          <span>{row.title}</span>
-          <StageBadge stage={row.stage} outcome={row.outcome} />
-        </div>
-        <div className="row-meta">
-          <span>
-            {asker} · {row.source}
-          </span>
-          <span>
-            {row.open ? (
-              <>
-                {duration(now - row.created_ms)} old · <When ms={row.updated_ms} now={now} />
-              </>
-            ) : (
-              <>
-                took {duration(row.duration_ms ?? 0)} · ended <When ms={row.updated_ms} now={now} />
-              </>
-            )}
-          </span>
-          <span>
-            {usd(row.spent_microusd)}
-            {row.budget_microusd ? ` of ${usd(row.budget_microusd)}` : ""}
-          </span>
-          {row.assignment ? (
-            <span>
-              worker {row.assignment.state}
-              {row.assignment.report ? `, last report ${row.assignment.report}` : ""}
-            </span>
-          ) : null}
-        </div>
-        {row.waiting_for ? <div className="row-waiting">{row.waiting_for}</div> : null}
-      </Link>
-    </li>
-  );
-}
-
-/** Problems first, then the order the owner wrote them in. */
-function byTrouble(jobs: JobRow[]): JobRow[] {
-  return [...jobs].sort((a, b) => Number(a.status === "up") - Number(b.status === "up"));
-}
-
-function Job({ job, now }: { job: JobRow; now: number }) {
-  return (
-    <li>
-      <div className="row plain">
-        <div className="row-title">
-          <span>{job.name}</span>
-          <JobBadge status={job.status} />
-        </div>
-        <div className="row-meta">
-          <span>{job.check}</span>
-          <span>
-            since <When ms={job.since_ms} now={now} />
-          </span>
-          {job.status === "up" ? <span>{job.detail}</span> : null}
-        </div>
-        {job.status !== "up" ? <div className="row-waiting">{job.detail}</div> : null}
-      </div>
-    </li>
-  );
-}
-
-/** The external jobs the Watchdog checks: work that runs outside agent mode and is not a ticket. */
-function ExternalJobs({ jobs, now }: { jobs: Jobs; now: number }) {
-  if (jobs.jobs.length === 0) return null;
-  const up = jobs.jobs.filter((job) => job.status === "up").length;
-  const stale = now - jobs.checked_ms > STALE_MS;
-  return (
-    <>
-      <h2>External jobs</h2>
-      <p className="sync">
-        <span>
-          checked <When ms={jobs.checked_ms} now={now} />
-        </span>
-        <span>
-          {up} of {jobs.jobs.length} up
-        </span>
-      </p>
-      {stale ? (
-        <p className="warn">
-          The Watchdog has not looked at these jobs for {duration(now - jobs.checked_ms)}, so they may have changed. The
-          agent may be down: <code>scripts/agent-deploy status</code>.
-        </p>
-      ) : null}
-      <ul className="rows">
-        {byTrouble(jobs.jobs).map((job) => (
-          <Job key={job.name} job={job} now={now} />
-        ))}
-      </ul>
-    </>
-  );
-}
-
-function Sync({ index, now }: { index: Index; now: number }) {
-  const at = index.generated_at ? Date.parse(index.generated_at) : Number.NaN;
-  if (Number.isNaN(at)) return null;
-  const stale = now - at > STALE_MS;
-  return (
-    <>
-      <p className="sync">
-        <span>
-          synced <When ms={at} now={now} />
-        </span>
-        <span>{index.open} open</span>
-      </p>
-      {stale ? (
-        <p className="warn">
-          Nothing has been published for {duration(now - at)}. The publisher on the box may be down:{" "}
-          <code>scripts/agent-deploy status</code>.
-        </p>
-      ) : null}
-    </>
-  );
-}
-
-export default async function Tickets() {
+export default async function CommandPage() {
   const viewer = await requireViewer();
-  let index: Index | null = null;
-  let failure: string | null = null;
+  const now = nowMs();
+  let index = null;
+  let indexError = false;
   try {
     index = await readIndex(viewer);
   } catch (error) {
     console.error(error);
-    failure = "The tickets could not be read from storage. Check the Blob store's credentials in the project.";
+    indexError = true;
   }
-  let jobs: Jobs | null = null;
-  let jobsFailure: string | null = null;
+  let jobs: Awaited<ReturnType<typeof readJobs>> = null;
+  let jobsError = false;
   try {
     jobs = await readJobs(viewer);
   } catch (error) {
     console.error(error);
-    jobsFailure = "The external jobs could not be read from storage.";
+    jobsError = true;
   }
-  const now = nowMs();
-  const open = index?.tickets.filter((row) => row.open) ?? [];
-  const ended = index?.tickets.filter((row) => !row.open) ?? [];
+  const rows = index?.tickets ?? [];
+  const open = rows.filter((row) => row.open);
+  const waiting = open.filter((row) => row.waiting_for);
+  const working = open.filter((row) => row.assignment?.state === "running");
+  const committed = open.reduce((sum, row) => sum + row.spent_microusd, 0);
+  const jobRows = [...(jobs?.jobs ?? [])].sort((a, b) => Number(a.status === "up") - Number(b.status === "up"));
+  const trouble = jobRows.filter((job) => job.status !== "up");
+  const jobsStale = jobs !== null && now - jobs.checked_ms > STALE_MS;
+  const recent = [...rows].sort((a, b) => b.updated_ms - a.updated_ms).slice(0, 3);
+  const generated = index?.generated_at ? Date.parse(index.generated_at) : null;
+  const stale = generated !== null && now - generated > STALE_MS;
+
+  const needs = [...waiting, ...open.filter((row) => row.stage === "approval" || row.stage === "answer")].filter(
+    (row, n, all) => all.findIndex((other) => other.id === row.id) === n,
+  );
 
   return (
     <>
-      <Refresh seconds={20} />
-      <h1>Tickets</h1>
-      {index ? <Sync index={index} now={now} /> : null}
-      {failure ? <p className="error">{failure}</p> : null}
-      {!failure && !index ? (
-        <p className="empty">
-          Nothing has been published yet. Is <code>solos-swarm agent publish</code> running on the box?
+      <header className="page-head">
+        <div>
+          <h1>Command</h1>
+          <p className="sub">
+            {index
+              ? `${open.length} open · ${waiting.length} waiting on you · ${working.length} working`
+              : "The swarm has not published its index yet."}
+          </p>
+        </div>
+        <div className="stamp">
+          {generated ? (
+            <>
+              <span>synced <When ms={generated} now={now} /></span>
+              <Refresh seconds={20} />
+            </>
+          ) : null}
+        </div>
+      </header>
+
+      {stale ? (
+        <p className="notice" style={{ marginBottom: 16 }}>
+          The publisher has not written for fifteen minutes; these figures may be old.
         </p>
       ) : null}
-      {jobs ? <ExternalJobs jobs={jobs} now={now} /> : null}
-      {jobsFailure ? <p className="error">{jobsFailure}</p> : null}
-      {index && open.length === 0 && ended.length === 0 ? <p className="empty">No tickets yet.</p> : null}
-      {open.length > 0 ? (
-        <>
-          <h2>Open</h2>
-          <ul className="rows">
-            {open.map((row) => (
-              <Row key={row.id} row={row} now={now} />
-            ))}
-          </ul>
-        </>
+      {jobsStale && !jobsError && jobs ? (
+        <p className="notice" style={{ marginBottom: 16 }}>
+          The Watchdog has not looked at these jobs for {duration(now - jobs.checked_ms)}.
+        </p>
       ) : null}
-      {ended.length > 0 ? (
-        <>
-          <h2>Recently ended</h2>
-          <ul className="rows">
-            {ended.map((row) => (
-              <Row key={row.id} row={row} now={now} />
-            ))}
-          </ul>
-        </>
-      ) : null}
+
+      {indexError ? (
+        <p className="notice">The tickets could not be read from storage.</p>
+      ) : !index ? (
+        <p className="empty">Nothing has been published yet. The publisher uploads the first index within a few seconds of a change.</p>
+      ) : (
+        <div className="grid">
+          <section className="panel col-12" aria-labelledby="field-title">
+            <div className="panel-head">
+              <h2 id="field-title">The field</h2>
+              <span className="legend">
+                <span><span className="dot live" />live worker</span>
+                <span><span className="dot warn" />waiting</span>
+                <span><span className="dot" />open</span>
+              </span>
+            </div>
+            <div className="field-split">
+              <div className="field-body">
+                <Field tickets={rows} />
+              </div>
+              <div className="needs">
+                <p className="needs-head" id="needs-title">
+                  <span>Needs you</span>
+                  <span>{needs.length ? `${needs.length} waiting` : "clear"}</span>
+                </p>
+                {needs.length === 0 ? (
+                  <p className="empty">Nothing is waiting on you. The swarm is working.</p>
+                ) : (
+                  <ul className="rows">
+                    {needs.slice(0, 3).map((row) => (
+                      <li key={row.id}>
+                        <Link href={`/tickets/${row.id}`} className="row">
+                          <div className="row-title">
+                            <span className="name">{row.title}</span>
+                            <StageBadge stage={row.stage} outcome={row.outcome} />
+                          </div>
+                          <div className="row-meta">
+                            <span>{row.waiting_for ?? row.stage.replace("_", " ")}</span>
+                          </div>
+                        </Link>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                <div className="side-strip" role="group" aria-label="Today">
+                  <div className="cell">
+                    <div className="label">Open tickets</div>
+                    <div className="value">{open.length}</div>
+                  </div>
+                  <div className="cell">
+                    <div className="label">Working now</div>
+                    <div className="value">{working.length}</div>
+                  </div>
+                  <div className="cell">
+                    <div className="label">Waiting on you</div>
+                    <div className="value">{waiting.length}</div>
+                  </div>
+                  <div className="cell">
+                    <div className="label">Committed</div>
+                    <div className="value">
+                      {usd(committed)}<small>on open tickets</small>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section className="panel col-12" aria-labelledby="recent-title">
+            <div className="dual">
+              <div className="dual-main">
+                <div className="panel-head">
+                  <h2 id="recent-title">Recent tickets</h2>
+                  <span className="legend"><Link href="/tickets">View all</Link></span>
+                </div>
+                {recent.length === 0 ? (
+                  <div className="panel-body">
+                    <p className="empty">No tickets yet.</p>
+                  </div>
+                ) : (
+                  <ul className="rows">
+                    {recent.map((row) => (
+                      <TicketRow key={row.id} row={row} now={now} />
+                    ))}
+                  </ul>
+                )}
+              </div>
+              <div className="dual-side" aria-labelledby="jobs-title">
+                <div className="panel-head">
+                  <h2 id="jobs-title">External jobs</h2>
+                  <span className="legend">
+                    {trouble.length ? `${trouble.length} in trouble` : jobRows.length ? "all up" : "none"}
+                    {jobRows.length > 3 ? (
+                      <>
+                        {" · "}
+                        <Link href="/jobs">View all</Link>
+                      </>
+                    ) : null}
+                  </span>
+                </div>
+                {jobsError ? (
+                  <div className="panel-body">
+                    <p className="notice">The external jobs could not be read from storage.</p>
+                  </div>
+                ) : jobRows.length === 0 ? (
+                  <div className="panel-body">
+                    <p className="empty">The Watchdog has no external jobs configured.</p>
+                  </div>
+                ) : (
+                  <ul className="rows">
+                    {jobRows.slice(0, 3).map((job) => (
+                      <JobRowView key={job.name} job={job} now={now} />
+                    ))}
+                  </ul>
+                )}
+              </div>
+            </div>
+          </section>
+        </div>
+      )}
     </>
   );
 }

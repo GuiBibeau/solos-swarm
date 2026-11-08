@@ -21,18 +21,33 @@ uploaded. Nothing here can reach the box, and the box never serves a request.
 
 ## Pages
 
+The site is one command center in the swarm's own field: matte carbon, hairline panels, Geist for words and
+JetBrains Mono for figures. An unlabelled rail on the left (a bottom bar on a phone) carries the five destinations.
+
 | Path | What |
 |---|---|
-| `/` | The external jobs, if any (see below), then open tickets, then the latest ended: title, stage, who asked and from where, age, spend, the worker's state, and what a ticket waits for. It says when it was last synced and warns when the index is fifteen minutes old. It reloads its data every 20 s. |
-| `/tickets/<id>` | The request, the conversation in order (what was said to the ticket and every reply the agent sent, rendered as markdown), the worker's reports, the browser's pages, the decisions, the budget, and a link to the original Discord message or GitHub issue where one can be made. An open ticket reloads every 10 s. |
+| `/` | **Command.** The field (every Ticket a node, a running worker its satellite, the host at the centre), what needs you, the four numbers, and the latest tickets beside the external jobs. It says when it was last synced and warns when the index or the Watchdog is fifteen minutes old. It reloads every 20 s. |
+| `/chat` | **Chat.** The latest conversations in order, including each worker's reports, in a list beside the selected thread. The agent reads its configured channels, not this page, so the composer is a link to the source thread. |
+| `/tickets` | **Tickets.** Open and recently ended tickets; each row carries who asked and from where, its age or duration, its worker and its spend. |
+| `/tickets/<id>` | **One ticket.** The request, the conversation, the worker's reports, the scope, the facts and budget, the browser's pages, and the decisions; a link to the original Discord message or GitHub issue where one can be made. An open ticket reloads every 10 s. |
+| `/swarm` | **Swarm.** The full field and every worker, with the numbers. |
+| `/jobs` | **Jobs.** Every external job: how it is checked, its state (`up`, `down`, `stalled`, low on disk), how long it has had that state, and what the last check found. |
 | `/login` | "Sign in with Vercel". |
 
-**External jobs.** With `watchdog.jobs` in agent.yaml, the home page has an "External jobs" section above the tickets.
-Each job shows its name, how it is checked, a badge (`up`, `down`, `stalled` or `low on disk`), how long it has had that
-status, and what the last check found. Jobs in trouble come first. It says when the Watchdog last looked and warns when
-that was fifteen minutes ago, since then the statuses may be old. Without jobs, or before the publisher uploads them,
-the section is not there. The data is `jobs/index.json`, the Watchdog's `state/watchdog-jobs.json` as it is
-([runtime.md, External jobs](../../docs/agent-mode/runtime.md#external-jobs)).
+**External jobs.** With `watchdog.jobs` in agent.yaml, the Watchdog writes `jobs/index.json` and the pages above read
+it ([runtime.md, External jobs](../../docs/agent-mode/runtime.md#external-jobs)). Jobs in trouble come first; the
+Command page shows the three that need a look and links to `/jobs` for the rest. The command center warns when the
+Watchdog last looked more than fifteen minutes ago, since then the statuses may be old.
+
+## Preview it locally
+
+```sh
+DASHBOARD_FIXTURES=1 npm run dev
+```
+
+reads the JSON fixtures in `tests/fixtures/` (written by `tests/agent_publish.rs`) instead of the Blob store, and skips
+sign-in, so every screen can be designed and checked without a deployment. The mode requires `NODE_ENV !==
+"production"`, so it cannot open a production build.
 
 Discord replies link to ticket pages: `https://agent.guibibeau.com/tickets/<id>`. A link opened before the publisher
 has uploaded that ticket says so and checks again by itself.

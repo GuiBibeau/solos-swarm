@@ -8,7 +8,7 @@ import { When } from "@/components/time";
 import { readTicket, validTicketId } from "@/lib/blob";
 import { nowMs } from "@/lib/clock";
 import { duration, stamp, usd } from "@/lib/format";
-import type { AssignmentView, Turn, TicketSnapshot } from "@/lib/types";
+import type { AssignmentView, TicketSnapshot, Turn } from "@/lib/types";
 import { requireViewer } from "@/lib/viewer";
 
 export const dynamic = "force-dynamic";
@@ -31,24 +31,31 @@ const KIND_LABEL: Record<Turn["kind"], string> = {
   secret: "vault",
 };
 
+function who(turn: Turn): string {
+  if (turn.from === "agent") return "Agent";
+  if (turn.from === "router") return "Router";
+  return turn.who ?? turn.from;
+}
+
 function TurnView({ turn, now }: { turn: Turn; now: number }) {
-  const who = turn.from === "agent" ? "Agent" : (turn.who ?? turn.from);
   return (
     <article className={`turn ${turn.from}`}>
       <div className="turn-head">
-        <strong>{who}</strong>
+        <strong>{who(turn)}</strong>
         <span>{KIND_LABEL[turn.kind]}</span>
         {turn.channel ? <span>on {turn.channel}</span> : null}
         <When ms={turn.at_ms} now={now} />
         {turn.delivery && !turn.delivery.delivered ? (
-          <span className="undelivered">
+          <span className="tag warn">
             not delivered yet
             {turn.delivery.attempts > 0 ? ` (${turn.delivery.attempts} failed)` : ""}
             {turn.delivery.error ? `: ${turn.delivery.error}` : ""}
           </span>
         ) : null}
       </div>
-      <Markdown>{turn.text}</Markdown>
+      <div className="prose">
+        <Markdown>{turn.text}</Markdown>
+      </div>
     </article>
   );
 }
@@ -58,7 +65,7 @@ function Assignment({ assignment, now, open }: { assignment: AssignmentView; now
   const end = assignment.ended_ms;
   const last = assignment.reports.at(-1);
   return (
-    <details open={open}>
+    <details className="reports" open={open}>
       <summary>
         <strong>{assignment.state}</strong>
         {last ? ` · last report ${last.status}` : ""}
@@ -67,7 +74,7 @@ function Assignment({ assignment, now, open }: { assignment: AssignmentView; now
         {end ? ` · ran ${duration(end - start)}` : ""}
         {assignment.ended_reason ? ` · ${assignment.ended_reason}` : ""}
       </summary>
-      <div className="reports">
+      <div>
         {assignment.report_count > assignment.reports.length ? (
           <p className="muted">
             Showing the latest {assignment.reports.length} of {assignment.report_count} reports.
@@ -81,9 +88,11 @@ function Assignment({ assignment, now, open }: { assignment: AssignmentView; now
               <When ms={report.at_ms} now={now} />
               {report.spent_microusd > 0 ? <span>{usd(report.spent_microusd)} so far</span> : null}
             </div>
-            <Markdown>{report.text}</Markdown>
+            <div className="prose">
+              <Markdown>{report.text}</Markdown>
+            </div>
             {report.question ? (
-              <p>
+              <p className="prose">
                 <strong>Question:</strong> {report.question}
               </p>
             ) : null}
@@ -109,7 +118,12 @@ function Facts({ ticket }: { ticket: TicketSnapshot }) {
     ["Owes", ticket.deliverable.replace("_", " ")],
   ];
   if (ticket.repo) {
-    facts.push(["Repository", <a key="repo" href={`https://github.com/${ticket.repo}`} target="_blank" rel="noopener noreferrer">{ticket.repo}</a>]);
+    facts.push([
+      "Repository",
+      <a key="repo" href={`https://github.com/${ticket.repo}`} target="_blank" rel="noopener noreferrer">
+        {ticket.repo}
+      </a>,
+    ]);
   }
   if (ticket.approval.state !== "not_needed") {
     facts.push([
@@ -121,9 +135,9 @@ function Facts({ ticket }: { ticket: TicketSnapshot }) {
     facts.push(["Ended", `${ticket.ended.outcome} by ${ticket.ended.by}, ${stamp(ticket.ended.at_ms)}`]);
   }
   return (
-    <dl className="facts">
+    <dl className="kv">
       {facts.map(([name, value]) => (
-        <div className="fact" key={name}>
+        <div key={name} style={{ display: "contents" }}>
           <dt>{name}</dt>
           <dd>{value}</dd>
         </div>
@@ -143,11 +157,15 @@ export default async function TicketPage({ params }: Props) {
     console.error(error);
     return (
       <>
-        <Link href="/" className="crumb">
-          ← Tickets
-        </Link>
-        <h1>Ticket {id}</h1>
-        <p className="error">This ticket could not be read from storage.</p>
+        <nav className="crumbs">
+          <Link href="/tickets">Tickets</Link>
+        </nav>
+        <header className="page-head">
+          <div>
+            <h1>Ticket {id}</h1>
+          </div>
+        </header>
+        <p className="notice">This ticket could not be read from storage.</p>
       </>
     );
   }
@@ -155,10 +173,14 @@ export default async function TicketPage({ params }: Props) {
     return (
       <>
         <Refresh seconds={10} />
-        <Link href="/" className="crumb">
-          ← Tickets
-        </Link>
-        <h1>Ticket {id}</h1>
+        <nav className="crumbs">
+          <Link href="/tickets">Tickets</Link>
+        </nav>
+        <header className="page-head">
+          <div>
+            <h1>Ticket {id}</h1>
+          </div>
+        </header>
         <p className="empty">
           This ticket has not reached the dashboard yet. The publisher uploads within a few seconds of a change; this
           page checks again by itself.
@@ -171,110 +193,152 @@ export default async function TicketPage({ params }: Props) {
   return (
     <>
       {ticket.open ? <Refresh seconds={10} /> : null}
-      <Link href="/" className="crumb">
-        ← Tickets
-      </Link>
-      <h1>{ticket.title}</h1>
-      <p className="row-meta">
-        <StageBadge stage={ticket.stage} outcome={outcome} />
-        <span className="mono">{ticket.id}</span>
-        {ticket.source_url ? (
-          <a href={ticket.source_url} target="_blank" rel="noopener noreferrer">
-            Open the conversation in {ticket.source}
-          </a>
-        ) : null}
-      </p>
+      <nav className="crumbs">
+        <Link href="/tickets">Tickets</Link>
+      </nav>
+      <header className="page-head">
+        <div>
+          <h1>{ticket.title}</h1>
+          <p className="sub">
+            <span className="mono">{ticket.id}</span>
+            {ticket.source_url ? (
+              <>
+                {" · "}
+                <a href={ticket.source_url} target="_blank" rel="noopener noreferrer">
+                  Open the conversation in {ticket.source}
+                </a>
+              </>
+            ) : null}
+          </p>
+        </div>
+        <div className="stamp">
+          <StageBadge stage={ticket.stage} outcome={outcome} />
+        </div>
+      </header>
 
       {ticket.attention ? (
-        <div className="callout">
+        <p className="notice" style={{ marginBottom: 16 }}>
           <strong>Waiting for a person.</strong> {ticket.attention}
+        </p>
+      ) : null}
+
+      <div className="detail-grid">
+        <div className="side-stack">
+          <section className="panel" aria-labelledby="conversation-title">
+            <h2 className="section-title" id="conversation-title">
+              Conversation
+            </h2>
+            <div className="transcript">
+              {ticket.request ? <TurnView turn={ticket.request} now={now} /> : null}
+              {ticket.conversation.map((turn, n) => (
+                <TurnView key={`${turn.at_ms}-${n}`} turn={turn} now={now} />
+              ))}
+            </div>
+          </section>
+
+          {ticket.assignments.length > 0 ? (
+            <section className="panel" aria-labelledby="work-title">
+              <h2 className="section-title" id="work-title">
+                Work
+              </h2>
+              {ticket.assignments.map((assignment, n) => (
+                <Assignment
+                  key={assignment.id}
+                  assignment={assignment}
+                  now={now}
+                  open={ticket.open && n === ticket.assignments.length - 1}
+                />
+              ))}
+            </section>
+          ) : null}
         </div>
-      ) : null}
-      <Facts ticket={ticket} />
 
-      <h2>Conversation</h2>
-      <div className="turns">
-        {ticket.request ? <TurnView turn={ticket.request} now={now} /> : null}
-        {ticket.conversation.map((turn, n) => (
-          <TurnView key={`${turn.at_ms}-${n}`} turn={turn} now={now} />
-        ))}
+        <div className="side-stack">
+          <section className="panel" aria-labelledby="facts-title">
+            <h2 className="section-title" id="facts-title">
+              Facts
+            </h2>
+            <div className="panel-body">
+              <Facts ticket={ticket} />
+            </div>
+          </section>
+
+          {ticket.browser ? (
+            <section className="panel" aria-labelledby="browser-title">
+              <h2 className="section-title" id="browser-title">
+                Browser
+              </h2>
+              <details className="reports">
+                <summary>
+                  {ticket.browser.steps} steps
+                  {ticket.browser.refused ? `, ${ticket.browser.refused} refused` : ""}
+                  {ticket.browser.lost ? `, ${ticket.browser.lost} unanswered` : ""}
+                  {ticket.browser.needs_approval.length > 0
+                    ? `, asked about ${ticket.browser.needs_approval.join(", ")}`
+                    : ""}
+                </summary>
+                <ul className="prose">
+                  {ticket.browser.pages_omitted > 0 ? (
+                    <li className="muted">{ticket.browser.pages_omitted} earlier pages not shown</li>
+                  ) : null}
+                  {ticket.browser.pages.map((page) => (
+                    <li key={`${page.n}-${page.at}`}>
+                      <span className="muted">
+                        {page.action} · {page.at.slice(11, 19)}
+                        {page.status ? ` · ${page.status}` : ""}
+                      </span>
+                      <br />
+                      {page.title ? <strong>{page.title} </strong> : null}
+                      <a href={page.url} target="_blank" rel="noopener noreferrer nofollow">
+                        {page.url}
+                      </a>
+                    </li>
+                  ))}
+                </ul>
+                <p className="muted">Addresses are shown without their query, and what was typed is not shown at all.</p>
+              </details>
+            </section>
+          ) : null}
+
+          <section className="panel" aria-labelledby="scope-title">
+            <h2 className="section-title" id="scope-title">
+              Scope
+            </h2>
+            <div className="panel-body prose">
+              <Markdown>{ticket.scope}</Markdown>
+            </div>
+          </section>
+
+          {ticket.decisions.length > 0 ? (
+            <section className="panel" aria-labelledby="decisions-title">
+              <h2 className="section-title" id="decisions-title">
+                Decisions
+              </h2>
+              <details className="reports">
+                <summary>
+                  {ticket.decisions.length} decision{ticket.decisions.length === 1 ? "" : "s"} about this ticket
+                </summary>
+                <ul className="rows">
+                  {ticket.decisions.map((decision) => (
+                    <li key={decision.id} className="row">
+                      <div className="row-title">
+                        <span className="name">{decision.kind}</span>
+                        <When ms={decision.at_ms} now={now} />
+                      </div>
+                      <div className="row-meta">
+                        <span>{decision.reason}</span>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            </section>
+          ) : null}
+        </div>
       </div>
-
-      {ticket.assignments.length > 0 ? (
-        <>
-          <h2>Work</h2>
-          {ticket.assignments.map((assignment, n) => (
-            <Assignment
-              key={assignment.id}
-              assignment={assignment}
-              now={now}
-              open={ticket.open && n === ticket.assignments.length - 1}
-            />
-          ))}
-        </>
-      ) : null}
-
-      {ticket.browser ? (
-        <>
-          <h2>Browser</h2>
-          <details>
-            <summary>
-              {ticket.browser.steps} steps
-              {ticket.browser.refused ? `, ${ticket.browser.refused} refused` : ""}
-              {ticket.browser.lost ? `, ${ticket.browser.lost} unanswered` : ""}
-              {ticket.browser.needs_approval.length > 0
-                ? `, asked about ${ticket.browser.needs_approval.join(", ")}`
-                : ""}
-            </summary>
-            <ul className="plain">
-              {ticket.browser.pages_omitted > 0 ? (
-                <li className="muted">{ticket.browser.pages_omitted} earlier pages not shown</li>
-              ) : null}
-              {ticket.browser.pages.map((page) => (
-                <li key={`${page.n}-${page.at}`}>
-                  <span className="muted">
-                    {page.action} · {page.at.slice(11, 19)}
-                    {page.status ? ` · ${page.status}` : ""}
-                  </span>
-                  <br />
-                  {page.title ? <strong>{page.title} </strong> : null}
-                  <a href={page.url} target="_blank" rel="noopener noreferrer nofollow">
-                    {page.url}
-                  </a>
-                </li>
-              ))}
-            </ul>
-            <p className="muted">Addresses are shown without their query, and what was typed is not shown at all.</p>
-          </details>
-        </>
-      ) : null}
-
-      {ticket.decisions.length > 0 ? (
-        <>
-          <h2>Decisions</h2>
-          <details>
-            <summary>
-              {ticket.decisions.length} decision{ticket.decisions.length === 1 ? "" : "s"} about this ticket
-            </summary>
-            <ul className="plain">
-              {ticket.decisions.map((decision) => (
-                <li key={decision.id}>
-                  <strong>{decision.kind}</strong> <span className="muted">{decision.at.slice(0, 19)}Z</span>
-                  <br />
-                  {decision.reason}
-                </li>
-              ))}
-            </ul>
-          </details>
-        </>
-      ) : null}
-
-      <details>
-        <summary>What the Router understood the work to be</summary>
-        <Markdown>{ticket.scope}</Markdown>
-      </details>
-
-      <p className="foot">Snapshot of {stamp(ticket.updated_ms)}.</p>
+      <p className="sub" style={{ marginTop: 16 }}>
+        Snapshot of {stamp(ticket.updated_ms)}.
+      </p>
     </>
   );
 }
