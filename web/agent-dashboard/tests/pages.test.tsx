@@ -45,10 +45,11 @@ vi.mock("next/navigation", () => ({
   },
 }));
 
-const { default: Command } = await import("@/app/page");
+const { default: Command } = await import("@/app/command/page");
 const { default: Tickets } = await import("@/app/tickets/page");
 const { default: TicketPage } = await import("@/app/tickets/[id]/page");
-const { default: Chat } = await import("@/app/chat/page");
+const { default: Chat } = await import("@/app/page");
+const { default: ChatRedirect } = await import("@/app/chat/page");
 const { default: Swarm } = await import("@/app/swarm/page");
 const { default: JobsPage } = await import("@/app/jobs/page");
 const { default: Login } = await import("@/app/login/page");
@@ -190,26 +191,39 @@ describe("the ticket list", () => {
 });
 
 describe("the chat page", () => {
-  it("shows the latest conversation and where to reply, with the turns as text", async () => {
-    readIndex.mockResolvedValue(index);
-    readTicket.mockImplementation(async (id: string) => tickets.find((ticket) => ticket.id === id) ?? null);
-    const newest = [...index.tickets].sort((a, b) => b.updated_ms - a.updated_ms)[0];
-    if (!newest) throw new Error("the fixture index is empty");
-    const out = await html(Chat({ searchParams: Promise.resolve({ t: newest.id }) }));
+  const thread = `wc_${"a".repeat(32)}`;
+  const webRow = {
+    ...index.tickets[0],
+    id: "tk_web000000000000",
+    title: "Move the release notes",
+    source: "web",
+    source_url: `https://agent.guibibeau.com/?t=${thread}`,
+  };
+
+  it("renders a conversation from its thread, with the transcript and the activity beside it", async () => {
+    readIndex.mockResolvedValue({ ...index, tickets: [webRow, ...index.tickets] });
+    const ticket = byTitle("Summarise the incident report");
+    readTicket.mockResolvedValue({ ...ticket, id: webRow.id, title: webRow.title, source: "web", source_url: webRow.source_url });
+    const out = await html(Chat({ searchParams: Promise.resolve({ t: thread }) }));
     expect(out).toContain("<h1>Chat</h1>");
-    expect(out).toContain("Conversations");
-    expect(out).toContain("Agent");
+    expect(out).toContain("Move the release notes");
     expect(out).toContain("Looking into it.");
+    expect(out).toContain("<strong>retry test</strong>");
+    expect(out).toContain("What&#x27;s happening");
+    expect(out).toContain("Message the swarm…");
     for (const bad of ["<script", "<img", "onerror"]) expect(out, bad).not.toContain(bad);
   });
 
-  it("selects a conversation from the query, and says where the thread lives", async () => {
+  it("starts a new conversation with the starters when the thread has no ticket yet", async () => {
     readIndex.mockResolvedValue(index);
-    readTicket.mockImplementation(async (id: string) => tickets.find((ticket) => ticket.id === id) ?? null);
-    const asking = byTitle("Rotate the staging keys");
-    const out = await html(Chat({ searchParams: Promise.resolve({ t: asking.id }) }));
-    expect(out).toContain("Rotate the staging keys");
-    expect(out).toContain(`/tickets/${asking.id}`);
+    const out = await html(Chat({ searchParams: Promise.resolve({ t: thread }) }));
+    expect(out).toContain("New conversation");
+    expect(out).toContain("What needs me right now?");
+    expect(out).toContain("No web conversation yet");
+  });
+
+  it("sends an old /chat link to the chat, which is the home now", () => {
+    expect(() => ChatRedirect()).toThrow("redirect:/");
   });
 });
 
