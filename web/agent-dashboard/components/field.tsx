@@ -15,8 +15,9 @@ function kind(row: IndexRow): "live" | "waiting" | "bad" | "open" | "ended" {
   return "open";
 }
 
-function shortId(id: string): string {
-  return id.length > 8 ? id.slice(-6) : id;
+function clipTitle(title: string): string {
+  const clean = title.replace(/\s+/g, " ").trim();
+  return clean.length > 26 ? `${clean.slice(0, 25)}…` : clean;
 }
 
 export function Field({ tickets, large = false }: { tickets: IndexRow[]; large?: boolean }) {
@@ -43,7 +44,7 @@ export function Field({ tickets, large = false }: { tickets: IndexRow[]; large?:
     const wy = y + 11 * Math.sin(angle);
     return { row, x, y, k, worker, wx, wy };
   });
-  const labelled = nodes.filter((n) => n.k === "live" || n.k === "waiting" || n.k === "open").slice(0, large ? 12 : 7);
+  const labelled = nodes.filter((n) => n.k === "live" || n.k === "waiting" || n.k === "open").slice(0, large ? 10 : 6);
 
   return (
     <svg
@@ -71,9 +72,17 @@ export function Field({ tickets, large = false }: { tickets: IndexRow[]; large?:
         <rect x={cx - 4} y={cy - 4} width={8} height={8} fill="var(--INK)" transform={`rotate(-35 ${cx} ${cy})`} />
       </g>
 
+      {large ? (
+        <g aria-hidden="true">
+          <text className="ring-label" x={cx + 8} y={cy - 100}>live or waiting</text>
+          <text className="ring-label" x={cx + 8} y={cy - 158}>open</text>
+          <text className="ring-label" x={cx + 8} y={cy - 213}>ended</text>
+        </g>
+      ) : null}
+
       {labelled.map(({ row, x, y, k }) => (
         <text key={row.id} className={`lbl ${k === "live" ? "live" : ""}`} x={x + 8} y={y - 7} textAnchor="start">
-          {shortId(row.id)}
+          {clipTitle(row.title)}
         </text>
       ))}
 

@@ -1,4 +1,7 @@
 import { redirect } from "next/navigation";
+import { Field } from "@/components/field";
+import { Mark } from "@/components/rail";
+import { FIXTURES } from "@/lib/fixtures";
 import { currentViewer } from "@/lib/viewer";
 
 export const dynamic = "force-dynamic";
@@ -19,22 +22,33 @@ export default async function Login({
 }: {
   searchParams: Promise<{ error?: string; next?: string }>;
 }) {
-  if (await currentViewer()) redirect("/");
+  if (!FIXTURES && (await currentViewer())) redirect("/");
   const { error, next } = await searchParams;
   const message = error ? (MESSAGES[error] ?? "The sign-in failed. Try again.") : null;
   const target = next && next.startsWith("/") && !next.startsWith("//") ? next : "/";
   return (
     <div className="signin">
-      <h1>Agent</h1>
-      <p className="muted">What the agent is doing, and what it said. Private.</p>
-      {message ? (
-        <p className="error" role="alert">
-          {message}
+      <div className="signin-copy">
+        <span className="signin-mark" aria-hidden="true">
+          <Mark />
+        </span>
+        <h1>The swarm, in one place.</h1>
+        <p className="sub">
+          solos agent: what it is working on, what it needs from you, and what it said. Private to you.
         </p>
-      ) : null}
-      <a className="button" href={`/auth/login?next=${encodeURIComponent(target)}`}>
-        Sign in with Vercel
-      </a>
+        {message ? (
+          <p className="notice signin-notice" role="alert">
+            {message}
+          </p>
+        ) : null}
+        <a className="button primary signin-action" href={`/auth/login?next=${encodeURIComponent(target)}`}>
+          Sign in with Vercel
+        </a>
+        <p className="signin-note">One allowed Vercel account. The box never accepts a connection.</p>
+      </div>
+      <div className="signin-field" aria-hidden="true">
+        <Field tickets={[]} large />
+      </div>
     </div>
   );
 }

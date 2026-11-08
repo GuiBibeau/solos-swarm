@@ -66,7 +66,9 @@ export default async function SwarmPage() {
               </span>
             </div>
             <div className="panel-body">
-              <Field tickets={rows} large />
+              <div className="field-large">
+                <Field tickets={rows} large />
+              </div>
             </div>
           </section>
 

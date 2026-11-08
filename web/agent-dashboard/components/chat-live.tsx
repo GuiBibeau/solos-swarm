@@ -3,7 +3,6 @@
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { JobBadge, StageBadge } from "@/components/badge";
-import { Field } from "@/components/field";
 import { Markdown } from "@/components/markdown";
 import { When } from "@/components/time";
 import { duration, usd } from "@/lib/format";
@@ -187,6 +186,7 @@ export function ChatLive({
 
   const needs = (index?.tickets ?? []).filter((row) => row.open && row.waiting_for).slice(0, 3);
   const busy = working(ticket, pending);
+  const lastReport = ticket?.assignments.at(-1)?.reports.at(-1) ?? null;
 
   const send = async (value: string) => {
     const trimmed = value.trim();
@@ -252,8 +252,6 @@ export function ChatLive({
         </div>
         <div className="stamp">
           <span className="dot live" aria-hidden="true" />
-          <span>{busy ? "working" : "live"}</span>
-          <span aria-hidden="true">·</span>
           <span>synced <When ms={now} now={now} /></span>
         </div>
       </header>
@@ -316,12 +314,44 @@ export function ChatLive({
             {messages.length === 0 ? (
               <div className="starters">
                 <p className="starters-title">What should the swarm do?</p>
-                <p className="sub">Ask for work, check on it, or ask what needs you. It also answers on Discord and GitHub.</p>
-                <ul>
+                <p className="sub">Ask for work, check on it, or take up what is waiting. It also answers on Discord and GitHub.</p>
+                {needs.length > 0 ? (
+                  <div className="starter-needs">
+                    <p className="starter-label">Waiting on you</p>
+                    <ul>
+                      {needs.map((row) => (
+                        <li key={row.id}>
+                          <button
+                            type="button"
+                            className="starter-line"
+                            onClick={() => {
+                              setText(`About "${row.title}": `);
+                              inputRef.current?.focus();
+                            }}
+                          >
+                            <span className="starter-mark" aria-hidden="true">›</span>
+                            <span className="starter-text">{row.title}</span>
+                            <span className="starter-why">{row.waiting_for}</span>
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+                <p className="starter-label">Or ask</p>
+                <ul className="starter-list">
                   {STARTERS.map((starter) => (
                     <li key={starter}>
-                      <button type="button" className="starter" onClick={() => { setText(starter); inputRef.current?.focus(); }}>
-                        {starter}
+                      <button
+                        type="button"
+                        className="starter-line"
+                        onClick={() => {
+                          setText(starter);
+                          inputRef.current?.focus();
+                        }}
+                      >
+                        <span className="starter-mark" aria-hidden="true">›</span>
+                        <span className="starter-text">{starter}</span>
                       </button>
                     </li>
                   ))}
@@ -398,12 +428,9 @@ export function ChatLive({
         <aside className="panel activity" aria-label="What is happening">
           <div className="panel-head">
             <h2>What&apos;s happening</h2>
-            <span className="legend">{busy ? "working" : "idle"}</span>
+            <span className="legend">{(index?.tickets ?? []).filter((row) => row.open).length} open</span>
           </div>
           <div className="activity-body">
-            <div className="activity-field">
-              <Field tickets={index?.tickets ?? []} />
-            </div>
             {ticket ? (
               <dl className="kv activity-kv">
                 <dt>Stage</dt>
@@ -419,24 +446,36 @@ export function ChatLive({
               <p className="sub activity-note">A new conversation starts a Ticket as soon as the agent picks it up.</p>
             )}
 
-            <div className="activity-block">
-              <div className="activity-head">
-                <span>Needs you</span>
-                <Link href="/command">All</Link>
+            {lastReport ? (
+              <div className="activity-block">
+                <div className="activity-head">
+                  <span>Last report</span>
+                  <span>{lastReport.status}</span>
+                </div>
+                <p className="activity-quote">{lastReport.text}</p>
               </div>
-              {needs.length === 0 ? (
-                <p className="sub activity-note">Nothing is waiting on you.</p>
-              ) : (
-                <ul className="activity-list">
-                  {needs.map((row) => (
-                    <li key={row.id} className="need">
-                      <Link href={`/tickets/${row.id}`}>{row.title}</Link>
-                      <span className="sub">{row.waiting_for}</span>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
+            ) : null}
+
+            {messages.length > 0 ? (
+              <div className="activity-block">
+                <div className="activity-head">
+                  <span>Needs you</span>
+                  <Link href="/command">All</Link>
+                </div>
+                {needs.length === 0 ? (
+                  <p className="sub activity-note">Nothing is waiting on you.</p>
+                ) : (
+                  <ul className="activity-list">
+                    {needs.map((row) => (
+                      <li key={row.id} className="need">
+                        <Link href={`/tickets/${row.id}`}>{row.title}</Link>
+                        <span className="sub">{row.waiting_for}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            ) : null}
 
             <div className="activity-block">
               <div className="activity-head">
