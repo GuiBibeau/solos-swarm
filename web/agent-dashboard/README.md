@@ -13,14 +13,17 @@ the box (accepts no inbound connection)           Vercel
    builds JSON snapshots, uploads the ones          tickets/index.json                               Sign in with Vercel,
    whose content changed, over HTTPS                tickets/<ticket id>.json                         one allowed email
    and carries the web chat's inbox into the        jobs/index.json
-   agent's state (web/inbox.json --> triggers)      web/inbox.json
+   agent's state (web/inbox.json --> triggers)      notes/index.json
+                                                    web/inbox.json
 ```
 
 The publisher is `solos-swarm agent publish` on the box
 ([production.md, Dashboard](../../docs/agent-mode/production.md#dashboard)). The app never reaches the box and the box
 never serves a request: a web message goes into `web/inbox.json` in the private store, the publisher turns it into a
 Trigger the agent already knows how to read (`kind: jsonl`), and the agent's replies come back in the published ticket
-snapshots. Discord and GitHub stay their own sources; the web chat is one more way in, not a replacement.
+snapshots. `notes/index.json` carries the Router's latest decisions on `web:` Threads, so the chat can show the agent's
+note (an Ignore's reason, for example) on a message that became no Ticket instead of leaving it without a reply. Discord
+and GitHub stay their own sources; the web chat is one more way in, not a replacement.
 
 The composer needs a signed-in, allowed person: the browser never holds the Blob token. `POST /api/chat` validates the
 thread and the text, writes the message with the server's token, and `GET /api/chat?t=<thread>` returns the thread's

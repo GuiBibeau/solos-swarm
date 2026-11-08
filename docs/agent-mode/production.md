@@ -471,7 +471,9 @@ solos-agent  --writes-->  agent.db  --read-only-->  solos-agent-publish  --HTTPS
 `solos-swarm agent publish` runs as the unit `solos-agent-publish`. It opens `agent.db` read-only and looks at it every
 `web.publish.every_secs` (5). A look that finds nothing written costs one SQLite pragma. When the Store changed, it
 builds `tickets/index.json` (the open tickets first, then the latest 100 ended) and one `tickets/<ticket id>.json` per
-ticket in the index. It uploads only a snapshot whose content changed, tickets first and the index last, so the index
+ticket in the index. It also builds `notes/index.json`: the latest 50 Decisions on `web:` Threads, oldest first, so the
+chat can say what the Router decided about a message that became no Ticket (an Ignore is the case that matters).
+It uploads only a snapshot whose content changed, tickets first and the index last, so the index
 never names a blob that is not there. When nothing changed, it uploads the index again every `heartbeat_secs` (300),
 which is how the dashboard tells a quiet agent from a dead publisher. Its state file is
 `state/publish-state.json`, the hash of each blob it last uploaded to the store its token names. A different store gets
@@ -551,6 +553,11 @@ It does not publish what a browser typed (the Store holds only a digest), vault 
 anything outside `agent.db`. A message is cut at 100,000 characters, an Assignment keeps its latest 20 Reports, and a
 browser trail its latest 40 pages. The one-line answer to a Discord button or a `stop` command is not in the Store, so it
 is not on the page.
+
+Beside the tickets, `notes/index.json` carries the latest 50 Decisions on `web:` Threads, newest last, with each
+Decision's Thread, time, kind (`accept`, `ignore`, `stop`, `unavailable` or `declined`) and the Router's reason. It is
+uploaded when its content changes, like a ticket snapshot. This is how the dashboard's chat explains a web message that
+became no Ticket, which otherwise would sit there with no reply.
 
 The Blob store is private: every read needs a token, and the dashboard reads it on the server after a sign-in whose email
 is in `ALLOWED_EMAILS`. Anyone who holds the read-write token can read all of it. The token rests at mode 0600 beside

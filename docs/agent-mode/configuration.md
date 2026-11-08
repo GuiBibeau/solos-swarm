@@ -530,6 +530,10 @@ source, or `token_file` or `identity` on `forge: github`) fails to load with a s
 | `heartbeat_secs` | `300` | The index is uploaded again after this long, so the dashboard can tell a quiet agent from a dead publisher. From `every_secs` to 86400. |
 | `api_url` | `https://vercel.com/api/blob` | For tests. `http` only for a loopback address. |
 
+A look uploads `tickets/index.json`, one `tickets/<id>.json` per Ticket in it and `notes/index.json` (the latest 50
+Decisions on `web:` Threads, so the dashboard's chat can explain a message that became no Ticket), each only when its
+content changed. The index is uploaded again every `heartbeat_secs`.
+
 `chat`:
 
 | Field | Default | Meaning |

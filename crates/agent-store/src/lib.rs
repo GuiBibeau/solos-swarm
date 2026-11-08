@@ -210,6 +210,23 @@ impl SqliteStore {
         Ok(found)
     }
 
+    /// Decisions on Threads whose key starts with `prefix`, newest first, at
+    /// most `limit`. Decisions are written once, in time order, so the scan
+    /// starts at the newest and stops after `limit` matches.
+    pub fn recent_decisions_on(
+        &self,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<Decision>, StoreError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT body FROM decisions \
+             WHERE substr(json_extract(body, '$.thread'), 1, length(?1)) = ?1 \
+             ORDER BY rowid DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![prefix, limit as i64], |row| row.get::<_, String>(0))?;
+        rows.map(|body| Ok(serde_json::from_str(&body?)?)).collect()
+    }
+
     /// One Trigger. Unlike the port's read, a failed read is an error here.
     pub fn read_trigger(&self, id: &TriggerId) -> Result<Option<Trigger>, StoreError> {
         self.body("SELECT body FROM triggers WHERE id = ?1", id.as_str())

@@ -7,15 +7,15 @@ use axum::body::{Body, to_bytes};
 use axum::extract::{Request, State};
 use axum::response::Response;
 use serde_json::{Value, json};
-use solos_agent_core::AllowlistPolicy;
 use solos_agent_core::model::{
     Actor, ActorKind, Addressed, AssignmentId, ChannelRef, ReportIn, ReportStatus, ThreadKey,
-    TicketId, Trigger, TriggerId,
+    TicketId, Trigger, TriggerId, Verdict,
 };
 use solos_agent_core::trail::{
     Digest, PageAction, PageSeen, STEP_VERSION, Signature, SignedStep, StepBody, StepOutcome,
     TrailAction, TrailKey, TrailOutcome,
 };
+use solos_agent_core::{AllowlistPolicy, Engine};
 use solos_agent_store::SqliteStore;
 use solos_swarm::agent::external_jobs::{
     FORMAT as JOBS_FORMAT, Record, State as JobsState, Status,
@@ -24,7 +24,8 @@ use solos_swarm::agent::jsonl::{JsonlChannel, JsonlSource};
 use solos_swarm::agent::ports::{BoxFuture, Channel, Delivery, Executor, Fact, FactSink, Launch};
 use solos_swarm::agent::publish::{
     API_VERSION, Backoff, BlobClient, BlobToken, Built, ChatOptions, CycleError, GetError,
-    INDEX_PATH, JOBS_PATH, Options, Publisher, PutError, STATE_FILE, Source, ticket_path,
+    INDEX_PATH, JOBS_PATH, NOTES_PATH, Options, Publisher, PutError, STATE_FILE, Source,
+    ticket_path,
 };
 use solos_swarm::agent::scripted::{ScriptedExecutor, ScriptedRouter};
 use solos_swarm::agent::{Adapters, RunOptions, Runtime, STORE_FILE};
@@ -1290,10 +1291,17 @@ async fn the_first_look_uploads_every_ticket_then_the_index_and_the_second_uploa
     assert!(report.built);
     let index = fake.blob(INDEX_PATH);
     let id = ticket_id(&index, "Summarise the incident report");
-    assert_eq!(report.uploaded, [ticket_path(&id), INDEX_PATH.to_owned()]);
+    assert_eq!(
+        report.uploaded,
+        [
+            ticket_path(&id),
+            NOTES_PATH.to_owned(),
+            INDEX_PATH.to_owned()
+        ]
+    );
     assert_eq!(
         paths(&fake.puts()),
-        [ticket_path(&id).as_str(), INDEX_PATH],
+        [ticket_path(&id).as_str(), NOTES_PATH, INDEX_PATH],
         "the ticket first, so the index never names a blob that is not there"
     );
     assert!(
@@ -1326,12 +1334,12 @@ async fn a_restart_uploads_nothing_that_is_already_there_and_another_store_gets_
     scratch.serve(Arc::new(ScriptedExecutor)).await;
     let fake = Fake::start().await;
     scratch.publisher(&fake).cycle().await.unwrap();
-    assert_eq!(fake.puts().len(), 2);
+    assert_eq!(fake.puts().len(), 3);
 
     let state = scratch.state().join(STATE_FILE);
     let remembered: Value = serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
     assert_eq!(remembered["store"], "Store123");
-    assert_eq!(remembered["hashes"].as_object().unwrap().len(), 2);
+    assert_eq!(remembered["hashes"].as_object().unwrap().len(), 3);
     assert!(
         !remembered.to_string().contains("secretsecret"),
         "no token in the state"
@@ -1347,7 +1355,7 @@ async fn a_restart_uploads_nothing_that_is_already_there_and_another_store_gets_
     let report = restarted.cycle().await.unwrap();
     assert!(report.built, "a new process builds once");
     assert!(report.uploaded.is_empty(), "{report:?}");
-    assert_eq!(report.unchanged, 2);
+    assert_eq!(report.unchanged, 3);
     assert!(fake.puts().is_empty());
 
     // Another store has none of it, whatever the state file says.
@@ -1358,7 +1366,7 @@ async fn a_restart_uploads_nothing_that_is_already_there_and_another_store_gets_
         Duration::from_secs(300),
     );
     let report = elsewhere.cycle().await.unwrap();
-    assert_eq!(report.uploaded.len(), 2, "{report:?}");
+    assert_eq!(report.uploaded.len(), 3, "{report:?}");
 }
 
 #[tokio::test]
@@ -1383,7 +1391,7 @@ async fn only_what_changed_goes_up_again() {
         [ticket_path(&second), INDEX_PATH.to_owned()],
         "the first ticket's snapshot did not change, so it did not go up"
     );
-    assert_eq!(report.unchanged, 1);
+    assert_eq!(report.unchanged, 2);
     assert_eq!(index["tickets"].as_array().unwrap().len(), 2);
     assert_ne!(first, second);
 }
@@ -1413,7 +1421,7 @@ async fn a_failed_upload_is_tried_again_with_the_store_unchanged_and_the_index_w
         !report.built,
         "the store did not change; the queue did the work"
     );
-    assert_eq!(report.uploaded.len(), 2);
+    assert_eq!(report.uploaded.len(), 3);
     let puts = fake.puts();
     assert_eq!(puts.last().map(String::as_str), Some(INDEX_PATH));
 }
@@ -1432,12 +1440,15 @@ async fn a_refused_token_stops_the_publisher_and_a_refused_blob_does_not() {
     assert!(refused.to_string().contains("replace it"), "{refused}");
     assert!(!refused.to_string().contains("secretsecret"));
 
-    // A 400 for the ticket's blob is reported and does not hold the index back.
+    // A 400 for the ticket's blob is reported and does not hold the rest back.
     let mut publisher = scratch.publisher(&fake);
     fake.script([Scripted::Status(400)]);
     let report = publisher.cycle().await.unwrap();
     assert_eq!(report.rejected.len(), 1, "{report:?}");
-    assert_eq!(report.uploaded, [INDEX_PATH.to_owned()]);
+    assert_eq!(
+        report.uploaded,
+        [NOTES_PATH.to_owned(), INDEX_PATH.to_owned()]
+    );
 }
 
 #[tokio::test]
@@ -1709,8 +1720,8 @@ async fn a_missing_inbox_is_not_a_failure_and_the_publisher_still_uploads() {
     assert_eq!(report.spooled, 0);
     assert_eq!(
         report.uploaded,
-        [INDEX_PATH.to_owned()],
-        "the index went up"
+        [NOTES_PATH.to_owned(), INDEX_PATH.to_owned()],
+        "the notes and the index went up"
     );
     assert_eq!(scratch.spool(), "");
 
@@ -1734,6 +1745,120 @@ async fn a_refused_token_stops_the_publisher_when_the_inbox_cannot_be_read() {
     assert!(matches!(refused, CycleError::Fatal(_)), "{refused}");
     assert!(refused.to_string().contains("replace it"), "{refused}");
     assert!(!refused.to_string().contains("secretsecret"), "{refused}");
+}
+
+// -- the Router's decisions for web threads -----------------------------------------------------
+
+/// 2026-11-08T21:54:40.311Z.
+const NOTE_AT: u64 = 1_794_174_880_311;
+/// The thread the notes fixture is about; not the mix's, which has a Ticket.
+const NOTE_THREAD: &str = "wc_11111111111111111111111111111111";
+const NOTE_REASON: &str = "Gui asks a status question: there is nothing to hand to a worker";
+
+/// A Store with two Decisions made by the Engine: an Ignore on a web Thread
+/// and one on a Slack Thread. Neither made a Ticket.
+fn decided_store(scratch: &Scratch) {
+    let now = std::rc::Rc::new(std::cell::Cell::new(NOTE_AT));
+    let clock = {
+        let now = now.clone();
+        move || now.get()
+    };
+    let policy = AllowlistPolicy {
+        people: [format!("web:{GUI}"), "slack:alice".to_owned()].into(),
+        ..AllowlistPolicy::default()
+    };
+    let mut engine = Engine::new(SqliteStore::open(scratch.db()).unwrap(), policy, clock);
+    engine
+        .receive(web_request("t-web", NOTE_THREAD, "what is the status?"))
+        .unwrap();
+    let eval = engine.evaluate_due().unwrap().remove(0);
+    engine
+        .decide(
+            &eval,
+            Verdict::Ignore {
+                reason: NOTE_REASON.into(),
+            },
+        )
+        .unwrap();
+    now.set(NOTE_AT + 60_000);
+    engine
+        .receive(request("t-slack", "T1", "Rotate the staging keys"))
+        .unwrap();
+    let eval = engine.evaluate_due().unwrap().remove(0);
+    engine
+        .decide(
+            &eval,
+            Verdict::Ignore {
+                reason: "the conversation is not a request".into(),
+            },
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn the_notes_blob_has_the_shape_the_dashboard_reads_and_feeds_its_fixtures() {
+    let scratch = Scratch::new("notes");
+    decided_store(&scratch);
+    let fake = Fake::start().await;
+
+    let built = scratch.source().build().unwrap();
+    let notes = value(&built.notes);
+    assert_eq!(notes["v"], 1);
+    assert!(
+        notes.get("generated_at").is_none(),
+        "the stamp is added at upload"
+    );
+    let [note] = notes["notes"].as_array().unwrap().as_slice() else {
+        panic!("only the web decision, not the Slack one: {notes}")
+    };
+    let mut keys: Vec<&str> = note
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["at_ms", "kind", "reason", "thread"]);
+    assert_eq!(note["thread"], format!("web:{NOTE_THREAD}"));
+    assert_eq!(note["at_ms"], NOTE_AT);
+    assert_eq!(note["kind"], "ignore");
+    assert_eq!(note["reason"], NOTE_REASON);
+
+    let mut publisher = scratch.publisher(&fake);
+    let report = publisher.cycle().await.unwrap();
+    assert!(report.built);
+    assert_eq!(
+        report.uploaded,
+        [NOTES_PATH.to_owned(), INDEX_PATH.to_owned()],
+        "no Ticket, so the notes and the index"
+    );
+    let blob = fake.blob(NOTES_PATH);
+    assert!(
+        blob["generated_at"]
+            .as_str()
+            .is_some_and(|at| at.ends_with('Z')),
+        "the uploaded notes are stamped: {blob}"
+    );
+    assert_eq!(blob["notes"], notes["notes"]);
+    fake.clear_puts();
+
+    // Nothing written since the last look: no build, no request.
+    let quiet = publisher.cycle().await.unwrap();
+    assert!(!quiet.built);
+    assert!(quiet.uploaded.is_empty(), "{quiet:?}");
+    assert!(fake.puts().is_empty());
+
+    // What the dashboard reads as its notes fixture.
+    if let Ok(dir) = std::env::var("PUBLISH_FIXTURE_DIR") {
+        let mut fixture = blob.clone();
+        fixture["generated_at"] = json!("2026-11-06T14:00:00Z");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            PathBuf::from(dir).join("notes.json"),
+            serde_json::to_string_pretty(&fixture).unwrap() + "\n",
+        )
+        .unwrap();
+    }
 }
 
 // -- the Store is only read --------------------------------------------------------------------
@@ -1846,7 +1971,7 @@ async fn the_command_reads_its_token_beside_the_config_and_publishes_once_or_unt
         .await
         .unwrap();
     assert!(!token.exists(), "the token file is consumed");
-    assert_eq!(fake.puts().len(), 2);
+    assert_eq!(fake.puts().len(), 3);
 
     // Serving: a new request reaches the store, and SIGTERM ends it cleanly.
     std::fs::write(&token, TOKEN).unwrap();
@@ -1953,7 +2078,7 @@ async fn the_watchdogs_jobs_go_up_when_they_change_and_every_heartbeat_and_not_b
 
     // The Watchdog has written nothing: there are no jobs to show.
     publisher.cycle().await.unwrap();
-    assert_eq!(paths(&fake.puts()), [INDEX_PATH]);
+    assert_eq!(paths(&fake.puts()), [NOTES_PATH, INDEX_PATH]);
     fake.clear_puts();
 
     // Its first look: the jobs go up alone, as the Watchdog wrote them.
@@ -2013,7 +2138,7 @@ async fn a_restart_does_not_upload_jobs_that_are_already_there() {
         .unwrap();
     let fake = Fake::start().await;
     scratch.publisher(&fake).cycle().await.unwrap();
-    assert_eq!(paths(&fake.puts()), [JOBS_PATH, INDEX_PATH]);
+    assert_eq!(paths(&fake.puts()), [NOTES_PATH, JOBS_PATH, INDEX_PATH]);
     fake.clear_puts();
 
     let mut restarted = scratch.publisher(&fake);
@@ -2030,14 +2155,20 @@ async fn jobs_the_api_refuses_are_not_sent_again_until_they_change() {
         .unwrap();
     let fake = Fake::start().await;
     let mut publisher = scratch.publisher(&fake);
+    // The first look carries the notes, the jobs and the index; after it,
+    // only a job's change is left to send.
+    publisher.cycle().await.unwrap();
+    fake.clear_puts();
 
+    jobs_state(JOBS_T0 + 60_000, Status::Down)
+        .save(&scratch.state())
+        .unwrap();
     fake.script([Scripted::Status(400)]);
     let report = publisher.cycle().await.unwrap();
     assert_eq!(report.rejected, [JOBS_PATH.to_owned()]);
-    assert_eq!(
-        report.uploaded,
-        [INDEX_PATH.to_owned()],
-        "the index is not held back"
+    assert!(
+        report.uploaded.is_empty(),
+        "the notes and index did not change: {report:?}"
     );
 
     let requests = fake.requests().len();
@@ -2048,7 +2179,7 @@ async fn jobs_the_api_refuses_are_not_sent_again_until_they_change() {
     );
     assert_eq!(fake.requests().len(), requests, "no request at all");
 
-    jobs_state(JOBS_T0 + 60_000, Status::Down)
+    jobs_state(JOBS_T0 + 120_000, Status::Stalled)
         .save(&scratch.state())
         .unwrap();
     let report = publisher.cycle().await.unwrap();
