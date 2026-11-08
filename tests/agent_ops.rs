@@ -1123,3 +1123,254 @@ async fn low_disk_pauses_new_work_and_the_pause_lifts_when_space_returns() {
         "new work flows again"
     );
 }
+
+/// What `claude auth status --json` prints. It also prints who is signed in,
+/// which the check must neither keep nor post.
+fn claude_status(logged_in: bool, ends: Option<&str>) -> String {
+    json!({
+        "loggedIn": logged_in,
+        "authMethod": "claude.ai",
+        "loginExpiresAt": ends,
+        "email": "owner@example.com",
+        "orgName": "Acme"
+    })
+    .to_string()
+}
+
+/// A `claude` that logs its arguments, refuses anything but
+/// `auth status --json`, and prints what the test queued with
+/// `queue_claude`. It never signs in, starts a session or reaches a network.
+fn fake_claude(scratch: &Scratch) -> PathBuf {
+    let bin = scratch.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let script = bin.join("claude");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nd=$(dirname \"$0\")\necho \"$*\" >> \"$d/claude-calls\"\n\
+         [ \"$*\" = \"auth status --json\" ] || { echo \"unexpected: $*\" >&2; exit 2; }\n\
+         cat \"$d/claude-status\"\nexit \"$(cat \"$d/claude-exit\")\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+fn queue_claude(claude: &Path, status: &str, exit: u8) {
+    let bin = claude.parent().unwrap();
+    std::fs::write(bin.join("claude-status"), status).unwrap();
+    std::fs::write(bin.join("claude-exit"), exit.to_string()).unwrap();
+}
+
+/// The health config, with Pi workers that name `claude`.
+fn claude_config(scratch: &Scratch, api_base: &str, harness: &str, claude: &Path) -> PathBuf {
+    let config = health_config(scratch, api_base, "health: {min_free_gb: 0}\n");
+    let yaml = std::fs::read_to_string(&config).unwrap().replace(
+        "executor: {kind: scripted}",
+        &format!(
+            "executor:\n  kind: pi\n  provider: deepseek\n  model: deepseek-flash\n  prices: \
+             {{input_microusd_per_million: 300000, output_microusd_per_million: 1200000}}\n\
+             {harness}  claude: {{binary: {}}}",
+            claude.display()
+        ),
+    );
+    std::fs::write(&config, yaml).unwrap();
+    config
+}
+
+fn check_named<'a>(report: &'a Value, name: &str) -> Option<&'a Value> {
+    report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == name)
+}
+
+#[tokio::test]
+async fn an_expired_claude_code_login_fails_the_check_posts_once_and_clears_after_a_new_login() {
+    let scratch = Scratch::new("claude-login");
+    let discord = Arc::new(Discord::default());
+    let base = fake_discord(discord.clone()).await;
+    fake_broker(&scratch.state(), "200 OK");
+    let (bin, unit) = fake_systemctl(&scratch);
+    let claude = fake_claude(&scratch);
+    queue_claude(
+        &claude,
+        &claude_status(true, Some("2999-01-01T00:00:00Z")),
+        0,
+    );
+    let health = Health {
+        scratch: &scratch,
+        bin,
+        unit,
+        config: claude_config(&scratch, &base, "  harness: claude-code\n", &claude),
+        token: scratch.write("run/discord-token", TOKEN),
+    };
+
+    let (code, out, err) = health.run(&[]).await;
+    assert_eq!(code, 0, "{out}{err}");
+    let report: Value = serde_json::from_str(&out).unwrap();
+    let names: Vec<&str> = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|check| check["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["config", "unit", "broker", "disk", "claude", "discord"],
+        "{out}"
+    );
+    assert_eq!(
+        check_named(&report, "claude").unwrap()["detail"],
+        "signed in until 2999-01-01T00:00:00Z"
+    );
+
+    // /login was never done again: the sign-in ended.
+    queue_claude(
+        &claude,
+        &claude_status(true, Some("2020-01-01T00:00:00Z")),
+        0,
+    );
+    let (code, out, _) = health.run(&[]).await;
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&out).unwrap()["posted"],
+        "down"
+    );
+    for _ in 0..3 {
+        let (code, out, _) = health.run(&[]).await;
+        assert_eq!(code, 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&out).unwrap()["quiet"],
+            "already told"
+        );
+        assert!(!out.contains("owner@example.com"), "{out}");
+    }
+    {
+        let posts = discord.posts.lock().unwrap();
+        assert_eq!(posts.len(), 1, "{posts:?}");
+        assert_eq!(posts[0].0, "42");
+        let text = posts[0].1["content"].as_str().unwrap();
+        assert!(
+            text.contains("the Claude Code sign-in on this host ended at 2020-01-01T00:00:00Z"),
+            "{text}"
+        );
+        assert!(text.contains("`claude auth login`"), "{text}");
+        assert!(!text.contains("owner@example.com"), "{text}");
+    }
+    let state = std::fs::read_to_string(scratch.state().join("health-state.json")).unwrap();
+    assert!(!state.contains("owner@example.com"), "{state}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&state).unwrap()["incident"]["announced"],
+        json!(["claude"])
+    );
+
+    // After a new sign-in.
+    queue_claude(
+        &claude,
+        &claude_status(true, Some("2999-01-01T00:00:00Z")),
+        0,
+    );
+    let (code, out, _) = health.run(&[]).await;
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&out).unwrap()["posted"],
+        "recovered"
+    );
+    assert_eq!(discord.posts.lock().unwrap().len(), 2);
+
+    // Signed out: `claude auth status` prints its JSON and exits 1.
+    queue_claude(&claude, &claude_status(false, None), 1);
+    let (code, out, _) = health.run(&[]).await;
+    assert_eq!(code, 1, "{out}");
+    let posts = discord.posts.lock().unwrap();
+    assert_eq!(posts.len(), 3, "a new incident is told again");
+    let text = posts[2].1["content"].as_str().unwrap();
+    assert!(
+        text.contains("Claude Code is not signed in on this host"),
+        "{text}"
+    );
+
+    let calls = std::fs::read_to_string(scratch.root.join("bin/claude-calls")).unwrap();
+    assert_eq!(calls.lines().count(), 7, "one call per run");
+    assert!(
+        calls.lines().all(|call| call == "auth status --json"),
+        "no session, no prompt: {calls}"
+    );
+}
+
+#[tokio::test]
+async fn claude_code_is_asked_about_where_it_is_installed_though_workers_run_on_pi() {
+    let scratch = Scratch::new("claude-optional");
+    let discord = Arc::new(Discord::default());
+    let base = fake_discord(discord.clone()).await;
+    fake_broker(&scratch.state(), "200 OK");
+    let (bin, unit) = fake_systemctl(&scratch);
+    let claude = scratch.root.join("bin/claude");
+    let health = Health {
+        scratch: &scratch,
+        bin,
+        unit,
+        config: claude_config(&scratch, &base, "", &claude),
+        token: scratch.write("run/discord-token", TOKEN),
+    };
+
+    // A Plan may name `claude`, but it is not installed here: nothing to ask.
+    let (code, out, err) = health.run(&[]).await;
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(
+        check_named(&serde_json::from_str(&out).unwrap(), "claude").is_none(),
+        "{out}"
+    );
+
+    fake_claude(&scratch);
+    queue_claude(
+        &claude,
+        &claude_status(true, Some("2020-01-01T00:00:00Z")),
+        0,
+    );
+    let (code, out, _) = health.run(&[]).await;
+    assert_eq!(code, 1, "{out}");
+    assert_eq!(
+        check_named(&serde_json::from_str(&out).unwrap(), "claude").unwrap()["ok"],
+        false
+    );
+    assert_eq!(discord.posts.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_claude_code_harness_whose_binary_is_gone_is_told() {
+    let scratch = Scratch::new("claude-gone");
+    let discord = Arc::new(Discord::default());
+    let base = fake_discord(discord.clone()).await;
+    fake_broker(&scratch.state(), "200 OK");
+    let (bin, unit) = fake_systemctl(&scratch);
+    let claude = scratch.root.join("bin/claude");
+    let health = Health {
+        scratch: &scratch,
+        bin,
+        unit,
+        config: claude_config(&scratch, &base, "  harness: claude-code\n", &claude),
+        token: scratch.write("run/discord-token", TOKEN),
+    };
+    let (code, out, _) = health.run(&[]).await;
+    assert_eq!(code, 1, "{out}");
+    let text = discord.posts.lock().unwrap()[0].1["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        text.contains("cannot ask Claude Code about its login"),
+        "{text}"
+    );
+    assert!(text.contains(&claude.display().to_string()), "{text}");
+
+    fake_claude(&scratch);
+    queue_claude(&claude, &claude_status(true, None), 0);
+    let (code, out, _) = health.run(&[]).await;
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&out).unwrap()["posted"],
+        "recovered"
+    );
+}
