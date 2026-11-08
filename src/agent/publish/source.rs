@@ -6,7 +6,7 @@
 
 use super::snapshot::{
     self, AssignmentBrief, AssignmentView, BrowserView, Delivery, FORMAT, Index, IndexRow,
-    MAX_REPORTS, PageView, PlanView, TicketSnapshot, Turn,
+    MAX_REPORTS, NOTES_FORMAT, NOTES_IN_INDEX, Notes, PageView, PlanView, TicketSnapshot, Turn,
 };
 use crate::agent::broker::Account;
 use crate::agent::watchdog::stage_name;
@@ -29,10 +29,12 @@ const MAX_PAGES: usize = 40;
 /// Rows read from the log or the queue at once.
 const PAGE: usize = 2_000;
 
-/// What one look found: the index and one snapshot per Ticket in it.
+/// What one look found: the index, the web notes and one snapshot per Ticket
+/// in the index.
 #[derive(Clone, Debug)]
 pub struct Built {
     pub index: Index,
+    pub notes: Notes,
     pub tickets: Vec<(TicketId, TicketSnapshot)>,
 }
 
@@ -167,6 +169,7 @@ impl Source {
         let (open_rows, ended_rows) = rows.split_at_mut(split);
         open_rows.sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms).then(a.id.cmp(&b.id)));
         ended_rows.sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms).then(a.id.cmp(&b.id)));
+        let notes = self.notes()?;
         self.version = Some(version);
         Ok(Built {
             index: Index {
@@ -175,7 +178,24 @@ impl Source {
                 open,
                 tickets: rows,
             },
+            notes,
             tickets: snapshots,
+        })
+    }
+
+    /// The Router's latest Decisions on web Threads, oldest first, so the
+    /// dashboard's chat can explain a message that became no Ticket.
+    fn notes(&self) -> Result<Notes> {
+        Ok(Notes {
+            v: NOTES_FORMAT,
+            generated_at: None,
+            notes: self
+                .store
+                .recent_decisions_on("web:", NOTES_IN_INDEX)?
+                .iter()
+                .rev()
+                .map(snapshot::note_view)
+                .collect(),
         })
     }
 

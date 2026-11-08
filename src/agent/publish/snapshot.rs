@@ -1,9 +1,11 @@
-//! What `agent publish` uploads: the shapes of `tickets/index.json` and
-//! `tickets/<id>.json`, and the pure pieces that fill them. Nothing here
-//! reads the Store; [`super::source`] does, and hands over what it read.
+//! What `agent publish` uploads: the shapes of `tickets/index.json`,
+//! `tickets/<id>.json` and `notes/index.json`, and the pure pieces that fill
+//! them. Nothing here reads the Store; [`super::source`] does, and hands over
+//! what it read.
 //!
 //! The dashboard (`web/agent-dashboard/lib/types.ts`) reads these shapes, so
-//! a change here is a change there. [`FORMAT`] counts them.
+//! a change here is a change there. [`FORMAT`] and [`NOTES_FORMAT`] count
+//! them.
 //!
 //! A snapshot holds nothing that changes while the Ticket does not: no
 //! "age" and no "generated at" inside a ticket's snapshot, so an unchanged
@@ -22,12 +24,16 @@ use solos_agent_core::model::{
 
 /// The version of the snapshots' shape.
 pub const FORMAT: u32 = 1;
+/// The version of `notes/index.json`, which the dashboard reads too.
+pub const NOTES_FORMAT: u32 = 1;
 
 /// A longer message is cut here and says so. A blob this size still reads
 /// on a phone; one far larger is not a conversation.
 pub const MAX_TEXT_CHARS: usize = 100_000;
 /// The latest this many Reports of an Assignment are kept.
 pub const MAX_REPORTS: usize = 20;
+/// The latest this many Decisions on web Threads `notes/index.json` keeps.
+pub const NOTES_IN_INDEX: usize = 50;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Person {
@@ -218,6 +224,27 @@ pub struct DecisionView {
     pub at: String,
 }
 
+/// `notes/index.json`: the Router's latest Decisions on web Threads, newest
+/// last, so the dashboard's chat can say what the agent decided about a
+/// message that became no Ticket.
+#[derive(Clone, Debug, Serialize)]
+pub struct Notes {
+    pub v: u32,
+    /// When the publisher last wrote this file. Not part of the hash.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generated_at: Option<String>,
+    pub notes: Vec<NoteView>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct NoteView {
+    pub thread: String,
+    pub at_ms: Ms,
+    /// `accept`, `ignore`, `stop`, `unavailable` or `declined`.
+    pub kind: &'static str,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct AssignmentView {
     pub id: String,
@@ -362,6 +389,15 @@ pub fn decision_view(decision: &Decision) -> DecisionView {
         reason: decision.reason.clone(),
         at_ms: decision.at_ms,
         at: iso(decision.at_ms),
+    }
+}
+
+pub fn note_view(decision: &Decision) -> NoteView {
+    NoteView {
+        thread: decision.thread.to_string(),
+        at_ms: decision.at_ms,
+        kind: decision_kind(decision.kind),
+        reason: decision.reason.clone(),
     }
 }
 

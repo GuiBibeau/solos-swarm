@@ -1,10 +1,11 @@
 //! `solos-swarm agent publish`: a sidecar that makes the agent's tickets
 //! readable from a dashboard on the internet while the agent's box accepts no
 //! inbound connection. Every few seconds it looks at `agent.db` (read-only,
-//! see [`source`]), builds one JSON snapshot per ticket and an index of them
-//! ([`snapshot`]), and uploads the snapshots whose content changed to a
-//! private Vercel Blob store over HTTPS ([`blob`]). The dashboard
-//! (`web/agent-dashboard`) reads them from there behind its own sign-in.
+//! see [`source`]), builds one JSON snapshot per ticket, an index of them and
+//! the Router's latest Decisions on web Threads ([`snapshot`]), and uploads
+//! the snapshots whose content changed to a private Vercel Blob store over
+//! HTTPS ([`blob`]). The dashboard (`web/agent-dashboard`) reads them from
+//! there behind its own sign-in.
 //!
 //! It only ever reads the Store. What it remembers is one small file in the
 //! state directory, [`STATE_FILE`]: the hash of what each blob last held, so
@@ -39,7 +40,7 @@ use crate::broker::now_ms;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use snapshot::{Index, TicketSnapshot, iso};
+use snapshot::{Index, Notes, TicketSnapshot, iso};
 use solos_agent_core::model::Ms;
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -52,6 +53,8 @@ use std::time::Duration;
 pub const STATE_FILE: &str = "publish-state.json";
 /// The index's pathname in the Blob store.
 pub const INDEX_PATH: &str = "tickets/index.json";
+/// The web notes' pathname in the Blob store.
+pub const NOTES_PATH: &str = "notes/index.json";
 /// The external jobs' pathname: what [`external_jobs::State`] holds.
 pub const JOBS_PATH: &str = "jobs/index.json";
 const CONTENT_TYPE: &str = "application/json";
@@ -315,6 +318,12 @@ impl Publisher {
                 self.queue.push(upload);
             }
         }
+        let notes = notes_upload(&built.notes, now);
+        if self.state.hashes.get(NOTES_PATH) != Some(&notes.hash) {
+            self.queue.push(notes);
+        } else {
+            unchanged += 1;
+        }
         let index = index_upload(&built.index, now);
         if self.state.hashes.get(INDEX_PATH) != Some(&index.hash) {
             self.queue.push(index);
@@ -442,6 +451,25 @@ fn index_upload(index: &Index, now: Ms) -> Upload {
         hash: hash(&serde_json::to_vec(&unstamped).unwrap_or_default()),
         body: serde_json::to_vec(&stamped).unwrap_or_default(),
         index: true,
+    }
+}
+
+/// The web notes as they are uploaded, stamped with `now`; their hash leaves
+/// the stamp out.
+fn notes_upload(notes: &Notes, now: Ms) -> Upload {
+    let unstamped = Notes {
+        generated_at: None,
+        ..notes.clone()
+    };
+    let stamped = Notes {
+        generated_at: Some(iso(now)),
+        ..notes.clone()
+    };
+    Upload {
+        path: NOTES_PATH.to_owned(),
+        hash: hash(&serde_json::to_vec(&unstamped).unwrap_or_default()),
+        body: serde_json::to_vec(&stamped).unwrap_or_default(),
+        index: false,
     }
 }
 
