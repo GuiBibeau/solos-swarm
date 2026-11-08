@@ -590,6 +590,7 @@ fn base_policy(rng: &mut Lcg) -> AllowlistPolicy {
         people,
         bots: ["slack:ci-bot".to_owned()].into(),
         approvers: ["slack:alice".to_owned()].into(),
+        answer_sources: Default::default(),
         accept_mode: rng.pick(&[AcceptMode::Off, AcceptMode::Observe, AcceptMode::Auto]),
         rules: ["r1".to_owned()].into(),
         auto_approve_microusd: rng.pick(&[1_000_000, 2_000_000, 5_000_000]),

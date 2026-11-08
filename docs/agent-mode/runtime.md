@@ -28,7 +28,8 @@ The Engine (`crates/agent-core`) decides everything, does no I/O, and leaves ext
   work. A decline means no upstream here may run the repository's workers: the Engine records a declined Decision and,
   on an explicit request, sends the host's sentence to the request's channel once. The Router's tool result says the
   person was told, or that nobody was. The accept's upstream and harness come from the repository's policy, never from
-  the Router's words.
+  the Router's words. With `policy.answer_sources`, an ignored explicit message from one of those sources is answered as
+  a session instead, with the message as its scope: a one-to-one chat always gets a reply.
 - **Budgets.** A budget above the approval threshold waits for an approver, and is checked at every launch against the
   current threshold.
 - **Work.** Assignments, Reports, resumes, handbacks and retries are Engine commands. A handed-back Trigger is judged

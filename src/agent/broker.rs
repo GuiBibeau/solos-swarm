@@ -630,6 +630,9 @@ pub struct DecideTerms {
     /// The Policy's approval threshold: the cap on an accept from a Source
     /// outside `approval_sources`.
     pub auto_approve_microusd: MicroUsd,
+    /// Sources whose explicit messages always get an answer, even where the
+    /// Router would ignore one (`policy.answer_sources`).
+    pub answer_sources: BTreeSet<String>,
     /// What a swarm plan may name, or `None` where no swarm runs.
     pub swarm: Option<SwarmTerms>,
     /// The repositories an accept may name, from `forge.repos`.
@@ -769,6 +772,7 @@ impl DecideTerms {
                 .then_some(config.policy.auto_approve_microusd),
             approval_sources: config.approval_sources(),
             auto_approve_microusd: config.policy.auto_approve_microusd,
+            answer_sources: config.policy.answer_sources.clone(),
             swarm,
             repos: config
                 .forge
@@ -1971,7 +1975,7 @@ enum PlanKind {
 /// `router_decide`'s arguments: one flat object, so every model's tool
 /// calling can fill it. Fields that do not belong to the chosen decision
 /// are ignored.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DecideArgs {
     eval: EvalId,
@@ -2011,12 +2015,37 @@ impl DecideArgs {
         terms: &DecideTerms,
         origin: Option<&str>,
         triggers: &[Trigger],
+        answer: bool,
     ) -> std::result::Result<(EvalId, Verdict), String> {
-        let reason = self.reason.trim().to_owned();
+        let mut reason = self.reason.trim().to_owned();
         if reason.is_empty() {
             return Err("a decision needs a reason".into());
         }
-        let verdict = match self.decision {
+        // A message from a Source in `policy.answer_sources` is a person
+        // talking to the agent, not a feed: the Router may judge it needs no
+        // worker, but the host answers it as a session rather than leave the
+        // person with silence. Its text is the scope and its first line the
+        // title when the Router named neither.
+        let answered = (answer && matches!(self.decision, Choice::Ignore))
+            .then(|| {
+                triggers.iter().find(|trigger| {
+                    terms.answer_sources.contains(&trigger.source)
+                        && trigger.addressed.is_addressed()
+                })
+            })
+            .flatten();
+        if let Some(trigger) = answered {
+            reason = format!(
+                "{reason}; answered because a message from {} always gets a reply",
+                trigger.source
+            );
+        }
+        let decision = if answered.is_some() {
+            Choice::Accept
+        } else {
+            self.decision
+        };
+        let verdict = match decision {
             Choice::Ignore => Verdict::Ignore { reason },
             Choice::Stop => Verdict::Stop {
                 ticket: self.ticket.ok_or("a stop names the ticket to stop")?,
@@ -2156,8 +2185,14 @@ impl DecideArgs {
                     Some(text) => Acknowledge::Text(text),
                 };
                 Verdict::Accept(Accept {
-                    title: self.title.unwrap_or_default(),
-                    scope: self.scope.unwrap_or_default(),
+                    title: self
+                        .title
+                        .or_else(|| answered.map(|trigger| chat_title(&trigger.text)))
+                        .unwrap_or_default(),
+                    scope: self
+                        .scope
+                        .or_else(|| answered.map(|trigger| trigger.text.clone()))
+                        .unwrap_or_default(),
                     reason,
                     plan,
                     budget_microusd: budget,
@@ -2171,6 +2206,22 @@ impl DecideArgs {
         };
         Ok((self.eval, verdict))
     }
+}
+
+/// The title a chat message answers under: its first non-empty line, kept to
+/// a menu-sized line. The Router supplies one when it names the work; this is
+/// the fallback for a message the host answers on the person's behalf.
+fn chat_title(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("A message");
+    let mut title: String = line.chars().take(80).collect();
+    if line.chars().count() > 80 {
+        title.push('…');
+    }
+    title
 }
 
 /// `router_decide`: the Verdict goes to the runtime, and the Engine's answer
@@ -2198,7 +2249,16 @@ async fn decide(broker: &AgentBroker, args: Value) -> Reply {
     let origin = broker.origin_source(&args.eval).await;
     let (strength, triggers) = broker.eval_context(&args.eval).await.map_err(failed)?;
     let (eval, verdict) = args
-        .verdict(&broker.inner.decide, origin.as_deref(), &triggers)
+        .verdict(
+            &broker.inner.decide,
+            origin.as_deref(),
+            &triggers,
+            strength == Some(Strength::Explicit)
+                && triggers.iter().any(|trigger| {
+                    broker.inner.decide.answer_sources.contains(&trigger.source)
+                        && trigger.addressed.is_addressed()
+                }),
+        )
         .map_err(|why| refuse(StatusCode::UNPROCESSABLE_ENTITY, why))?;
     let told = match &verdict {
         Verdict::Decline { told, .. } => Some(told.clone()),
@@ -2741,7 +2801,8 @@ mod tests {
     use serde_json::json;
     use solos_agent_core::change::{Deliverable, RepoName};
     use solos_agent_core::model::{
-        Acknowledge, AssignmentId, Method, Plan, ReportStatus, TicketId, UpstreamChoice, Verdict,
+        Acknowledge, Actor, Addressed, AssignmentId, Method, Plan, ReportStatus, ThreadKey,
+        TicketId, Trigger, TriggerId, UpstreamChoice, Verdict,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -2781,8 +2842,52 @@ mod tests {
         triggers: &[solos_agent_core::model::Trigger],
     ) -> Result<Verdict, String> {
         let args: DecideArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
-        args.verdict(terms, None, triggers)
+        args.verdict(terms, None, triggers, false)
             .map(|(_, verdict)| verdict)
+    }
+
+    #[test]
+    fn an_ignored_message_from_an_answer_source_becomes_a_session() {
+        let mut terms = terms();
+        terms.answer_sources = ["web".to_owned()].into();
+        let trigger = Trigger {
+            id: TriggerId::new("tr_1"),
+            source: "web".into(),
+            at_ms: 1,
+            actor: Actor::person("g.bibeaulaviolette@gmail.com"),
+            addressed: Addressed::Mention,
+            text: "what is the status on the quant model".into(),
+            threads: vec![ThreadKey::new("web:wc_1")],
+            reply_to: vec![],
+            meta: json!({}),
+        };
+        let args: DecideArgs = serde_json::from_value(
+            json!({"eval": "ev_1", "decision": "ignore", "reason": "nothing to act on"}),
+        )
+        .unwrap();
+
+        let (_, answered) = args
+            .clone()
+            .verdict(&terms, Some("web"), std::slice::from_ref(&trigger), true)
+            .unwrap();
+        match answered {
+            Verdict::Accept(accept) => {
+                assert_eq!(accept.scope, "what is the status on the quant model");
+                assert_eq!(accept.title, "what is the status on the quant model");
+                assert!(
+                    accept.reason.contains("always gets a reply"),
+                    "{}",
+                    accept.reason
+                );
+                assert!(matches!(accept.plan, Plan::Session { .. }));
+            }
+            other => panic!("expected a session, got {other:?}"),
+        }
+
+        let (_, ignored) = args
+            .verdict(&terms, Some("web"), std::slice::from_ref(&trigger), false)
+            .unwrap();
+        assert!(matches!(ignored, Verdict::Ignore { .. }), "{ignored:?}");
     }
 
     #[test]
@@ -3397,7 +3502,7 @@ mod tests {
                 auto_approve_microusd: 500_000,
                 ..terms()
             };
-            args.verdict(&terms, origin, &[]).map(|_| ())
+            args.verdict(&terms, origin, &[], false).map(|_| ())
         };
 
         assert_eq!(

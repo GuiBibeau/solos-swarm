@@ -63,6 +63,7 @@ policy:
   people: [discord:<your Discord user id>, mcp:<your name>, github:<your GitHub login>, web:g.bibeaulaviolette@gmail.com]
   approvers: [discord:<your Discord user id>, github:<your GitHub login>, web:g.bibeaulaviolette@gmail.com]
   auto_approve_microusd: 500000            # a budget above this waits for Approve
+  answer_sources: [web]                    # a chat message is always answered, even where the Router would ignore it
 sources:
   - kind: discord
     guilds: [<server id>]

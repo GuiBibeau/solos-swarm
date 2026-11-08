@@ -42,20 +42,52 @@ function who(turn: Turn): string {
   return turn.who ?? turn.from;
 }
 
+function normalize(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+/**
+ * The thread as one timeline. A worker's `ready` report and the agent's delivered result usually carry the
+ * same text; the conversation already has the reply, so the report is only added when it says something the
+ * conversation does not. The same turn delivered twice is kept once.
+ */
 function items(ticket: TicketSnapshot | null): Item[] {
   if (!ticket) return [];
-  const turns: Item[] = [ticket.request, ...ticket.conversation]
-    .filter((turn): turn is Turn => Boolean(turn))
-    .map((turn) => ({ kind: "turn" as const, at_ms: turn.at_ms, turn }));
-  const reports: Item[] = ticket.assignments.flatMap((assignment) =>
-    assignment.reports.map((report) => ({
-      kind: "report" as const,
-      at_ms: report.at_ms,
-      status: report.status,
-      text: report.text,
-      question: report.question,
-    })),
-  );
+  const seenTurns = new Set<string>();
+  const said = new Set<string>();
+  const turns: Item[] = [];
+  for (const turn of [ticket.request, ...ticket.conversation]) {
+    if (!turn) continue;
+    const text = normalize(turn.text);
+    const key = `${turn.at_ms}|${turn.from}|${text}`;
+    if (seenTurns.has(key)) continue;
+    seenTurns.add(key);
+    said.add(text);
+    turns.push({ kind: "turn", at_ms: turn.at_ms, turn });
+  }
+  const spoken = [...said];
+  const seenReports = new Set<string>();
+  const reports: Item[] = [];
+  for (const assignment of ticket.assignments) {
+    for (const report of assignment.reports) {
+      const text = normalize(report.text);
+      const key = `${report.at_ms}|${text}`;
+      if (text.length === 0 || seenReports.has(key)) continue;
+      seenReports.add(key);
+      // A report the conversation already delivered, or that the agent's reply contains (the reply may add a
+      // sentence around it), is the same answer; showing it again reads as two answers.
+      if (spoken.some((turn) => turn === text || (text.length >= 80 && (turn.includes(text) || text.includes(turn))))) {
+        continue;
+      }
+      reports.push({
+        kind: "report",
+        at_ms: report.at_ms,
+        status: report.status,
+        text: report.text,
+        question: report.question,
+      });
+    }
+  }
   return [...turns, ...reports].sort((a, b) => a.at_ms - b.at_ms);
 }
 
@@ -63,6 +95,14 @@ function makeThread(): string {
   const bytes = new Uint8Array(16);
   crypto.getRandomValues(bytes);
   return `wc_${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")}`;
+}
+
+/** The state mark beside a conversation, as a bot's avatar shows idle, working or needs-you. */
+function threadTone(row: IndexRow): string {
+  if (!row.open) return row.outcome === "completed" ? "good" : "";
+  if (row.assignment?.state === "running") return "live";
+  if (row.waiting_for) return "warn";
+  return "";
 }
 
 function working(ticket: TicketSnapshot | null, pending: ChatMessage[]): boolean {
@@ -284,7 +324,10 @@ export function ChatLive({
                   <button type="button" className="thread-item" aria-current={id === thread} onClick={() => choose(id)}>
                     <span className="t">{row.title}</span>
                     <span className="m">
-                      <span>{row.assignment?.state === "running" ? "working" : row.stage.replace("_", " ")}</span>
+                      <span className="thread-state">
+                        <span className={`dot ${threadTone(row)}`} aria-hidden="true" />
+                        {row.assignment?.state === "running" ? "working" : row.stage.replace("_", " ")}
+                      </span>
                       <span><When ms={row.updated_ms} now={now} /></span>
                     </span>
                   </button>

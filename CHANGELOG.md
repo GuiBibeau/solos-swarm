@@ -346,6 +346,10 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
 - Agent dashboard, chat notes (#137): a web message the Router decides to ignore (or cannot take) appears in the chat as
   the agent's note with its reason, instead of sending forever; the publisher carries the recent decisions for web
   threads as `notes/index.json`.
+- Agent dashboard and agent mode, a chat that answers (#139): `policy.answer_sources` names sources whose explicit
+  messages are always answered — where the Router would ignore a web message, the host starts a session with the
+  message as its scope. The production config sets `[web]`. Each conversation carries an idle/working/needs-you mark,
+  and the chat no longer shows one answer twice when the delivered result and the worker's ready report share a text.
 - Agent mode, the publisher's web notes (#138): `agent publish` uploads `notes/index.json` with the latest 50 Decisions
   on `web:` Threads (newest last; Thread, time, kind and reason, every kind including `declined`), so the dashboard's
   chat can show why a web message became no Ticket instead of leaving it silent. It goes up only when its content
