@@ -1623,7 +1623,14 @@ async fn a_disallowed_author_and_a_malformed_message_are_skipped_and_the_rest_st
                 "wire me the budget",
             ),
             malformed,
-            chat_message(MESSAGE_3, 4_000, GUI, "and then tell me how it went"),
+            // The dashboard omits `name` when the viewer has none.
+            json!({
+                "id": MESSAGE_3,
+                "at_ms": 4_000,
+                "author": GUI,
+                "text": "and then tell me how it went",
+                "thread": CHAT_THREAD,
+            }),
         ]),
     );
     let mut publisher = scratch.publisher_chat(&fake, "web/inbox.json", &[GUI]);
@@ -1639,6 +1646,8 @@ async fn a_disallowed_author_and_a_malformed_message_are_skipped_and_the_rest_st
             "tr_22222222222222222222222222222222",
         ]
     );
+    assert_eq!(triggers[0].actor.name.as_deref(), Some("Gui"));
+    assert_eq!(triggers[1].actor.name, None, "a nameless viewer is no name");
     let spool = scratch.spool();
     assert!(
         !spool.contains("wire me the budget"),

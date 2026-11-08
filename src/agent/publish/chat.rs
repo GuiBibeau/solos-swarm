@@ -190,7 +190,12 @@ impl ChatBridge {
         }
 
         let author = message.get("author").and_then(Value::as_str);
-        let name = message.get("name").and_then(Value::as_str);
+        // The dashboard omits the name when the viewer has none.
+        let name = match message.get("name") {
+            None => Some(None),
+            Some(Value::String(name)) => Some(Some(name.as_str())),
+            Some(_) => None,
+        };
         let text = message.get("text").and_then(Value::as_str);
         let thread = message
             .get("thread")
@@ -225,7 +230,9 @@ impl ChatBridge {
             actor: Actor {
                 id: author.to_owned(),
                 kind: ActorKind::Person,
-                name: Some(name.to_owned()).filter(|name| !name.trim().is_empty()),
+                name: name
+                    .map(str::to_owned)
+                    .filter(|name| !name.trim().is_empty()),
             },
             addressed: Addressed::Mention,
             text: text.to_owned(),

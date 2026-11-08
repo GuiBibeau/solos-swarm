@@ -215,7 +215,11 @@ describe("the chat page", () => {
   });
 
   it("starts a new conversation with the starters when the thread has no ticket yet", async () => {
-    readIndex.mockResolvedValue(index);
+    // The fixture index has one web conversation; this case is the empty list.
+    readIndex.mockResolvedValue({
+      ...index,
+      tickets: index.tickets.filter((row) => row.source !== "web"),
+    });
     const out = await html(Chat({ searchParams: Promise.resolve({ t: thread }) }));
     expect(out).toContain("New conversation");
     expect(out).toContain("What needs me right now?");

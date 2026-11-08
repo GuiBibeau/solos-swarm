@@ -572,7 +572,8 @@ agent's `kind: jsonl` Source follows it.
 Each message becomes a Trigger with:
 
 - `source: "web"`, `addressed: "mention"`, and the message's id as `tr_<the same 32 hex>`, so a redelivery is dropped
-- `actor: {id: "<author email>", kind: "person", name: "<name>"}`, so the principal is `web:<author email>`
+- `actor: {id: "<author email>", kind: "person", name: "<name>"}` (no `name` when the dashboard has none), so the
+  principal is `web:<author email>`
 - `threads: ["web:<thread>"]` and `reply_to: [{source: "web", address: {thread: "<thread>"}}]`
 - `meta: {thread: "<thread>", url: "https://agent.guibibeau.com/?t=<thread>"}`
 
