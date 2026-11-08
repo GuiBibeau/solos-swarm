@@ -1897,7 +1897,13 @@ impl<R: Repositories> Tx<'_, R> {
             return Ok(None);
         }
         let queued = std::mem::take(&mut thread.queued);
-        let has_tickets = !thread.subscriptions.is_empty();
+        // An ended Ticket is history: the Router's gate admits an unlisted
+        // person's comment as an inferred candidate only beside live work.
+        let has_tickets = thread
+            .subscriptions
+            .iter()
+            .filter_map(|id| self.ticket(id))
+            .any(|ticket| ticket.ended.is_none());
         let mut admitted: Vec<(Strength, Trigger)> = Vec::new();
         let mut rejected: Vec<(TriggerId, String)> = Vec::new();
         for trigger in queued.iter().filter_map(|id| self.trigger(id)) {

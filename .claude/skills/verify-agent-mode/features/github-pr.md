@@ -11,7 +11,9 @@ head <sha12> · opened`. The worker has no push, no token and no pull-request to
 ## Sub-features
 
 - `delivers`: one pull request, ready (not draft), authored by the App's bot, on `solos/<ticket>/<slug>`, whose head is
-  the commit the chain's `ProposalAdmitted` names, and whose commits are all by the bot as author and committer.
+  the commit the chain's `ProposalAdmitted` names, and whose commits are all by the bot as author and committer. The
+  body names no branch but `headRefName`: the worker is told the host names and pushes the branch, so a local branch
+  name in the body (`fix/...`) is a failure.
 - `origin-closes`: asked from a GitHub issue, the pull request's body says `Closes #<issue>`, and asked from Discord it does
   not.
 - `refusal`: a worker that commits as someone else, or into `.github/`, is refused with the remedy, nothing is pushed, and

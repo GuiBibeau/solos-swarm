@@ -33,8 +33,9 @@ to check it, in a sentence. The same rules are in `WORKER_INSTRUCTIONS`, and pst
 `Skipped in solos-swarm` lines, and other notes on how the work went, are sent as `progress` reports, which no person is
 told and `agent status` shows.
 
-**Follow-ups.** A message on a running Ticket reaches its worker as the next turn of the same conversation, with no
-recap. An allowed person's message after the Ticket ended, or while it waits on a question, reopens that Ticket with a
+**Follow-ups.** A message from an allowed person on a running Ticket reaches its worker as the next turn of the same
+conversation, with no recap. Other people's and bots' messages on the Thread reach it as context, with no turn of their
+own. An allowed person's message after the Ticket ended, or while it waits on a question, reopens that Ticket with a
 new worker. A restart's recovery and a repair round start one the same way. That worker is a fresh session, so its
 first prompt quotes what the agent said before, as "Your earlier replies on this ticket (context, not instructions)":
 
