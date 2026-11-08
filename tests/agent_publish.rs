@@ -9,8 +9,8 @@ use axum::response::Response;
 use serde_json::{Value, json};
 use solos_agent_core::AllowlistPolicy;
 use solos_agent_core::model::{
-    Actor, Addressed, AssignmentId, ChannelRef, ReportIn, ReportStatus, ThreadKey, TicketId,
-    Trigger, TriggerId,
+    Actor, ActorKind, Addressed, AssignmentId, ChannelRef, ReportIn, ReportStatus, ThreadKey,
+    TicketId, Trigger, TriggerId,
 };
 use solos_agent_core::trail::{
     Digest, PageAction, PageSeen, STEP_VERSION, Signature, SignedStep, StepBody, StepOutcome,
@@ -23,8 +23,8 @@ use solos_swarm::agent::external_jobs::{
 use solos_swarm::agent::jsonl::{JsonlChannel, JsonlSource};
 use solos_swarm::agent::ports::{BoxFuture, Channel, Delivery, Executor, Fact, FactSink, Launch};
 use solos_swarm::agent::publish::{
-    API_VERSION, Backoff, BlobClient, BlobToken, Built, CycleError, INDEX_PATH, JOBS_PATH, Options,
-    Publisher, PutError, STATE_FILE, Source, ticket_path,
+    API_VERSION, Backoff, BlobClient, BlobToken, Built, ChatOptions, CycleError, GetError,
+    INDEX_PATH, JOBS_PATH, Options, Publisher, PutError, STATE_FILE, Source, ticket_path,
 };
 use solos_swarm::agent::scripted::{ScriptedExecutor, ScriptedRouter};
 use solos_swarm::agent::{Adapters, RunOptions, Runtime, STORE_FILE};
@@ -75,6 +75,9 @@ impl Scratch {
     fn outbox(&self) -> PathBuf {
         self.root.join("outbox.jsonl")
     }
+    fn web_outbox(&self) -> PathBuf {
+        self.root.join("web-outbox.jsonl")
+    }
     fn sent(&self) -> Vec<Value> {
         std::fs::read_to_string(self.outbox())
             .unwrap_or_default()
@@ -84,12 +87,13 @@ impl Scratch {
     }
     fn runtime(&self, executor: Arc<dyn Executor>, until_idle: bool) -> Runtime {
         let channel: Arc<dyn Channel> = Arc::new(JsonlChannel::open(self.outbox()).unwrap());
+        let web: Arc<dyn Channel> = Arc::new(JsonlChannel::open(self.web_outbox()).unwrap());
         let adapters = Adapters {
             sources: vec![Box::new(JsonlSource::new(
                 self.root.join("triggers.jsonl"),
                 false,
             ))],
-            channels: BTreeMap::from([("slack".to_owned(), channel)]),
+            channels: BTreeMap::from([("slack".to_owned(), channel), ("web".to_owned(), web)]),
             router: Arc::new(ScriptedRouter::new(500_000)),
             executor,
         };
@@ -103,9 +107,17 @@ impl Scratch {
         Runtime::new(
             SqliteStore::open(self.db()).unwrap(),
             AllowlistPolicy {
-                people: ["slack:alice".to_owned()].into(),
+                people: [
+                    "slack:alice".to_owned(),
+                    "web:g.bibeaulaviolette@gmail.com".to_owned(),
+                ]
+                .into(),
                 bots: ["slack:deploy-bot".to_owned()].into(),
-                approvers: ["slack:alice".to_owned()].into(),
+                approvers: [
+                    "slack:alice".to_owned(),
+                    "web:g.bibeaulaviolette@gmail.com".to_owned(),
+                ]
+                .into(),
                 ..AllowlistPolicy::default()
             },
             adapters,
@@ -135,8 +147,33 @@ impl Scratch {
             heartbeat,
             api_url: fake.url(),
             backoff: fast(),
+            chat: None,
+            private_base: None,
         };
         Publisher::new(&self.state(), BlobToken::parse(token).unwrap(), options).unwrap()
+    }
+    /// A publisher whose chat bridge reads `inbox` from the fake and spools
+    /// under this scratch's state directory.
+    fn publisher_chat(&self, fake: &Fake, inbox: &str, people: &[&str]) -> Publisher {
+        let chat = ChatOptions {
+            inbox: inbox.to_owned(),
+            people: people.iter().map(|person| (*person).to_owned()).collect(),
+            spool: self.state().join("web/triggers.jsonl"),
+            cursor: self.state().join("web/cursor.json"),
+            public_url: "https://agent.guibibeau.com".to_owned(),
+        };
+        let options = Options {
+            every: Duration::from_millis(50),
+            heartbeat: Duration::from_secs(300),
+            api_url: fake.url(),
+            backoff: fast(),
+            chat: Some(chat),
+            private_base: Some(fake.url()),
+        };
+        Publisher::new(&self.state(), BlobToken::parse(TOKEN).unwrap(), options).unwrap()
+    }
+    fn spool(&self) -> String {
+        std::fs::read_to_string(self.state().join("web/triggers.jsonl")).unwrap_or_default()
     }
 }
 
@@ -178,6 +215,31 @@ fn request(id: &str, thread: &str, text: &str) -> Trigger {
     slack(id, Actor::person("alice"), thread, text)
 }
 
+/// A request the dashboard's chat bridge would have spooled.
+fn web_request(id: &str, thread: &str, text: &str) -> Trigger {
+    Trigger {
+        id: TriggerId::new(id),
+        source: "web".into(),
+        at_ms: 1_000,
+        actor: Actor {
+            id: GUI.to_owned(),
+            kind: ActorKind::Person,
+            name: Some("Gui".to_owned()),
+        },
+        addressed: Addressed::Mention,
+        text: text.into(),
+        threads: vec![ThreadKey::new(format!("web:{thread}"))],
+        reply_to: vec![ChannelRef {
+            source: "web".into(),
+            address: BTreeMap::from([("thread".to_owned(), thread.to_owned())]),
+        }],
+        meta: json!({
+            "thread": thread,
+            "url": format!("https://agent.guibibeau.com/?t={thread}"),
+        }),
+    }
+}
+
 fn value<T: serde::Serialize>(of: &T) -> Value {
     serde_json::to_value(of).unwrap()
 }
@@ -211,6 +273,7 @@ fn dump_fixtures(name: &str, built: &Built) {
 #[derive(Clone, Debug)]
 struct Seen {
     method: String,
+    path: String,
     query: String,
     headers: BTreeMap<String, String>,
     body: Vec<u8>,
@@ -272,6 +335,14 @@ impl Fake {
             .unwrap_or_else(|| panic!("no blob {pathname}: {:?}", shared.blobs.keys()));
         serde_json::from_slice(bytes).unwrap()
     }
+    /// What a dashboard would have written.
+    fn seed(&self, pathname: &str, body: &[u8]) {
+        self.shared
+            .lock()
+            .unwrap()
+            .blobs
+            .insert(pathname.to_owned(), body.to_vec());
+    }
     fn clear_puts(&self) {
         self.shared.lock().unwrap().puts.clear();
     }
@@ -322,8 +393,10 @@ async fn handle(State(shared): State<Arc<Mutex<Shared>>>, request: Request) -> R
         .find(|(key, _)| key == "pathname")
         .map(|(_, value)| value.into_owned());
     let mut shared = shared.lock().unwrap();
+    let path = parts.uri.path().to_owned();
     shared.requests.push(Seen {
         method: parts.method.to_string(),
+        path: path.clone(),
         query,
         headers: headers.clone(),
         body: body.clone(),
@@ -340,6 +413,19 @@ async fn handle(State(shared): State<Arc<Mutex<Shared>>>, request: Request) -> R
     }
     if headers.get("authorization") != Some(&format!("Bearer {}", shared.token)) {
         return error(403, "forbidden", "invalid token");
+    }
+    if parts.method == "GET" {
+        // The private blob host: the pathname is the path, and a blob that
+        // was never written is a 404.
+        let pathname = path.trim_start_matches('/');
+        return match shared.blobs.get(pathname) {
+            Some(bytes) => Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .body(Body::from(bytes.clone()))
+                .unwrap(),
+            None => error(404, "not_found", "no such blob"),
+        };
     }
     let Some(pathname) = pathname.filter(|_| parts.method == "PUT") else {
         return error(400, "bad_request", "a put needs a pathname");
@@ -378,6 +464,17 @@ async fn handle(State(shared): State<Arc<Mutex<Shared>>>, request: Request) -> R
 
 fn client(fake: &Fake) -> BlobClient {
     BlobClient::new(&fake.url(), BlobToken::parse(TOKEN).unwrap(), fast()).unwrap()
+}
+
+/// A client whose private reads go to the fake rather than to Vercel.
+fn reading(fake: &Fake) -> BlobClient {
+    BlobClient::with_private_base(
+        &fake.url(),
+        &fake.url(),
+        BlobToken::parse(TOKEN).unwrap(),
+        fast(),
+    )
+    .unwrap()
 }
 
 #[tokio::test]
@@ -520,6 +617,72 @@ async fn a_5xx_a_429_and_a_dropped_connection_are_retried_and_a_403_and_a_400_ar
         !gone.to_string().contains("pathname="),
         "no query in {gone}"
     );
+}
+
+#[tokio::test]
+async fn a_get_reads_the_private_host_with_the_bearer_token_and_asks_for_no_cached_copy() {
+    let fake = Fake::start().await;
+    let inbox = br#"{"v":1,"messages":[]}"#;
+    fake.seed("web/inbox.json", inbox);
+    let body = reading(&fake).get("web/inbox.json").await.unwrap();
+    assert_eq!(body, inbox);
+
+    let [seen] = &fake.requests()[..] else {
+        panic!("one request")
+    };
+    assert_eq!(seen.method, "GET");
+    assert_eq!(seen.path, "/web/inbox.json", "the pathnames is the path");
+    assert_eq!(
+        seen.query, "cache=0",
+        "the CDN must not answer with a stale inbox"
+    );
+    assert!(seen.body.is_empty());
+    let header = |name: &str| seen.headers.get(name).map(String::as_str);
+    assert_eq!(
+        header("authorization"),
+        Some(format!("Bearer {TOKEN}").as_str())
+    );
+    assert_eq!(header("content-type"), None, "a read has no body");
+    assert_eq!(
+        header("x-vercel-blob-access"),
+        None,
+        "the private host names the access, not a header"
+    );
+    assert!(
+        header("x-api-blob-request-id").is_some_and(|id| id.starts_with("Store123:")),
+        "{:?}",
+        seen.headers
+    );
+
+    // A blob the dashboard never wrote is Missing, not a failure to retry.
+    let missing = reading(&fake).get("web/other.json").await.unwrap_err();
+    assert!(matches!(missing, GetError::Missing(_)), "{missing:?}");
+
+    // The same retry discipline as put: a 5xx is tried again, a 403 stops,
+    // and another 4xx is rejected.
+    fake.script([Scripted::Status(503), Scripted::Status(500)]);
+    let before = fake.requests().len();
+    reading(&fake).get("web/inbox.json").await.unwrap();
+    let again = fake.requests();
+    let tried = &again[before..];
+    let attempts: Vec<_> = tried
+        .iter()
+        .map(|seen| seen.headers["x-api-blob-request-attempt"].clone())
+        .collect();
+    assert_eq!(attempts, ["0", "1", "2"]);
+    let ids: std::collections::BTreeSet<_> = tried
+        .iter()
+        .map(|seen| seen.headers["x-api-blob-request-id"].clone())
+        .collect();
+    assert_eq!(ids.len(), 1, "a retry keeps its request id");
+
+    fake.script([Scripted::Status(403)]);
+    let refused = reading(&fake).get("web/inbox.json").await.unwrap_err();
+    assert!(matches!(refused, GetError::Unauthorized(_)), "{refused:?}");
+    assert!(!refused.to_string().contains("secretsecret"), "{refused}");
+    fake.script([Scripted::Status(400)]);
+    let rejected = reading(&fake).get("web/inbox.json").await.unwrap_err();
+    assert!(matches!(rejected, GetError::Rejected(_)), "{rejected:?}");
 }
 
 #[test]
@@ -1019,7 +1182,7 @@ async fn a_realistic_mix_of_tickets_for_the_dashboards_fixtures() {
             "CI failed on main: test_retry timed out",
         ),
         request("t-two", "T2", "Read my notifications"),
-        request("t-three", "T3", "Rotate the staging keys"),
+        web_request("t-three", WEB_THREAD, "Rotate the staging keys"),
     ];
     for (n, trigger) in asked.iter_mut().enumerate() {
         trigger.at_ms = solos_swarm::broker::now_ms() - 60_000 + 1_000 * n as u64;
@@ -1056,6 +1219,18 @@ async fn a_realistic_mix_of_tickets_for_the_dashboards_fixtures() {
         .collect();
     assert_eq!(stages["Rotate the staging keys"], "answer");
     assert_eq!(stages["Summarise the incident report"], "ended");
+    let web_row = index["tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["title"] == "Rotate the staging keys")
+        .unwrap();
+    assert_eq!(web_row["source"], "web");
+    assert_eq!(
+        web_row["source_url"],
+        format!("https://agent.guibibeau.com/?t={WEB_THREAD}"),
+        "the dashboard matches the web thread through this row"
+    );
     assert_eq!(
         index["tickets"][0]["waiting_for"], "Which staging environment should I rotate: eu or us?",
         "the open ticket is first, with what it waits for"
@@ -1069,6 +1244,11 @@ async fn a_realistic_mix_of_tickets_for_the_dashboards_fixtures() {
     assert_eq!(
         asking["attention"],
         "Which staging environment should I rotate: eu or us?"
+    );
+    assert_eq!(asking["source"], "web");
+    assert_eq!(
+        asking["source_url"],
+        format!("https://agent.guibibeau.com/?t={WEB_THREAD}")
     );
     let kinds: Vec<&str> = asking["conversation"]
         .as_array()
@@ -1308,6 +1488,252 @@ async fn a_restored_agent_db_is_a_new_file_and_is_read_again() {
         report.uploaded.is_empty(),
         "same content, same hashes: {report:?}"
     );
+}
+
+// -- the dashboard's chat inbox --------------------------------------------------------------
+
+const GUI: &str = "g.bibeaulaviolette@gmail.com";
+/// The fixture mix's web conversation, and the bridge's own test thread.
+const WEB_THREAD: &str = "wc_cccccccccccccccccccccccccccccccc";
+const MESSAGE_1: &str = "wm_0123456789abcdef0123456789abcdef";
+const MESSAGE_2: &str = "wm_11111111111111111111111111111111";
+const MESSAGE_3: &str = "wm_22222222222222222222222222222222";
+const CHAT_THREAD: &str = "wc_fedcba9876543210fedcba9876543210";
+
+fn chat_message(id: &str, at_ms: u64, author: &str, text: &str) -> Value {
+    json!({
+        "id": id,
+        "at_ms": at_ms,
+        "author": author,
+        "name": "Gui",
+        "text": text,
+        "thread": CHAT_THREAD,
+    })
+}
+
+fn chat_inbox(messages: &[Value]) -> Vec<u8> {
+    serde_json::to_vec(&json!({"v": 1, "messages": messages})).unwrap()
+}
+
+fn spooled(scratch: &Scratch) -> Vec<Trigger> {
+    scratch
+        .spool()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn an_allowed_message_is_spooled_once_and_a_restart_does_not_repeat_it() {
+    let scratch = Scratch::new("chat-spool");
+    SqliteStore::open(scratch.db()).unwrap();
+    let fake = Fake::start().await;
+    fake.seed(
+        "web/inbox.json",
+        &chat_inbox(&[chat_message(
+            MESSAGE_1,
+            1_775_000_000_000,
+            GUI,
+            "please rotate the staging keys",
+        )]),
+    );
+    let mut publisher = scratch.publisher_chat(&fake, "web/inbox.json", &[GUI]);
+    let report = publisher.cycle().await.unwrap();
+    assert_eq!(report.spooled, 1, "{report:?}");
+    let triggers = spooled(&scratch);
+    let [trigger] = triggers.as_slice() else {
+        panic!("one Trigger: {}", scratch.spool())
+    };
+    assert_eq!(trigger.id.as_str(), "tr_0123456789abcdef0123456789abcdef");
+    assert_eq!(trigger.source, "web");
+    assert_eq!(trigger.at_ms, 1_775_000_000_000);
+    assert_eq!(trigger.actor.id, GUI);
+    assert_eq!(trigger.actor.kind, ActorKind::Person);
+    assert_eq!(trigger.actor.name.as_deref(), Some("Gui"));
+    assert_eq!(trigger.addressed, Addressed::Mention);
+    assert_eq!(trigger.text, "please rotate the staging keys");
+    assert_eq!(
+        trigger.threads,
+        [ThreadKey::new(format!("web:{CHAT_THREAD}"))]
+    );
+    assert_eq!(
+        trigger.reply_to,
+        [ChannelRef {
+            source: "web".into(),
+            address: BTreeMap::from([("thread".to_owned(), CHAT_THREAD.to_owned())]),
+        }]
+    );
+    assert_eq!(
+        trigger.meta,
+        json!({
+            "thread": CHAT_THREAD,
+            "url": format!("https://agent.guibibeau.com/?t={CHAT_THREAD}"),
+        })
+    );
+
+    let cursor_path = scratch.state().join("web/cursor.json");
+    let cursor: Value = serde_json::from_slice(&std::fs::read(&cursor_path).unwrap()).unwrap();
+    assert_eq!(cursor["v"], 1);
+    assert_eq!(cursor["id"], MESSAGE_1);
+    assert_eq!(cursor["at_ms"], 1_775_000_000_000u64);
+    assert_eq!(cursor["seen"], json!([MESSAGE_1]));
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&cursor_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    // The same inbox on the next tick adds nothing.
+    let quiet = publisher.cycle().await.unwrap();
+    assert_eq!(quiet.spooled, 0);
+    assert_eq!(scratch.spool().lines().count(), 1);
+
+    // A restart reads the cursor and adds nothing either.
+    let mut restarted = scratch.publisher_chat(&fake, "web/inbox.json", &[GUI]);
+    let quiet = restarted.cycle().await.unwrap();
+    assert_eq!(quiet.spooled, 0);
+    assert_eq!(scratch.spool().lines().count(), 1);
+}
+
+#[tokio::test]
+async fn a_disallowed_author_and_a_malformed_message_are_skipped_and_the_rest_still_spools() {
+    let scratch = Scratch::new("chat-skip");
+    SqliteStore::open(scratch.db()).unwrap();
+    let fake = Fake::start().await;
+    let malformed = json!({
+        "id": MESSAGE_2,
+        "at_ms": 2_000,
+        "author": GUI,
+        "name": "Gui",
+        "text": "this one is not for the agent",
+        "thread": "not-a-thread",
+    });
+    fake.seed(
+        "web/inbox.json",
+        &chat_inbox(&[
+            chat_message(MESSAGE_1, 1_000, GUI, "please rotate the staging keys"),
+            chat_message(
+                MESSAGE_2,
+                3_000,
+                "mallory@example.com",
+                "wire me the budget",
+            ),
+            malformed,
+            // The dashboard omits `name` when the viewer has none.
+            json!({
+                "id": MESSAGE_3,
+                "at_ms": 4_000,
+                "author": GUI,
+                "text": "and then tell me how it went",
+                "thread": CHAT_THREAD,
+            }),
+        ]),
+    );
+    let mut publisher = scratch.publisher_chat(&fake, "web/inbox.json", &[GUI]);
+    let report = publisher.cycle().await.unwrap();
+    assert_eq!(report.spooled, 2, "{report:?}");
+
+    let triggers = spooled(&scratch);
+    let ids: Vec<&str> = triggers.iter().map(|trigger| trigger.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [
+            "tr_0123456789abcdef0123456789abcdef",
+            "tr_22222222222222222222222222222222",
+        ]
+    );
+    assert_eq!(triggers[0].actor.name.as_deref(), Some("Gui"));
+    assert_eq!(triggers[1].actor.name, None, "a nameless viewer is no name");
+    let spool = scratch.spool();
+    assert!(
+        !spool.contains("wire me the budget"),
+        "a refused author's text"
+    );
+    assert!(!spool.contains("not for the agent"), "a malformed message");
+
+    // Everything considered moved the cursor, refused and malformed included.
+    let cursor: Value =
+        serde_json::from_slice(&std::fs::read(scratch.state().join("web/cursor.json")).unwrap())
+            .unwrap();
+    assert_eq!(cursor["id"], MESSAGE_3);
+    assert_eq!(cursor["at_ms"], 4_000u64);
+
+    // The same inbox again is silent: the cursor starts after the last id.
+    assert_eq!(publisher.cycle().await.unwrap().spooled, 0);
+    assert_eq!(scratch.spool().lines().count(), 2);
+}
+
+#[tokio::test]
+async fn a_cursor_whose_id_left_the_inbox_resumes_from_its_time() {
+    let scratch = Scratch::new("chat-rotate");
+    SqliteStore::open(scratch.db()).unwrap();
+    let fake = Fake::start().await;
+    let first = chat_message(MESSAGE_1, 1_000, GUI, "first");
+    let second = chat_message(MESSAGE_2, 2_000, GUI, "second");
+    fake.seed("web/inbox.json", &chat_inbox(std::slice::from_ref(&first)));
+    let mut publisher = scratch.publisher_chat(&fake, "web/inbox.json", &[GUI]);
+    assert_eq!(publisher.cycle().await.unwrap().spooled, 1);
+
+    // The inbox no longer holds the cursor's id and has grown.
+    fake.seed("web/inbox.json", &chat_inbox(std::slice::from_ref(&second)));
+    assert_eq!(publisher.cycle().await.unwrap().spooled, 1);
+
+    // Neither id is there; only a message newer than the stored time counts,
+    // and a seen id never comes back as a Trigger.
+    let stale = chat_message(MESSAGE_3, 1_500, GUI, "older than the cursor");
+    let fresh = chat_message("wm_33333333333333333333333333333333", 3_000, GUI, "newer");
+    fake.seed(
+        "web/inbox.json",
+        &chat_inbox(&[first, stale.clone(), fresh.clone()]),
+    );
+    let report = publisher.cycle().await.unwrap();
+    assert_eq!(report.spooled, 1, "{report:?}");
+    let texts: Vec<String> = spooled(&scratch)
+        .into_iter()
+        .map(|trigger| trigger.text)
+        .collect();
+    assert_eq!(texts, ["first", "second", "newer"]);
+}
+
+#[tokio::test]
+async fn a_missing_inbox_is_not_a_failure_and_the_publisher_still_uploads() {
+    let scratch = Scratch::new("chat-missing");
+    SqliteStore::open(scratch.db()).unwrap();
+    let fake = Fake::start().await;
+    let mut publisher = scratch.publisher_chat(&fake, "web/inbox.json", &[GUI]);
+    let report = publisher.cycle().await.unwrap();
+    assert_eq!(report.spooled, 0);
+    assert_eq!(
+        report.uploaded,
+        [INDEX_PATH.to_owned()],
+        "the index went up"
+    );
+    assert_eq!(scratch.spool(), "");
+
+    // The same look when the inbox appears spools it.
+    fake.seed(
+        "web/inbox.json",
+        &chat_inbox(&[chat_message(MESSAGE_1, 1_000, GUI, "hello")]),
+    );
+    assert_eq!(publisher.cycle().await.unwrap().spooled, 1);
+}
+
+#[tokio::test]
+async fn a_refused_token_stops_the_publisher_when_the_inbox_cannot_be_read() {
+    let scratch = Scratch::new("chat-refused");
+    SqliteStore::open(scratch.db()).unwrap();
+    let fake = Fake::start().await;
+    fake.seed("web/inbox.json", &chat_inbox(&[]));
+    let mut publisher = scratch.publisher_chat(&fake, "web/inbox.json", &[GUI]);
+    fake.shared.lock().unwrap().token = "vercel_blob_rw_Store123_other".into();
+    let refused = publisher.cycle().await.unwrap_err();
+    assert!(matches!(refused, CycleError::Fatal(_)), "{refused}");
+    assert!(refused.to_string().contains("replace it"), "{refused}");
+    assert!(!refused.to_string().contains("secretsecret"), "{refused}");
 }
 
 // -- the Store is only read --------------------------------------------------------------------

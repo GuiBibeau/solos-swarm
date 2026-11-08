@@ -347,6 +347,7 @@ impl Source {
             updated_at: snapshot::iso(updated_ms),
             duration_ms: ended_ms.map(|at| at.saturating_sub(ticket.created_ms)),
             source: ticket.mandate.source.clone(),
+            source_url: origin.as_ref().and_then(snapshot::source_url),
             asker: requester.clone(),
             spent_microusd: spent,
             budget_microusd: ticket.mandate.budget_microusd,

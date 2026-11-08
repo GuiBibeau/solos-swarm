@@ -84,6 +84,10 @@ pub struct IndexRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<Ms>,
     pub source: String,
+    /// The conversation the request came from, where its address says. The
+    /// dashboard matches a web chat thread to its ticket through this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
     pub asker: Person,
     pub spent_microusd: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -415,11 +419,27 @@ pub fn scrub_url(url: &str) -> Option<String> {
 }
 
 /// The conversation a Trigger came from, as a link, when its Source's
-/// addresses make one: a Discord message, or a GitHub issue or pull request
-/// on github.com. Slack's links need the workspace's name, which the agent
-/// does not hold.
+/// addresses make one: a Discord message, a GitHub issue or pull request on
+/// github.com, or a web chat thread whose address the bridge wrote. Slack's
+/// links need the workspace's name, which the agent does not hold.
 pub fn source_url(trigger: &Trigger) -> Option<String> {
     match trigger.source.as_str() {
+        "web" => {
+            // The bridge writes the dashboard's address in `meta.url`; keep
+            // only its origin and path, and take the thread from the
+            // Trigger's own key, so no query or fragment it carried survives.
+            let raw = trigger.meta.get("url")?.as_str()?;
+            let thread = trigger.threads.first()?.as_str().strip_prefix("web:")?;
+            let shaped = thread.len() == 35
+                && thread.starts_with("wc_")
+                && thread[3..].bytes().all(|b| b.is_ascii_hexdigit());
+            if !shaped {
+                return None;
+            }
+            let mut url = reqwest::Url::parse(&scrub_url(raw)?).ok()?;
+            url.query_pairs_mut().append_pair("t", thread);
+            Some(url.to_string())
+        }
         "discord" => {
             // An id the Source did not write, or none at all: absent is
             // fine for a guild (a direct message) and the message, but one
@@ -545,6 +565,49 @@ mod tests {
             source_url(&trigger("slack", "slack:C1:123.4", json!({}))),
             None
         );
+    }
+
+    #[test]
+    fn a_web_thread_links_to_its_conversation_and_keeps_only_the_thread_query() {
+        let thread = format!("wc_{}", "ab".repeat(16));
+        let web = trigger(
+            "web",
+            &format!("web:{thread}"),
+            json!({
+                "thread": thread,
+                "url": format!("https://agent.guibibeau.com/?t={thread}"),
+            }),
+        );
+        assert_eq!(
+            source_url(&web),
+            Some(format!("https://agent.guibibeau.com/?t={thread}"))
+        );
+
+        // A login, another query and a fragment do not survive; the thread
+        // in the Trigger's own key fills the query the dashboard matches on.
+        let hostile = trigger(
+            "web",
+            &format!("web:{thread}"),
+            json!({"url": "https://user:pw@agent.guibibeau.com/tickets/1?token=secret&t=evil#frag"}),
+        );
+        assert_eq!(
+            source_url(&hostile),
+            Some(format!("https://agent.guibibeau.com/tickets/1?t={thread}"))
+        );
+
+        for (key, meta) in [
+            ("web:not-a-thread", json!({"url": "https://a.example/"})),
+            (
+                &format!("web:wc_{}", "zz".repeat(16)),
+                json!({"url": "https://a.example/"}),
+            ),
+            (&format!("web:{thread}"), json!({})),
+            (&format!("web:{thread}"), json!("https://a.example/")),
+            (&format!("web:{thread}"), json!({"url": "not a url"})),
+            ("github:acme/app#1", json!({"url": "https://a.example/"})),
+        ] {
+            assert_eq!(source_url(&trigger("web", key, meta)), None, "{key}");
+        }
     }
 
     #[test]

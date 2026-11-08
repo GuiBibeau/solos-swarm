@@ -67,9 +67,19 @@ impl Cursor {
         to_end: bool,
         what: &str,
     ) -> Result<Vec<T>> {
-        let mut file = tokio::fs::File::open(path)
-            .await
-            .with_context(|| format!("cannot open trigger file {}", path.display()))?;
+        // A followed file that nothing has written yet is empty: the
+        // publisher creates the web spool with its first message, and the
+        // agent must start before that.
+        let mut file = match tokio::fs::File::open(path).await {
+            Ok(file) => file,
+            Err(err) if !to_end && err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Vec::new());
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("cannot open trigger file {}", path.display()));
+            }
+        };
         if file.metadata().await?.len() < self.offset {
             // Truncated or replaced: start over; stored Triggers come back as duplicates.
             *self = Self::default();
@@ -323,6 +333,28 @@ mod tests {
         writeln!(file, "{}", line("t3")).unwrap();
         let next = tokio::time::timeout(Duration::from_secs(5), batches.recv()).await;
         assert_eq!(ids(&next.unwrap().unwrap()), ["t2", "t3"]);
+        follow.abort();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_followed_source_waits_for_a_file_that_is_not_there_yet() {
+        let dir = scratch("missing");
+        let path = dir.join("triggers.jsonl");
+        let (sink, mut batches) = mpsc::channel(4);
+        let follow = tokio::spawn(Box::new(JsonlSource::new(&path, true)).run(sink, facts()));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), batches.recv())
+                .await
+                .is_err(),
+            "nothing to read yet, and no error"
+        );
+        std::fs::write(&path, format!("{}\n", line("t1"))).unwrap();
+        let batch = tokio::time::timeout(Duration::from_secs(5), batches.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ids(&batch), ["t1"]);
         follow.abort();
         std::fs::remove_dir_all(&dir).unwrap();
     }

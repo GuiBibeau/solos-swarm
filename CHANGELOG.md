@@ -343,6 +343,14 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   beacon field), the empty chat leads with what waits on the person and one-line commands instead of suggestion cards,
   the activity rail shows the active ticket's last worker report instead of a miniature field, and the field labels its
   rings and tickets; the Swarm field is sized so the workers land on the first screen.
+- Agent mode, the dashboard's web chat (#135): `web.chat` makes `agent publish` read `web/inbox.json` from the private
+  Blob store each look and spool new messages from `web.chat.people` as Trigger JSON lines in
+  `state/web/triggers.jsonl`, which the agent's `kind: jsonl` Source follows; a cursor in `state/web/cursor.json` keeps
+  a restart from repeating one, and a missing inbox is not a failure. The Blob client reads a private blob at its
+  documented host with the bearer token, `cache=0` and a put's retry rules. `tickets/index.json` rows and ticket
+  snapshots gain `source_url`, a web one carrying `?t=<thread>` for the dashboard's thread match, and a followed jsonl
+  Source waits for its file to appear, so the agent can start before the first message. `configuration.md` and
+  `production.md` carry the block, the required source/channel/policy lines and the trust model.
 
 ### Fixed
 

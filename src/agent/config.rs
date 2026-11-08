@@ -13,7 +13,7 @@ pub use sources::{Interval, ReplyTo, ScheduleConfig, TimeOfDay};
 pub use watchdog::{
     DiskFloor, JobCheck, JobConfig, OperatorConfig, Progress, ThresholdsConfig, WatchdogConfig,
 };
-pub use web::{DEFAULT_API_URL, PublishConfig, WebConfig};
+pub use web::{ChatConfig, DEFAULT_API_URL, PublishConfig, WebConfig};
 
 use super::broker::ModelTerms;
 use super::broker::memory::{DreamTerms, MemoryParts};
@@ -1240,6 +1240,11 @@ impl AgentConfig {
         }
         if let Some(publish) = config.web.as_mut().and_then(|web| web.publish.as_mut()) {
             publish.token_file = base.join(&publish.token_file);
+        }
+        if let Some(chat) = config.web.as_mut().and_then(|web| web.chat.as_mut())
+            && let Some(spool) = &mut chat.spool
+        {
+            *spool = base.join(&*spool);
         }
         // GitHub logins are case-blind, and the Policy spells them in lower
         // case, as the Source does.

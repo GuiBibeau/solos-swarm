@@ -27,7 +27,10 @@
 //! with a short exponential backoff, and also waits out a 429's
 //! `retry-after`. A private blob is read back with the same token at
 //! `https://<storeId>.private.blob.vercel-storage.com/<pathname>`; the
-//! dashboard does that through `get(pathname, {access: "private"})`.
+//! dashboard does that through `get(pathname, {access: "private"})`: the
+//! bearer token, `?cache=0` so the CDN does not answer with a stale copy, and
+//! a 404 means "no such blob". [`BlobClient::get`] sends that too, plus the
+//! request diagnostics [`BlobClient::put`] sends, with the same retries.
 //!
 //! `tests/agent_publish.rs` holds this to a fake server, header by header.
 
@@ -159,6 +162,35 @@ impl std::fmt::Display for PutError {
 
 impl std::error::Error for PutError {}
 
+/// Why a read did not happen.
+#[derive(Debug)]
+pub enum GetError {
+    /// The API refused the token (401, 403). Retrying cannot help until the
+    /// operator replaces it.
+    Unauthorized(String),
+    /// Out of attempts on a network error, a 5xx or a 429: the next look
+    /// tries again.
+    Transient(String),
+    /// The store has no such blob (404), which is what a dashboard that has
+    /// not sent a message yet looks like.
+    Missing(String),
+    /// Another 4xx: this pathname will not be read as it is.
+    Rejected(String),
+}
+
+impl std::fmt::Display for GetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unauthorized(why)
+            | Self::Transient(why)
+            | Self::Missing(why)
+            | Self::Rejected(why) => f.write_str(why),
+        }
+    }
+}
+
+impl std::error::Error for GetError {}
+
 /// What a successful put answers with.
 #[derive(Clone, Debug, Deserialize)]
 pub struct Put {
@@ -179,10 +211,13 @@ struct ErrorDetail {
     message: Option<String>,
 }
 
-/// Puts blobs into one private store.
+/// Puts blobs into one private store, and reads them back.
 pub struct BlobClient {
     http: reqwest::Client,
     api_url: String,
+    /// `https://<storeId>.private.blob.vercel-storage.com`, or a fake's
+    /// address in a test.
+    private_base: String,
     token: BlobToken,
     backoff: Backoff,
 }
@@ -190,6 +225,21 @@ pub struct BlobClient {
 impl BlobClient {
     /// `api_url` has no trailing slash.
     pub fn new(api_url: &str, token: BlobToken, backoff: Backoff) -> Result<Self> {
+        let private_base = format!(
+            "https://{}.private.blob.vercel-storage.com",
+            token.store_id()
+        );
+        Self::with_private_base(api_url, &private_base, token, backoff)
+    }
+
+    /// [`Self::new`] with the private blob host named, so a test can point
+    /// reads at its own server.
+    pub fn with_private_base(
+        api_url: &str,
+        private_base: &str,
+        token: BlobToken,
+        backoff: Backoff,
+    ) -> Result<Self> {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(60))
@@ -205,6 +255,7 @@ impl BlobClient {
         Ok(Self {
             http,
             api_url: api_url.trim_end_matches('/').to_owned(),
+            private_base: private_base.trim_end_matches('/').to_owned(),
             token,
             backoff,
         })
@@ -286,6 +337,99 @@ impl BlobClient {
         Err(PutError::Transient(last))
     }
 
+    /// Read `pathname` from the private store, as `get(pathname, {access:
+    /// "private", useCache: false})` in `@vercel/blob` does: the blob's host,
+    /// the bearer token, `cache=0`, and no body.
+    pub async fn get(&self, pathname: &str) -> Result<Vec<u8>, GetError> {
+        check_pathname(pathname).map_err(|why| GetError::Rejected(format!("{pathname}: {why}")))?;
+        let url = self
+            .private_url(pathname)
+            .map_err(|why| GetError::Rejected(format!("{pathname}: {why}")))?;
+        let request_id = format!(
+            "{}:{}:{:x}",
+            self.token.store_id,
+            crate::broker::now_ms(),
+            rand::random::<u32>()
+        );
+        let mut last = String::new();
+        for attempt in 0..self.backoff.attempts.max(1) {
+            if attempt > 0 {
+                tokio::time::sleep(self.backoff.wait(attempt - 1)).await;
+            }
+            let headers = self
+                .get_headers(&request_id, attempt)
+                .map_err(|err| GetError::Rejected(format!("{pathname}: {err:#}")))?;
+            let sent = self.http.get(url.clone()).headers(headers).send().await;
+            let response = match sent {
+                Ok(response) => response,
+                Err(err) => {
+                    last = format!("{pathname}: the request failed: {}", describe(err));
+                    continue;
+                }
+            };
+            let status = response.status();
+            if status.is_success() {
+                return response
+                    .bytes()
+                    .await
+                    .map(|body| body.to_vec())
+                    .map_err(|err| GetError::Transient(format!("{pathname}: bad answer: {err}")));
+            }
+            let retry_after = response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .map(|seconds| Duration::from_secs(seconds).min(MAX_RETRY_AFTER));
+            let detail = error_detail(response).await;
+            let why = format!("{pathname}: Vercel Blob answered {status}{detail}");
+            match status.as_u16() {
+                401 | 403 => return Err(GetError::Unauthorized(why)),
+                404 => return Err(GetError::Missing(why)),
+                408 | 425 | 429 | 500..=599 => {
+                    last = why;
+                    if let Some(wait) = retry_after
+                        && attempt + 1 < self.backoff.attempts
+                    {
+                        tokio::time::sleep(wait).await;
+                    }
+                }
+                _ => return Err(GetError::Rejected(why)),
+            }
+        }
+        Err(GetError::Transient(last))
+    }
+
+    /// The documented private address, and `cache=0` so the CDN answers with
+    /// the inbox as the dashboard last wrote it.
+    fn private_url(&self, pathname: &str) -> Result<reqwest::Url> {
+        let mut url = reqwest::Url::parse(&format!("{}/", self.private_base))?;
+        url.set_path(&format!("/{pathname}"));
+        url.query_pairs_mut().append_pair("cache", "0");
+        Ok(url)
+    }
+
+    /// The bearer token and the same request diagnostics a put sends. The
+    /// store id is in the host, not a header.
+    fn get_headers(&self, request_id: &str, attempt: u32) -> Result<HeaderMap> {
+        let mut headers = HeaderMap::new();
+        let mut get = |name: &'static str, value: &str| -> Result<()> {
+            headers.insert(
+                HeaderName::from_static(name),
+                HeaderValue::from_str(value).with_context(|| format!("header {name}"))?,
+            );
+            Ok(())
+        };
+        get("x-api-blob-request-id", request_id)?;
+        get("x-api-blob-request-attempt", &attempt.to_string())?;
+        let mut authorization =
+            HeaderValue::from_str(&format!("Bearer {}", self.token.secret.as_str()))
+                .context("the token as a header")?;
+        authorization.set_sensitive(true);
+        headers.insert(AUTHORIZATION, authorization);
+        Ok(headers)
+    }
+
     fn headers(&self, content_type: &str, request_id: &str, attempt: u32) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
         let mut put = |name: &'static str, value: &str| -> Result<()> {
@@ -315,7 +459,7 @@ impl BlobClient {
 
 /// `pathname`'s rules in the SDK: not empty, at most 950 characters, and no
 /// `//`. A leading `/` would name a different blob than the dashboard reads.
-fn check_pathname(pathname: &str) -> Result<()> {
+pub fn check_pathname(pathname: &str) -> Result<()> {
     ensure!(!pathname.is_empty(), "the pathname is empty");
     ensure!(
         pathname.chars().count() <= MAX_PATHNAME_CHARS,

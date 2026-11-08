@@ -60,8 +60,8 @@ vault key.
 ```yaml
 # ~/agent/agent.yaml on the box
 policy:
-  people: [discord:<your Discord user id>, mcp:<your name>, github:<your GitHub login>]
-  approvers: [discord:<your Discord user id>, github:<your GitHub login>]
+  people: [discord:<your Discord user id>, mcp:<your name>, github:<your GitHub login>, web:g.bibeaulaviolette@gmail.com]
+  approvers: [discord:<your Discord user id>, github:<your GitHub login>, web:g.bibeaulaviolette@gmail.com]
   auto_approve_microusd: 500000            # a budget above this waits for Approve
 sources:
   - kind: discord
@@ -69,10 +69,15 @@ sources:
     token_file: /run/user/1000/solos-agent/discord-token
   - kind: mcp                              # `solos-swarm mcp`, `agent stop` and `agent memo` on the box
   - kind: github                           # no fields: it reads forge.repos as the App
+  - kind: jsonl                            # the dashboard's chat, spooled by `agent publish`
+    path: state/web/triggers.jsonl
 channels:
   - kind: discord
   - kind: mcp
   - kind: github                           # comments as the App's bot
+  - kind: jsonl                            # replies to the web chat
+    source: web
+    path: state/web/replies.jsonl
 router:
   kind: pi
   provider: deepseek
@@ -119,6 +124,10 @@ web:
   public_url: https://agent.guibibeau.com
   publish:
     token_file: /run/user/1000/solos-agent-publish/vercel-blob-token
+  chat:
+    inbox: web/inbox.json                  # the dashboard writes it on every send
+    people: [g.bibeaulaviolette@gmail.com] # the only author whose messages become Triggers
+    # spool: state/web/triggers.jsonl      # the default: <state>/web/triggers.jsonl
 ```
 
 Read these before you change it:
@@ -140,6 +149,10 @@ Read these before you change it:
   health check posts only to a `source: discord` operator.
 - Write `web.publish` in block style, as above. `scripts/agent-deploy` looks for a `publish:` line under `web:` to know
   whether to run the publisher.
+- `web.chat` needs the jsonl Source, the `source: web` jsonl Channel and `web:<your email>` in `policy.people` and
+  `policy.approvers`, all as above. The publisher refuses an author not in `web.chat.people`; the agent's Policy refuses
+  `web:<author>` again if it is not in `policy.people`. Both lists must name the address
+  ([web.chat](configuration.md#web)).
 - `memory:` and `health:` can be left out. Their defaults are in [memory](configuration.md#memory) and
   [The disk floor](#the-disk-floor).
 
@@ -443,6 +456,9 @@ person. The box accepts no inbound connection, so it pushes:
 
 ```text
 solos-agent  --writes-->  agent.db  --read-only-->  solos-agent-publish  --HTTPS PUT-->  private Vercel Blob store
+     ^                                                  |  <--HTTPS GET web/inbox.json------------^
+     |                                                  +--> state/web/triggers.jsonl
+     +-- its jsonl Source (source: web) follows the spool, and its jsonl Channel writes state/web/replies.jsonl
                                                                                                   |
                                        you  -->  agent.guibibeau.com (web/agent-dashboard)  <--reads, server side
 ```
@@ -452,9 +468,11 @@ solos-agent  --writes-->  agent.db  --read-only-->  solos-agent-publish  --HTTPS
 builds `tickets/index.json` (the open tickets first, then the latest 100 ended) and one `tickets/<ticket id>.json` per
 ticket in the index. It uploads only a snapshot whose content changed, tickets first and the index last, so the index
 never names a blob that is not there. When nothing changed, it uploads the index again every `heartbeat_secs` (300),
-which is how the dashboard tells a quiet agent from a dead publisher. Its only file is
+which is how the dashboard tells a quiet agent from a dead publisher. Its state file is
 `state/publish-state.json`, the hash of each blob it last uploaded to the store its token names. A different store gets
-everything again. The web app is [web/agent-dashboard](../../web/agent-dashboard/README.md).
+everything again. With `web.chat` it also reads the dashboard's inbox and appends to `state/web/triggers.jsonl`,
+remembering progress in `state/web/cursor.json` ([Chat from the web](#chat-from-the-web)). The web app is
+[web/agent-dashboard](../../web/agent-dashboard/README.md).
 
 With `watchdog.jobs` in agent.yaml, the Watchdog writes `state/watchdog-jobs.json`, and the publisher reads that file
 (the one thing it reads besides `agent.db`) and uploads it as `jobs/index.json`: when its content changes, which leaves
@@ -481,7 +499,13 @@ minutes ([External jobs](runtime.md#external-jobs)).
        token_file: /run/user/1000/solos-agent-publish/vercel-blob-token
        every_secs: 5                              # optional, 1 to 3600
        heartbeat_secs: 300                        # optional, every_secs to 86400
+     chat:                                        # optional: the dashboard's chat becomes Triggers
+       inbox: web/inbox.json
+       people: [g.bibeaulaviolette@gmail.com]     # also add web:<this email> to policy.people and approvers
    ```
+
+   With `chat`, also add the jsonl Source and Channel and the `web:` principals from the production config above
+   ([Chat from the web](#chat-from-the-web)).
 
 4. Run `scripts/agent-deploy deploy`, or `scripts/agent-deploy restart` on the current release.
 5. Check it:
@@ -535,6 +559,41 @@ hold.
 
 Blob operations are billed, and a put is an "advanced operation". A working ticket changes its snapshot with each report
 and each reply, so a busy hour is tens of puts. An idle day is about 290: one index every five minutes.
+
+### Chat from the web
+
+The dashboard's chat (at `/` on `agent.guibibeau.com`) writes `web/inbox.json` into the same private Blob store on every
+send. Its own server function is the only writer, after Sign in with Vercel; the browser never holds the Blob token.
+With `web.chat` in `web:`, every look of `agent publish` also reads that blob with the publisher's Blob token, at
+`https://<storeId>.private.blob.vercel-storage.com/web/inbox.json?cache=0`, and appends each new message from a person
+on `web.chat.people` to `state/web/triggers.jsonl` as one Trigger JSON line. One write and one `fsync` per look, so the
+agent's `kind: jsonl` Source follows it.
+
+Each message becomes a Trigger with:
+
+- `source: "web"`, `addressed: "mention"`, and the message's id as `tr_<the same 32 hex>`, so a redelivery is dropped
+- `actor: {id: "<author email>", kind: "person", name: "<name>"}` (no `name` when the dashboard has none), so the
+  principal is `web:<author email>`
+- `threads: ["web:<thread>"]` and `reply_to: [{source: "web", address: {thread: "<thread>"}}]`
+- `meta: {thread: "<thread>", url: "https://agent.guibibeau.com/?t=<thread>"}`
+
+The ticket's `source_url`, in `tickets/index.json` and in its snapshot, is that same address. The dashboard matches a
+conversation's thread to its ticket through it. `state/web/replies.jsonl`, written by the `source: web` jsonl Channel,
+holds the agent's replies; the ticket snapshot's conversation carries them to the web page.
+
+What was read is remembered in `state/web/cursor.json`: the last processed id and time, and the last 200 ids. A restart
+never turns the same message into a Trigger. If the last id has fallen out of the inbox (the dashboard keeps 200
+messages), only messages newer than the stored time are considered, and an id already in the list is never processed
+again. Malformed messages and authors off the list are logged and skipped; they do not stop the publisher. A fresh
+cursor treats everything in the inbox as new, so the first run can spool up to 200 Triggers.
+
+The trust model, plainly. The private Blob store's read-write token is the boundary: it can read and write every blob,
+it rests at mode 0600 beside the others, and only the publisher's unit and the dashboard's server functions hold one.
+The browser never does. The dashboard writes only what a signed-in person sent. The publisher then enforces
+`web.chat.people` before any text reaches the spool, and the agent's Policy checks the principal
+`web:<author email>` against `policy.people` again — so a misconfigured first list still does not make the agent work for
+a stranger. The message text is data: it cannot change a permission, a budget or a Policy, and it never appears in a log
+line. The agent unit does not hold the Blob token.
 
 ### Rotate the dashboard's secrets
 
