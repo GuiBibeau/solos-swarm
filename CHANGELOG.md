@@ -354,6 +354,12 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   snapshots gain `source_url`, a web one carrying `?t=<thread>` for the dashboard's thread match, and a followed jsonl
   Source waits for its file to appear, so the agent can start before the first message. `configuration.md` and
   `production.md` carry the block, the required source/channel/policy lines and the trust model.
+- Agent mode, a model policy per repository, PR 2 (#134): at accept the host picks the repository's worker upstream from
+  `forge.repos.<repo>.models` and records it in `Mandate.upstream` (name, provider, model, harness), with its harness in
+  the Plan; the Router never names a model or a harness. A repository that admits nothing, or whose allowed providers no
+  upstream here serves, is declined with one sentence, sent to an explicit requester once, and nothing starts. An
+  accept whose GitHub thread carries a restricted repository's text must name that repository, and before the clone the
+  executor checks the Ticket's upstream against the policy as it is now. Store schema 11 with an empty migration.
 
 ### Fixed
 
