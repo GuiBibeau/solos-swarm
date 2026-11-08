@@ -8,11 +8,12 @@ import { readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { get } from "@vercel/blob";
 import { FIXTURES } from "./fixtures";
-import { FORMAT, JOBS_FORMAT, type Index, type Jobs, type TicketSnapshot } from "./types";
+import { FORMAT, JOBS_FORMAT, NOTES_FORMAT, type Index, type Jobs, type Notes, type TicketSnapshot } from "./types";
 import type { Viewer } from "./viewer-core";
 
 export const INDEX_PATH = "tickets/index.json";
 export const JOBS_PATH = "jobs/index.json";
+export const NOTES_PATH = "notes/index.json";
 
 /** Ticket ids are `tk_` and hex; anything else is not a path into the store. */
 export function validTicketId(id: string): boolean {
@@ -86,6 +87,18 @@ export async function readJobs(viewer: Viewer): Promise<Jobs | null> {
     throw new StoreError(`${JOBS_PATH} is in a format this dashboard does not know`);
   }
   return json as unknown as Jobs;
+}
+
+/** The agent's recent decisions for web threads; null until the publisher carries them. */
+export async function readNotes(viewer: Viewer): Promise<Notes | null> {
+  void viewer;
+  if (FIXTURES) return null;
+  const json = await readJson(NOTES_PATH);
+  if (json === null) return null;
+  if (!isRecord(json) || json.v !== NOTES_FORMAT || !Array.isArray(json.notes)) {
+    throw new StoreError(`${NOTES_PATH} is in a format this dashboard does not know`);
+  }
+  return json as unknown as Notes;
 }
 
 /** One ticket's snapshot, or null when there is none (yet) or the id is not one. */

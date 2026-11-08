@@ -24,6 +24,7 @@ const NOW = Date.parse(index.generated_at ?? "") + 5 * 60 * 1000;
 const readIndex = vi.fn();
 const readTicket = vi.fn();
 const readJobs = vi.fn();
+const readNotes = vi.fn();
 vi.mock("@/lib/viewer", () => ({
   requireViewer: async () => ({ email: "g.bibeaulaviolette@gmail.com" }),
   currentViewer: async () => null,
@@ -35,6 +36,7 @@ vi.mock("@/lib/blob", async () => ({
   readIndex,
   readTicket,
   readJobs,
+  readNotes,
 }));
 vi.mock("next/navigation", () => ({
   redirect: (to: string) => {
@@ -59,6 +61,8 @@ beforeEach(() => {
   readTicket.mockReset();
   readJobs.mockReset();
   readJobs.mockResolvedValue(null);
+  readNotes.mockReset();
+  readNotes.mockResolvedValue(null);
   vi.spyOn(console, "error").mockImplementation(() => {});
 });
 
@@ -212,6 +216,18 @@ describe("the chat page", () => {
     expect(out).toContain("What&#x27;s happening");
     expect(out).toContain("Message the swarm…");
     for (const bad of ["<script", "<img", "onerror"]) expect(out, bad).not.toContain(bad);
+  });
+
+  it("shows the agent's note when a message became no ticket", async () => {
+    readIndex.mockResolvedValue({ ...index, tickets: [webRow, ...index.tickets] });
+    readTicket.mockResolvedValue(null);
+    readNotes.mockResolvedValue({
+      v: 1,
+      notes: [{ thread: `web:${thread}`, at_ms: NOW - 1000, kind: "ignore", reason: "Nothing to hand to a worker." }],
+    });
+    const out = await html(Chat({ searchParams: Promise.resolve({ t: thread }) }));
+    expect(out).toContain("no ticket");
+    expect(out).toContain("Nothing to hand to a worker.");
   });
 
   it("starts a new conversation with the starters when the thread has no ticket yet", async () => {

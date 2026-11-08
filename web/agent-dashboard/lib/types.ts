@@ -203,3 +203,13 @@ export type ChatMessage = {
   text: string;
   thread: string;
 };
+
+/** One decision the publisher carries for a web thread, so the chat can explain a message that became no Ticket. */
+export const NOTES_FORMAT = 1;
+export type Note = {
+  thread: string;
+  at_ms: number;
+  kind: "accept" | "ignore" | "stop" | "unavailable";
+  reason: string;
+};
+export type Notes = { v: number; generated_at?: string; notes: Note[] };
