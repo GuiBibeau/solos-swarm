@@ -70,7 +70,7 @@ fn a_file_from_a_newer_build_is_refused_and_this_build_writes_the_version_older_
         .unwrap()
         .schema_version()
         .unwrap();
-    assert_eq!(known, 10, "a build that knows only 9 refuses this file");
+    assert_eq!(known, 11, "a build that knows only 10 refuses this file");
 
     db.raw()
         .execute(
