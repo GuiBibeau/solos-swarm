@@ -2180,78 +2180,23 @@ async fn calls_that_find_nothing_new_are_stopped_after_thirty_and_a_new_turn_may
 }
 
 #[tokio::test]
-async fn a_turn_is_stopped_at_its_ceiling_of_tool_calls() {
-    let scratch = Scratch::new("tool-ceiling");
+async fn a_turn_has_no_ceiling_on_its_tool_or_model_calls() {
+    let scratch = Scratch::new("no-ceiling");
     let worker = Looper::new(&scratch, None).await;
 
-    // Every call is a different one, so nothing but the ceiling stops them.
-    for call in 0..200 {
+    // Every call is a different one, more than the old ceilings of 200 tool
+    // calls and 250 model calls: nothing stops a turn that keeps finding new
+    // things.
+    for call in 0..260 {
         assert_eq!(
             worker.fetch(format!("page{call}")).await.0,
             200,
             "call {call}"
         );
-    }
-    let (status, refused) = worker.fetch("page200").await;
-
-    assert_eq!(status, 429, "{refused}");
-    assert!(
-        refused["error"]
-            .as_str()
-            .unwrap()
-            .contains("Your turn is stopped because you made 200 tool calls in this turn"),
-        "{refused}"
-    );
-    assert_eq!(worker.hits(), 200);
-    assert_eq!(worker.ask().await.0, 403);
-    assert_eq!(
-        worker.seat.take_model_failure(),
-        Some(ModelFailure::Stuck(
-            "I made 200 tool calls without finishing, so I stopped. Should I keep going from \
-             where I am?"
-                .into()
-        ))
-    );
-}
-
-#[tokio::test]
-async fn a_turn_is_stopped_at_its_ceiling_of_model_calls_and_runs_no_tool_after() {
-    let scratch = Scratch::new("model-ceiling");
-    let worker = Looper::new(&scratch, None).await;
-
-    for call in 1..=250 {
         assert_eq!(worker.ask().await.0, 200, "model call {call}");
     }
-    assert_eq!(
-        worker.fetch("page").await.0,
-        200,
-        "the tools are not stopped yet"
-    );
-    let (status, refused) = worker.ask().await;
-
-    assert_eq!(status, 403, "{refused}");
-    assert!(
-        refused["error"]
-            .as_str()
-            .unwrap()
-            .contains("the turn was stopped because the worker made 250 model calls in this turn"),
-        "{refused}"
-    );
-    assert_eq!(worker.provider.calls(), 250, "the 251st was not sent");
-    assert_eq!(
-        worker.seat.take_model_failure(),
-        Some(ModelFailure::Stuck(
-            "I made 250 model calls without finishing, so I stopped. Should I keep going from \
-             where I am?"
-                .into()
-        ))
-    );
-    assert_eq!(
-        worker.fetch("page").await.0,
-        429,
-        "a stopped turn runs no tool"
-    );
-    assert_eq!(worker.hits(), 1);
+    assert_eq!(worker.seat.take_model_failure(), None);
+    assert_eq!(worker.hits(), 260);
 }
 
 #[tokio::test]

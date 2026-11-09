@@ -22,8 +22,9 @@
 //!    order that never settles, or a loop whose calls differ by a counter. So
 //!    the guard also stops a turn that has made [`NOTHING_NEW`] calls in a row
 //!    with nothing new in them (no call it had not made this turn, and no
-//!    answer it had not seen), and one that passes a hard ceiling of tool
-//!    calls or of model calls, which nothing else has to catch.
+//!    answer it had not seen). A turn has no ceiling on its length: a long,
+//!    productive investigation is the work, and its Ticket's budget or the
+//!    person is what bounds it.
 //! 4. A failure that comes back is a loop even when the calls differ. One
 //!    Ticket sent eight heredoc edits of one file that failed alike, between
 //!    reads of it, and made about ninety calls before the steps above caught
@@ -37,9 +38,7 @@
 //! The guard is per seat and per turn, remembers hashes of the calls and of
 //! their answers, and leaves alone a tool whose registry entry says a repeat
 //! is normal: such a call is never refused, ends any circle it falls into,
-//! and is not counted as a call that found nothing new or against the tool
-//! ceiling (its model call still counts against the model ceiling, which is
-//! what bounds a loop made of them alone).
+//! and is not counted as a call that found nothing new.
 
 mod gist;
 
@@ -77,14 +76,10 @@ pub(super) const STOP_FAILING: usize = 3;
 /// ten times that, and as many calls as a whole investigation re-read after a
 /// compaction would take.
 pub(super) const NOTHING_NEW: usize = 30;
-/// The most tool calls a turn makes before it is stopped, whatever they were.
-/// The longest turn on record that ended well made 128; a turn that is worth
-/// more than this is one a person can tell to go on.
-pub(super) const TOOL_CALLS: usize = 200;
-/// The most model calls a turn makes. Above [`TOOL_CALLS`] because a call of
-/// each tool is a model call and the model's compactions are too, and it is
-/// the only bound on a loop of tools that may repeat (`job_wait`, `browser_act`).
-pub(super) const MODEL_CALLS: usize = 250;
+// A turn has no ceiling on how many calls it makes: a long, productive
+// investigation is the work, and a person who wants it to stop can say so.
+// What ends a turn is a circle (the guards above), a failure that repeats,
+// the Ticket's budget, or the Watchdog's stalled retry — never the count.
 /// How many calls' results the guard keeps, to say what a refused call
 /// answered the first time.
 const ANSWERS: usize = 2 * RECENT;
@@ -98,8 +93,6 @@ const QUOTED_CHARS: usize = 320;
 // latest ones, which this many remembered calls must cover.
 const _: () = assert!(NOTHING_NEW <= RECENT);
 
-/// The question after a ceiling: the worker was working, not looping.
-const CARRY_ON: &str = "Should I keep going from where I am?";
 /// The question when there is nothing to name.
 const OTHER_WAY: &str = "Is there another way you want me to handle this, or should I stop here?";
 
@@ -150,10 +143,6 @@ pub(super) enum Stopped {
     NothingNew(usize),
     /// This many calls of one shape failed the same way.
     Failing(usize),
-    /// It made this many tool calls, the turn's ceiling.
-    ToolCalls(usize),
-    /// It made this many model calls, the turn's ceiling.
-    ModelCalls(usize),
 }
 
 impl Stopped {
@@ -168,8 +157,6 @@ impl Stopped {
             Self::Failing(count) => {
                 format!("made {count} calls of one kind that failed the same way each time")
             }
-            Self::ToolCalls(count) => format!("made {count} tool calls in this turn"),
-            Self::ModelCalls(count) => format!("made {count} model calls in this turn"),
         }
     }
 }
@@ -188,14 +175,12 @@ pub(super) struct RepeatGuard {
     answers: VecDeque<(u64, String)>,
     refused_in_a_row: usize,
     refused_in_turn: usize,
-    /// The hashes of every call and of every answer of the turn, which the
-    /// tool ceiling bounds.
+    /// The hashes of every call and of every answer of the turn, so a call
+    /// that brings nothing new is known as one. They grow with the turn.
     calls_seen: HashSet<u64>,
     answers_seen: HashSet<u64>,
     /// The calls since the turn last saw a new call or a new answer.
     since_new: usize,
-    tool_calls: usize,
-    model_calls: usize,
     stopped: Option<Stopped>,
     /// How many of the latest calls say what the worker was doing.
     look_back: usize,
@@ -298,8 +283,8 @@ impl RepeatGuard {
     ///
     /// A refusal is counted, and a call that is not refused ends the run of
     /// refusals in a row. A call of a tool that may not repeat is counted
-    /// too: as one that brought something new or not, and against the turn's
-    /// ceiling. See [`stopped`](Self::stopped).
+    /// too: as one that brought something new or not. See
+    /// [`stopped`](Self::stopped).
     pub(super) fn call(&mut self, tool: &str, args: &Value, repeatable: bool) -> Option<Repeated> {
         let call = (!repeatable).then(|| key(tool, args));
         if repeatable {
@@ -315,7 +300,6 @@ impl RepeatGuard {
             if self.doings.len() > RECENT {
                 self.doings.pop_front();
             }
-            self.tool_calls += 1;
             if self.calls_seen.insert(call) {
                 self.since_new = 0;
             } else {
@@ -366,25 +350,12 @@ impl RepeatGuard {
         if self.since_new >= NOTHING_NEW {
             return Some((Stopped::NothingNew(self.since_new), self.since_new));
         }
-        (self.tool_calls > TOOL_CALLS).then_some((Stopped::ToolCalls(TOOL_CALLS), 0))
+        None
     }
 
-    /// Note a model call, and stop the turn if it is past the ceiling. A
-    /// turn already stopped counts nothing more.
-    pub(super) fn model_call(&mut self) {
-        if self.stopped.is_some() {
-            return;
-        }
-        self.model_calls += 1;
-        if self.model_calls > MODEL_CALLS {
-            self.stopped = Some(Stopped::ModelCalls(MODEL_CALLS));
-            self.look_back = 0;
-        }
-    }
-
-    /// Why the turn is stopped, once the refusals reach a limit, the calls
-    /// stop bringing anything new, or a ceiling is passed. It stays stopped
-    /// until the next turn begins.
+    /// Why the turn is stopped, once the refusals reach a limit or the calls
+    /// stop bringing anything new. It stays stopped until the next turn
+    /// begins.
     pub(super) fn stopped(&self) -> Option<Stopped> {
         self.stopped
     }
@@ -395,12 +366,6 @@ impl RepeatGuard {
     /// the programs and files of the calls and quotes none of them.
     pub(super) fn sentence(&self) -> Option<String> {
         Some(match self.stopped? {
-            Stopped::ToolCalls(calls) => {
-                format!("I made {calls} tool calls without finishing, so I stopped. {CARRY_ON}")
-            }
-            Stopped::ModelCalls(calls) => {
-                format!("I made {calls} model calls without finishing, so I stopped. {CARRY_ON}")
-            }
             Stopped::Failing(times) => match &self.failing {
                 Some(doing) => failed(doing, times),
                 None => format!(
@@ -550,8 +515,8 @@ fn first_lines(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ANSWERS, MODEL_CALLS, NOTHING_NEW, RECENT, RepeatGuard, Repeated, STOP_FAILING,
-        STOP_IN_A_ROW, STOP_IN_A_TURN, Stopped, TOOL_CALLS,
+        ANSWERS, NOTHING_NEW, RECENT, RepeatGuard, Repeated, STOP_FAILING, STOP_IN_A_ROW,
+        STOP_IN_A_TURN, Stopped,
     };
     use serde_json::json;
 
@@ -1021,58 +986,18 @@ mod tests {
         assert_eq!(guard.since_new, 0, "its body changed");
     }
 
+    /// A turn has no ceiling on its length: work that keeps finding something
+    /// new runs until it reports, and only a circle or a repeated failure
+    /// stops it.
     #[test]
-    fn the_turn_is_stopped_at_the_tool_call_ceiling_whatever_the_calls_were() {
+    fn a_long_turn_of_calls_that_keep_finding_new_things_is_never_stopped() {
         let mut guard = RepeatGuard::default();
-        for call in 0..TOOL_CALLS {
-            // Different calls with different answers: nothing else would stop this.
+        for call in 0..1_000 {
+            // Different calls with different answers.
             let refused = run_and_answer(&mut guard, &format!("echo {call}"), &call.to_string());
-            assert_eq!(refused, None);
+            assert_eq!(refused, None, "call {call}");
             assert_eq!(guard.stopped(), None, "call {call}");
         }
-        assert_eq!(run(&mut guard, "one more"), None);
-        assert_eq!(guard.stopped(), Some(Stopped::ToolCalls(TOOL_CALLS)));
-        assert_eq!(
-            guard.sentence().as_deref(),
-            Some(
-                "I made 200 tool calls without finishing, so I stopped. Should I keep going \
-                 from where I am?"
-            )
-        );
-        assert_eq!(
-            Stopped::ToolCalls(200).note(),
-            "made 200 tool calls in this turn"
-        );
-        guard.begin_turn();
-        assert_eq!(run(&mut guard, "one more"), None);
-        assert_eq!(guard.stopped(), None);
-    }
-
-    #[test]
-    fn the_turn_is_stopped_at_the_model_call_ceiling() {
-        let mut guard = RepeatGuard::default();
-        for call in 1..=MODEL_CALLS {
-            guard.model_call();
-            assert_eq!(guard.stopped(), None, "model call {call}");
-        }
-        guard.model_call();
-        assert_eq!(guard.stopped(), Some(Stopped::ModelCalls(MODEL_CALLS)));
-        assert_eq!(
-            guard.sentence().as_deref(),
-            Some(
-                "I made 250 model calls without finishing, so I stopped. Should I keep going \
-                 from where I am?"
-            )
-        );
-        guard.model_call();
-        assert_eq!(
-            guard.stopped(),
-            Some(Stopped::ModelCalls(MODEL_CALLS)),
-            "it stays stopped, and a stopped turn counts nothing more"
-        );
-        guard.begin_turn();
-        guard.model_call();
-        assert_eq!(guard.stopped(), None, "a new turn starts the count again");
     }
 
     #[test]
@@ -1087,10 +1012,8 @@ mod tests {
                 let tests = format!("{edit} tests passed");
                 assert_eq!(run_and_answer(&mut guard, "cargo test", &tests), None);
             }
-            guard.model_call();
             assert_eq!(guard.stopped(), None, "edit {edit}");
         }
-        assert!(guard.tool_calls < TOOL_CALLS);
     }
 
     #[test]
@@ -1101,9 +1024,9 @@ mod tests {
             assert_eq!(guard.call("job_wait", &wait, true), None, "poll {poll}");
         }
         assert_eq!(
-            (guard.tool_calls, guard.since_new, guard.stopped()),
-            (0, 0, None),
-            "a wait is no call that found nothing new, and not a tool call of the ceiling"
+            (guard.since_new, guard.stopped()),
+            (0, None),
+            "a wait is no call that found nothing new"
         );
         // Between waits a worker reads the log the job writes, which moves.
         for poll in 0..100 {
@@ -1323,16 +1246,6 @@ mod tests {
             fail(&mut worst, &command, "boom");
         }
         let mut stopped = vec![worst];
-        let mut tools = RepeatGuard::default();
-        for call in 0..=TOOL_CALLS {
-            run_and_answer(&mut tools, &format!("echo {call}"), &call.to_string());
-        }
-        stopped.push(tools);
-        let mut models = RepeatGuard::default();
-        for _ in 0..=MODEL_CALLS {
-            models.model_call();
-        }
-        stopped.push(models);
         let mut circle = RepeatGuard::default();
         loop_on(&mut circle, "ls", 5);
         stopped.push(circle);

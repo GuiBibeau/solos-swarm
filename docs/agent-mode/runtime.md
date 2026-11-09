@@ -167,8 +167,8 @@ scope, and how to report. A relaunched Assignment also gets the Ticket's earlier
 [Follow-ups](channels.md#how-the-agent-talks)). With `recovery`, the prompt adds a note to check `/work` before
 repeating any outside action. After the first prompt, the worker gets each later batch of Inputs between turns. A batch that holds only
 context from someone the Policy does not allow (a stranger's or a bot's comment, labelled `context only`) starts no
-turn, since a turn can cost up to 250 model calls. It waits and comes in the prompt of the next turn that an allowed
-person's message or a Note starts.
+turn, since a turn is a paid session. It waits and comes in the prompt of the next turn that an allowed person's
+message or a Note starts.
 
 **Reports.** `progress` and `waiting` are quiet. `ready` sends the result. A question, `blocked` or `failed` asks a
 person. A turn that ends with no Report, or with `progress` only, counts as `waiting`, except in the two cases below. A
@@ -224,7 +224,8 @@ sessions do not report their last text yet, so they keep the old behavior.
 
 The broker stops a worker that loops or makes no progress (`src/agent/broker/repeat.rs`), per seat and per turn. It
 works in steps, and each step catches what the one before cannot: a circle, refusals that are ignored, calls that
-bring nothing new, a failure that comes back in a call that is never byte-identical, and finally the turn's ceilings.
+bring nothing new, and a failure that comes back in a call that is never byte-identical. A turn has no ceiling on its
+length: a long, productive investigation runs until it reports, and a person who wants it to stop says so.
 
 **Circles.** A circle is one call, or up to ten calls in turn, repeated three times with byte-identical arguments:
 `A A A`, `A B A B A B`, or five `sed -n` slices of one file gone round three times. The call that closes the third round
@@ -250,12 +251,8 @@ So the guard also stops a turn on what it brings:
 
 - 30 calls in a row of tools that may not repeat, each a call the worker already made this turn, and each answering
   what it had already been answered (a command's exit code and output, or a response without its headers).
-- A ceiling of 200 such tool calls in a turn.
-- A ceiling of 250 model calls in a turn, compactions included. This is the only bound on a loop made of `repeatable`
-  tools.
 
-A call of a `repeatable` tool counts toward neither of the first two, so waiting on a job with `job_wait` is not
-penalized. A call that is the same but answers something new, such as reading the log a build is writing, is progress.
+A call of a `repeatable` tool does not count toward that, so waiting on a job with `job_wait` is not penalized. A call that is the same but answers something new, such as reading the log a build is writing, is progress.
 The thresholds come from the transcripts of the Tickets that looped and of the ones that did not. A normal turn has at
 most 2 or 3 such calls in a row, compactions included, and the longest turn that ended well made 128 tool calls,
 while the loops made 767 and 1,107.
@@ -281,9 +278,9 @@ I tried 3 times to run `python3` on lib.sh, and it failed the same way each time
 you want me to handle lib.sh, or should I stop here?
 ```
 
-A circle or a ceiling asks its own question, such as `I kept re-reading the same parts of meteora-dlmm-allocate-encode.js
-without making progress, so I stopped. What should I be looking for in meteora-dlmm-allocate-encode.js?` or `I made 200
-tool calls without finishing, so I stopped. Should I keep going from where I am?` The Report is recorded with the
+A circle asks its own question, such as `I kept re-reading the same parts of meteora-dlmm-allocate-encode.js
+without making progress, so I stopped. What should I be looking for in meteora-dlmm-allocate-encode.js?` A turn has no
+cap on how many calls it makes: a long, productive investigation is the work. The Report is recorded with the
 Ticket, and its text is also the Ticket's question, so the Ticket waits at `Stage::Answer` rather than
 `Stage::Failed`: the person hears it once, a restart sends nothing, and a reply on the thread answers it. The reply
 starts a new turn, which starts every count again. A Claude Code session has no turn to end on a refused model call:

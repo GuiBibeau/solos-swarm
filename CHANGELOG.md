@@ -377,6 +377,15 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   accept whose GitHub thread carries a restricted repository's text must name that repository, and before the clone the
   executor checks the Ticket's upstream against the policy as it is now. Store schema 11 with an empty migration.
 
+### Changed
+
+- Agent mode, a worker's turn has no ceiling (#146): the broker stopped a turn at 200 tool calls or 250 model calls,
+  whatever the calls were, so a long, productive investigation ended with "I made 200 tool calls without finishing,
+  so I stopped. Should I keep going from where I am?" and waited on a person (the GitHub review on #143 did). Those
+  ceilings are gone: the loop guard's circle, refused-call, repeated-failure and nothing-new stops remain — they stop
+  a loop, never work — and a turn is bounded by the Ticket's budget and by a person's stop. The scripted harness keeps
+  its own anti-hang bound (`AGENT_CALLS`, 300 model calls) so a test that hangs fails.
+
 ### Fixed
 
 - Agent mode, a follow-up on an answered ticket (#141): a person's message on a web (or any) thread whose ticket
