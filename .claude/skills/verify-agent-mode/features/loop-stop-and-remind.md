@@ -36,8 +36,8 @@ plan.
 - Proof: `bin/evidence.sh $RUN loop-stop-and-remind`. `replies.jsonl` has the three messages in that order and no
   fourth. `events.jsonl` has one `reminded` row whose `since_ms` equals the Ticket's `reminded_ms`; read the Ticket
   with the `q` helper from SKILL.md and check the two values match. `status.json` shows the Ticket at `answer`.
-- `reminder-once` across a restart: use the restart commands in SKILL.md (the start commands without
-  `rm -rf state`), wait two `remind_after` periods, then read the outbox and the live store. No new `attention`
+- `reminder-once` across a restart: relaunch with `bin/launch.sh $RUN --keep-state` ("Restart a run and keep its state"
+  in SKILL.md), wait two `remind_after` periods, then read the outbox and the live store. No new `attention`
   message is there, and `events.jsonl` still holds one `reminded` row for the wait.
 - `failing-shape`: ask the worker to run one command that always fails, three times, one `run_code` call each:
   `bin/mcp.sh $RUN request "Use run_code to run exactly this command three separate times, one call each time: sh -c 'echo cannot-edit >&2; exit 3'. It fails every time; that is expected. Do not try another command. After the third call, tell me what happened."`.
