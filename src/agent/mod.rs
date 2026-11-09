@@ -479,6 +479,17 @@ where
         let worker_model = workers
             .as_ref()
             .map(|parts| parts.terms.upstream.model.clone());
+        // Every upstream a worker's Ticket may run on: `default` on the
+        // credential file's transport, and each named upstream on its own
+        // key, read once here and deleted.
+        let worker_upstreams = match &workers {
+            Some(parts) => Some(broker::worker_upstreams(
+                config,
+                provider.clone(),
+                &parts.terms,
+            )?),
+            None => None,
+        };
         let job_limits = match &config.executor {
             ExecutorConfig::Pi {
                 run_code: Some(run_code),
@@ -502,7 +513,8 @@ where
             },
             nodes: nodes.map(Listener::environments).unwrap_or_default(),
         };
-        let broker = AgentBroker::with_pstack(parts, job_limits, remote, pstack)?;
+        let broker =
+            AgentBroker::with_upstreams(parts, job_limits, remote, pstack, worker_upstreams)?;
         if let Some(memory) = config.memory_parts()? {
             eprintln!(
                 "agent: workers propose memos; {} decides each that is not outside text",

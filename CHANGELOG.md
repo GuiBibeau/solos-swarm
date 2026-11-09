@@ -313,6 +313,16 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
 
 ### Changed
 
+- Agent mode, a transport per upstream (#150): the broker holds a map from upstream name to transport and terms
+  instead of one transport on the default provider. Each `executor.upstreams.<name>` builds its own transport from
+  its provider, model, prices and limits, with its `key_file` read once and deleted at serve start; a missing key
+  fails startup naming the upstream and its file. A worker's seat carries the upstream its Ticket was accepted on,
+  admission takes that upstream's terms, and every model call and Messages call is dispatched on that upstream's
+  transport and key — a grant naming an upstream the map does not hold is refused, never falling back to another's
+  transport. The launch refusal that read "this build's broker holds one transport" is gone. The Router keeps its
+  own transport, and the memory review runs on the default one. `Assignment.ran_on` is not part of this change; the
+  ledger row's provider already names the upstream, which the acceptance test checks.
+
 - An OpenAI-compatible provider in the config (#148): `executor.upstreams` entries with
   `provider: openai-compatible` carry their own `base_url` (https, or http only on loopback) and `models`
   catalog, with validation and the transport built from the configured URL. The broker still holds one

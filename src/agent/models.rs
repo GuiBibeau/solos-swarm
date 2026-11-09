@@ -384,20 +384,10 @@ impl ModelPolicy {
             ));
         };
         if self.admits(Some(repo), Role::Worker, info.provider) {
-            // The broker holds one transport, on the default upstream's
-            // provider, until a transport per upstream lands. A Ticket on
-            // another provider's upstream could not be sent there; its calls
-            // would go to `default`, whose provider its repository may not
-            // allow. Refused rather than run on the wrong provider.
-            if let Some(default) = self.upstreams.get(&UpstreamName::default_upstream())
-                && info.provider != default.provider
-            {
-                return Some(format!(
-                    "this build's broker holds one transport, on {}: upstream {name} runs on {}, \
-                     and a Ticket on it cannot be sent there. Nothing was cloned",
-                    default.provider, info.provider
-                ));
-            }
+            // The broker holds a transport for every upstream here, so a
+            // Ticket accepted on this one runs on this one; a transport the
+            // broker's map does not hold is refused at admission and at
+            // dispatch, naming it.
             return None;
         }
         let allowed = self
@@ -790,6 +780,54 @@ executor:
     }
 
     #[test]
+    fn two_repositories_whose_worker_roles_allow_one_upstream_each_resolve_to_theirs() {
+        let named = "  upstreams:
+    venice:
+      provider: venice
+      model: zai-org-glm-5
+      wire: chat
+      harness: pi
+      key_file: keys/venice.key
+      prices: {input_microusd_per_million: 300000, output_microusd_per_million: 1200000}
+";
+        let policy = build(
+            "    acme/deepseek-only:
+      about: DeepSeek only.
+      base: main
+      models: {allow: [deepseek]}
+    acme/venice-only:
+      about: Venice only.
+      base: main
+      models: {allow: [venice]}",
+            named,
+        )
+        .unwrap();
+        let deepseek_only = repo("acme/deepseek-only");
+        let venice_only = repo("acme/venice-only");
+        let deepseek_choice = policy.worker_choice(&deepseek_only).unwrap();
+        let venice_choice = policy.worker_choice(&venice_only).unwrap();
+        assert_eq!(
+            (
+                deepseek_choice.name.as_str(),
+                deepseek_choice.provider.as_str()
+            ),
+            ("default", "deepseek")
+        );
+        assert_eq!(
+            (venice_choice.name.as_str(), venice_choice.provider.as_str()),
+            ("venice", "venice")
+        );
+        assert_eq!(
+            policy.launch_refusal(&deepseek_only, Some(&deepseek_choice)),
+            None
+        );
+        assert_eq!(
+            policy.launch_refusal(&venice_only, Some(&venice_choice)),
+            None
+        );
+    }
+
+    #[test]
     fn a_repository_with_no_allowed_upstream_here_is_declined_in_one_sentence() {
         let policy = build(
             "    acme/widgets: {about: Widgets., base: main, models: {allow: [anthropic]}}",
@@ -861,7 +899,7 @@ executor:
     }
 
     #[test]
-    fn a_launch_on_another_providers_upstream_is_refused_until_its_transport_lands() {
+    fn a_launch_on_a_named_upstream_runs_now_that_the_broker_holds_its_transport() {
         let named = "  upstreams:
     venice:
       provider: venice
@@ -885,12 +923,7 @@ executor:
             (choice.name.as_str(), choice.provider.as_str()),
             ("venice", "venice")
         );
-        let said = policy.launch_refusal(&widgets, Some(&choice)).unwrap();
-        assert!(
-            said.contains("holds one transport, on deepseek")
-                && said.contains("upstream venice runs on venice"),
-            "{said}"
-        );
+        assert_eq!(policy.launch_refusal(&widgets, Some(&choice)), None);
     }
 
     #[test]
