@@ -254,6 +254,23 @@ pub fn assignment_text(launch: &Launch, run_code: bool) -> String {
         text.push_str("\n\n");
         text.push_str(&earlier);
     }
+    // A person's message on a ticket that already delivered an answer is a
+    // follow-up in that conversation. A fresh worker's first instinct is to
+    // redo the ticket and say the same thing again; say what the message is,
+    // and that other work is not its to answer.
+    if launch
+        .earlier
+        .iter()
+        .any(|report| report.status == ReportStatus::Ready)
+    {
+        text.push_str(
+            "\n\nThis ticket has already delivered the replies quoted above. The newest input is a \
+             follow-up on them: answer it, building on what you already said, and do not repeat an \
+             earlier reply or redo the work it reported unless the input asks for that. An input \
+             about other work is not yours to answer: hand it back to the Router with \
+             worker_handback.",
+        );
+    }
     text.push_str(
         "\n\nWhen the work is done, call worker_report with status ready and your reply to the person, \
          written as you would say it in chat, the answer first and no restated goal. Report blocked \
@@ -1810,6 +1827,10 @@ mod tests {
             text.find(needle)
                 .unwrap_or_else(|| panic!("{needle}: {text}"))
         };
+        assert!(
+            text.contains("This ticket has already delivered the replies quoted above."),
+            "a resumed ticket whose answer already went out says so: {text}"
+        );
         let (inputs, ci, follow_up) = (
             at("Input on the ticket so far, oldest first:"),
             at(
@@ -1850,6 +1871,10 @@ mod tests {
         waiting.earlier = Vec::new();
         assert!(!assignment_text(&waiting, true).contains("earlier replies"));
         assert!(!assignment_text(&launch("tk_1", "as_1"), true).contains("earlier replies"));
+        assert!(
+            !assignment_text(&waiting, true).contains("already delivered"),
+            "only a ticket that answered before says its answer is out"
+        );
     }
 
     #[test]

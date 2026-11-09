@@ -379,6 +379,13 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
 
 ### Fixed
 
+- Agent mode, a follow-up on an answered ticket (#141): a person's message on a web (or any) thread whose ticket
+  already delivered `ready` resumes that ticket, and the fresh worker used to redo the work and send the same answer
+  again — the quant thread showed the same solos-data answer three times. The resumed assignment's first prompt now
+  says the ticket already delivered the replies quoted above, that the newest input is a follow-up to answer from them
+  without repeating an earlier reply or redoing the reported work, and that input about other work belongs to the
+  Router via `worker_handback` (so a "what are you working on?" follow-up reaches the supervisor's `router_status`
+  answer instead of another re-run).
 - Agent mode, the bench (#37): the workload has 24 distinct tasks, and `WorkloadSpec::validate` refuses more requests
   than tasks, so no two requests ask for the same work.
 - Agent mode, the Pi Router (#45): a prompt holds at most `router.max_batch` cards (6). A reply cut off at the output
