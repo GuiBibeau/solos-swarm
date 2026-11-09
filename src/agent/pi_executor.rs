@@ -793,7 +793,8 @@ where
             work,
             launch.budget_microusd,
         )
-        .in_environment(named.map(str::to_owned));
+        .in_environment(named.map(str::to_owned))
+        .on_upstream(launch.upstream.clone());
         if let Some((_, installed)) = &workspace {
             seat = seat.on_repository(host);
             if let Dependencies::Ready { extras, .. } = installed {
@@ -830,12 +831,18 @@ where
             token: token.clone(),
         };
         run.seat = Some(seat.clone());
+        // The session asks the broker for the model of the upstream its
+        // Ticket was accepted on; the broker holds that upstream's terms.
+        let model = launch
+            .upstream
+            .as_ref()
+            .map_or_else(|| parts.model.clone(), |upstream| upstream.model.clone());
         let spec = SessionSpec {
             id: launch.assignment.to_string(),
             role: Role::TicketWorker,
             grants,
             token,
-            model: parts.model.clone(),
+            model,
             pi_settings: dir.join("pi-settings.json"),
             run_dir: dir,
             broker_socket: parts.broker_socket.clone(),

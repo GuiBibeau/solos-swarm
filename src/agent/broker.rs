@@ -19,7 +19,7 @@ use super::config::{ExecutorConfig, RepoConfig};
 use super::environment::{Environments, ExecutionEnvironment, Harvested, Nodes};
 use super::forge::REPO_JSON;
 use super::jobs::{Host, JobLimits, Jobs, Refused};
-use super::models::{ModelPolicy, Provider as ModelProvider, Role as ModelRole};
+use super::models::{ModelPolicy, Provider as ModelProvider, Role as ModelRole, UpstreamName};
 use super::pi_executor::private_dir;
 use super::ports::{Applied, Fact, FactSink, Forge, Proposal, Refusal as Unadmitted, Workspace};
 use super::pstack::{self, Pstack, Reader};
@@ -48,7 +48,8 @@ use solos_agent_core::delivery::{Admission, NotReady, ready_gate};
 use solos_agent_core::memo::MemoAudience;
 use solos_agent_core::model::{
     Accept, Acknowledge, AssignmentId, DecisionKind, EvalId, Method, MicroUsd, Ms, Plan, ReportIn,
-    ReportStatus, Strength, ThreadKey, Ticket, TicketId, Trigger, TriggerId, Verdict,
+    ReportStatus, Strength, ThreadKey, Ticket, TicketId, Trigger, TriggerId, UpstreamChoice,
+    Verdict,
 };
 use solos_agent_store::{
     Charge, HoldId, HoldRequest, Reservation, SqliteStore, StoreError, Tokens,
@@ -60,6 +61,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
 use std::time::Duration;
 use tokio::net::UnixListener;
 use toolbox::{Env, Lookup, Toolbox, WorkerCall};
+use zeroize::Zeroizing;
 
 /// The broker's socket in the state directory.
 pub const SOCKET_FILE: &str = "broker.sock";
@@ -141,6 +143,10 @@ pub struct WorkerSeat {
     environment: Option<String>,
     /// A repository Ticket's `<ticket>/host`.
     host_dir: Option<PathBuf>,
+    /// The upstream its Ticket was accepted on, fixed at accept. `None` for a
+    /// Ticket with no repository, and for one accepted before this build: its
+    /// calls run on `default`.
+    upstream: Option<UpstreamChoice>,
     /// What this host adds to its `run_code` sandbox, such as the repository's
     /// installed dependencies.
     extras: Extras,
@@ -197,6 +203,7 @@ impl WorkerSeat {
             work_dir,
             environment: None,
             host_dir: None,
+            upstream: None,
             extras: Extras::default(),
             budget_microusd: budget_microusd.into(),
             since_ms: now_ms(),
@@ -244,6 +251,22 @@ impl WorkerSeat {
     pub fn on_repository(mut self, host_dir: PathBuf) -> Self {
         self.host_dir = Some(host_dir);
         self
+    }
+
+    /// Its Ticket was accepted on `upstream`: its calls run on that
+    /// upstream's transport and terms, and never on another's. `None` is a
+    /// Ticket with no repository, which runs on `default`.
+    pub fn on_upstream(mut self, upstream: Option<UpstreamChoice>) -> Self {
+        self.upstream = upstream;
+        self
+    }
+
+    /// The upstream its calls run on: its Ticket's, or `default` where the
+    /// Ticket recorded none.
+    fn upstream_name(&self) -> &str {
+        self.upstream
+            .as_ref()
+            .map_or(UpstreamName::DEFAULT, |upstream| upstream.name.as_str())
     }
 
     /// Its `run_code` sandbox gets `extras` too.
@@ -806,11 +829,14 @@ pub struct BrokerParts {
     /// Where the Router's Verdicts and the workers' Reports and handbacks go.
     pub facts: FactSink,
     pub decide: DecideTerms,
-    /// What workers are admitted on; `None` admits none.
+    /// What workers share: the default upstream's terms and the host
+    /// resources they may use. `None` admits none.
     pub workers: Option<WorkerParts>,
 }
 
 pub struct WorkerParts {
+    /// The `default` upstream's terms: what a worker whose Ticket recorded no
+    /// upstream is admitted on.
     pub terms: ModelTerms,
     /// `None`: this host offers workers no `run_code`.
     pub code: Option<Arc<CodeExecutor>>,
@@ -824,6 +850,98 @@ pub struct WorkerParts {
     /// hop, because this host also runs services on those addresses. On, it
     /// reaches them (`executor.fetch.allow_private_networks`).
     pub allow_private_networks: bool,
+}
+
+/// One worker upstream the broker can send a Ticket's calls to: its
+/// transport, which holds its key, and the terms its calls are held and
+/// settled at.
+#[derive(Clone)]
+pub struct WorkerUpstream {
+    pub transport: Arc<dyn Provider>,
+    pub terms: ModelTerms,
+}
+
+/// Every upstream a worker's Ticket may run on here: `default`, from the
+/// default executor fields and the credential file's transport, and each
+/// `executor.upstreams.<name>` from its own provider, model and prices, with
+/// its `key_file` read once and deleted. A named key that cannot be read
+/// fails startup, naming the upstream and its file.
+pub fn worker_upstreams(
+    config: &AgentConfig,
+    default_transport: Arc<dyn Provider>,
+    default_terms: &ModelTerms,
+) -> Result<BTreeMap<String, WorkerUpstream>> {
+    let mut upstreams = BTreeMap::from([(
+        UpstreamName::DEFAULT.to_owned(),
+        WorkerUpstream {
+            transport: default_transport,
+            terms: default_terms.clone(),
+        },
+    )]);
+    let ExecutorConfig::Pi {
+        upstreams: named, ..
+    } = &config.executor
+    else {
+        return Ok(upstreams);
+    };
+    let client = crate::swarm::http_client()?;
+    for (name, upstream) in named {
+        let context = || format!("executor.upstreams.{name}");
+        let key = take_key_file(&upstream.key_file).with_context(|| {
+            format!(
+                "{}: cannot read its key file {}",
+                context(),
+                upstream.key_file.display()
+            )
+        })?;
+        let resolved = gateway::configured_upstream(
+            &upstream.provider,
+            &upstream.model,
+            upstream.base_url.as_deref(),
+            &upstream.models,
+        )
+        .with_context(context)?;
+        let chat =
+            gateway::provider_for(&resolved, client.clone(), key.clone()).with_context(context)?;
+        let transport: Arc<dyn Provider> = if upstream.wire == gateway::Wire::Anthropic {
+            Arc::new(gateway::BothWires {
+                chat,
+                messages: gateway::messages_for(&resolved, client.clone(), key, None)
+                    .with_context(context)?,
+            })
+        } else {
+            Arc::new(chat)
+        };
+        upstreams.insert(
+            name.to_string(),
+            WorkerUpstream {
+                transport,
+                terms: ModelTerms {
+                    upstream: resolved,
+                    prices: upstream.prices,
+                    max_input_bytes: upstream
+                        .max_input_bytes
+                        .unwrap_or(default_terms.max_input_bytes),
+                    max_output_tokens: upstream
+                        .max_output_tokens
+                        .unwrap_or(default_terms.max_output_tokens),
+                    call_limit: None,
+                    temperature: default_terms.temperature,
+                    thinking: None,
+                },
+            },
+        );
+    }
+    Ok(upstreams)
+}
+
+/// Read a named upstream's key once and delete its file, whether or not the
+/// read worked, as `agent serve --credential-file` does.
+fn take_key_file(path: &Path) -> Result<Zeroizing<String>> {
+    let read = std::fs::read_to_string(path);
+    let _ = std::fs::remove_file(path);
+    let raw = Zeroizing::new(read.context("the key could not be read")?);
+    Ok(Zeroizing::new(raw.trim().to_owned()))
 }
 
 pub struct VaultParts {
@@ -845,8 +963,9 @@ struct Inner {
     provider: Arc<dyn Provider>,
     facts: FactSink,
     decide: DecideTerms,
-    /// The model terms every admitted worker gets; `None` admits none.
-    worker_terms: Option<ModelTerms>,
+    /// The transport and terms of every upstream a worker's Ticket may run
+    /// on, by name, `default` included; `None` admits no workers.
+    worker_upstreams: Option<BTreeMap<String, WorkerUpstream>>,
     /// Whether `fetch_url`, keyed or not, may reach a private address.
     allow_private_networks: bool,
     grants: RwLock<BTreeMap<String, Arc<Grant>>>,
@@ -1019,6 +1138,31 @@ impl AgentBroker {
         nodes: Nodes,
         pstack: Option<Arc<Pstack>>,
     ) -> Result<Self> {
+        // Every worker's Ticket runs on `default`, whose transport is the
+        // host's and whose terms are the worker parts'.
+        let upstreams = parts.workers.as_ref().map(|workers| {
+            BTreeMap::from([(
+                UpstreamName::DEFAULT.to_owned(),
+                WorkerUpstream {
+                    transport: parts.provider.clone(),
+                    terms: workers.terms.clone(),
+                },
+            )])
+        });
+        Self::with_upstreams(parts, jobs, nodes, pstack, upstreams)
+    }
+
+    /// [`with_pstack`](Self::with_pstack), with every upstream a worker's
+    /// Ticket may run on. A worker whose Ticket names an upstream the map
+    /// does not hold is refused, and never falls back to another's
+    /// transport.
+    pub fn with_upstreams(
+        parts: BrokerParts,
+        jobs: JobLimits,
+        nodes: Nodes,
+        pstack: Option<Arc<Pstack>>,
+        upstreams: Option<BTreeMap<String, WorkerUpstream>>,
+    ) -> Result<Self> {
         let BrokerParts {
             dir,
             mut store,
@@ -1033,21 +1177,20 @@ impl AgentBroker {
                 "agent: charged {orphans} model calls a previous run left open at their hold"
             );
         }
-        let (worker_terms, local, vault, browser, allow_private_networks) = match workers {
+        let (local, vault, browser, allow_private_networks) = match workers {
             Some(WorkerParts {
-                terms,
+                terms: _,
                 code,
                 vault,
                 browser,
                 allow_private_networks,
             }) => (
-                Some(terms),
                 code,
                 vault.map(Arc::new),
                 browser.map(Arc::new),
                 allow_private_networks,
             ),
-            None => (None, None, None, None, false),
+            None => (None, None, None, false),
         };
         Ok(Self {
             inner: Arc::new(Inner {
@@ -1057,7 +1200,7 @@ impl AgentBroker {
                 facts,
                 decide,
                 environments: Environments::new(local, nodes),
-                worker_terms,
+                worker_upstreams: upstreams,
                 allow_private_networks,
                 grants: RwLock::new(BTreeMap::new()),
                 overrun: AtomicBool::new(false),
@@ -1081,19 +1224,30 @@ impl AgentBroker {
         Ok(())
     }
 
-    /// Admit one Assignment's worker on its Ticket's account, with the
-    /// workers' model terms and `system_prompt` at `/session`.
+    /// Admit one Assignment's worker on its Ticket's account, with the terms
+    /// of the upstream its Ticket was accepted on and `system_prompt` at
+    /// `/session`.
     pub fn admit_worker(
         &self,
         token: String,
         mut seat: WorkerSeat,
         system_prompt: String,
     ) -> Result<Arc<WorkerSeat>> {
+        let name = seat.upstream_name().to_owned();
         let mut terms = self
             .inner
-            .worker_terms
-            .clone()
-            .context("this broker admits no workers")?;
+            .worker_upstreams
+            .as_ref()
+            .context("this broker admits no workers")?
+            .get(&name)
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "this broker holds no transport for upstream {name}, so its ticket cannot \
+                     run here"
+                )
+            })?
+            .terms;
         if let Some(dream) = &mut seat.dream {
             let memory = self
                 .inner
@@ -1365,11 +1519,12 @@ impl AgentBroker {
 
     /// The routes, for the grants admitted so far and any worker.
     pub fn router(&self) -> Result<axum::Router> {
-        let workers = self
-            .inner
-            .worker_terms
-            .as_ref()
-            .map(|terms| terms.max_input_bytes);
+        let workers = self.inner.worker_upstreams.as_ref().and_then(|upstreams| {
+            upstreams
+                .values()
+                .map(|upstream| upstream.terms.max_input_bytes)
+                .max()
+        });
         let largest = self
             .inner
             .grants
@@ -1578,10 +1733,12 @@ impl Call {
         named: &mut Option<ModelFailure>,
     ) -> Reply {
         self.check(broker, grant, named)?;
+        let transport = broker.transport(grant)?;
         let spent = broker
             .spend(
                 &grant.account,
                 &grant.terms,
+                transport,
                 self.input_bytes,
                 self.max_output_tokens,
                 self.upstream,
@@ -1669,12 +1826,43 @@ enum Closing {
 }
 
 impl AgentBroker {
+    /// The transport `grant`'s calls go to: the Router's own, or the one of
+    /// the upstream its Ticket was accepted on. A worker whose upstream this
+    /// broker does not hold is refused, naming it, and never falls back to
+    /// another's transport.
+    fn transport(&self, grant: &Grant) -> std::result::Result<Arc<dyn Provider>, Refusal> {
+        match &grant.principal {
+            Principal::Router => Ok(self.inner.provider.clone()),
+            Principal::Worker(seat) => self.worker_transport(seat),
+        }
+    }
+
+    /// The transport of `seat`'s upstream, or a refusal naming it.
+    fn worker_transport(
+        &self,
+        seat: &WorkerSeat,
+    ) -> std::result::Result<Arc<dyn Provider>, Refusal> {
+        let name = seat.upstream_name();
+        self.inner
+            .worker_upstreams
+            .as_ref()
+            .and_then(|upstreams| upstreams.get(name))
+            .map(|upstream| upstream.transport.clone())
+            .ok_or_else(|| {
+                forbidden(format!(
+                    "this broker holds no transport for upstream {name}, so the call was not \
+                     sent"
+                ))
+            })
+    }
+
     /// Hold a call of `input_bytes` that may answer `max_output_tokens` on
-    /// `account`, send `body` upstream and close the hold.
+    /// `account`, send `body` on `transport` and close the hold.
     async fn spend(
         &self,
         account: &Account,
         terms: &ModelTerms,
+        transport: Arc<dyn Provider>,
         input_bytes: usize,
         max_output_tokens: u64,
         body: Value,
@@ -1691,6 +1879,7 @@ impl AgentBroker {
             self.clone(),
             account.clone(),
             terms.clone(),
+            transport,
             id,
             hold,
             body,
@@ -1791,19 +1980,21 @@ impl AgentBroker {
     }
 }
 
-/// Send one held call upstream and close its hold: settled at the receipt's
-/// cost, released if the provider failed, or charged at the hold if it
-/// answered with a receipt that cannot be read or did not answer within the
-/// terms' call limit, since the provider may still bill a request it got.
+/// Send one held call on its upstream's transport and close its hold: settled
+/// at the receipt's cost, released if the provider failed, or charged at the
+/// hold if it answered with a receipt that cannot be read or did not answer
+/// within the terms' call limit, since the provider may still bill a request
+/// it got.
 async fn dispatch(
     broker: AgentBroker,
     account: Account,
     terms: ModelTerms,
+    transport: Arc<dyn Provider>,
     id: HoldId,
     hold: u64,
     body: Value,
 ) -> Reply {
-    let sent = broker.inner.provider.dispatch(body);
+    let sent = transport.dispatch(body);
     let sent = match terms.call_limit {
         None => sent.await,
         Some(limit) => match tokio::time::timeout(limit, sent).await {
@@ -2942,8 +3133,8 @@ mod messages;
 #[cfg(test)]
 mod tests {
     use super::{
-        Account, DecideArgs, DecideTerms, ModelFailure, Refusal, SwarmTerms, WorkerSeat, clip,
-        refuse,
+        Account, DecideArgs, DecideTerms, ModelFailure, ModelTerms, Refusal, SwarmTerms,
+        WorkerSeat, clip, refuse,
     };
     use crate::agent::config::RepoConfig;
     use crate::agent::models::{ModelPolicy, Provider as ModelProvider};
@@ -3819,5 +4010,86 @@ mod tests {
         ] {
             assert_eq!(failure.question(), None, "{failure:?} asks nothing");
         }
+    }
+
+    /// A transport that never answers: enough to build the upstreams.
+    struct NoModel;
+
+    impl crate::gateway::Provider for NoModel {
+        fn dispatch(&self, _: serde_json::Value) -> crate::gateway::Dispatch {
+            Box::pin(async { Err(anyhow::anyhow!("no model")) })
+        }
+    }
+
+    #[test]
+    fn a_named_upstream_takes_its_terms_and_key_file_and_a_missing_key_names_both() {
+        let dir = std::env::temp_dir().join(format!(
+            "agent-upstream-key-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("venice.key");
+        std::fs::write(&key, "sk-venice\n").unwrap();
+        let yaml = format!(
+            "policy: {{people: [slack:alice]}}
+sources: [{{kind: jsonl, path: triggers.jsonl}}]
+channels: [{{kind: jsonl, source: slack, path: outbox.jsonl}}]
+router: {{kind: scripted}}
+executor:
+  kind: pi
+  provider: deepseek
+  model: deepseek-flash
+  prices: {{input_microusd_per_million: 300000, output_microusd_per_million: 1200000}}
+  run_code: {{}}
+  upstreams:
+    venice:
+      provider: venice
+      model: zai-org-glm-5
+      wire: chat
+      harness: pi
+      key_file: \"{}\"
+      prices: {{input_microusd_per_million: 310000, output_microusd_per_million: 1300000}}
+      max_output_tokens: 4096
+",
+            key.display()
+        );
+        let config: crate::agent::AgentConfig = serde_yaml::from_str(&yaml).unwrap();
+        let default_terms = ModelTerms {
+            upstream: crate::gateway::Upstream::deepseek("deepseek-flash"),
+            prices: crate::gateway::PriceTable {
+                input_microusd_per_million: 300_000,
+                output_microusd_per_million: 1_200_000,
+                cache_hit_microusd_per_million: None,
+            },
+            max_input_bytes: 65_536,
+            max_output_tokens: 2_048,
+            call_limit: None,
+            temperature: None,
+            thinking: None,
+        };
+        let upstreams =
+            super::worker_upstreams(&config, std::sync::Arc::new(NoModel), &default_terms).unwrap();
+        assert!(!key.exists(), "the named key is read once and deleted");
+        assert_eq!(upstreams["default"].terms, default_terms);
+        let venice = &upstreams["venice"];
+        assert_eq!(venice.terms.upstream.model, "zai-org-glm-5");
+        assert_eq!(venice.terms.prices.input_microusd_per_million, 310_000);
+        assert_eq!(venice.terms.max_output_tokens, 4_096, "its own ceiling");
+        assert_eq!(
+            venice.terms.max_input_bytes, default_terms.max_input_bytes,
+            "unset limits default as the executor's"
+        );
+
+        // The key is gone now, so the next start fails naming the upstream
+        // and its file.
+        let refused =
+            super::worker_upstreams(&config, std::sync::Arc::new(NoModel), &default_terms)
+                .err()
+                .expect("the missing key is refused");
+        let said = format!("{refused:#}");
+        assert!(said.contains("executor.upstreams.venice"), "{said}");
+        assert!(said.contains(key.to_str().unwrap()), "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

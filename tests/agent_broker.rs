@@ -9,7 +9,7 @@ use solos_agent_core::memo::{MemoAudience, MemoAuthor, MemoIn, MemoScope, MemoSo
 use solos_agent_core::model::{
     Actor, Addressed, Approval, AssignmentId, Candidate, ChannelRef, DecisionKind, DomainEvent,
     InputBody, MessageKind, OutboundMessage, Plan, ReportStatus, ThreadKey, TicketId, Trigger,
-    TriggerId,
+    TriggerId, UpstreamChoice,
 };
 use solos_agent_core::{AllowlistPolicy, Engine};
 use solos_agent_store::{SpendState, SqliteStore};
@@ -20,6 +20,7 @@ use solos_swarm::agent::broker::review::{Effort, ReviewTerms};
 use solos_swarm::agent::broker::{
     self, Account, AgentBroker, BrokerParts, DecideTerms, Grant, ModelFailure, ModelTerms,
     Principal, ROUTER_TOOLS, SwarmTerms, VaultParts, WORKER_TOOLS, WorkerParts, WorkerSeat,
+    WorkerUpstream,
 };
 use solos_swarm::agent::environment::{ExecutionEnvironment, Nodes, Offline, Work};
 use solos_swarm::agent::jobs::JobLimits;
@@ -35,7 +36,9 @@ use solos_swarm::agent::{Adapters, AgentConfig, RunOptions, Runtime, STORE_FILE}
 use solos_swarm::browse::fake::FakeCdp;
 use solos_swarm::browse::{BrowserConfig, Browsers, Launcher, TrailSigner};
 use solos_swarm::code::{CodeConfig, CodeExecutor, OutputBounds, Started};
-use solos_swarm::gateway::{Dispatch, PriceTable, Provider, Temperature, Upstream, upstream_body};
+use solos_swarm::gateway::{
+    Dialect, Dispatch, OpenAiCompatible, PriceTable, Provider, Temperature, Upstream, upstream_body,
+};
 use solos_swarm::vault::{SandboxView, Vault, VaultConfig};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -443,6 +446,124 @@ fn serve_on(
     }
 }
 
+/// A broker serving on the state directory's socket, with every upstream a
+/// worker's Ticket may run on given, and a client for it.
+fn serve_upstreams(
+    scratch: &Scratch,
+    provider: Arc<Scripted>,
+    facts: FactSink,
+    daily: u64,
+    upstreams: BTreeMap<String, WorkerUpstream>,
+) -> Served {
+    let parts = BrokerParts {
+        dir: scratch.state(),
+        store: scratch.store(),
+        provider,
+        facts,
+        decide: decide_terms(),
+        workers: Some(workers(None, None)),
+    };
+    let broker = AgentBroker::with_upstreams(
+        parts,
+        JobLimits::default(),
+        Nodes::default(),
+        None,
+        Some(upstreams),
+    )
+    .unwrap();
+    broker.admit(TOKEN.into(), grant(daily)).unwrap();
+    let (listener, socket) = broker::bind(&scratch.state()).unwrap();
+    let app = broker.router().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = reqwest::Client::builder()
+        .unix_socket(socket)
+        .build()
+        .unwrap();
+    Served {
+        server,
+        client,
+        broker,
+    }
+}
+
+/// What one fake chat upstream received: its Authorization header and body.
+#[derive(Default)]
+struct ChatFake {
+    calls: Mutex<Vec<(String, Value)>>,
+}
+
+async fn chat_upstream(
+    axum::extract::State(fake): axum::extract::State<Arc<ChatFake>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::Json<Value> {
+    let authorization = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    fake.calls.lock().unwrap().push((authorization, body));
+    axum::Json(json!({
+        "id": "receipt-fake",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "ok"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 100, "prompt_cache_hit_tokens": 0, "completion_tokens": 50},
+    }))
+}
+
+/// A fake chat upstream on a loopback port: its endpoint, what it received,
+/// and its server.
+async fn fake_chat() -> (String, Arc<ChatFake>, tokio::task::JoinHandle<()>) {
+    let fake = Arc::new(ChatFake::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/chat", listener.local_addr().unwrap());
+    let app = axum::Router::new()
+        .route("/chat", axum::routing::post(chat_upstream))
+        .with_state(fake.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (endpoint, fake, server)
+}
+
+/// A transport that posts to a fake's endpoint with its own key.
+fn chat_transport(endpoint: &str, key: &str) -> Arc<dyn Provider> {
+    Arc::new(OpenAiCompatible {
+        endpoint: endpoint.to_owned(),
+        dialect: Dialect::OpenAi,
+        client: reqwest::Client::new(),
+        key: zeroize::Zeroizing::new(key.to_owned()),
+    })
+}
+
+/// Terms whose upstream names `provider` and `model`, priced as `PRICES`.
+fn upstream_terms(provider: &str, model: &str) -> ModelTerms {
+    ModelTerms {
+        upstream: Upstream {
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+            dialect: Dialect::OpenAi,
+            base_url: None,
+        },
+        ..terms()
+    }
+}
+
+fn upstream_choice(name: &str, provider: &str, model: &str) -> UpstreamChoice {
+    UpstreamChoice {
+        name: name.into(),
+        provider: provider.into(),
+        model: model.into(),
+        harness: "pi".into(),
+    }
+}
+
 /// A broker whose runtime never runs: enough for model calls.
 fn model_only(scratch: &Scratch, provider: Arc<Scripted>, daily: u64) -> (Runtime, Served) {
     let runtime = scratch.runtime(Arc::new(Holding::default()), true);
@@ -486,6 +607,166 @@ async fn a_router_call_is_held_then_settled_against_the_router_account() {
         row.tokens.map(|t| (t.input, t.cached_input, t.output)),
         Some((100, 0, 50))
     );
+}
+
+/// Each worker upstream's own key.
+const ALPHA_KEY: &str = "sk-alpha-upstream";
+const BETA_KEY: &str = "sk-beta-upstream";
+
+#[tokio::test]
+async fn two_worker_upstreams_carry_their_own_transport_terms_and_key() {
+    let scratch = Scratch::new("upstreams");
+    let runtime = scratch.runtime(Arc::new(Holding::default()), true);
+    let (alpha_endpoint, alpha, alpha_server) = fake_chat().await;
+    let (beta_endpoint, beta, beta_server) = fake_chat().await;
+    let router = Scripted::new();
+    let upstreams = BTreeMap::from([
+        (
+            "alpha".to_owned(),
+            WorkerUpstream {
+                transport: chat_transport(&alpha_endpoint, ALPHA_KEY),
+                terms: upstream_terms("deepseek", "model-alpha"),
+            },
+        ),
+        (
+            "beta".to_owned(),
+            WorkerUpstream {
+                transport: chat_transport(&beta_endpoint, BETA_KEY),
+                terms: upstream_terms("venice", "model-beta"),
+            },
+        ),
+        (
+            "default".to_owned(),
+            WorkerUpstream {
+                transport: router.clone(),
+                terms: terms(),
+            },
+        ),
+    ]);
+    let served = serve_upstreams(
+        &scratch,
+        router.clone(),
+        runtime.facts(),
+        1_000_000,
+        upstreams,
+    );
+    for (token, ticket, name, provider, model) in [
+        (
+            "worker-alpha",
+            "tk_alpha",
+            "alpha",
+            "deepseek",
+            "model-alpha",
+        ),
+        ("worker-beta", "tk_beta", "beta", "venice", "model-beta"),
+    ] {
+        let seat = WorkerSeat::new(
+            TicketId::new(ticket),
+            AssignmentId::new("as_1"),
+            scratch.state(),
+            500_000,
+        )
+        .on_upstream(Some(upstream_choice(name, provider, model)));
+        served
+            .broker
+            .admit_worker(token.into(), seat, format!("You are the worker on {name}."))
+            .unwrap();
+    }
+    let ask = |token: &'static str, model: &'static str, text: &'static str| {
+        let mut request = model_request_for("worker_report", text);
+        request["model"] = json!(model);
+        served.post("model", Some(token), request)
+    };
+
+    // Two Tickets side by side: each call reaches its own fake with its own
+    // key, and neither reaches the Router's transport.
+    assert_eq!(
+        ask("worker-alpha", "model-alpha", "alpha work").await.0,
+        200
+    );
+    assert_eq!(ask("worker-beta", "model-beta", "beta work").await.0, 200);
+    let alpha_calls = alpha.calls.lock().unwrap().clone();
+    let beta_calls = beta.calls.lock().unwrap().clone();
+    assert_eq!(alpha_calls.len(), 1, "{alpha_calls:?}");
+    assert_eq!(alpha_calls[0].0, format!("Bearer {ALPHA_KEY}"));
+    assert_eq!(alpha_calls[0].1["model"], "model-alpha");
+    assert_eq!(beta_calls.len(), 1, "{beta_calls:?}");
+    assert_eq!(beta_calls[0].0, format!("Bearer {BETA_KEY}"));
+    assert_eq!(beta_calls[0].1["model"], "model-beta");
+    assert_eq!(
+        router.calls(),
+        0,
+        "no worker call reached the Router's transport"
+    );
+
+    // The ledger names each upstream's provider on its Ticket's account.
+    let rows = scratch.store().spend("ticket:tk_alpha").unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        (rows[0].provider.as_str(), rows[0].cost_microusd),
+        ("deepseek", COST)
+    );
+    let rows = scratch.store().spend("ticket:tk_beta").unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        (rows[0].provider.as_str(), rows[0].cost_microusd),
+        ("venice", COST)
+    );
+
+    // No prompt and no upstream request carries a key.
+    for (token, key) in [("worker-alpha", ALPHA_KEY), ("worker-beta", BETA_KEY)] {
+        let (status, session) = served.post("session", Some(token), json!({})).await;
+        assert_eq!(status, 200, "{session}");
+        let prompt = session["system_prompt"].as_str().unwrap();
+        for held in [ALPHA_KEY, BETA_KEY] {
+            assert!(!prompt.contains(held), "the prompt holds {held}");
+        }
+        assert!(!prompt.contains(key));
+    }
+    for call in alpha_calls.iter().chain(&beta_calls) {
+        let sent = serde_json::to_string(&call.1).unwrap();
+        for key in [ALPHA_KEY, BETA_KEY] {
+            assert!(!sent.contains(key), "the upstream body holds {key}");
+        }
+    }
+    alpha_server.abort();
+    beta_server.abort();
+}
+
+#[tokio::test]
+async fn a_worker_on_an_upstream_the_broker_does_not_hold_is_refused_and_named() {
+    let scratch = Scratch::new("upstream-gone");
+    let runtime = scratch.runtime(Arc::new(Holding::default()), true);
+    let router = Scripted::new();
+    let upstreams = BTreeMap::from([(
+        "alpha".to_owned(),
+        WorkerUpstream {
+            transport: router.clone(),
+            terms: upstream_terms("deepseek", "model-alpha"),
+        },
+    )]);
+    let served = serve_upstreams(&scratch, router, runtime.facts(), 1_000_000, upstreams);
+    let seat = WorkerSeat::new(
+        TicketId::new("tk_beta"),
+        AssignmentId::new("as_1"),
+        scratch.state(),
+        500_000,
+    )
+    .on_upstream(Some(upstream_choice("beta", "venice", "model-beta")));
+
+    let refused = served
+        .broker
+        .admit_worker("worker-beta".into(), seat, "You are a worker.".into())
+        .unwrap_err();
+    let said = format!("{refused:#}");
+    assert!(said.contains("upstream beta"), "{said}");
+    assert!(said.contains("holds no transport"), "{said}");
+
+    // Nothing was admitted: the token names no grant.
+    let (status, _) = served
+        .post("model", Some("worker-beta"), model_request("beta work"))
+        .await;
+    assert_eq!(status, 403, "a refused seat never runs");
 }
 
 #[tokio::test]

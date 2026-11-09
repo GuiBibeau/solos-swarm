@@ -49,7 +49,10 @@ async fn reply(
     body: &Value,
 ) -> Result<Response, Refusal> {
     let grant = broker.authenticate(headers)?;
-    match broker.inner.provider.messages() {
+    // The wire belongs to the grant's own upstream: a worker's Messages
+    // calls never go to another upstream's endpoint or key.
+    let transport = broker.transport(&grant)?;
+    match transport.messages() {
         Some(wire) => forward(broker, &grant, wire.clone(), body).await,
         None => translate(broker, &grant, body).await,
     }

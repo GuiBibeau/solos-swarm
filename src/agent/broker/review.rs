@@ -460,8 +460,17 @@ impl AgentBroker {
             daily_microusd: memory.parts.daily_microusd,
         };
         let terms = &review.terms;
+        // The review runs on the default upstream's transport and terms: it
+        // is the host's own call, not a Ticket's.
         let spent = self
-            .spend(&account, terms, input_bytes, terms.max_output_tokens, body)
+            .spend(
+                &account,
+                terms,
+                self.inner.provider.clone(),
+                input_bytes,
+                terms.max_output_tokens,
+                body,
+            )
             .await
             .map_err(|(_, Json(why))| anyhow!("{}", why["error"]))?;
         let answer = match spent {
