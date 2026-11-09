@@ -3,7 +3,7 @@
 A web dashboard of [agent mode](../../docs/agent-mode/README.md)'s tickets, for one person on a phone or a laptop:
 what the agent is working on, what it was asked, everything it replied, and what it spent. It also lists the external
 jobs the Watchdog checks. It is a Next.js app (App
-Router, TypeScript) on Vercel at `https://agent.guibibeau.com`, behind **Sign in with Vercel**. It is not part of the
+Router, TypeScript) on Vercel at `https://agent.example.com`, behind **Sign in with Vercel**. It is not part of the
 Rust build.
 
 ```text
@@ -61,7 +61,7 @@ reads the JSON fixtures in `tests/fixtures/` (written by `tests/agent_publish.rs
 sign-in, so every screen can be designed and checked without a deployment. The mode requires `NODE_ENV !==
 "production"`, so it cannot open a production build.
 
-Discord replies link to ticket pages: `https://agent.guibibeau.com/tickets/<id>`. A link opened before the publisher
+Discord replies link to ticket pages: `https://agent.example.com/tickets/<id>`. A link opened before the publisher
 has uploaded that ticket says so and checks again by itself.
 
 ## How sign-in works
@@ -99,7 +99,7 @@ link. The Content-Security-Policy, with a nonce per request set in `proxy.ts`, a
 | `VERCEL_APP_CLIENT_SECRET` | you, Production only, sensitive | One of the app's client secrets. |
 | `SESSION_SECRET` | you, Production only, sensitive | Encrypts the cookies. At least 32 characters (`openssl rand -base64 32`). Changing it signs everyone out. |
 | `ALLOWED_EMAILS` | you, Production only | Who may sign in: Vercel account emails, separated by commas. They are compared in lower case. |
-| `PUBLIC_URL` | you, Production only | The origin the app is reached at, with no trailing slash: `https://agent.guibibeau.com`. The callback is `${PUBLIC_URL}/auth/callback`. |
+| `PUBLIC_URL` | you, Production only | The origin the app is reached at, with no trailing slash: `https://agent.example.com`. The callback is `${PUBLIC_URL}/auth/callback`. |
 | `BLOB_STORE_ID` | connecting the Blob store to the project | Which store to read. With it, `@vercel/blob` reads with the deployment's short-lived OIDC token, so the project holds no Blob token. Connecting the store also adds `BLOB_WEBHOOK_PUBLIC_KEY`, which the app does not use. |
 | `BLOB_READ_WRITE_TOKEN` | you, local development only | The store's read-write token, to run the app against the real store from your machine. The deployed app does not have it. |
 
@@ -107,14 +107,14 @@ link. The Content-Security-Policy, with a nonce per request set in `proxy.ts`, a
 
 ## Set up on Vercel
 
-The deployed app lives in the team `guivercelpro`, as the project `agent-dashboard`, on the domain
-`agent.guibibeau.com`. The domain `guibibeau.com` is already in the team. The project has no Git connection: you deploy
+The deployed app lives in the team `<your-team>`, as the project `agent-dashboard`, on the domain
+`agent.example.com`. The domain `example.com` is already in the team. The project has no Git connection: you deploy
 it with the CLI from `web/agent-dashboard`. Nothing below is automated. Do it once.
 
 1. **Create and link the project.** From `web/agent-dashboard`:
 
    ```sh
-   vercel link --yes --scope guivercelpro --project agent-dashboard
+   vercel link --yes --scope <your-team> --project agent-dashboard
    ```
 
    The framework, Next.js, is detected. The build is `npm run build` with the defaults, and only the production
@@ -132,12 +132,12 @@ it with the CLI from `web/agent-dashboard`. Nothing below is automated. Do it on
 
    - **Authentication**: generate a client secret and keep `client_secret_post` enabled. The app sends the secret in
      the token request's form, as Vercel's example does. Copy the secret now, because it is shown once.
-   - **Authorization Callback URLs**: add `https://agent.guibibeau.com/auth/callback`. For local development, also add
+   - **Authorization Callback URLs**: add `https://agent.example.com/auth/callback`. For local development, also add
      `http://localhost:3000/auth/callback`.
    - **Permissions**: enable `openid`, `email` and `profile`. Leave `offline_access` off, because the app wants no
      refresh token.
    - **General, Sign-In Access** (optional, a second lock): choose **Members of the team**, so that only people in
-     `guivercelpro` can finish a sign-in. `ALLOWED_EMAILS` still decides who gets in.
+     `<your-team>` can finish a sign-in. `ALLOWED_EMAILS` still decides who gets in.
 
    Copy the client id (`cl_...`) from the same page.
 
@@ -149,7 +149,7 @@ it with the CLI from `web/agent-dashboard`. Nothing below is automated. Do it on
    vercel env add VERCEL_APP_CLIENT_SECRET production --sensitive         # paste the secret
    openssl rand -base64 32 | vercel env add SESSION_SECRET production --sensitive
    printf '%s' '<your Vercel account email>' | vercel env add ALLOWED_EMAILS production
-   printf '%s' 'https://agent.guibibeau.com' | vercel env add PUBLIC_URL production
+   printf '%s' 'https://agent.example.com' | vercel env add PUBLIC_URL production
    ```
 
    For more than one person, separate the emails with commas: `a@example.com,b@example.com`.
@@ -157,17 +157,17 @@ it with the CLI from `web/agent-dashboard`. Nothing below is automated. Do it on
 5. **Add the domain.**
 
    ```sh
-   vercel domains add agent.guibibeau.com agent-dashboard
+   vercel domains add agent.example.com agent-dashboard
    ```
 
-   If `guibibeau.com` uses Vercel's nameservers, Vercel makes the record. Otherwise add a `CNAME` for `agent` to
+   If `example.com` uses Vercel's nameservers, Vercel makes the record. Otherwise add a `CNAME` for `agent` to
    `cname.vercel-dns.com` where its DNS is.
 
 6. **Deploy.** From `web/agent-dashboard`, run `vercel deploy --prod`. Leave Deployment Protection at its default. It
    covers the `*.vercel.app` URLs, and the app does its own sign-in on the custom domain. A visit to the project's
    `vercel.app` address that gets past it is redirected to `PUBLIC_URL` to sign in.
 
-7. **Check it.** Open `https://agent.guibibeau.com`. It redirects to the sign-in page. Sign in with the allowed account
+7. **Check it.** Open `https://agent.example.com`. It redirects to the sign-in page. Sign in with the allowed account
    and you land on the ticket list, which says "Nothing has been published yet" until the publisher on the box has run
    once. Any other Vercel account sees "That Vercel account is not allowed here."
 

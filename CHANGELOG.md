@@ -313,6 +313,15 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
 
 ### Changed
 
+- An OpenAI-compatible provider in the config (#148): `executor.upstreams` entries with
+  `provider: openai-compatible` carry their own `base_url` (https, or http only on loopback) and `models`
+  catalog, with validation and the transport built from the configured URL. The broker still holds one
+  transport, the executor's default provider, so a Ticket on such an upstream is refused until the
+  per-upstream transport map lands (the next change). Shipped providers keep their fixed endpoints. The docs also stop carrying one maintainer's identifiers: examples use
+  `you@example.com`, `agent.example.com`, placeholder Discord ids and `acme/*` repositories, and the new
+  `agent.yaml.example` plus `docs/agent-mode/how-to/adopting.md` walk someone from a clone to their first
+  ticket, with the current limits (GitHub-only forge, Vercel-only dashboard) stated plainly.
+
 - CI (#66): the `ci` workflow runs `lint`, `scripts`, `tokenizers`, `build` (one `cargo nextest archive`), four `test`
   shards and four `test-isolated` jobs, then a `check` job that passes only when every job before it passed. `check`
   is the status to require. CI builds without debug info, and small crypto, SQLite and JSON crates build optimized in

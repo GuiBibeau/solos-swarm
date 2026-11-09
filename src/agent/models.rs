@@ -4,11 +4,11 @@
 //!
 //! `forge.repos.<repo>.models` is required on every repository, so no
 //! repository reaches a provider by default. The providers are
-//! `deepseek`, `venice`, `zhipu`, `zhipu-coding` and `anthropic`; an upstream
-//! runs on every one but `anthropic` in this build.
+//! `deepseek`, `venice`, `zhipu`, `zhipu-coding`, `openai-compatible` and
+//! `anthropic`; an upstream runs on every one but `anthropic` in this build.
 
 use super::config::{ExecutorConfig, HarnessKind, UpstreamConfig};
-use crate::gateway::{Wire, endpoint, upstream_profile};
+use crate::gateway::{Wire, check_base_url, configured_upstream, endpoint, upstream_profile};
 use anyhow::{Context, Result, bail, ensure};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer};
@@ -30,6 +30,11 @@ pub enum Provider {
     /// (error 1113), so the two are separate providers.
     #[serde(rename = "zhipu-coding")]
     ZhipuCoding,
+    /// Any OpenAI-compatible endpoint named in `executor.upstreams` with its
+    /// own `base_url` and model catalog. A named upstream only: the default
+    /// executor, the Router and memory resolve shipped profiles.
+    #[serde(rename = "openai-compatible")]
+    OpenAiCompatible,
     /// Admitted in a repository's `allow` from this release, but no upstream
     /// runs on it until its transport and key land.
     Anthropic,
@@ -42,6 +47,7 @@ impl Provider {
             Self::Venice => "venice",
             Self::Zhipu => "zhipu",
             Self::ZhipuCoding => "zhipu-coding",
+            Self::OpenAiCompatible => "openai-compatible",
             Self::Anthropic => "anthropic",
         }
     }
@@ -52,6 +58,7 @@ impl Provider {
             "venice" => Ok(Self::Venice),
             "zhipu" => Ok(Self::Zhipu),
             "zhipu-coding" => Ok(Self::ZhipuCoding),
+            "openai-compatible" => Ok(Self::OpenAiCompatible),
             "anthropic" => Ok(Self::Anthropic),
             other => bail!("provider outside the deployment allowlist: {other}"),
         }
@@ -62,7 +69,8 @@ impl Provider {
     fn upstream_here(self) -> Result<Self> {
         ensure!(
             self != Self::Anthropic,
-            "provider anthropic is not admitted yet: an upstream runs on deepseek, venice, zhipu or zhipu-coding"
+            "provider anthropic is not admitted yet: an upstream runs on deepseek, venice, \
+             zhipu, zhipu-coding or openai-compatible"
         );
         Ok(self)
     }
@@ -459,8 +467,57 @@ executor:
 fn validate_upstream(name: &UpstreamName, upstream: &UpstreamConfig, claude: bool) -> Result<()> {
     let context = || format!("executor.upstreams.{name}");
     let provider = upstream.provider.upstream_here().with_context(context)?;
-    upstream_profile(provider.as_str(), &upstream.model).with_context(context)?;
-    endpoint(provider.as_str(), upstream.wire).with_context(context)?;
+    if provider == Provider::OpenAiCompatible {
+        // The generic provider is a base URL and its own catalog, and speaks
+        // chat only: there is no Messages endpoint to forward to.
+        ensure!(
+            upstream.wire == Wire::Chat,
+            "{}: provider openai-compatible has no Anthropic wire; wire must be chat",
+            context()
+        );
+        let base_url = upstream.base_url.as_deref().with_context(|| {
+            format!("{}: provider openai-compatible needs a base_url", context())
+        })?;
+        ensure!(
+            !upstream.models.is_empty(),
+            "{}: provider openai-compatible needs a models catalog",
+            context()
+        );
+        let mut seen = BTreeSet::new();
+        for model in &upstream.models {
+            ensure!(
+                !model.is_empty() && model.chars().count() <= 200,
+                "{}: a catalog model id must be 1 to 200 characters",
+                context()
+            );
+            ensure!(
+                seen.insert(model),
+                "{}: model {model} is named twice in its catalog",
+                context()
+            );
+        }
+        let base_url = check_base_url(base_url).with_context(context)?;
+        configured_upstream(
+            &provider,
+            &upstream.model,
+            Some(&base_url),
+            &upstream.models,
+        )
+        .with_context(context)?;
+    } else {
+        ensure!(
+            upstream.base_url.is_none(),
+            "{}: base_url is only for provider openai-compatible",
+            context()
+        );
+        ensure!(
+            upstream.models.is_empty(),
+            "{}: models is only for provider openai-compatible",
+            context()
+        );
+        upstream_profile(provider.as_str(), &upstream.model).with_context(context)?;
+        endpoint(provider.as_str(), upstream.wire).with_context(context)?;
+    }
     ensure!(
         upstream.harness == HarnessKind::ClaudeCode || upstream.wire == Wire::Chat,
         "{}: harness pi needs wire: chat; wire: anthropic needs harness: claude-code",
@@ -573,7 +630,9 @@ fn names(allowed: &BTreeSet<Provider>) -> String {
 mod tests {
     use super::{ModelPolicy, Provider, Role, UpstreamName};
     use crate::agent::AgentConfig;
+    use crate::gateway::{Dialect, configured_upstream, provider_for};
     use solos_agent_core::change::RepoName;
+    use zeroize::Zeroizing;
 
     fn config(forge: &str, executor_extra: &str) -> AgentConfig {
         let yaml = format!(
@@ -852,6 +911,27 @@ executor:
         let said = format!("{refused:#}");
         assert!(said.contains("models.worker is absent"), "{said}");
         assert!(said.contains("name one with models.worker"), "{said}");
+    }
+
+    #[test]
+    fn a_configured_base_url_rides_the_transport_agent_mode_builds() {
+        let upstream = configured_upstream(
+            &Provider::OpenAiCompatible,
+            "my-model",
+            Some("https://api.example.com/v1/"),
+            &["my-model".to_owned()],
+        )
+        .unwrap();
+        let built = provider_for(
+            &upstream,
+            reqwest::Client::new(),
+            Zeroizing::new(String::new()),
+        )
+        .unwrap();
+        assert_eq!(
+            (built.endpoint.as_str(), built.dialect),
+            ("https://api.example.com/v1", Dialect::OpenAi)
+        );
     }
 
     #[test]

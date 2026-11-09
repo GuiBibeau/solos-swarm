@@ -928,7 +928,7 @@ fn the_agent_user_is_the_login_name_of_every_ssh_command() {
             .arg(SCRIPT)
             .arg("restart")
             .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-            .env_remove("AGENT_HOST")
+            .env("AGENT_HOST", "host-a")
             .env_remove("AGENT_USER");
         if let Some(user) = user {
             command.env("AGENT_USER", user);
@@ -957,7 +957,7 @@ fn the_agent_user_is_the_login_name_of_every_ssh_command() {
     assert_eq!(named.len(), 2);
     for line in &named {
         assert!(
-            line.contains("-o ServerAliveInterval=30 -l solos-agent remote-ai "),
+            line.contains("-o ServerAliveInterval=30 -l solos-agent host-a "),
             "{line}"
         );
     }

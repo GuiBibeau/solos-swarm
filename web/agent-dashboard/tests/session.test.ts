@@ -61,8 +61,8 @@ describe("who is let in", () => {
   });
 
   it("admits an address on the list in any case and nobody when the list is empty", () => {
-    expect(isAllowed("G.Bibeaulaviolette@gmail.com", [OWNER])).toBe(true);
-    expect(isAllowed(" g.bibeaulaviolette@gmail.com ", [OWNER])).toBe(true);
+    expect(isAllowed("YOU@EXAMPLE.COM", [OWNER])).toBe(true);
+    expect(isAllowed(" you@example.com ", [OWNER])).toBe(true);
     expect(isAllowed("other@gmail.com", [OWNER])).toBe(false);
     expect(isAllowed(OWNER, [])).toBe(false);
   });
@@ -83,7 +83,7 @@ describe("the settings", () => {
     VERCEL_APP_CLIENT_SECRET: "secret",
     SESSION_SECRET: "x".repeat(32),
     ALLOWED_EMAILS: OWNER,
-    PUBLIC_URL: "https://agent.guibibeau.com",
+    PUBLIC_URL: "https://agent.example.com",
   };
 
   it("read the documented variables", () => {
@@ -92,7 +92,7 @@ describe("the settings", () => {
       clientSecret: "secret",
       sessionSecret: "x".repeat(32),
       allowedEmails: [OWNER],
-      publicUrl: "https://agent.guibibeau.com",
+      publicUrl: "https://agent.example.com",
     });
   });
 
@@ -103,10 +103,10 @@ describe("the settings", () => {
       expect(() => authConfig(without(name)), name).toThrow(name);
     }
     expect(() => authConfig({ ...env, SESSION_SECRET: "short" })).toThrow(/32 characters/);
-    for (const bad of ["http://agent.guibibeau.com", "https://agent.guibibeau.com/x", "agent.guibibeau.com", "https://a@b.com"]) {
+    for (const bad of ["http://agent.example.com", "https://agent.example.com/x", "agent.example.com", "https://a@b.com"]) {
       expect(() => authConfig({ ...env, PUBLIC_URL: bad }), bad).toThrow(ConfigError);
     }
     expect(authConfig({ ...env, PUBLIC_URL: "http://localhost:3000" }).publicUrl).toBe("http://localhost:3000");
-    expect(authConfig({ ...env, PUBLIC_URL: "https://agent.guibibeau.com/" }).publicUrl).toBe("https://agent.guibibeau.com");
+    expect(authConfig({ ...env, PUBLIC_URL: "https://agent.example.com/" }).publicUrl).toBe("https://agent.example.com");
   });
 });

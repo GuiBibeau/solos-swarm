@@ -108,17 +108,9 @@ impl Scratch {
         Runtime::new(
             SqliteStore::open(self.db()).unwrap(),
             AllowlistPolicy {
-                people: [
-                    "slack:alice".to_owned(),
-                    "web:g.bibeaulaviolette@gmail.com".to_owned(),
-                ]
-                .into(),
+                people: ["slack:alice".to_owned(), "web:you@example.com".to_owned()].into(),
                 bots: ["slack:deploy-bot".to_owned()].into(),
-                approvers: [
-                    "slack:alice".to_owned(),
-                    "web:g.bibeaulaviolette@gmail.com".to_owned(),
-                ]
-                .into(),
+                approvers: ["slack:alice".to_owned(), "web:you@example.com".to_owned()].into(),
                 ..AllowlistPolicy::default()
             },
             adapters,
@@ -161,7 +153,7 @@ impl Scratch {
             people: people.iter().map(|person| (*person).to_owned()).collect(),
             spool: self.state().join("web/triggers.jsonl"),
             cursor: self.state().join("web/cursor.json"),
-            public_url: "https://agent.guibibeau.com".to_owned(),
+            public_url: "https://agent.example.com".to_owned(),
         };
         let options = Options {
             every: Duration::from_millis(50),
@@ -236,7 +228,7 @@ fn web_request(id: &str, thread: &str, text: &str) -> Trigger {
         }],
         meta: json!({
             "thread": thread,
-            "url": format!("https://agent.guibibeau.com/?t={thread}"),
+            "url": format!("https://agent.example.com/?t={thread}"),
         }),
     }
 }
@@ -1229,7 +1221,7 @@ async fn a_realistic_mix_of_tickets_for_the_dashboards_fixtures() {
     assert_eq!(web_row["source"], "web");
     assert_eq!(
         web_row["source_url"],
-        format!("https://agent.guibibeau.com/?t={WEB_THREAD}"),
+        format!("https://agent.example.com/?t={WEB_THREAD}"),
         "the dashboard matches the web thread through this row"
     );
     assert_eq!(
@@ -1249,7 +1241,7 @@ async fn a_realistic_mix_of_tickets_for_the_dashboards_fixtures() {
     assert_eq!(asking["source"], "web");
     assert_eq!(
         asking["source_url"],
-        format!("https://agent.guibibeau.com/?t={WEB_THREAD}")
+        format!("https://agent.example.com/?t={WEB_THREAD}")
     );
     let kinds: Vec<&str> = asking["conversation"]
         .as_array()
@@ -1503,7 +1495,7 @@ async fn a_restored_agent_db_is_a_new_file_and_is_read_again() {
 
 // -- the dashboard's chat inbox --------------------------------------------------------------
 
-const GUI: &str = "g.bibeaulaviolette@gmail.com";
+const GUI: &str = "you@example.com";
 /// The fixture mix's web conversation, and the bridge's own test thread.
 const WEB_THREAD: &str = "wc_cccccccccccccccccccccccccccccccc";
 const MESSAGE_1: &str = "wm_0123456789abcdef0123456789abcdef";
@@ -1578,7 +1570,7 @@ async fn an_allowed_message_is_spooled_once_and_a_restart_does_not_repeat_it() {
         trigger.meta,
         json!({
             "thread": CHAT_THREAD,
-            "url": format!("https://agent.guibibeau.com/?t={CHAT_THREAD}"),
+            "url": format!("https://agent.example.com/?t={CHAT_THREAD}"),
         })
     );
 

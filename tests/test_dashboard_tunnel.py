@@ -14,7 +14,7 @@ class Tunnel(unittest.TestCase):
     def test_default_command_binds_loopback_on_both_ends(self):
         r = run("--dry-run")
         self.assertEqual(r.returncode, 0)
-        self.assertIn("ssh -N -L 4173:127.0.0.1:4173 -o ExitOnForwardFailure=yes remote-ai", r.stdout)
+        self.assertIn("ssh -N -L 4173:127.0.0.1:4173 -o ExitOnForwardFailure=yes ", r.stdout)
         self.assertIn("open http://127.0.0.1:4173/", r.stdout)
 
     def test_start_port_and_host(self):

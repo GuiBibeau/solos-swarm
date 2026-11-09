@@ -918,8 +918,9 @@ pub enum ExecutorConfig {
 #[serde(deny_unknown_fields)]
 pub struct UpstreamConfig {
     /// Who receives the text and bills for it: `deepseek`, `venice`,
-    /// `zhipu` or `zhipu-coding` in this build. `anthropic` is a valid entry in a repository's
-    /// `allow`, but an upstream runs on it only once its transport lands.
+    /// `zhipu`, `zhipu-coding` or `openai-compatible` in this build.
+    /// `anthropic` is a valid entry in a repository's `allow`, but an
+    /// upstream runs on it only once its transport lands.
     pub provider: Provider,
     pub model: String,
     /// How the broker reaches the provider: `chat` translates Claude Code's
@@ -933,6 +934,16 @@ pub struct UpstreamConfig {
     /// deleted, and refused under any path a sandbox can read.
     pub key_file: PathBuf,
     pub prices: PriceTable,
+    /// Where a generic `openai-compatible` upstream posts its chat calls,
+    /// HTTPS or loopback HTTP. Only for that provider, which this build
+    /// admits in `executor.upstreams` alone: not as the default executor,
+    /// the Router or memory.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// The model ids a generic `openai-compatible` upstream admits, its own
+    /// catalog instead of a shipped one. Only for that provider.
+    #[serde(default)]
+    pub models: Vec<String>,
     /// What one of its calls may send or answer. Defaults as `executor`'s.
     #[serde(default)]
     pub max_input_bytes: Option<usize>,
@@ -2493,11 +2504,12 @@ forge:
             "harness claude-code needs executor.claude",
             "executor.upstreams.claude",
         );
-        // This build runs an upstream on deepseek, venice, zhipu or zhipu-coding.
+        // This build runs an upstream on deepseek, venice, zhipu,
+        // zhipu-coding or openai-compatible.
         refused(
             with_upstreams(&upstream("anthropic", "anthropic", "claude-code")),
             "provider anthropic is not admitted yet",
-            "deepseek, venice, zhipu or zhipu-coding",
+            "deepseek, venice, zhipu, zhipu-coding or openai-compatible",
         );
         refused(
             with_upstreams(
@@ -2570,6 +2582,8 @@ forge:
                     output_microusd_per_million: 1_200_000,
                     cache_hit_microusd_per_million: None,
                 },
+                base_url: None,
+                models: Vec::new(),
                 max_input_bytes: None,
                 max_output_tokens: None,
             }
@@ -2596,6 +2610,92 @@ forge:
             assert_eq!(found.provider, Provider::named(provider).unwrap());
             assert_eq!(found.model, "glm-5.3-flash");
         }
+    }
+
+    #[test]
+    fn an_openai_compatible_upstream_carries_its_base_url_and_its_own_catalog() {
+        let generic = |base_url: &str, models: &str| {
+            format!(
+                "    generic:
+      provider: openai-compatible
+      model: my-model
+      wire: chat
+      harness: pi
+      key_file: keys/generic.key
+      prices: {{input_microusd_per_million: 300000, output_microusd_per_million: 1200000}}
+{base_url}      models: {models}
+"
+            )
+        };
+        let base_url = "      base_url: https://api.example.com/v1\n";
+        let config = parse(&with_upstreams(&generic(
+            base_url,
+            "[my-model, other-model]",
+        )))
+        .unwrap();
+        let ExecutorConfig::Pi { upstreams, .. } = &config.executor else {
+            panic!("{:?}", config.executor)
+        };
+        let found = upstreams.values().next().unwrap();
+        assert_eq!(found.provider, Provider::OpenAiCompatible);
+        assert_eq!(
+            found.base_url.as_deref(),
+            Some("https://api.example.com/v1")
+        );
+        assert_eq!(
+            found.models,
+            vec!["my-model".to_owned(), "other-model".to_owned()]
+        );
+
+        let refused = |yaml: &str, said: &str| {
+            let err = format!("{:#}", parse(&with_upstreams(yaml)).unwrap_err());
+            assert!(err.contains(said), "{said}: {err}");
+        };
+        refused(&generic("", "[my-model]"), "needs a base_url");
+        refused(&generic(base_url, "[]"), "needs a models catalog");
+        refused(
+            &generic(base_url, "[my-model, my-model]"),
+            "my-model is named twice",
+        );
+        refused(
+            &generic("      base_url: http://api.example.com/v1\n", "[my-model]"),
+            "must be https",
+        );
+        // base_url and models are only the generic provider's.
+        let venice_base = venice().replace(
+            "      key_file: keys/venice.key\n",
+            &format!("      key_file: keys/venice.key\n{base_url}"),
+        );
+        refused(
+            &venice_base,
+            "base_url is only for provider openai-compatible",
+        );
+        let venice_models = venice().replace(
+            "      key_file: keys/venice.key\n",
+            "      key_file: keys/venice.key\n      models: [my-model]\n",
+        );
+        refused(
+            &venice_models,
+            "models is only for provider openai-compatible",
+        );
+
+        // The generic provider has no Anthropic Messages wire.
+        let upstream = crate::gateway::configured_upstream(
+            &Provider::OpenAiCompatible,
+            "my-model",
+            Some("https://api.example.com/v1"),
+            &["my-model".to_owned()],
+        )
+        .unwrap();
+        assert!(
+            crate::gateway::messages_for(
+                &upstream,
+                reqwest::Client::new(),
+                zeroize::Zeroizing::new(String::new()),
+                None,
+            )
+            .is_err()
+        );
     }
 
     #[test]

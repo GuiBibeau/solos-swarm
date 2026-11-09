@@ -2,6 +2,7 @@
 //! contract a broker enforces before it forwards a call.
 
 use super::forward::WebSearch;
+use crate::agent::models::Provider as PolicyProvider;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -29,6 +30,11 @@ pub struct Upstream {
     pub provider: String,
     pub model: String,
     pub dialect: Dialect,
+    /// The endpoint a generic `openai-compatible` upstream posts to, checked
+    /// and normalized by [`check_base_url`]. Absent for every shipped
+    /// profile, whose endpoint [`endpoint`] fixes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
 }
 impl Upstream {
     pub fn deepseek(model: &str) -> Self {
@@ -36,7 +42,20 @@ impl Upstream {
             provider: "deepseek".into(),
             model: model.into(),
             dialect: Dialect::DeepSeek,
+            base_url: None,
         }
+    }
+
+    /// A generic OpenAI-compatible endpoint named in `executor.upstreams`:
+    /// its base URL is the whole chat endpoint, and its own catalog admits
+    /// the model.
+    pub fn openai_compatible(model: &str, base_url: &str) -> Result<Self> {
+        Ok(Self {
+            provider: "openai-compatible".into(),
+            model: model.into(),
+            dialect: Dialect::OpenAi,
+            base_url: Some(check_base_url(base_url)?),
+        })
     }
 }
 /// Model IDs of the admitted Venice catalog. Newer revisions carry a date
@@ -66,6 +85,7 @@ pub fn upstream_profile(provider: &str, model: &str) -> Result<Upstream> {
             provider: provider.into(),
             model: model.into(),
             dialect: Dialect::OpenAi,
+            base_url: None,
         }
     } else if provider == "zhipu" || provider == "zhipu-coding" {
         ensure!(
@@ -76,10 +96,60 @@ pub fn upstream_profile(provider: &str, model: &str) -> Result<Upstream> {
             provider: provider.into(),
             model: model.into(),
             dialect: Dialect::Zhipu,
+            base_url: None,
         }
     } else {
         bail!("provider outside the deployment allowlist: {provider}")
     })
+}
+
+/// Resolve an upstream from its config: a shipped provider keeps its
+/// [`upstream_profile`], and `openai-compatible` admits a model from its own
+/// catalog and posts to its base URL. Only `executor.upstreams` names the
+/// generic provider; the default executor, the Router and memory resolve
+/// shipped profiles.
+pub fn configured_upstream(
+    provider: &PolicyProvider,
+    model: &str,
+    base_url: Option<&str>,
+    models: &[String],
+) -> Result<Upstream> {
+    if *provider != PolicyProvider::OpenAiCompatible {
+        return upstream_profile(provider.as_str(), model);
+    }
+    ensure!(!model.is_empty(), "provider model is empty");
+    ensure!(
+        !models.is_empty(),
+        "provider openai-compatible names no models in its catalog"
+    );
+    ensure!(
+        models.iter().any(|admitted| admitted == model),
+        "model {model} is outside the upstream's catalog: {}",
+        models.join(", ")
+    );
+    let base_url = base_url.context("provider openai-compatible needs a base_url")?;
+    Upstream::openai_compatible(model, base_url)
+}
+
+/// Check a generic upstream's base URL: HTTPS, or HTTP only on loopback, and
+/// no credentials, query or fragment, so the key never travels in the clear
+/// and the transport posts to exactly the endpoint that was admitted.
+/// Returns it normalized without a trailing slash.
+pub fn check_base_url(url: &str) -> Result<String> {
+    let parsed =
+        reqwest::Url::parse(url).with_context(|| format!("base_url {url:?} is not a URL"))?;
+    match parsed.scheme() {
+        "https" => {}
+        "http" if matches!(parsed.host_str(), Some("127.0.0.1" | "localhost")) => {}
+        scheme => bail!("base_url must be https, or http on 127.0.0.1 or localhost, not {scheme}"),
+    }
+    ensure!(
+        parsed.username().is_empty() && parsed.password().is_none(),
+        "base_url carries credentials"
+    );
+    ensure!(parsed.fragment().is_none(), "base_url carries a fragment");
+    ensure!(parsed.query().is_none(), "base_url carries a query");
+    Ok(parsed.as_str().trim_end_matches('/').to_owned())
 }
 
 /// How a harness's Anthropic Messages calls reach the provider.
@@ -178,16 +248,17 @@ impl Provider for BothWires {
 }
 /// An OpenAI-compatible hosted endpoint. `dialect` is the only difference
 /// between the shipped profiles, so one transport serves every one and none
-/// duplicates the receipt, bound or error handling.
+/// duplicates the receipt, bound or error handling. `endpoint` is a shipped
+/// profile's fixed endpoint or a generic upstream's configured base URL.
 pub struct OpenAiCompatible {
-    pub endpoint: &'static str,
+    pub endpoint: String,
     pub dialect: Dialect,
     pub client: reqwest::Client,
     pub key: Zeroizing<String>,
 }
 impl Provider for OpenAiCompatible {
     fn dispatch(&self, body: Value) -> Dispatch {
-        let endpoint = self.endpoint;
+        let endpoint = self.endpoint.clone();
         let dialect = self.dialect;
         let client = self.client.clone();
         let key = self.key.clone();
@@ -307,18 +378,31 @@ pub fn endpoint(provider: &str, wire: Wire) -> Result<&'static str> {
         ("zhipu", Wire::Anthropic) | ("zhipu-coding", Wire::Anthropic) => {
             bail!("provider {provider} has no Anthropic wire")
         }
+        // Its endpoint is the upstream's own `base_url`, so there is none to
+        // name here on either wire.
+        ("openai-compatible", Wire::Anthropic) => {
+            bail!("provider openai-compatible has no Anthropic wire")
+        }
+        ("openai-compatible", Wire::Chat) => {
+            bail!("provider openai-compatible has no shipped endpoint: name its base_url")
+        }
         (other, _) => bail!("provider outside the deployment allowlist: {other}"),
     }
 }
 /// Build the transport for a resolved upstream, so every shipped profile shares
-/// one receipt, bound and error path.
+/// one receipt, bound and error path. A generic upstream posts to its own base
+/// URL; every other one to the endpoint its profile fixes.
 pub fn provider_for(
     upstream: &Upstream,
     client: reqwest::Client,
     key: Zeroizing<String>,
 ) -> Result<OpenAiCompatible> {
+    let endpoint = match &upstream.base_url {
+        Some(base_url) => base_url.clone(),
+        None => endpoint(&upstream.provider, Wire::Chat)?.to_owned(),
+    };
     Ok(OpenAiCompatible {
-        endpoint: endpoint(&upstream.provider, Wire::Chat)?,
+        endpoint,
         dialect: upstream.dialect,
         client,
         key,
@@ -676,7 +760,7 @@ mod tests {
         let venice = upstream_profile("venice", "zai-org-glm-5").unwrap();
         let built = provider_for(&venice, reqwest::Client::new(), key()).unwrap();
         assert_eq!(
-            (built.endpoint, built.dialect),
+            (built.endpoint.as_str(), built.dialect),
             (
                 "https://api.venice.ai/api/v1/chat/completions",
                 Dialect::OpenAi
@@ -685,7 +769,7 @@ mod tests {
         let deepseek = Upstream::deepseek("deepseek-flash");
         let built = provider_for(&deepseek, reqwest::Client::new(), key()).unwrap();
         assert_eq!(
-            (built.endpoint, built.dialect),
+            (built.endpoint.as_str(), built.dialect),
             (
                 "https://api.deepseek.com/chat/completions",
                 Dialect::DeepSeek
@@ -700,7 +784,7 @@ mod tests {
         let zhipu = upstream_profile("zhipu", "glm-5.3").unwrap();
         let built = provider_for(&zhipu, reqwest::Client::new(), key()).unwrap();
         assert_eq!(
-            (built.endpoint, built.dialect),
+            (built.endpoint.as_str(), built.dialect),
             (
                 "https://api.z.ai/api/paas/v4/chat/completions",
                 Dialect::Zhipu
@@ -718,7 +802,7 @@ mod tests {
         let coding = upstream_profile("zhipu-coding", "glm-5.3-flash").unwrap();
         let built = provider_for(&coding, reqwest::Client::new(), key()).unwrap();
         assert_eq!(
-            (built.endpoint, built.dialect),
+            (built.endpoint.as_str(), built.dialect),
             (
                 "https://api.z.ai/api/coding/paas/v4/chat/completions",
                 Dialect::Zhipu
@@ -737,5 +821,77 @@ mod tests {
         };
         assert!(provider_for(&other, reqwest::Client::new(), key()).is_err());
         assert!(messages_for(&other, reqwest::Client::new(), key(), None).is_err());
+    }
+
+    #[test]
+    fn configured_upstream_admits_a_generic_upstream_from_its_own_catalog() {
+        let provider = crate::agent::models::Provider::named("openai-compatible").unwrap();
+        let catalog = ["my-model".to_owned(), "other-model".to_owned()];
+        let upstream = configured_upstream(
+            &provider,
+            "my-model",
+            Some("https://api.example.com/v1"),
+            &catalog,
+        )
+        .unwrap();
+        assert_eq!(
+            upstream,
+            Upstream {
+                provider: "openai-compatible".into(),
+                model: "my-model".into(),
+                dialect: Dialect::OpenAi,
+                base_url: Some("https://api.example.com/v1".into()),
+            }
+        );
+        let refused = configured_upstream(
+            &provider,
+            "not-mine",
+            Some("https://api.example.com/v1"),
+            &catalog,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            refused.contains("my-model, other-model"),
+            "the upstream's catalog is named: {refused}"
+        );
+        // A shipped provider delegates to its profile.
+        let deepseek = crate::agent::models::Provider::named("deepseek").unwrap();
+        assert_eq!(
+            configured_upstream(&deepseek, "deepseek-flash", None, &[]).unwrap(),
+            Upstream::deepseek("deepseek-flash")
+        );
+    }
+
+    #[test]
+    fn a_base_url_is_https_or_loopback_http_and_carries_nothing_else() {
+        assert_eq!(
+            check_base_url("https://api.example.com/v1").unwrap(),
+            "https://api.example.com/v1"
+        );
+        assert_eq!(
+            check_base_url("https://api.example.com/v1/").unwrap(),
+            "https://api.example.com/v1",
+            "normalized without a trailing slash"
+        );
+        assert_eq!(
+            check_base_url("http://127.0.0.1:8080/v1").unwrap(),
+            "http://127.0.0.1:8080/v1"
+        );
+        assert_eq!(
+            check_base_url("http://localhost:8080/v1").unwrap(),
+            "http://localhost:8080/v1"
+        );
+        for refused in [
+            "http://api.example.com/v1",
+            "https://user:pass@api.example.com/v1",
+            "https://user@api.example.com/v1",
+            "https://api.example.com/v1#frag",
+            "https://api.example.com/v1?key=1",
+            "api.example.com/v1",
+            "",
+        ] {
+            assert!(check_base_url(refused).is_err(), "{refused}");
+        }
     }
 }

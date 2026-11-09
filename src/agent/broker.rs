@@ -3004,7 +3004,7 @@ mod tests {
             id: TriggerId::new("tr_1"),
             source: "web".into(),
             at_ms: 1,
-            actor: Actor::person("g.bibeaulaviolette@gmail.com"),
+            actor: Actor::person("you@example.com"),
             addressed: Addressed::Mention,
             text: "what is the status on the quant model".into(),
             threads: vec![ThreadKey::new("web:wc_1")],

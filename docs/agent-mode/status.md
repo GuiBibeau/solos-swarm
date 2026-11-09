@@ -263,7 +263,7 @@ See [Memory](runtime.md#memory) and [Manage the agent's memory](how-to/memory.md
 | PR | Change | Where it is described |
 |---|---|---|
 | #45 | The Pi Router survives long batches, hung calls and stale Eval ids. | [The Router](runtime.md#the-router) |
-| #52, #59 | The `verify-agent-mode` skill drives agent mode for real on remote-ai. | `.claude/skills/verify-agent-mode/` |
+| #52, #59 | The `verify-agent-mode` skill drives agent mode for real on host-a. | `.claude/skills/verify-agent-mode/` |
 | #55, #56, #58 | Refactors: the Engine decides who may approve or stop, one module decides what sessions can see, and a worker tool is one bound entry held per seat. | [The tool surface](architecture.md#the-tool-surface) |
 | #60 | Agent mode in production as a systemd user unit, with `scripts/agent-deploy`. | [production.md](production.md) |
 | #65 | A looping worker is refused, and a failed model call that ends a turn is told to the person. | [Workers](runtime.md#workers) |

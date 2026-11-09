@@ -26,7 +26,7 @@ const readTicket = vi.fn();
 const readJobs = vi.fn();
 const readNotes = vi.fn();
 vi.mock("@/lib/viewer", () => ({
-  requireViewer: async () => ({ email: "g.bibeaulaviolette@gmail.com" }),
+  requireViewer: async () => ({ email: "you@example.com" }),
   currentViewer: async () => null,
 }));
 vi.mock("@/lib/clock", () => ({ nowMs: () => NOW }));
@@ -201,7 +201,7 @@ describe("the chat page", () => {
     id: "tk_web000000000000",
     title: "Move the release notes",
     source: "web",
-    source_url: `https://agent.guibibeau.com/?t=${thread}`,
+    source_url: `https://agent.example.com/?t=${thread}`,
   };
 
   it("renders a conversation from its thread, with the transcript and the activity beside it", async () => {
