@@ -15,6 +15,7 @@ pub use pause::{effective_control, paused_reply, peak_retry_after, unix_secs};
 pub use pricing::{PriceTable, Receipt, Usage, completion_usage};
 pub use upstream::{
     AnthropicMessages, BothWires, Dialect, Dispatch, OpenAiCompatible, Provider, Temperature,
-    Upstream, Wire, admit_request, endpoint, messages_for, provider_for, reasoning_model, sampled,
-    thinking_body, upstream_body, upstream_profile, venice_model, zhipu_model,
+    Upstream, Wire, admit_request, check_base_url, configured_upstream, endpoint, messages_for,
+    provider_for, reasoning_model, sampled, thinking_body, upstream_body, upstream_profile,
+    venice_model, zhipu_model,
 };

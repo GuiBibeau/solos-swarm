@@ -4,7 +4,7 @@
   "tickets": [
     {
       "asker": {
-        "id": "g.bibeaulaviolette@gmail.com",
+        "id": "you@example.com",
         "kind": "person",
         "name": "Gui"
       },
@@ -19,7 +19,7 @@
       "id": "tk_bce17d50234a4e85",
       "open": true,
       "source": "web",
-      "source_url": "https://agent.guibibeau.com/?t=wc_cccccccccccccccccccccccccccccccc",
+      "source_url": "https://agent.example.com/?t=wc_cccccccccccccccccccccccccccccccc",
       "spent_microusd": 0,
       "stage": "answer",
       "title": "Rotate the staging keys",

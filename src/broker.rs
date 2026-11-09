@@ -2120,6 +2120,7 @@ mod tests {
             provider: "venice".into(),
             model: "deepseek-v4-1-flash-uncensored".into(),
             dialect: Dialect::OpenAi,
+            base_url: None,
         });
         assert!(goal.validate().is_err());
         goal.model = "deepseek-v4-1-flash-uncensored".into();

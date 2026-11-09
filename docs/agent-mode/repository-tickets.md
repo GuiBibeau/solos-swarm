@@ -268,7 +268,7 @@ stay with the repository's CI.
 
 **Why the worker runs the command and the host does not.** The host could run the command itself after `admit`, on a
 fresh checkout of the admitted head, and append the JSON, which a worker could then neither mangle nor make up. That is
-the more trustworthy design, and it is not this one, for now. `verify` takes about a minute on `GuiBibeau/solos` and
+the more trustworthy design, and it is not this one, for now. `verify` takes about a minute on `acme/tools` and
 more on a bigger repository. That is too long to hold a `worker_report` call (the Pi extension's broker call times out
 at 11 minutes) or the mirror's lock. The result would also have to cross from `admit` to `Publish` and go into a
 description that the host builds from the worker's text. The gate above catches a missing, malformed, failed or dirty

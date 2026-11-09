@@ -6,7 +6,7 @@ vi.mock("@vercel/blob", () => ({ get }));
 const { readIndex, readJobs, readTicket, validTicketId, StoreError } = await import("@/lib/blob");
 import type { Viewer } from "@/lib/viewer-core";
 
-const viewer = { email: "g.bibeaulaviolette@gmail.com" } as Viewer;
+const viewer = { email: "you@example.com" } as Viewer;
 
 function found(body: unknown) {
   return {

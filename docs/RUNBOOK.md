@@ -2,7 +2,7 @@
 
 This runbook takes one swarm run on a Linux host from build to evidence with `scripts/remote.py`. The script runs
 on the controller, your Mac, and drives the host over SSH. Each run is one Goal played by 1 to 30 sandboxed Pi
-agents under a transient systemd user unit. The host is `remote-ai` in the examples.
+agents under a transient systemd user unit. The host is `host-a` in the examples.
 
 Related pages:
 
@@ -33,7 +33,7 @@ On the host you need bubblewrap (`bwrap`), a systemd user manager, `python3`, Ru
 Tell the script which host to use. Without this it uses the alias `solos-node`:
 
 ```sh
-export SOLOS_SWARM_SSH_TARGET=remote-ai     # or pass --host remote-ai to each command
+export SOLOS_SWARM_SSH_TARGET=host-a     # or pass --host host-a to each command
 ```
 
 ## Check the host
@@ -141,7 +141,7 @@ For a per-agent table, run `scripts/swarm_progress.py` on the host against the r
 source checkout, so send the script from the Mac:
 
 ```sh
-ssh remote-ai python3 - .local/state/solos-swarm/runs/RUN < scripts/swarm_progress.py
+ssh host-a python3 - .local/state/solos-swarm/runs/RUN < scripts/swarm_progress.py
 ```
 
 Spend that stays flat while agents run means the broker is paused: by the peak window, by an operator, or by a

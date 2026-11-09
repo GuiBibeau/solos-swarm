@@ -8,7 +8,7 @@ import type { Deps } from "@/lib/auth-flow";
 export const CLIENT_ID = "cl_test_client";
 export const CLIENT_SECRET = "shh-client-secret";
 export const ORIGIN = "https://agent.example";
-export const OWNER = "g.bibeaulaviolette@gmail.com";
+export const OWNER = "you@example.com";
 
 export const config: AuthConfig = {
   clientId: CLIENT_ID,

@@ -1,0 +1,93 @@
+# agent.yaml.example: a copyable agent-mode config for a generic deployment.
+#
+# Copy this file to agent.yaml and fill every <placeholder>. `agent serve`
+# checks every field at load: an unknown one, or a typo, stops it with a
+# sentence. A relative path is relative to this file. Every token_file and
+# key_file is a one-use file: the agent reads it once and deletes it, so keep
+# a durable copy and place a fresh one before each start. Keep those files
+# outside every path a sandbox can read.
+#
+# Every field is in docs/agent-mode/configuration.md. The step-by-step from a
+# clone to the first Ticket is docs/agent-mode/how-to/adopting.md.
+
+policy:
+  # A principal is <source>:<id>. GitHub logins are lowercase.
+  people:
+    - "github:<your-github-login>"      # who may ask for work
+    - "discord:123456789012345678"      # your Discord user id
+    - "mcp:you"                         # solos-swarm mcp --operator you
+    - "web:you@example.com"             # the dashboard chat, if you turn it on
+  approvers:
+    - "github:<your-github-login>"      # who may approve a budget above
+    - "discord:123456789012345678"      # auto_approve_microusd
+    - "web:you@example.com"
+  auto_approve_microusd: 500000         # a budget above this waits for Approve
+  # off: explicit requests only. observe: record what the Router would accept
+  # and start nothing. auto: start an inferred candidate that matches a rule.
+  accept_mode: observe
+  # A Source listed here always gets an answer. `web` pairs with web.chat in
+  # the commented block below; remove it if you do not turn the chat on.
+  answer_sources: [web]
+
+sources:
+  # Discord is optional. Remove this Source and the discord Channel together
+  # if you do not use it.
+  - kind: discord
+    guilds: [123456789012345678]        # your server's id
+    # channels: [123456789012345678]    # optional: only these channels
+    token_file: secrets/discord-token   # a one-use file
+  - kind: github                        # no fields: it reads forge.repos as the App
+  - kind: mcp                           # requests filed by solos-swarm mcp
+
+channels:
+  - kind: discord                       # needs the discord Source above
+  - kind: github                        # comments as the App's bot
+  - kind: mcp
+
+router:
+  kind: pi
+  provider: deepseek                    # the names `run --provider` takes
+  model: deepseek-flash
+  # The admitted floor: $0.30 per million input and $1.20 per million output
+  # tokens, in microUSD. Raise them to what your provider charges.
+  prices: {input_microusd_per_million: 300000, output_microusd_per_million: 1200000}
+
+executor:
+  kind: pi
+  provider: deepseek                    # one key serves the Router and workers
+  model: deepseek-flash
+  prices: {input_microusd_per_million: 300000, output_microusd_per_million: 1200000}
+  max_workers: 2                        # 1 to 64
+  run_code: {}                          # the forge needs it: workers run git in their clones
+
+github:
+  app_id: 123456                        # the App's numeric id
+  key_file: secrets/github-app.pem      # its private key, a one-use file
+  # poll_secs: 60
+  # writes: true                        # false: no write token, so the agent writes nothing
+
+forge:
+  kind: github
+  repos:
+    "<owner>/<name>":                   # a repository the App is installed on
+      about: What this repository is, for the Router.
+      base: main                        # the branch each Ticket starts from
+      owes: answer                      # answer, change or pull_request
+      models: {allow: [deepseek]}       # the providers its text may reach
+    "<owner>/<second-name>":
+      about: What the second repository is, for the Router.
+      base: main
+      owes: pull_request
+      models: {allow: [deepseek]}
+
+# Optional. The dashboard is a Vercel app: it reads a private Vercel Blob
+# store and signs people in with Sign in with Vercel. `web.chat` also needs a
+# jsonl Source and Channel and `web:<email>` in policy.people; the full block
+# is in docs/agent-mode/configuration.md#web. Uncomment it to publish.
+# web:
+#   public_url: https://agent.example.com
+#   publish:
+#     token_file: secrets/vercel-blob-token   # a one-use file
+#   chat:
+#     inbox: web/inbox.json
+#     people: [you@example.com]

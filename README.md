@@ -29,6 +29,21 @@ The second command prints one JSON line with `"verdict":"PASS"` and `"live_spend
 `drain_holds_nothing` and `resume_keeps_ledger`. It runs the binary's own broker, ledger, pause gate, drain and resume
 against a scripted provider.
 
+## Make it yours
+
+Agent mode is the always-on half: a Router judges requests from Discord, GitHub and MCP, and sandboxed workers do
+the work. [agent.yaml.example](agent.yaml.example) is a config to copy and fill, and
+[docs/agent-mode/how-to/adopting.md](docs/agent-mode/how-to/adopting.md) walks from a clone to the first issue that
+tags the bot.
+
+Three limits are worth knowing first. The shipped providers are `deepseek`, `venice`, `zhipu` and `zhipu-coding`
+(Anthropic is policy-only); a custom OpenAI-compatible endpoint can be configured as a named upstream, though the
+broker's one-transport limit still refuses a Ticket on it until the per-upstream map lands. The forge is GitHub-only. The hosted dashboard is a Vercel app with a private Blob store and Sign in with
+Vercel, the web chat needs it, and deployment assumes systemd user units on one Linux host.
+
+[docs/agent-mode/configuration.md](docs/agent-mode/configuration.md) has every field, and
+[docs/agent-mode/production.md](docs/agent-mode/production.md) is the runbook for the box.
+
 ## Numbers
 
 <p align="center">

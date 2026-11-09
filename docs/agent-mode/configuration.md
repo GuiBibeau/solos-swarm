@@ -556,8 +556,8 @@ channels:
     source: web
     path: state/web/replies.jsonl
 policy:
-  people: [web:g.bibeaulaviolette@gmail.com]
-  approvers: [web:g.bibeaulaviolette@gmail.com]
+  people: [web:you@example.com]
+  approvers: [web:you@example.com]
 ```
 
 A web message's principal is `web:<author email>`, so `policy.people` must name the same address as `web.chat.people`.

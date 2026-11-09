@@ -100,7 +100,7 @@ auth file. A Coding Plan key needs the plan's base URL, `https://api.z.ai/api/co
     "zai": {
       "baseUrl": "https://api.z.ai/api/coding/paas/v4",
       "api": "openai-completions",
-      "apiKey": "!jq -r '.zai.key' /Users/guillaume/.pi/agent/auth.json",
+      "apiKey": "!jq -r '.zai.key' /home/you/.pi/agent/auth.json",
       "compat": {
         "supportsDeveloperRole": false,
         "supportsReasoningEffort": true,

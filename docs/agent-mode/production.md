@@ -3,7 +3,7 @@
 This runbook is for the person who operates the always-on agent. One box runs `solos-swarm agent serve` as the systemd
 user unit `solos-agent`, with three helper units beside it: the dashboard publisher, the health check and the daily
 prune. You run `scripts/agent-deploy` on the Mac, in this repository, and it does the work on the box over SSH. The box
-is `remote-ai` unless `AGENT_HOST` names another, and the agent runs as the user that SSH logs in as (`AGENT_USER`
+is `host-a` unless `AGENT_HOST` names another, and the agent runs as the user that SSH logs in as (`AGENT_USER`
 names another). Everything on the box is under that user's `~/agent` ([layout](#layout-on-the-box)).
 
 Run the agent as a user of its own, with no sudo and no groups, so that anything that escapes a worker, or runs on the
@@ -60,8 +60,8 @@ vault key.
 ```yaml
 # ~/agent/agent.yaml on the box
 policy:
-  people: [discord:<your Discord user id>, mcp:<your name>, github:<your GitHub login>, web:g.bibeaulaviolette@gmail.com]
-  approvers: [discord:<your Discord user id>, github:<your GitHub login>, web:g.bibeaulaviolette@gmail.com]
+  people: [discord:<your Discord user id>, mcp:<your name>, github:<your GitHub login>, web:you@example.com]
+  approvers: [discord:<your Discord user id>, github:<your GitHub login>, web:you@example.com]
   auto_approve_microusd: 500000            # a budget above this waits for Approve
   answer_sources: [web]                    # a chat message is always answered, even where the Router would ignore it
 sources:
@@ -99,14 +99,14 @@ github:
 forge:
   kind: github
   repos:
-    GuiBibeau/solos:
+    acme/tools:
       about: solos, one binary agents call to trade across venues (JavaScript).
       base: main
       owes: pull_request                   # the most the agent does here
       models: {allow: [deepseek]}          # the only provider its text may reach
       deps: {kind: bun}                    # the host installs bun.lock's dependencies
       evidence: {command: "bun run solos dev verify --scope unit --json"}
-    GuiBibeau/solos-swarm:
+    acme/widgets:
       about: solos-swarm, the agent's own code (Rust and TypeScript).
       base: main                           # no owes: it defaults to answer, so the agent only reads here
       models: {allow: [deepseek, anthropic]}
@@ -122,12 +122,12 @@ watchdog:
 health:
   min_free_gb: 50                          # pause new work below 50 GB free on the state directory's disk
 web:
-  public_url: https://agent.guibibeau.com
+  public_url: https://agent.example.com
   publish:
     token_file: /run/user/1000/solos-agent-publish/vercel-blob-token
   chat:
     inbox: web/inbox.json                  # the dashboard writes it on every send
-    people: [g.bibeaulaviolette@gmail.com] # the only author whose messages become Triggers
+    people: [you@example.com] # the only author whose messages become Triggers
     # spool: state/web/triggers.jsonl      # the default: <state>/web/triggers.jsonl
 ```
 
@@ -210,7 +210,7 @@ Every command prints how long its parts took. A deploy that went well ends like 
 sent 53f30cbf570b (3s)
 compiled in 71s
 built release 53f30cbf570b in 77s
-backed up agent.db to /home/debian/agent/backups/20261107T142301Z-ebb9f39ae70a
+backed up agent.db to /home/you/agent/backups/20261107T142301Z-ebb9f39ae70a
 release 53f30cbf570b is serving (pid 812345)
 switch took 24s: drain 0s, stop 2s, backup 0s, units and start 1s, health wait 21s
 unpaused
@@ -393,7 +393,7 @@ reads `forge-token`. Delete it from `~/agent/tokens`.
 ## Install a repository's dependencies and require evidence
 
 A worker's sandbox has no network, and its clone has no `node_modules`. So a JavaScript repository's checks cannot run
-there, and a pull request without their proof fails that repository's CI. `GuiBibeau/solos` wants the JSON of
+there, and a pull request without their proof fails that repository's CI. `acme/tools` wants the JSON of
 `bun run solos dev verify --scope unit --json` under `## Evidence` in every pull request (its `AGENTS.md`, "Evidence").
 Two keys on its repository handle both:
 
@@ -401,7 +401,7 @@ Two keys on its repository handle both:
 # ~/agent/agent.yaml
 forge:
   repos:
-    GuiBibeau/solos:
+    acme/tools:
       about: ...
       base: main
       owes: pull_request
@@ -411,7 +411,7 @@ forge:
 ```
 
 - `deps`: the first time a Ticket on the repository starts, the host installs the dependencies from `bun.lock` at the
-  base commit into `state/deps/GuiBibeau/solos/<key>/`. On the box that cache is 2.2 GiB. A later Ticket mounts the same
+  base commit into `state/deps/acme/tools/<key>/`. On the box that cache is 2.2 GiB. A later Ticket mounts the same
   cache read-only, and a new lockfile on `main` makes a new cache. The install runs in its own sandbox, the one place
   besides the browser that reaches the network.
 - `deps.memory_bytes` is the address space (a cap, not memory used) for this repository's `run_code`, 16 GiB by
@@ -424,7 +424,7 @@ The box needs `bun`, `bwrap` and `prlimit`. Keep `state/` off a tmpfs, because a
 removes a cache no Ticket has used for its `--keep-days`. What the mechanism trusts and what it leaves to CI is in
 [Install dependencies and require evidence](how-to/repositories.md#install-dependencies-and-require-evidence).
 
-A Rust repository, `GuiBibeau/solos-swarm` here, asks for `deps: {kind: cargo, binary: <toolchain>/bin/cargo}` instead,
+A Rust repository, `acme/widgets` here, asks for `deps: {kind: cargo, binary: <toolchain>/bin/cargo}` instead,
 and its Tickets then build and test offline. The box needs the toolchain, `cc`, `bwrap` and `prlimit`, and no
 `run_code.mounts` entry:
 [Build a Rust repository offline](how-to/repositories.md#build-a-rust-repository-offline).
@@ -441,7 +441,7 @@ Operate it from the box:
 
 ```sh
 ssh <box> '~/agent/current/bin/solos-swarm agent memo list --state-dir ~/agent/state'          # --all adds retired and forgotten memos
-ssh <box> '~/agent/current/bin/solos-swarm agent memo add --state-dir ~/agent/state --operator <your name> --scope repo:GuiBibeau/solos "Tests run with bun test"'
+ssh <box> '~/agent/current/bin/solos-swarm agent memo add --state-dir ~/agent/state --operator <your name> --scope repo:acme/tools "Tests run with bun test"'
 ssh <box> '~/agent/current/bin/solos-swarm agent memo retire --state-dir ~/agent/state --operator <your name> mm_0123456789abcdef --reason "no longer true"'
 ssh <box> '~/agent/current/bin/solos-swarm agent memo forget --state-dir ~/agent/state --operator <your name> mm_0123456789abcdef'
 ```
@@ -460,7 +460,7 @@ reasons and keeps its digest, so the event chain still verifies.
 
 ## Dashboard
 
-The dashboard is a web page of the agent's tickets at `https://agent.guibibeau.com`, behind Sign in with Vercel, for one
+The dashboard is a web page of the agent's tickets at `https://agent.example.com`, behind Sign in with Vercel, for one
 person. The box accepts no inbound connection, so it pushes:
 
 ```text
@@ -469,7 +469,7 @@ solos-agent  --writes-->  agent.db  --read-only-->  solos-agent-publish  --HTTPS
      |                                                  +--> state/web/triggers.jsonl
      +-- its jsonl Source (source: web) follows the spool, and its jsonl Channel writes state/web/replies.jsonl
                                                                                                   |
-                                       you  -->  agent.guibibeau.com (web/agent-dashboard)  <--reads, server side
+                                       you  -->  agent.example.com (web/agent-dashboard)  <--reads, server side
 ```
 
 `solos-swarm agent publish` runs as the unit `solos-agent-publish`. It opens `agent.db` read-only and looks at it every
@@ -505,14 +505,14 @@ minutes ([External jobs](runtime.md#external-jobs)).
 
    ```yaml
    web:
-     public_url: https://agent.guibibeau.com      # https, no trailing slash: a ticket's page is {public_url}/tickets/{id}
+     public_url: https://agent.example.com      # https, no trailing slash: a ticket's page is {public_url}/tickets/{id}
      publish:
        token_file: /run/user/1000/solos-agent-publish/vercel-blob-token
        every_secs: 5                              # optional, 1 to 3600
        heartbeat_secs: 300                        # optional, every_secs to 86400
      chat:                                        # optional: the dashboard's chat becomes Triggers
        inbox: web/inbox.json
-       people: [g.bibeaulaviolette@gmail.com]     # also add web:<this email> to policy.people and approvers
+       people: [you@example.com]     # also add web:<this email> to policy.people and approvers
    ```
 
    With `chat`, also add the jsonl Source and Channel and the `web:` principals from the production config above
@@ -578,7 +578,7 @@ and each reply, so a busy hour is tens of puts. An idle day is about 290: one in
 
 ### Chat from the web
 
-The dashboard's chat (at `/` on `agent.guibibeau.com`) writes `web/inbox.json` into the same private Blob store on every
+The dashboard's chat (at `/` on `agent.example.com`) writes `web/inbox.json` into the same private Blob store on every
 send. Its own server function is the only writer, after Sign in with Vercel; the browser never holds the Blob token.
 With `web.chat` in `web:`, every look of `agent publish` also reads that blob with the publisher's Blob token, at
 `https://<storeId>.private.blob.vercel-storage.com/web/inbox.json?cache=0`, and appends each new message from a person
@@ -591,7 +591,7 @@ Each message becomes a Trigger with:
 - `actor: {id: "<author email>", kind: "person", name: "<name>"}` (no `name` when the dashboard has none), so the
   principal is `web:<author email>`
 - `threads: ["web:<thread>"]` and `reply_to: [{source: "web", address: {thread: "<thread>"}}]`
-- `meta: {thread: "<thread>", url: "https://agent.guibibeau.com/?t=<thread>"}`
+- `meta: {thread: "<thread>", url: "https://agent.example.com/?t=<thread>"}`
 
 The ticket's `source_url`, in `tickets/index.json` and in its snapshot, is that same address. The dashboard matches a
 conversation's thread to its ticket through it. `state/web/replies.jsonl`, written by the `source: web` jsonl Channel,
@@ -813,7 +813,7 @@ that runs on the host from a repository, reaches the agent's own files and the n
 runs it as the main user, which has passwordless sudo and owns the other services.
 
 Nothing in the repository assumes a user name or uid. `scripts/agent-deploy` logs in as `AGENT_USER` when it is set,
-and as the SSH config's user otherwise. This section moves an agent from one user (`debian` below) to a new one
+and as the SSH config's user otherwise. This section moves an agent from one user (`you` below) to a new one
 (`solos-agent`). Do it when the agent has nothing running that you mind interrupting, and plan for the downtime of one
 cold build: the new user builds its own release. The old user's `~/agent` stays untouched until you are sure, so
 rolling back is starting it again.
@@ -833,17 +833,17 @@ ls -d /run/user/$(id -u solos-agent) # exists: lingering started its systemd
 From the Mac, put the key the Mac logs in with into the new user's `authorized_keys`, and check that it works:
 
 ```sh
-ssh remote-ai "sudo -Hu solos-agent sh -c 'umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys'" < ~/.ssh/<key>.pub
-ssh -l solos-agent remote-ai id
+ssh host-a "sudo -Hu solos-agent sh -c 'umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys'" < ~/.ssh/<key>.pub
+ssh -l solos-agent host-a id
 ```
 
 `useradd` leaves the password locked, and keys still work because sshd uses PAM on Debian. If SSH refuses the account,
 set its password field to `*` with `sudo usermod -p '*' solos-agent`. `-l` beats the `User` of your ssh config for that
-one command, so the `remote-ai` alias and its key serve both users.
+one command, so the `host-a` alias and its key serve both users.
 
 ### 2. Give it the build tools
 
-As the new user (`ssh -l solos-agent remote-ai`), the same as [Before you start](#before-you-start): rustup with
+As the new user (`ssh -l solos-agent host-a`), the same as [Before you start](#before-you-start): rustup with
 toolchain 1.96.0, Node 24.18.0 at `~/.local/opt/node-v24.18.0-linux-x64/`, and `bun` at `~/.bun/bin/bun` for a repository
 with `deps`. `bwrap` and `prlimit` are the box's. Nothing is shared with the old user's home, which the new user cannot
 read.
@@ -856,7 +856,7 @@ units are disabled so that neither a reboot nor the old health check brings it o
 ```sh
 scripts/agent-deploy releases                  # note the release marked (current)
 scripts/agent-deploy stop                      # drains, then stops the publisher and the agent
-ssh remote-ai 'systemctl --user disable --now solos-agent solos-agent-publish solos-agent-health.timer solos-agent-prune.timer'
+ssh host-a 'systemctl --user disable --now solos-agent solos-agent-publish solos-agent-health.timer solos-agent-prune.timer'
 ```
 
 Leave out `solos-agent-publish` if you never turned on the dashboard.
@@ -868,19 +868,19 @@ On the box, as a user with sudo. Copy `agent.yaml`, the tokens, the state and th
 user builds its own.
 
 ```sh
-sudo install -d -m 0700 -o solos-agent -g solos-agent /home/solos-agent/agent
-sudo cp -a /home/debian/agent/{agent.yaml,tokens,state,backups} /home/solos-agent/agent/
-sudo rm -f /home/solos-agent/agent/state/broker.sock
-sudo chown -R solos-agent:solos-agent /home/solos-agent/agent
+sudo install -d -m 0700 -o solos-agent -g solos-agent /home/agent/agent
+sudo cp -a /home/you/agent/{agent.yaml,tokens,state,backups} /home/agent/agent/
+sudo rm -f /home/agent/agent/state/broker.sock
+sudo chown -R solos-agent:solos-agent /home/agent/agent
 ```
 
-Then edit `/home/solos-agent/agent/agent.yaml`. Every `/run/user/<uid>/` path (`token_file`, `key_file`) takes the new
-uid, and every path under `/home/debian/` takes one the new user can read, such as `run_code` mounts of Node and `bun`:
+Then edit `/home/agent/agent/agent.yaml`. Every `/run/user/<uid>/` path (`token_file`, `key_file`) takes the new
+uid, and every path under `/home/you/` takes one the new user can read, such as `run_code` mounts of Node and `bun`:
 
 ```sh
-sudo sed -i -E "s|/run/user/[0-9]+/|/run/user/$(id -u solos-agent)/|g; s|/home/debian/|/home/solos-agent/|g" \
-  /home/solos-agent/agent/agent.yaml
-sudo grep -n '/home/\|/run/user/' /home/solos-agent/agent/agent.yaml   # nothing of the old user's is left
+sudo sed -i -E "s|/run/user/[0-9]+/|/run/user/$(id -u solos-agent)/|g; s|/home/you/|/home/agent/|g" \
+  /home/agent/agent/agent.yaml
+sudo grep -n '/home/\|/run/user/' /home/agent/agent/agent.yaml   # nothing of the old user's is left
 ```
 
 A dataset or a repository checkout that only the old user can read is not readable by the new one. Give it exactly
@@ -907,7 +907,7 @@ stops anything, if `agent.yaml` names another uid's `/run/user` directory.
 
 ```sh
 AGENT_USER=solos-agent scripts/agent-deploy status             # "user: solos-agent (uid ...)", the release, no health incident
-ssh -l solos-agent remote-ai 'id; sudo -n true; systemctl --user show solos-agent -p NoNewPrivileges -p ProtectHome'
+ssh -l solos-agent host-a 'id; sudo -n true; systemctl --user show solos-agent -p NoNewPrivileges -p ProtectHome'
 ```
 
 `id` shows one group, `sudo -n true` is refused, and the unit shows `NoNewPrivileges=yes` and
@@ -922,7 +922,7 @@ After the agent has run as the new user for several days: remove the old agent's
 tokens the old home held, because they stay readable to its owner.
 
 ```sh
-ssh remote-ai 'rm -f ~/.config/systemd/user/solos-agent*.service ~/.config/systemd/user/solos-agent*.timer; \
+ssh host-a 'rm -f ~/.config/systemd/user/solos-agent*.service ~/.config/systemd/user/solos-agent*.timer; \
   rm -rf ~/.config/systemd/user/solos-agent-publish.service.d; systemctl --user daemon-reload; \
   shred -u ~/agent/tokens/* ; rm -rf ~/agent'
 ```
@@ -937,8 +937,8 @@ units so a reboot does not start them, and start the old ones:
 
 ```sh
 AGENT_USER=solos-agent scripts/agent-deploy stop
-ssh -l solos-agent remote-ai 'systemctl --user disable --now solos-agent solos-agent-publish solos-agent-health.timer solos-agent-prune.timer'
-ssh remote-ai 'systemctl --user enable --now solos-agent solos-agent-publish solos-agent-health.timer solos-agent-prune.timer'
+ssh -l solos-agent host-a 'systemctl --user disable --now solos-agent solos-agent-publish solos-agent-health.timer solos-agent-prune.timer'
+ssh host-a 'systemctl --user enable --now solos-agent solos-agent-publish solos-agent-health.timer solos-agent-prune.timer'
 scripts/agent-deploy status
 ```
 
@@ -1017,7 +1017,7 @@ thread per core filled the publisher's `TasksMax` and hung its uploads.
 | `--drain SECONDS` | How long a drain waits. Default 90. |
 | `--no-drain` | No drain: stop at once. |
 | `AGENT_DRAIN_SECS` | The default for `--drain`. |
-| `AGENT_HOST` | The box. Default `remote-ai`. |
+| `AGENT_HOST` | The box. Default `host-a`. |
 | `AGENT_USER` | The user the agent runs as: SSH logs in with `-l`, which beats the `User` of your ssh config. Default: whatever the config or the Mac's login says. Letters, digits, `_` and `-`. |
 
 On the box, `bash ~/agent/.agent-deploy --on-host drain [SECONDS]`, `--on-host resume` and

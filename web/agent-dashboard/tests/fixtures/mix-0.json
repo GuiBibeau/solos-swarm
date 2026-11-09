@@ -77,13 +77,13 @@
     "who": "Gui"
   },
   "requester": {
-    "id": "g.bibeaulaviolette@gmail.com",
+    "id": "you@example.com",
     "kind": "person",
     "name": "Gui"
   },
   "scope": "Rotate the staging keys",
   "source": "web",
-  "source_url": "https://agent.guibibeau.com/?t=wc_cccccccccccccccccccccccccccccccc",
+  "source_url": "https://agent.example.com/?t=wc_cccccccccccccccccccccccccccccccc",
   "spent_microusd": 0,
   "stage": "answer",
   "title": "Rotate the staging keys",

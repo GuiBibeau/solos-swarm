@@ -200,12 +200,12 @@ mod tests {
     #[test]
     fn the_documented_section_loads_with_its_defaults() {
         let config = web("
-public_url: https://agent.guibibeau.com
+public_url: https://agent.example.com
 publish:
   token_file: /run/user/1000/solos-agent/vercel-blob-token
 ")
         .unwrap();
-        assert_eq!(config.public_url, "https://agent.guibibeau.com");
+        assert_eq!(config.public_url, "https://agent.example.com");
         assert_eq!(
             config.publish,
             Some(PublishConfig {
@@ -217,25 +217,25 @@ publish:
         );
         assert_eq!(
             config.ticket_url(&TicketId::new("tk_0123456789abcdef")),
-            "https://agent.guibibeau.com/tickets/tk_0123456789abcdef"
+            "https://agent.example.com/tickets/tk_0123456789abcdef"
         );
     }
 
     #[test]
     fn links_alone_need_no_publisher() {
-        let config = web("public_url: https://agent.guibibeau.com").unwrap();
+        let config = web("public_url: https://agent.example.com").unwrap();
         assert_eq!(config.publish, None);
     }
 
     #[test]
     fn a_public_url_is_an_https_origin_with_no_trailing_slash() {
         for bad in [
-            "http://agent.guibibeau.com",
-            "https://agent.guibibeau.com/",
-            "https://agent.guibibeau.com/?x=1",
-            "https://agent.guibibeau.com#top",
-            "https://user:pw@agent.guibibeau.com",
-            "agent.guibibeau.com",
+            "http://agent.example.com",
+            "https://agent.example.com/",
+            "https://agent.example.com/?x=1",
+            "https://agent.example.com#top",
+            "https://user:pw@agent.example.com",
+            "agent.example.com",
             "https://",
             "",
         ] {
@@ -273,20 +273,17 @@ publish:
     #[test]
     fn the_chat_inbox_loads_beside_the_publisher() {
         let config = web("
-public_url: https://agent.guibibeau.com
+public_url: https://agent.example.com
 publish:
   token_file: blob.token
 chat:
   inbox: web/inbox.json
-  people: [g.bibeaulaviolette@gmail.com]
+  people: [you@example.com]
 ")
         .unwrap();
         let chat = config.chat.unwrap();
         assert_eq!(chat.inbox, "web/inbox.json");
-        assert_eq!(
-            chat.people.iter().collect::<Vec<_>>(),
-            ["g.bibeaulaviolette@gmail.com"]
-        );
+        assert_eq!(chat.people.iter().collect::<Vec<_>>(), ["you@example.com"]);
         assert_eq!(chat.spool, None, "the state directory fills the default");
     }
 

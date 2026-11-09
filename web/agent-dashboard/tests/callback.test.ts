@@ -191,7 +191,7 @@ describe("the callback", () => {
   });
 
   it("lets nobody in who is not on the allowlist, whoever Vercel says they are", async () => {
-    for (const email of ["mallory@example.com", `x${OWNER}`, `${OWNER}.evil.com`, "bibeaulaviolette@gmail.com"]) {
+    for (const email of ["mallory@example.com", `x${OWNER}`, `${OWNER}.evil.com`, "you@example.org"]) {
       const { response } = await signIn({ email });
       expect(location(response), email).toBe(`${ORIGIN}/login?error=forbidden`);
       expect(setCookies(response)[SESSION_COOKIE]).toBeUndefined();

@@ -14,7 +14,7 @@ github: {app_id: 123456, key_file: secrets/github-app.pem}   # the App; see "Set
 forge:
   kind: github                             # the clone's commits are by the App's bot
   repos:
-    GuiBibeau/solos-swarm:
+    acme/widgets:
       about: The agent's own code, Rust and TypeScript.   # the Router reads this
       base: main                           # each clone starts at its tip
       budget_microusd: 3000000             # an accept that names no budget gets this
@@ -83,7 +83,7 @@ worker's report carry what the repository's CI asks of a pull request.
 ```yaml
 forge:
   repos:
-    GuiBibeau/solos:
+    acme/tools:
       about: ...
       base: main
       owes: pull_request
@@ -93,7 +93,7 @@ forge:
 ```
 
 - The host needs `bun`, `bwrap` and `prlimit`.
-- Keep `<state>` off a tmpfs. A large dependency tree uses many inodes: about 234,000 for `GuiBibeau/solos`.
+- Keep `<state>` off a tmpfs. A large dependency tree uses many inodes: about 234,000 for `acme/tools`.
 - Bun (JavaScriptCore) reserves a great deal of address space and aborts under about 8 GiB. `deps.memory_bytes` raises
   the address-space cap of `run_code` for this repository's Tickets only, and never lowers it.
 - Prefer the text lockfile, `bun.lock`. A lockfile that needs a private registry or a scope token is not supported.
@@ -114,7 +114,7 @@ and the toolchain read-only, and cargo is set to the vendored sources and to off
 # agent.yaml
 forge:
   repos:
-    GuiBibeau/solos-swarm:
+    acme/widgets:
       about: solos-swarm, the agent's own code (Rust and TypeScript).
       base: main
       owes: pull_request
@@ -122,7 +122,7 @@ forge:
       deps:
         kind: cargo
         # Required, and the cargo of one toolchain, not rustup's proxy at ~/.cargo/bin/cargo.
-        binary: /home/debian/.rustup/toolchains/1.96.0-x86_64-unknown-linux-gnu/bin/cargo
+        binary: /home/you/.rustup/toolchains/1.96.0-x86_64-unknown-linux-gnu/bin/cargo
         # memory_bytes: 17179869184   # the address space of `rustc` in run_code; 16 GiB by default, 6 GiB is enough
       notes: Test a crate with `cargo test -p solos-agent-core --offline`. Build the root crate with job_start.
 ```
