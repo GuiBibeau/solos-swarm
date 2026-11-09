@@ -4,8 +4,8 @@
 //!
 //! `forge.repos.<repo>.models` is required on every repository, so no
 //! repository reaches a provider by default. The providers are
-//! `deepseek`, `venice` and `anthropic`; an upstream runs on `deepseek` or
-//! `venice` in this build.
+//! `deepseek`, `venice`, `zhipu`, `zhipu-coding` and `anthropic`; an upstream
+//! runs on every one but `anthropic` in this build.
 
 use super::config::{ExecutorConfig, HarnessKind, UpstreamConfig};
 use crate::gateway::{Wire, endpoint, upstream_profile};
@@ -23,6 +23,13 @@ use std::collections::{BTreeMap, BTreeSet};
 pub enum Provider {
     Deepseek,
     Venice,
+    /// Zhipu's pay-as-you-go API.
+    Zhipu,
+    /// Zhipu's GLM Coding Plan: the same models on the plan's own endpoint
+    /// and quota. A plan key is refused on the pay-as-you-go endpoint
+    /// (error 1113), so the two are separate providers.
+    #[serde(rename = "zhipu-coding")]
+    ZhipuCoding,
     /// Admitted in a repository's `allow` from this release, but no upstream
     /// runs on it until its transport and key land.
     Anthropic,
@@ -33,6 +40,8 @@ impl Provider {
         match self {
             Self::Deepseek => "deepseek",
             Self::Venice => "venice",
+            Self::Zhipu => "zhipu",
+            Self::ZhipuCoding => "zhipu-coding",
             Self::Anthropic => "anthropic",
         }
     }
@@ -41,6 +50,8 @@ impl Provider {
         match name {
             "deepseek" => Ok(Self::Deepseek),
             "venice" => Ok(Self::Venice),
+            "zhipu" => Ok(Self::Zhipu),
+            "zhipu-coding" => Ok(Self::ZhipuCoding),
             "anthropic" => Ok(Self::Anthropic),
             other => bail!("provider outside the deployment allowlist: {other}"),
         }
@@ -51,7 +62,7 @@ impl Provider {
     fn upstream_here(self) -> Result<Self> {
         ensure!(
             self != Self::Anthropic,
-            "provider anthropic is not admitted yet: an upstream runs on deepseek or venice"
+            "provider anthropic is not admitted yet: an upstream runs on deepseek, venice, zhipu or zhipu-coding"
         );
         Ok(self)
     }

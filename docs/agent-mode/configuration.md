@@ -115,8 +115,8 @@ still open is ignored, as a follow-up that Ticket already has. `agent bench` use
 
 | Field | Default | Meaning |
 |---|---|---|
-| `provider` | required | `deepseek` or `venice`, the names `solos-swarm run --provider` takes. When the executor is `pi` too, both name one provider, since one credential serves both. |
-| `model` | required | Any model for `deepseek`. For `venice`, a model whose id starts with `deepseek-v4-1-flash-uncensored` or `zai-org-glm-5`. |
+| `provider` | required | `deepseek`, `venice`, `zhipu` or `zhipu-coding`, the names `solos-swarm run --provider` takes. When the executor is `pi` too, both name one provider, since one credential serves both. |
+| `model` | required | Any model for `deepseek`. For `zhipu` or `zhipu-coding`, exactly `glm-5.3`, `glm-5.3-flash` or `glm-5.3-flashx`. For `venice`, a model whose id starts with `deepseek-v4-1-flash-uncensored` or `zai-org-glm-5`. |
 | `prices` | required | `input_microusd_per_million` (at least 300000), `output_microusd_per_million` (at least 1200000), both at most 10000000, and optional `cache_hit_microusd_per_million`. Without a cache-hit rate, every input token settles at the input rate. |
 | `max_input_bytes` | `1048576` | 1 to 16777216. |
 | `max_output_tokens` | `8192` | 1 to 393216. |
@@ -153,7 +153,7 @@ its Ticket's budget:
 | `swarm` | none | How `Plan::Swarm` Tickets run. Without it, they fail. See [executor.swarm](#executorswarm). |
 | `harness` | `pi` | The harness of a session Ticket whose Plan names none: `pi` or `claude-code`. `claude-code` needs `claude`. |
 | `claude` | none | Where Claude Code is. See [executor.claude](#executorclaude). |
-| `wire` | `chat` | How a Claude Code session's Messages calls reach `provider`: `chat` translates them onto its chat completions, or `anthropic` forwards them to its own Messages endpoint with the broker's key. `anthropic` needs `claude`, and only `deepseek` serves it. See [executor.wire](#executorwire). |
+| `wire` | `chat` | How a Claude Code session's Messages calls reach `provider`: `chat` translates them onto its chat completions, or `anthropic` forwards them to its own Messages endpoint with the broker's key. `anthropic` needs `claude`, and only `deepseek` serves it; `zhipu` and `zhipu-coding` have only a `chat` wire here. See [executor.wire](#executorwire). |
 | `web_search` | none | The provider's own web search, which the broker adds to every call it forwards. Needs `wire: anthropic`. See [executor.web_search](#executorweb_search). |
 | `environment` | `local` | Where a session's commands run when its Plan names nowhere: `local` or a node in `nodes.allow`. |
 | `upstreams` | empty | Other upstreams a Ticket may run on, by name. Each has its own provider, model, wire, harness and key file. See [executor.upstreams](#executorupstreams). |
@@ -166,9 +166,9 @@ Other upstreams a Ticket may run on, by name. `default` is this section's own `p
 
 | Field | Default | Meaning |
 |---|---|---|
-| `provider` | required | Who receives the text and bills for it: `deepseek` or `venice`. `anthropic` is not admitted for an upstream in this release. |
+| `provider` | required | Who receives the text and bills for it: `deepseek`, `venice`, `zhipu` or `zhipu-coding`. `anthropic` is not admitted for an upstream in this release. |
 | `model` | required | The model, as the provider's catalog names it. |
-| `wire` | required | `chat` or `anthropic`. A `pi` session needs `chat`; `anthropic` needs `harness: claude-code`, and only `deepseek` serves it. |
+| `wire` | required | `chat` or `anthropic`. A `pi` session needs `chat`; `anthropic` needs `harness: claude-code`, and only `deepseek` serves it; `zhipu` has only a `chat` wire here. |
 | `harness` | required | `pi` or `claude-code`. `claude-code` needs `executor.claude`. |
 | `key_file` | required | The upstream's key, a one-use token file read once and deleted. `serve` refuses it under any path a sandbox can read. A relative path resolves beside this file. |
 | `prices` | required | The same table as `executor.prices`. |
@@ -235,7 +235,8 @@ completions: `src/gateway/anthropic.rs` turns each request into a chat body and 
 session's prompt, tools, `thinking` and `output_config` go upstream as the session wrote them, minus fields such as
 `metadata` and `mcp_servers`. The broker still sets `model`, `max_tokens` (the lower of the session's and the
 executor's), `stream` and, where the call does not think, `temperature`. A streamed reply comes back as the provider
-frames it, as it arrives. Only `deepseek` has an admitted Messages endpoint; `venice` is refused at config load.
+frames it, as it arrives. Only `deepseek` has an admitted Messages endpoint; `venice`, `zhipu` and `zhipu-coding` are
+refused at config load.
 
 A forwarded call is held and settled like a chat call. Its usage is counted as every input token: `cache_read_input_tokens`
 settle at `prices.cache_hit_microusd_per_million`, and `cache_creation_input_tokens` at the input rate, since the price
@@ -452,8 +453,8 @@ Each entry of `forge.repos`, keyed `<owner>/<name>`:
 - `worker`: the repository's Tickets' workers, and any worker shown a memo that carries it.
 - `memory`: the memory review and the dream.
 
-A provider is `deepseek`, `venice` or `anthropic`. `anthropic` may be allowed before an upstream runs on it: a
-repository that no upstream here serves still loads, and `agent serve` logs it at start.
+A provider is `deepseek`, `venice`, `zhipu`, `zhipu-coding` or `anthropic`. `anthropic` remains policy-only: it may be allowed before
+an upstream runs on it, so a repository that no upstream here serves still loads, and `agent serve` logs it at start.
 
 `worker` names `default` or a key of `executor.upstreams`, and that upstream's provider must be one the `worker` role
 allows. Without it: `default` when its provider is allowed, else the one upstream here whose provider is allowed. Two

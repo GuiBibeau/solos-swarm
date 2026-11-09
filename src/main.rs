@@ -124,7 +124,7 @@ enum Action {
         pi_root: PathBuf,
         #[arg(long)]
         node: PathBuf,
-        #[arg(long, value_parser = ["deepseek", "venice"])]
+        #[arg(long, value_parser = ["deepseek", "venice", "zhipu", "zhipu-coding"])]
         provider: Option<String>,
         #[arg(long)]
         credential_file: Option<PathBuf>,

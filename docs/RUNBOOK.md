@@ -24,7 +24,8 @@ On the controller you need:
 - An SSH alias for the host whose host key is already in `known_hosts`. The script connects with `BatchMode=yes`
   and `StrictHostKeyChecking=yes`, so it never prompts.
 - The Pi auth file, `~/.pi/agent/auth.json`, with an entry of `"type": "api_key"` for the provider the run spends
-  against (`deepseek` or `venice`). The key leaves the Mac only over SSH stdin, at `start`.
+  against (`deepseek`, `venice`, `zhipu` or `zhipu-coding`, by the entry's own name in that file). The key
+  leaves the Mac only over SSH stdin, at `start`.
 
 On the host you need bubblewrap (`bwrap`), a systemd user manager, `python3`, Rust 1.96.0 with `cargo` in
 `~/.cargo/bin` or on `PATH`, and Node 24.18.0 unpacked at `~/.local/opt/node-v24.18.0-linux-x64`.
@@ -112,7 +113,7 @@ python3 scripts/remote.py start --candidate current --run-id RUN --seed 1 \
 - `--seed` is always required. Without a Goal file it picks the synthetic case.
 - `--refuse-peak` makes the broker hold model calls Monday to Friday, 01:00 to 04:00 and 06:00 to 10:00 UTC. The
   Goal deadline counts only the time that is not paused. See [pause-mode.md](pause-mode.md).
-- `--provider deepseek|venice` picks the auth-file entry. Without it, the script uses the Goal's own
+- `--provider deepseek|venice|zhipu|zhipu-coding` picks the auth-file entry. Without it, the script uses the Goal's own
   `upstream.provider`, and then `deepseek`.
 
 The script asks the host to start the run, and sends the key only when the host asks for one. The host writes the

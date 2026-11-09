@@ -313,8 +313,11 @@ Workers sample at `executor.temperature`, 0.6 unless the config says otherwise. 
 shared upstream body's 0, which swarm mode pins byte for byte. A model that decodes greedily is the likelier to go
 round in circles, and DeepSeek's V4 model card recommends 1.0 (its API default is 1, and an older table says 0.0 for
 code). 0.6 is the low end of what agentic runs use: enough randomness to leave a loop, and low enough for a command to
-come out as meant. Thinking is off for workers, so the temperature takes effect. No frequency or presence penalty is
-sent, because DeepSeek's API documents `frequency_penalty` and `presence_penalty` as no longer supported.
+come out as meant. Thinking is off for workers on `deepseek` and `venice`, so the temperature takes effect. A `zhipu`
+upstream is the exception: GLM-5.3 always thinks and rejects a disabled `thinking`, so the gateway removes the field,
+sends `reasoning_effort: "low"` where a session wanted thinking off, and otherwise clamps the effort to `low`, `high`
+or `max`. No frequency or presence penalty is sent, because DeepSeek's API documents `frequency_penalty` and
+`presence_penalty` as no longer supported.
 
 ### After a restart
 

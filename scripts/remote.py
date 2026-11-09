@@ -784,7 +784,7 @@ def main():
     start.add_argument("--goal-file", type=Path, help="Frozen Goal JSON prepared locally; skips host-side prepare_case")
     start.add_argument("--expected-file", type=Path, help="Private evaluator payload paired with --goal-file")
     start.add_argument("--auth-file", type=Path, default=Path.home() / ".pi/agent/auth.json")
-    start.add_argument("--provider", choices=("deepseek", "venice"),
+    start.add_argument("--provider", choices=("deepseek", "venice", "zhipu", "zhipu-coding"),
                        help="Provider that spends for this run; defaults to the Goal's own upstream")
     start.add_argument("--refuse-peak", action="store_true", help="Broker pauses model calls Mon-Fri 01-04 and 06-10 UTC (needs a candidate built with this support)")
     start.add_argument("--idle-probe", action="store_true", help="Exercise lifecycle with no paid model calls; never qualifies")

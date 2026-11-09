@@ -15,6 +15,11 @@ pub enum Dialect {
     DeepSeek,
     /// Any other OpenAI-compatible gateway; reasoning is steered by `reasoning_effort`.
     OpenAi,
+    /// Zhipu hosted: OpenAI-compatible, but `thinking` is removed because GLM
+    /// rejects it. A session that wanted thinking off gets
+    /// `reasoning_effort: "low"` (the least Zhipu admits), and one that wanted
+    /// it on gets its effort clamped to low, high or max.
+    Zhipu,
 }
 /// The exact admitted upstream a Goal spends against. The provider is named
 /// explicitly because it is what the receipt, ledger and checker attribute.
@@ -39,6 +44,11 @@ impl Upstream {
 pub fn venice_model(model: &str) -> bool {
     model.starts_with("deepseek-v4-1-flash-uncensored") || model.starts_with("zai-org-glm-5")
 }
+/// Model IDs of the admitted Zhipu catalog, exact because Z.ai's chat API
+/// admits exactly these three GLM-5.3 ids (Z.ai's documentation, 2026-11-09).
+pub fn zhipu_model(model: &str) -> bool {
+    matches!(model, "glm-5.3" | "glm-5.3-flash" | "glm-5.3-flashx")
+}
 /// Resolve a deployment provider id and model into its admitted upstream, so an
 /// operator selects a shipped profile by name instead of restating its dialect.
 /// An unknown provider fails rather than silently defaulting, because the wrong
@@ -56,6 +66,16 @@ pub fn upstream_profile(provider: &str, model: &str) -> Result<Upstream> {
             provider: provider.into(),
             model: model.into(),
             dialect: Dialect::OpenAi,
+        }
+    } else if provider == "zhipu" || provider == "zhipu-coding" {
+        ensure!(
+            zhipu_model(model),
+            "model is outside the admitted Zhipu catalog"
+        );
+        Upstream {
+            provider: provider.into(),
+            model: model.into(),
+            dialect: Dialect::Zhipu,
         }
     } else {
         bail!("provider outside the deployment allowlist: {provider}")
@@ -157,7 +177,7 @@ impl Provider for BothWires {
     }
 }
 /// An OpenAI-compatible hosted endpoint. `dialect` is the only difference
-/// between the shipped profiles, so one transport serves both and neither
+/// between the shipped profiles, so one transport serves every one and none
 /// duplicates the receipt, bound or error handling.
 pub struct OpenAiCompatible {
     pub endpoint: &'static str,
@@ -172,24 +192,8 @@ impl Provider for OpenAiCompatible {
         let client = self.client.clone();
         let key = self.key.clone();
         Box::pin(async move {
-            // `thinking` is DeepSeek's own dialect and Venice rejects it outright
-            // ("Invalid request parameters", HTTP 400), so an OpenAI-compatible
-            // route REPLACES it rather than augmenting: the field is removed and
-            // the intent re-expressed as `reasoning_effort`, because a reasoning
-            // model would otherwise leave reasoning at its costlier default. A
-            // non-reasoning model rejects `reasoning_effort: "none"`, so that is
-            // only sent where the Goal declared reasoning off.
-            let mut body = body;
             let limit = response_limit(&body);
-            if dialect == Dialect::OpenAi {
-                let disabled = body["thinking"]["type"] == json!("disabled");
-                if let Some(object) = body.as_object_mut() {
-                    object.remove("thinking");
-                }
-                if disabled && reasoning_model(body["model"].as_str().unwrap_or_default()) {
-                    body["reasoning_effort"] = json!("none");
-                }
-            }
+            let body = sanitized(dialect, body);
             let mut response = client
                 .post(endpoint)
                 .bearer_auth(key.as_str())
@@ -218,6 +222,56 @@ impl Provider for OpenAiCompatible {
         })
     }
 }
+/// Rewrite an admitted body into what `dialect` accepts. `thinking` is
+/// DeepSeek's own dialect and the OpenAI-compatible gateways reject it outright
+/// ("Invalid request parameters", HTTP 400), so those routes REPLACE it rather
+/// than augmenting: the field is removed and the intent re-expressed as
+/// `reasoning_effort`, because a reasoning model would otherwise leave
+/// reasoning at its costlier default. A non-reasoning model rejects
+/// `reasoning_effort: "none"`, so that is only sent where the Goal declared
+/// reasoning off. Zhipu cannot be told not to think: every earlier
+/// `reasoning_content` is removed, a disabled session gets the least effort
+/// Zhipu admits, and an enabled one gets its effort clamped to low, high or
+/// max.
+pub(crate) fn sanitized(dialect: Dialect, mut body: Value) -> Value {
+    match dialect {
+        Dialect::DeepSeek => body,
+        Dialect::OpenAi => {
+            let disabled = body["thinking"]["type"] == json!("disabled");
+            if let Some(object) = body.as_object_mut() {
+                object.remove("thinking");
+            }
+            if disabled && reasoning_model(body["model"].as_str().unwrap_or_default()) {
+                body["reasoning_effort"] = json!("none");
+            }
+            body
+        }
+        Dialect::Zhipu => {
+            let disabled = body["thinking"]["type"] == json!("disabled");
+            if let Some(object) = body.as_object_mut() {
+                object.remove("thinking");
+                if let Some(messages) = object.get_mut("messages").and_then(Value::as_array_mut) {
+                    for message in messages {
+                        if let Some(message) = message.as_object_mut() {
+                            message.remove("reasoning_content");
+                        }
+                    }
+                }
+            }
+            if disabled {
+                body["reasoning_effort"] = json!("low");
+            } else if let Some(effort) = body.get("reasoning_effort") {
+                let effort = match effort.as_str() {
+                    Some("low") => "low",
+                    Some("max" | "xhigh") => "max",
+                    _ => "high",
+                };
+                body["reasoning_effort"] = json!(effort);
+            }
+            body
+        }
+    }
+}
 /// The most a provider's answer may be. A call with thinking on also brings
 /// back its reasoning (`reasoning_content`), up to its whole output ceiling,
 /// so it may be larger; every call with thinking off, as swarm mode and agent
@@ -232,7 +286,9 @@ fn response_limit(body: &Value) -> usize {
 
 /// Models whose `reasoning_effort` field is meaningful on an OpenAI-compatible
 /// gateway. Kept beside the catalog admission so adding a model to one without
-/// the other is visible.
+/// the other is visible. The Zhipu catalog is deliberately absent: Z.ai's
+/// GLM rejects `reasoning_effort: "none"`, and its dialect always carries an
+/// admitted effort instead.
 pub fn reasoning_model(model: &str) -> bool {
     model.starts_with("deepseek-v4-1-flash") || model.starts_with("zai-org-glm-5")
 }
@@ -246,10 +302,15 @@ pub fn endpoint(provider: &str, wire: Wire) -> Result<&'static str> {
         ("deepseek", Wire::Anthropic) => Ok("https://api.deepseek.com/anthropic/v1/messages"),
         ("venice", Wire::Chat) => Ok("https://api.venice.ai/api/v1/chat/completions"),
         ("venice", Wire::Anthropic) => bail!("provider venice has no Anthropic wire"),
+        ("zhipu", Wire::Chat) => Ok("https://api.z.ai/api/paas/v4/chat/completions"),
+        ("zhipu-coding", Wire::Chat) => Ok("https://api.z.ai/api/coding/paas/v4/chat/completions"),
+        ("zhipu", Wire::Anthropic) | ("zhipu-coding", Wire::Anthropic) => {
+            bail!("provider {provider} has no Anthropic wire")
+        }
         (other, _) => bail!("provider outside the deployment allowlist: {other}"),
     }
 }
-/// Build the transport for a resolved upstream, so both shipped profiles share
+/// Build the transport for a resolved upstream, so every shipped profile shares
 /// one receipt, bound and error path.
 pub fn provider_for(
     upstream: &Upstream,
@@ -497,6 +558,119 @@ mod tests {
     }
 
     #[test]
+    fn the_zhipu_dialect_removes_thinking_and_strips_reasoning_content() {
+        let request = json!({"messages":[
+            {"role":"user","content":"x"},
+            {"role":"assistant","content":"y","reasoning_content":"R1"},
+            {"role":"tool","content":"ok","reasoning_content":"R2"},
+        ]});
+        // A session that wanted thinking off: GLM cannot be told not to think,
+        // and `thinking: disabled` is a 400, so it gets the least effort admitted.
+        let body = upstream_body("glm-5.3", &request, 131_072);
+        let sent = sanitized(Dialect::Zhipu, body);
+        assert!(sent.get("thinking").is_none(), "GLM rejects `thinking`");
+        assert_eq!(sent["reasoning_effort"], "low");
+        assert_eq!(sent["max_tokens"], 131_072);
+        assert!(
+            sent["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|message| message.get("reasoning_content").is_none())
+        );
+
+        // A session that thinks keeps its effort, clamped to what Zhipu admits.
+        let body = thinking_body("glm-5.3", &request, 131_072, "max");
+        let sent = sanitized(Dialect::Zhipu, body);
+        assert!(sent.get("thinking").is_none());
+        assert_eq!(sent["reasoning_effort"], "max");
+        assert!(
+            sent["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|message| message.get("reasoning_content").is_none())
+        );
+
+        let effort = |effort: Value| {
+            sanitized(
+                Dialect::Zhipu,
+                json!({"model":"glm-5.3","messages":[],"thinking":{"type":"enabled"},
+                       "reasoning_effort":effort}),
+            )["reasoning_effort"]
+                .clone()
+        };
+        assert_eq!(effort(json!("low")), "low");
+        assert_eq!(effort(json!("medium")), "high");
+        assert_eq!(effort(json!("high")), "high");
+        assert_eq!(effort(json!("xhigh")), "max");
+        assert_eq!(effort(json!("none")), "high");
+        assert_eq!(effort(json!(7)), "high");
+
+        // Enabled with no effort named: none is invented.
+        let sent = sanitized(
+            Dialect::Zhipu,
+            json!({"model":"glm-5.3","messages":[],"thinking":{"type":"enabled"}}),
+        );
+        assert!(sent.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn the_deepseek_dialect_keeps_its_thinking_field_untouched() {
+        let body = json!({"model":"deepseek-flash","messages":[
+            {"role":"assistant","content":"x","reasoning_content":"R1"},
+        ],"thinking":{"type":"disabled"},"reasoning_effort":"max"});
+        let sent = sanitized(Dialect::DeepSeek, body);
+        assert_eq!(sent["thinking"]["type"], "disabled");
+        assert_eq!(sent["reasoning_effort"], "max");
+        assert_eq!(sent["messages"][0]["reasoning_content"], "R1");
+    }
+
+    #[test]
+    fn the_openai_dialect_still_sends_none_for_a_reasoning_model() {
+        let body = json!({"model":"deepseek-v4-1-flash-uncensored",
+                          "thinking":{"type":"disabled"}});
+        let sent = sanitized(Dialect::OpenAi, body);
+        assert!(sent.get("thinking").is_none(), "Venice rejects `thinking`");
+        assert_eq!(sent["reasoning_effort"], "none");
+
+        // A non-reasoning model still drops the field but gains no effort value.
+        let non = json!({"model":"some-chat-model","thinking":{"type":"disabled"}});
+        let sent = sanitized(Dialect::OpenAi, non);
+        assert!(sent.get("thinking").is_none() && sent.get("reasoning_effort").is_none());
+
+        // Thinking on leaves no effort behind: only the field is replaced.
+        let enabled = json!({"model":"deepseek-v4-1-flash-uncensored",
+                            "thinking":{"type":"enabled"}});
+        let sent = sanitized(Dialect::OpenAi, enabled);
+        assert!(sent.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn the_zhipu_catalog_admits_exactly_its_three_models() {
+        for provider in ["zhipu", "zhipu-coding"] {
+            for model in ["glm-5.3", "glm-5.3-flash", "glm-5.3-flashx"] {
+                let upstream = upstream_profile(provider, model).unwrap();
+                assert_eq!(
+                    (
+                        upstream.provider.as_str(),
+                        upstream.model.as_str(),
+                        upstream.dialect
+                    ),
+                    (provider, model, Dialect::Zhipu)
+                );
+            }
+        }
+        assert!(!zhipu_model("glm-5.3-2026-01-01"));
+        assert_eq!(
+            upstream_profile("zhipu", "glm-5.4")
+                .unwrap_err()
+                .to_string(),
+            "model is outside the admitted Zhipu catalog"
+        );
+    }
+
+    #[test]
     fn each_shipped_profile_has_one_endpoint_and_others_have_none() {
         let key = || Zeroizing::new(String::new());
         let venice = upstream_profile("venice", "zai-org-glm-5").unwrap();
@@ -523,6 +697,40 @@ mod tests {
             "https://api.deepseek.com/anthropic/v1/messages"
         );
         assert!(messages_for(&venice, reqwest::Client::new(), key(), None).is_err());
+        let zhipu = upstream_profile("zhipu", "glm-5.3").unwrap();
+        let built = provider_for(&zhipu, reqwest::Client::new(), key()).unwrap();
+        assert_eq!(
+            (built.endpoint, built.dialect),
+            (
+                "https://api.z.ai/api/paas/v4/chat/completions",
+                Dialect::Zhipu
+            )
+        );
+        assert_eq!(
+            messages_for(&zhipu, reqwest::Client::new(), key(), None)
+                .err()
+                .unwrap()
+                .to_string(),
+            "provider zhipu has no Anthropic wire"
+        );
+        // The Coding Plan is its own provider: same models and dialect, the
+        // plan's endpoint, and its key is refused on the pay-as-you-go one.
+        let coding = upstream_profile("zhipu-coding", "glm-5.3-flash").unwrap();
+        let built = provider_for(&coding, reqwest::Client::new(), key()).unwrap();
+        assert_eq!(
+            (built.endpoint, built.dialect),
+            (
+                "https://api.z.ai/api/coding/paas/v4/chat/completions",
+                Dialect::Zhipu
+            )
+        );
+        assert_eq!(
+            messages_for(&coding, reqwest::Client::new(), key(), None)
+                .err()
+                .unwrap()
+                .to_string(),
+            "provider zhipu-coding has no Anthropic wire"
+        );
         let other = Upstream {
             provider: "openrouter".into(),
             ..deepseek
