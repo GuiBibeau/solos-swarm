@@ -783,7 +783,7 @@ pub enum RouterConfig {
     /// through the agent broker against the Router's daily cap.
     Pi {
         /// An admitted upstream, by the names `solos-swarm run --provider`
-        /// takes: `deepseek` or `venice`.
+        /// takes: `deepseek`, `venice`, `zhipu` or `zhipu-coding`.
         provider: String,
         model: String,
         prices: PriceTable,
@@ -917,9 +917,9 @@ pub enum ExecutorConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamConfig {
-    /// Who receives the text and bills for it: `deepseek` or `venice` in
-    /// this build. `anthropic` is a valid entry in a repository's `allow`,
-    /// but an upstream runs on it only once its transport lands.
+    /// Who receives the text and bills for it: `deepseek`, `venice`,
+    /// `zhipu` or `zhipu-coding` in this build. `anthropic` is a valid entry in a repository's
+    /// `allow`, but an upstream runs on it only once its transport lands.
     pub provider: Provider,
     pub model: String,
     /// How the broker reaches the provider: `chat` translates Claude Code's
@@ -2493,11 +2493,11 @@ forge:
             "harness claude-code needs executor.claude",
             "executor.upstreams.claude",
         );
-        // This build runs an upstream on deepseek or venice.
+        // This build runs an upstream on deepseek, venice, zhipu or zhipu-coding.
         refused(
             with_upstreams(&upstream("anthropic", "anthropic", "claude-code")),
             "provider anthropic is not admitted yet",
-            "deepseek or venice",
+            "deepseek, venice, zhipu or zhipu-coding",
         );
         refused(
             with_upstreams(
@@ -2574,6 +2574,28 @@ forge:
                 max_output_tokens: None,
             }
         );
+
+        // The two Zhipu providers parse and validate: the pay-as-you-go API
+        // and the GLM Coding Plan, each with its own key file and endpoint.
+        for provider in ["zhipu", "zhipu-coding"] {
+            let zhipu = format!(
+                "    zhipu-flash:
+      provider: {provider}
+      model: glm-5.3-flash
+      wire: chat
+      harness: pi
+      key_file: keys/zhipu.key
+      prices: {{input_microusd_per_million: 300000, output_microusd_per_million: 1200000}}
+"
+            );
+            let config = parse(&with_upstreams(&zhipu)).unwrap();
+            let ExecutorConfig::Pi { upstreams, .. } = &config.executor else {
+                panic!("{:?}", config.executor)
+            };
+            let found = upstreams.values().next().unwrap();
+            assert_eq!(found.provider, Provider::named(provider).unwrap());
+            assert_eq!(found.model, "glm-5.3-flash");
+        }
     }
 
     #[test]

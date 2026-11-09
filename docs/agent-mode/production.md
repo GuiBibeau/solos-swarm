@@ -131,6 +131,9 @@ web:
     # spool: state/web/triggers.jsonl      # the default: <state>/web/triggers.jsonl
 ```
 
+A `models.allow` list may also name `zhipu` or `zhipu-coding`; [Zhipu AI](providers/zhipu.md) has an `executor.upstreams` example
+and the Claude Code settings for Z.ai's own Anthropic endpoint.
+
 Read these before you change it:
 
 - Every `token_file` and `github.key_file` names the unit's runtime copy, as [Store a token](#store-a-token) says.

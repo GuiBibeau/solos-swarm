@@ -299,6 +299,17 @@ Pull requests merged to `main` after the minimal reference (#1-#5). Dates are me
   opened once with `O_NOFOLLOW` and renames a fresh `O_CREAT | O_EXCL` file over its target, so a link the worker made
   cannot take a write outside; `run_code`'s `files` use the same writer. The worker's system prompt tells it to use the
   tools rather than a heredoc.
+- Agent mode, Zhipu AI as a provider (#147): `zhipu` (the pay-as-you-go API) and `zhipu-coding` (the GLM Coding Plan,
+  a separate provider because Z.ai refuses a plan key on the pay-as-you-go endpoint with error 1113) are admitted in a
+  repository's `models.allow` and as upstreams (`Provider::Zhipu`/`ZhipuCoding`, `Dialect::Zhipu`), with `glm-5.3`,
+  `glm-5.3-flash` and `glm-5.3-flashx` on `https://api.z.ai/api/paas/v4/chat/completions` and
+  `https://api.z.ai/api/coding/paas/v4/chat/completions` under a Bearer key. GLM-5.3 rejects a disabled `thinking` and
+  cannot turn thinking off, so a Zhipu call never carries the field: a session that wanted thinking off asks for
+  `reasoning_effort: "low"`, and every other call's effort is clamped to low, high or max. No Anthropic Messages wire
+  is shipped for it, so a `claude-code` harness reaches it through the bridge's translation onto chat completions.
+  [The provider docs](docs/agent-mode/providers/zhipu.md) include the Claude Code direct setup against
+  `https://api.z.ai/api/anthropic` with `ANTHROPIC_AUTH_TOKEN` and the `[1m]` model names, and a Pi `models.json`
+  entry. `anthropic` remains policy-only.
 
 ### Changed
 

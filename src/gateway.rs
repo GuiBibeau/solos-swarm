@@ -16,5 +16,5 @@ pub use pricing::{PriceTable, Receipt, Usage, completion_usage};
 pub use upstream::{
     AnthropicMessages, BothWires, Dialect, Dispatch, OpenAiCompatible, Provider, Temperature,
     Upstream, Wire, admit_request, endpoint, messages_for, provider_for, reasoning_model, sampled,
-    thinking_body, upstream_body, upstream_profile, venice_model,
+    thinking_body, upstream_body, upstream_profile, venice_model, zhipu_model,
 };
