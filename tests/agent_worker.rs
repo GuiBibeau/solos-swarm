@@ -1067,72 +1067,14 @@ async fn a_worker_whose_calls_bring_nothing_new_is_stopped_after_thirty_of_them(
 }
 
 #[tokio::test]
-async fn a_worker_is_stopped_at_the_ceiling_of_tool_calls_however_different_they_are() {
-    let scratch = Scratch::new("loop-tool-ceiling");
-    scratch.ask("t-ask", "T1", "Find where the bps range is checked");
-    let (url, hits, web) = counting_page().await;
-    let model = fetching(url, |n| n, None);
-
-    scratch
-        .serve(
-            scratch.config(false, ""),
-            scratch.host(agent_loop(), model.clone()),
-        )
-        .await;
-
-    assert_told_once_that_it_got_stuck(
-        &scratch,
-        "I made 200 tool calls without finishing, so I stopped. Should I keep going from \
-         where I am?",
-    );
-    assert_eq!(model.worker_calls(), 201);
-    assert_eq!(hits.load(Ordering::SeqCst), 200);
-    assert_settled(&scratch.store());
-    web.abort();
-}
-
-#[tokio::test]
-async fn a_worker_that_only_reports_progress_is_stopped_at_the_ceiling_of_model_calls() {
-    let scratch = Scratch::new("loop-model-ceiling");
-    scratch.ask("t-ask", "T1", "Go through the logs");
-    // A report is no call the guard counts, so only the model calls do.
-    let model = Model::looping(Box::new(|_| vec![report("progress", "Still going.")]));
-
-    scratch
-        .serve(
-            scratch.config(false, ""),
-            scratch.host(agent_loop(), model.clone()),
-        )
-        .await;
-
-    assert_eq!(model.worker_calls(), 250);
-    assert_eq!(
-        scratch.replies(),
-        [
-            ("T1".to_owned(), MessageKind::Acknowledgement),
-            ("T1".to_owned(), MessageKind::Attention)
-        ],
-        "progress tells nobody, and the host tells the person once"
-    );
-    assert_eq!(
-        scratch.sent()[1].text,
-        "I made 250 model calls without finishing, so I stopped. Should I keep going from \
-         where I am?"
-    );
-    let tickets = scratch.tickets();
-    let report = tickets[0].latest_report().unwrap();
-    assert_eq!(report.status, ReportStatus::Failed);
-    assert_eq!(tickets[0].stage(), Stage::Answer);
-    assert_settled(&scratch.store());
-}
-
-#[tokio::test]
 async fn a_long_session_of_different_calls_is_not_stopped() {
     let scratch = Scratch::new("long-session");
     scratch.ask("t-ask", "T1", "Find where the bps range is checked");
     let (url, hits, web) = counting_page().await;
-    // Eighty different calls, then the answer.
-    let model = fetching(url, |n| n, Some(80));
+    // Two hundred and sixty different calls, more than the old ceiling of 200
+    // tools and 250 model calls, then the answer: a turn has no ceiling. The
+    // scripted harness's own anti-hang bound sits at 300 model calls.
+    let model = fetching(url, |n| n, Some(260));
 
     scratch
         .serve(
@@ -1143,8 +1085,8 @@ async fn a_long_session_of_different_calls_is_not_stopped() {
 
     assert_eq!(scratch.replies(), ack_and_result("T1"));
     assert_eq!(scratch.sent()[1].text, "Found it.");
-    assert_eq!(hits.load(Ordering::SeqCst), 80);
-    assert_eq!(model.worker_calls(), 81);
+    assert_eq!(hits.load(Ordering::SeqCst), 260);
+    assert_eq!(model.worker_calls(), 261);
     assert_settled(&scratch.store());
     web.abort();
 }

@@ -367,9 +367,8 @@ impl WorkerSeat {
 
     /// Refuse a tool call that repeats the seat's latest calls too often,
     /// and say what the call answered before. Once the refusals reach the
-    /// limit, the calls stop bringing anything new, or the turn passes its
-    /// ceiling of tool calls, the turn is stopped: that call and each one
-    /// after it is told so, and runs nothing.
+    /// limit or the calls stop bringing anything new, the turn is stopped:
+    /// that call and each one after it is told so, and runs nothing.
     fn repeat_refused(&self, tool: &str, args: &Value, repeatable: bool) -> Option<Refusal> {
         let mut repeats = self.guard();
         if let Some(stopped) = repeats.stopped() {
@@ -403,15 +402,13 @@ impl WorkerSeat {
         self.guard().answered(tool, args, answer);
     }
 
-    /// A model call is about to be made: note it, and say whether the turn is
-    /// stopped, by what the guard saw of the tool calls or by this call being
-    /// past the turn's ceiling. Then the seat's model calls are refused,
-    /// which ends a Pi turn, until the next turn begins; this is why, and
-    /// what the host tells the person.
+    /// A model call is about to be made: say whether the turn is stopped, by
+    /// what the guard saw of the tool calls. Then the seat's model calls are
+    /// refused, which ends a Pi turn, until the next turn begins; this is
+    /// why, and what the host tells the person.
     fn stopped_before_model_call(&self) -> Option<(String, ModelFailure)> {
-        let mut repeats = self.guard();
+        let repeats = self.guard();
         let was = repeats.stopped();
-        repeats.model_call();
         let stopped = repeats.stopped()?;
         if was.is_none() {
             eprintln!(
@@ -441,8 +438,8 @@ pub enum ModelFailure {
     Failed(String),
     /// The broker stopped the turn: the worker kept sending the same call
     /// after it was refused, or made calls that failed the same way or
-    /// brought nothing new, or passed the turn's ceiling of calls, so the
-    /// call after the stop was refused too, with no model call spent. The
+    /// brought nothing new, so the call after the stop was refused too,
+    /// with no model call spent. The
     /// text is what the host tells the person in the worker's place, in the
     /// worker's words: what it kept doing, that it stopped, and the one
     /// question that would get it going again.
@@ -1604,9 +1601,8 @@ impl Call {
         grant: &Grant,
         named: &mut Option<ModelFailure>,
     ) -> std::result::Result<(), Refusal> {
-        // First of all: the turn of a worker that loops, makes no progress or
-        // has made its ceiling of calls ends here, with no hold, no upstream
-        // call and no cost.
+        // First of all: the turn of a worker that loops or makes no progress
+        // ends here, with no hold, no upstream call and no cost.
         if let Principal::Worker(seat) = &grant.principal
             && let Some((reason, failure)) = seat.stopped_before_model_call()
         {
